@@ -437,8 +437,20 @@ class SubscribeTests(unittest.TestCase):
 # ----------------------------------------------------------------------
 class ConfigTests(unittest.TestCase):
     def test_missing_file_returns_defaults(self) -> None:
+        # Config.load() falls through to $OPENCODE_BRIDGE_CONFIG and then
+        # ./config.json when the explicit path does not exist, so this test must
+        # isolate both — otherwise it fails from an installed copy where the
+        # installer has just created a real ./config.json.
         with tempfile.TemporaryDirectory() as td:
-            cfg = Config.load(os.path.join(td, "nope.json"))
+            cwd = os.getcwd()
+            saved_env = os.environ.pop("OPENCODE_BRIDGE_CONFIG", None)
+            try:
+                os.chdir(td)
+                cfg = Config.load(os.path.join(td, "nope.json"))
+            finally:
+                os.chdir(cwd)
+                if saved_env is not None:
+                    os.environ["OPENCODE_BRIDGE_CONFIG"] = saved_env
         self.assertEqual(cfg.opencode_url, "")
         self.assertEqual(cfg.opencode_directory, ".")
         self.assertEqual(cfg.permissions_mode, "ask")

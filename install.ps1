@@ -105,8 +105,9 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
         Write-Info "[1/4] 更新已有 clone: git -C `"$BridgeDir`" pull --ff-only"
         # git 的 stdout 属于本函数的"返回流"，会被调用方 $code = Sync-Source ... 捕获成数组，
         # 导致 if ($code -ne 0) 对数组求值恒为真而提前返回（安装在第 1 步后静默中断）。
-        # 因此显式把 git 输出送往 host，保证返回流里只有 0/1。
-        git -C $BridgeDir pull --ff-only 2>&1 | Out-Host
+        # 因此只把 stdout 送往 host；stderr 保持原样直通控制台（PS 5.1 下加 2>&1 会把它
+        # 包成 NativeCommandError 红字）。
+        git -C $BridgeDir pull --ff-only | Out-Host
         if ($LASTEXITCODE -ne 0) {
             Write-Warn "       [警告] git pull 失败（本地有改动或网络问题），继续使用现有副本"
         }
@@ -136,7 +137,7 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
     }
     $parent = Split-Path -Parent $BridgeDir
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-    git clone $SourcePath $BridgeDir 2>&1 | Out-Host
+    git clone $SourcePath $BridgeDir | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Bad "[错误] git clone 失败 (exit code $LASTEXITCODE)"
         if ($savedCfg) {

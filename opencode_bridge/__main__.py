@@ -76,7 +76,7 @@ def _has_configured_adapter(cfg: Config) -> bool:
         if not isinstance(entry, dict):
             continue
         token = entry.get("bot_token")
-        if token is None or str(token).strip():
+        if token is not None and str(token).strip():
             return True
     return False
 
@@ -99,7 +99,11 @@ def run_check(cfg: Config) -> int:
 def run_bridge(cfg: Config) -> int:
     if not _has_configured_adapter(cfg):
         print(NO_ADAPTER_MESSAGE, file=sys.stderr)
-        return 1
+        print(
+            "提示：配置完成后下次启动自动生效；也可在 bot 内发送 /setup 查看分平台接入引导。",
+            file=sys.stderr,
+        )
+        return 0
 
     endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
     client = OpenCodeClient(endpoint)

@@ -395,6 +395,141 @@ class CommandTests(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
+# /setup onboarding command (Lane R)
+# ----------------------------------------------------------------------
+class SetupCommandTests(unittest.TestCase):
+    def test_setup_menu_lists_three_platforms(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup"))
+
+            self.assertEqual(client.prompts, [])
+            self.assertEqual(client.create_attempts, [])
+            text = adapter.sent[-1].text
+            for needle in ("Telegram", "Slack", "Discord", "1)", "2)", "3)"):
+                self.assertIn(needle, text)
+            self.assertIn("/setup 1", text)  # pure-text numbered fallback
+
+            # buttons ride a follow-up edit (adapter.send has no buttons)
+            self.assertEqual(len(adapter.sent), 1)
+            self.assertEqual(len(adapter.edited), 1)
+            buttons = adapter.edited[-1][1].buttons
+            self.assertEqual(
+                [b.data for b in buttons],
+                ["setup:telegram", "setup:slack", "setup:discord"],
+            )
+
+    def test_setup_telegram_guide_contains_botfather_steps(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup telegram"))
+            text = adapter.sent[-1].text
+            self.assertIn("@BotFather", text)
+            self.assertIn("allowed_chat_ids", text)
+            self.assertIn("123456789:AA", text)
+            self.assertEqual(client.prompts, [])
+
+    def test_setup_slack_guide_mentions_xoxb_and_inbound_todo(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup slack"))
+            text = adapter.sent[-1].text
+            self.assertIn("xoxb-", text)
+            self.assertIn("conversations.history", text)
+            self.assertEqual(client.prompts, [])
+
+    def test_setup_discord_guide_mentions_intent_and_dev_portal(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup discord"))
+            text = adapter.sent[-1].text
+            self.assertIn("MESSAGE CONTENT INTENT", text)
+            self.assertIn("discord.com/developers", text)
+            self.assertEqual(client.prompts, [])
+
+    def test_setup_is_case_insensitive_and_accepts_numbers(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup TELEGRAM"))
+            self.assertIn("@BotFather", adapter.sent[-1].text)
+            core.on_inbound(inbound("chat:55", "/Setup 1"))
+            self.assertIn("@BotFather", adapter.sent[-1].text)
+            core.on_inbound(inbound("chat:55", "/setup 2"))
+            self.assertIn("xoxb-", adapter.sent[-1].text)
+            self.assertEqual(client.prompts, [])
+
+    def test_setup_invalid_argument_lists_platforms_without_raising(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/setup bogus"))
+            out = adapter.sent[-1]
+            self.assertEqual(out.kind, "error")
+            for needle in ("Telegram", "Slack", "Discord", "/setup 1",
+                           "telegram"):
+                self.assertIn(needle, out.text)
+            self.assertEqual(client.prompts, [])
+            # the event loop survives a bad argument: next command still works
+            core.on_inbound(inbound("chat:55", "/help"))
+            self.assertEqual(adapter.sent[-1].text, HELP_TEXT)
+
+    def test_setup_replies_do_not_contain_machine_specific_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            for cmd in ("/setup", "/setup telegram", "/setup slack",
+                        "/setup discord", "/setup bogus"):
+                core.on_inbound(inbound("chat:55", cmd))
+            for out in adapter.sent:
+                lines = out.text.splitlines()
+                # line 1 is the runtime-computed config path (machine-specific
+                # by design); the frozen copy around it must never hardcode one
+                if lines and lines[0].startswith("配置文件："):
+                    body = "\n".join(lines[1:])
+                else:
+                    body = out.text
+                self.assertNotIn("D:\\workSpace", body)
+                self.assertNotIn("C:\\Users\\33204", body)
+
+    def test_setup_config_path_is_derived_at_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            core, client, adapter, _, _, _ = make_env(td)
+            with mock.patch.dict(
+                os.environ, {"OPENCODE_BRIDGE_CONFIG": cfg_path}
+            ):
+                core.on_inbound(inbound("chat:55", "/setup telegram"))
+            first = adapter.sent[-1].text.splitlines()[0]
+            self.assertEqual(first, f"配置文件： {os.path.abspath(cfg_path)}")
+
+    def test_setup_button_callback_replies_exactly_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            # Lane B fires on_inbound(kind="callback") *and* on_callback;
+            # on_inbound must drop its copy or the reply would double-send.
+            core.on_inbound(
+                Inbound(
+                    conversation_id="chat:55",
+                    text="setup:telegram",
+                    kind="callback",
+                    callback_query_id="Q7",
+                )
+            )
+            self.assertEqual(adapter.sent, [])
+            core.on_callback("chat:55", "setup:telegram", "Q7")
+            self.assertEqual(len(adapter.sent), 1)
+            self.assertIn("@BotFather", adapter.sent[0].text)
+            self.assertEqual(adapter.answers, [("Q7", "已打开接入引导")])
+            self.assertEqual(client.prompts, [])
+
+    def test_help_lists_setup_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/help"))
+            self.assertIn("/setup", adapter.sent[-1].text)
+
+
+# ----------------------------------------------------------------------
 # 5-6: prompt routing / queueing
 # ----------------------------------------------------------------------
 class PromptRoutingTests(unittest.TestCase):
@@ -946,7 +1081,7 @@ class CliTests(unittest.TestCase):
             json.dump(data, fh)
         return path
 
-    def test_empty_adapter_tokens_exit_1_without_traceback(self):
+    def test_empty_adapter_tokens_exit_0_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._write_config(
                 td,
@@ -969,10 +1104,13 @@ class CliTests(unittest.TestCase):
             ):
                 with redirect_stderr(stderr):
                     rc = cli.main(["--config", path])
-        self.assertEqual(rc, 1)
-        self.assertIn("没有任何可用适配器", stderr.getvalue())
+        out = stderr.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("没有任何可用适配器", out)
+        self.assertIn("/setup", out)
+        self.assertNotIn("Traceback", out)
 
-    def test_no_adapters_configured_exits_1(self):
+    def test_no_adapters_configured_exits_0_gracefully(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._write_config(
                 td, {"state_path": os.path.join(td, "state.json")}
@@ -987,8 +1125,48 @@ class CliTests(unittest.TestCase):
             ):
                 with redirect_stderr(stderr):
                     rc = cli.main(["--config", path])
-        self.assertEqual(rc, 1)
-        self.assertIn("没有任何可用适配器", stderr.getvalue())
+        out = stderr.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("没有任何可用适配器", out)
+        self.assertIn("/setup", out)
+        self.assertNotIn("Traceback", out)
+
+    @staticmethod
+    def _cfg_with(adapters) -> Config:
+        return Config(
+            opencode_url="",
+            opencode_password="",
+            opencode_directory=".",
+            opencode_agent="",
+            permissions_mode="ask",
+            log_level="INFO",
+            state_path="state.json",
+            bridge=dict(DEFAULT_BRIDGE),
+            adapters=adapters,
+        )
+
+    def test_has_configured_adapter_three_states(self):
+        # bot_token key missing -> False
+        self.assertFalse(
+            cli._has_configured_adapter(self._cfg_with({"telegram": {}}))
+        )
+        # empty string -> False
+        self.assertFalse(
+            cli._has_configured_adapter(
+                self._cfg_with({"telegram": {"bot_token": ""}})
+            )
+        )
+        # non-empty token -> True
+        self.assertTrue(
+            cli._has_configured_adapter(
+                self._cfg_with({"telegram": {"bot_token": "x"}})
+            )
+        )
+
+    def test_has_configured_adapter_empty_or_nondict_adapters(self):
+        self.assertFalse(cli._has_configured_adapter(self._cfg_with({})))
+        self.assertFalse(cli._has_configured_adapter(self._cfg_with("nope")))
+        self.assertFalse(cli._has_configured_adapter(self._cfg_with(None)))
 
     def test_check_prints_version_pid_url_and_exits_0(self):
         seen: dict = {}

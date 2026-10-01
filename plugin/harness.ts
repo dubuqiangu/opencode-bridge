@@ -1,8 +1,8 @@
 // harness.ts — opencode-bridge 插件独立验证脚本（用 bun 跑，不触碰 opencode 服务）。
 //   cd opencode-bridge\plugin
 //   bun harness.ts
-// 覆盖 14 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析），全部断言通过才
-// 打印 PASS 14/14 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
+// 覆盖 15 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析 + 1 个 exit-0 语义），全部断言通过才
+// 打印 PASS 15/15 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
 // 还原被它改动的 <插件目录>/config.json 与环境变量 OPENCODE_BRIDGE_DIR。
 // 注意：全程不运行真实的 python -m opencode_bridge，也不触碰 opencode 服务。
 
@@ -90,6 +90,11 @@ function liveCode(marker: string): string {
 
 function fastFailCode(marker: string): string {
   return `require('fs').appendFileSync(${JSON.stringify(marker)},'s\\n');process.exit(3)`
+}
+
+/** 快速 exit(0)：模拟「未配置 adapter」时 Python 侧的正常退出（不应进 backoff）。 */
+function fastOkExitCode(marker: string): string {
+  return `require('fs').appendFileSync(${JSON.stringify(marker)},'s\\n');process.exit(0)`
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +520,73 @@ async function run() {
     // 源码静态断言：index.ts 不得残留任何本机硬编码盘符路径（D:\ 或 D:/）
     const src = fs.readFileSync(indexTsPath, "utf8")
     assert(!/D:[\\/]/.test(src), "index.ts 不得包含硬编码盘符路径 D:\\ 或 D:/")
+  })
+
+  // ---- 15: 快速 exit(0)（未配置 adapter 的正常退出）→ 不记 failedAt、不 backoff、可 respawn ----
+  await test(15, "快速 exit(0) → 不记 failedAt、不进 backoff、可 respawn、打印“不是崩溃”日志", async () => {
+    const d15 = dirFor("t15")
+    const m15 = path.join(tmpRoot, "t15.marker")
+    const l15 = lockPathOf(d15)
+    const o = {
+      options: {
+        bridgeDir: d15,
+        logDir: logsDir,
+        python: RUNNER,
+        args: evalArgs(fastOkExitCode(m15)),
+        backoffMs: 60000, // 与 #10 相同：若误进快失败分支，第二次 setup 会被挡住
+      } satisfies BridgePluginOptions,
+    }
+    // 日志文件是所有场景共用的 append 文件（#10 已写入过“快速非零退出”）：
+    // 先等前序场景的异步 exit 日志落盘，再记录偏移，只对本场景新增的日志行做断言。
+    const logPath = path.join(logsDir, "bridge-plugin.log")
+    const readLog = (): string => {
+      try {
+        return fs.readFileSync(logPath, "utf8")
+      } catch {
+        return ""
+      }
+    }
+    let logPrev = readLog()
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 25))
+      const now = readLog()
+      if (now === logPrev) break
+      logPrev = now
+    }
+    const logBefore = logPrev
+    const cleanup1 = plugin.setup(o)
+    cleanups.push(cleanup1)
+    seenLockPids.push(l15)
+
+    // 1) 子进程被 spawn
+    await waitFor(() => markerCount(m15) >= 1, 5000, "exit-0 子进程已启动")
+    // 2) 退出处理跑完（exit(0) 很快发生）后：锁里不得有 failedAt（= 没进 backoff）
+    await waitFor(() => !fs.existsSync(l15) || readLock(l15) === null || !("failedAt" in (readLock(l15) || {})), 5000, "exit(0) 后锁中不出现 failedAt")
+    const lock15 = readLock(l15)
+    assert(!lock15 || !("failedAt" in lock15), `exit(0) 后锁不应包含 failedAt，实际: ${JSON.stringify(lock15)}`)
+
+    // 4) 日志出现“不是崩溃 / 不进 backoff / 尚未配置”语义（至少命中其一）
+    const logText = readLog()
+    const delta = logText.slice(logBefore.length)
+    assert(
+      delta.includes("不是崩溃") || delta.includes("不会进入 backoff") || delta.includes("尚未配置"),
+      `日志应出现“不是崩溃/不会进入 backoff/尚未配置”之一，实际新增尾部: ${JSON.stringify(delta.slice(-800))}`,
+    )
+    // 5) 本场景新增日志不得出现“快速非零退出”（确认没走快失败分支）
+    assert(
+      !delta.includes("快速非零退出"),
+      "exit(0) 不应打印“快速非零退出”（说明误入了快失败分支）",
+    )
+
+    // 3) 紧接着再跑一次 setup()：能正常 respawn（spawn 次数 +1），证明没被 backoff 挡住
+    const cleanup2 = plugin.setup(o)
+    cleanups.push(cleanup2)
+    await waitFor(() => markerCount(m15) >= 2, 5000, "exit(0) 后再次 setup() 应正常 respawn")
+    assert(markerCount(m15) === 2, `exit(0) 后 respawn 次数应为 2，实际 ${markerCount(m15)}`)
+
+    cleanup2()
+    cleanup1()
+    assert(!fs.existsSync(l15), "最终锁应被删除")
   })
 }
 

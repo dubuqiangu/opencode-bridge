@@ -451,6 +451,14 @@ export default {
               )
             } else {
               deleteLockIfPid(lockPath, c.pid)
+              if (code === 0 && aliveMs < FAST_FAIL_MS) {
+                // 未配置 adapter 时 Python 侧会 exit 0 正常退出：这不是崩溃，不写 failedAt、不进 backoff。
+                log(
+                  `bridge 启动后即退出 (code=0, 存活 ${aliveMs}ms)：不是崩溃，不会进入 backoff —— ` +
+                    `通常是因为尚未配置 adapter（三个 bot_token 均为空），属正常情况。` +
+                    `填好 token 后下次 location 加载会自动启动；见 README「接入平台引导」与「未配置时的行为」，或在 bot 内发送 /setup`,
+                )
+              }
               log(`bridge pid=${c.pid} 退出 (code=${code} signal=${signal}, 存活 ${aliveMs}ms)，锁已删除`)
             }
           } catch (e) {

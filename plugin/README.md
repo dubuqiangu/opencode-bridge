@@ -54,6 +54,18 @@ opencode service restart
 
 或关闭并重新打开 opencode TUI。
 
+## 装完之后
+
+插件装好只代表 bridge 能随 opencode 启动，**还要按平台填好 token** 才有消息进出。
+完整的分步引导见仓库根 [`README.md`](../README.md) 的「接入平台引导」一节（三个平台各一份，含配置文件路径），这里只给一句话概述：
+
+- **Telegram**：`@BotFather` 建 bot 拿 token、`@userinfobot` 查 chat id，填进 `adapters.telegram` → 支持双向对话；
+- **Slack**：`api.slack.com/apps` 建 App 拿 `xoxb-` token（Event Subscriptions 保持关闭）→ v1 仅能主动发送；
+- **Discord**：开发者后台建 Application、开 MESSAGE CONTENT INTENT、用 URL Generator 邀请进服务器 → v1 仅能主动发送。
+
+填好 token 并 `opencode service restart` 之后，可在 bot 内发送 **`/setup`** 查看 / 重温这套引导
+（`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台）。
+
 ## bridgeDir 解析优先级
 
 每一级都容错（拿不到就落向下一级，绝不抛异常）：

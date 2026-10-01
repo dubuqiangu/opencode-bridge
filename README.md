@@ -102,6 +102,76 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 之后在 IM 里给 bot 发消息即可开始对话；收到权限请求时用 `/approve` / `/deny` 回复。
 
+## 接入平台引导
+
+各平台当前能力一览：
+
+| 平台 | 接收消息 | 发送消息 | 状态 |
+|---|---|---|---|
+| Telegram | ✅ 长轮询 | ✅ | 完整，可双向对话 |
+| Slack | ⬜ TODO | ✅ | 仅发送 |
+| Discord | ⬜ TODO | ✅ | 仅发送 |
+
+> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温下面这套引导；
+> `/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
+
+### 配置文件位置
+
+| | 路径 |
+|---|---|
+| Windows | `%USERPROFILE%\.config\opencode-bridge\config.json` |
+| macOS / Linux | `${XDG_CONFIG_HOME:-~/.config}/opencode-bridge/config.json` |
+
+### Telegram（支持双向）
+
+1. 打开 Telegram，找 **@BotFather** → 发送 `/newbot`
+2. 依次设置显示名、用户名（**必须以 `bot` 结尾**），复制返回的 token（形如 `123456789:AA...`）
+3. 找 **@userinfobot** → 发送任意一句话 → 复制返回的**纯数字** chat id
+4. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": {
+     "telegram": { "bot_token": "123456789:AA...", "allowed_chat_ids": [123456789] }
+   }
+   ```
+
+   `allowed_chat_ids` 是数组，**数字不要加引号**
+5. 执行 `opencode service restart`
+6. 在 Telegram 给你的 bot 发一句 `hi`，收到回复即成功
+
+### Slack（⚠️ v1 仅支持主动发送）
+
+1. 打开 <https://api.slack.com/apps> → **Create New App** → **From scratch** → 选 workspace
+2. 左侧 **OAuth & Permissions** → **Bot User OAuth Token**（`xoxb-` 开头）→ 复制
+3. **Event Subscriptions 先保持关闭**（v1 入站轮询尚未接入）
+4. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "slack": { "bot_token": "xoxb-..." } }
+   ```
+
+5. 左侧 **Install App** → **Install to Workspace**，把 App 邀请进目标频道
+6. 执行 `opencode service restart`
+
+> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`conversations.history`）为 TODO，当前**无法在 Slack 里与 bot 双向对话**。
+
+### Discord（⚠️ v1 仅支持主动发送）
+
+1. 打开 <https://discord.com/developers/applications> → **New Application** → 左侧 **Bot**
+2. **Reset Token** → 复制 token
+3. 同一页把 **Privileged Gateway Intents** 下的 **MESSAGE CONTENT INTENT** 打开（**必需**）
+4. 左侧 **OAuth2 → URL Generator** → 勾选 scope: `bot` → Permissions: **Send Messages**
+5. 用生成的 URL 把 bot 邀请进你的服务器
+6. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "discord": { "bot_token": "..." } }
+   ```
+
+7. 执行 `opencode service restart`
+
+> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`GET /channels/{id}/messages`）为 TODO，当前**无法在 Discord 里与 bot 双向对话**。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -179,7 +249,7 @@ python -m opencode_bridge [--config PATH] [--verbose] [--check]
 | `--verbose` | 输出 DEBUG 日志 |
 | `--check` | 只做连通性自检后退出（不创建 session、不启动适配器） |
 
-退出码：`0` 正常；`1` 自检失败 / 没有任何可用适配器 / 未捕获异常。
+退出码：`0` 正常（含**未配置任何 adapter** 的优雅退出，会打印提示）；`1` 自检失败 / 未捕获异常 / adapter 构建失败。
 
 ## 4. `--check` 输出示例
 
@@ -214,6 +284,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 | `/approve <请求ID> always` | 回复权限请求：总是允许 |
 | `/allow <请求ID>` | 同 `/approve` |
 | `/deny <请求ID>` | 拒绝权限请求 |
+| `/setup` | 查看分平台接入引导（`/setup telegram` / `slack` / `discord` 可直达） |
 | 其它以 `/` 开头 | 视为未知命令，回一条用法提示（**不会**转发给模型） |
 
 普通文本直接发送即可；权限请求也会以文字形式推送（形如 `🔐 权限请求 … 回复: /approve xxx`），用上面的命令回复。
@@ -271,7 +342,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 | 连接被拒绝（`Connection refused`） | 服务没起或端口不对；`opencode serve` 后确认 `url` |
 | 发消息没有回复、日志见 `409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
 | 日志见 `provider.transport` 重试（`⏳ 重试中 (attempt N): ...`） | 上游模型服务不可达 / 超时，opencode 正在按退避重试；检查网络与 provider 配置 |
-| `没有任何可用适配器` | `config.json` 里所有适配器的 `bot_token` 都为空；填好 token 后重启 |
+| `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。填好各平台 `bot_token`（见「接入平台引导」）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge |
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中 |
 | 会话行为异常 / 想清空上下文 | 发送 `/new`（或 `/reset`）重建 session |
 | 插件没拉起 bridge | 看 `<bridgeDir>\bridge-plugin.log` 与 `<bridgeDir>\.bridge-plugin.lock`；确认插件目录里的 `config.json` 中 `bridgeDir` 指向真实存在的目录 |

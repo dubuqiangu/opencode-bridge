@@ -24,18 +24,19 @@ Robustness rules:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .adapters import Adapter
-from .config import Config
-from .hooks import Inbound, MsgHandle, Outbound  # BridgeCore implements Hooks
+from .config import DEFAULT_CONFIG_NAME, Config
+from .hooks import Button, Inbound, MsgHandle, Outbound  # BridgeCore implements Hooks
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .state import StateStore
 
-__all__ = ["BridgeCore", "HELP_TEXT", "NO_OUTPUT_TEXT", "ruleset_for"]
+__all__ = ["BridgeCore", "HELP_TEXT", "NO_OUTPUT_TEXT", "ruleset_for", "SETUP_MENU_TEXT"]
 
 logger = logging.getLogger("opencode_bridge.core")
 
@@ -52,6 +53,7 @@ _PERM_DECISIONS = ("once", "always", "reject")
 HELP_TEXT = """\
 可用命令：
 /help                       显示本帮助
+/setup [平台]               三个平台接入引导（Telegram / Slack / Discord）
 /new  /reset                新建会话（丢弃当前上下文）
 /stop                       中断当前正在执行的任务
 /status                     查看当前会话状态
@@ -62,10 +64,110 @@ HELP_TEXT = """\
 安全提示：桥接进程拥有与你相同的本地权限，请仅在可信环境运行，
 并务必为适配器配置 allowed_chat_ids 白名单。"""
 
+#: ``/setup`` with no argument: the platform chooser (frozen copy).
+SETUP_MENU_TEXT = """\
+选择要接入的平台：
+1) Telegram —— 支持双向对话
+2) Slack —— v1 仅支持主动发送
+3) Discord —— v1 仅支持主动发送
 
-# ----------------------------------------------------------------------
-# helpers
-# ----------------------------------------------------------------------
+回复 /setup 1、/setup 2 或 /setup 3 也可直接查看。"""
+
+#: ``/setup <bad>``: same list, framed as a usage hint (frozen copy).
+SETUP_INVALID_TEXT = """\
+无法识别的平台。可接入的平台有：
+1) Telegram —— 支持双向对话
+2) Slack —— v1 仅支持主动发送
+3) Discord —— v1 仅支持主动发送
+
+用法: /setup 1|2|3 或 /setup telegram|slack|discord"""
+
+#: Accepted ``/setup`` arguments -> canonical platform key (lower-cased first).
+_SETUP_ALIASES = {
+    "1": "telegram",
+    "telegram": "telegram",
+    "2": "slack",
+    "slack": "slack",
+    "3": "discord",
+    "discord": "discord",
+}
+
+#: Inline buttons offered on the menu (adapter may ignore them).
+_SETUP_BUTTON_LABELS = (("telegram", "Telegram"), ("slack", "Slack"),
+                         ("discord", "Discord"))
+
+
+def _config_path_hint() -> str:
+    """Absolute config-file path for the ``/setup`` guides (runtime only).
+
+    Mirrors :meth:`Config.load`'s search chain: honour ``OPENCODE_BRIDGE_CONFIG``
+    when it points at a real file, else ``<cwd>/config.json`` when present,
+    else fall back to ``<package root>/config.json`` with an explanatory note.
+    Never raises and never hardcodes a machine-specific path.
+    """
+    def bridge_root() -> str:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    env_path = (os.environ.get("OPENCODE_BRIDGE_CONFIG") or "").strip()
+    if env_path and os.path.isfile(env_path):
+        return os.path.abspath(env_path)
+    cwd_path = os.path.join(os.getcwd(), DEFAULT_CONFIG_NAME)
+    if os.path.isfile(cwd_path):
+        return os.path.abspath(cwd_path)
+    return (
+        os.path.join(bridge_root(), DEFAULT_CONFIG_NAME)
+        + "（未找到已生效的配置文件，以上为桥接目录默认位置）"
+    )
+
+
+#: Frozen per-platform onboarding guides (factual copy; do not reword).
+_SETUP_GUIDES = {
+    "telegram": """\
+1. 打开 Telegram，找 @BotFather → 发送 /newbot
+2. 依次设置显示名、用户名（必须以 bot 结尾），复制返回的 token（形如 123456789:AA...)
+3. 找 @userinfobot → 发送任意一句话 → 复制返回的纯数字 chat id
+4. 编辑配置文件：
+     "adapters": {
+       "telegram": { "bot_token": "123456789:AA...", "allowed_chat_ids": [123456789] }
+     }
+   注意 allowed_chat_ids 是数组，数字不要加引号
+5. 执行 opencode service restart
+6. 在 Telegram 给你的 bot 发一句 hi，收到回复即成功""",
+    "slack": """\
+1. 打开 https://api.slack.com/apps → Create New App → From scratch → 选 workspace
+2. 左侧 OAuth & Permissions → Bot User OAuth Token（xoxb- 开头）→ 复制
+3. Event Subscriptions 先保持关闭（v1 入站轮询尚未接入）
+4. 编辑配置文件：
+     "adapters": { "slack": { "bot_token": "xoxb-..." } }
+5. 左侧 Install App → Install to Workspace，把 App 邀请进目标频道
+6. 执行 opencode service restart
+
+能力说明：v1 仅实现主动 send/edit，入站轮询（conversations.history）为 TODO，
+当前无法在 Slack 里与 bot 双向对话。""",
+    "discord": """\
+1. 打开 https://discord.com/developers/applications → New Application → 左侧 Bot
+2. Reset Token → 复制 token
+3. 同页面把 Privileged Gateway Intents 下的 MESSAGE CONTENT INTENT 打开（必需）
+4. 左侧 OAuth2 → URL Generator → 勾选 scope: bot → Permissions: Send Messages
+5. 用生成的 URL 把 bot 邀请进你的服务器
+6. 编辑配置文件：
+     "adapters": { "discord": { "bot_token": "..." } }
+7. 执行 opencode service restart
+
+能力说明：v1 仅实现主动 send/edit，入站轮询（GET /channels/{id}/messages）为 TODO，
+当前无法在 Discord 里与 bot 双向对话。""",
+}
+
+
+def _setup_guide(platform: str) -> str:
+    """Compose the ``/setup <platform>`` reply: path hint + frozen guide."""
+    return (
+        f"配置文件： {_config_path_hint()}\n"
+        "改完后执行： opencode service restart\n\n"
+        + _SETUP_GUIDES[platform]
+    )
+
+
 def _clean(text: Any) -> str:
     """Make ``text`` safe for any messaging platform.
 
@@ -347,11 +449,25 @@ class BridgeCore:
     def on_callback(
         self, conversation_id: str, data: str, query_id: str
     ) -> None:
-        """Handle ``perm:<sessionID>:<reqID>:<once|always|reject>`` presses."""
+        """Handle ``setup:<platform>`` and ``perm:<sessionID>:<reqID>:<decision>``."""
         adapter = None
         try:
             adapter = self._adapter_for(conversation_id)
-            parts = str(data or "").split(":", 3)
+            data = str(data or "")
+            # /setup inline-button press: reply once here (on_inbound already
+            # dropped the kind="callback" copy, so no double-send) and ack.
+            if data.startswith("setup:"):
+                platform = _SETUP_ALIASES.get(data.split(":", 1)[1].strip().lower())
+                if platform is None:
+                    self._answer(adapter, query_id, "未知平台")
+                    return
+                self._send_text(
+                    conversation_id, _setup_guide(platform), kind="text",
+                    adapter=adapter,
+                )
+                self._answer(adapter, query_id, "已打开接入引导")
+                return
+            parts = data.split(":", 3)
             decision_ok = len(parts) == 4 and parts[0] == "perm"
             if decision_ok:
                 _, session_id, request_id, decision = parts
@@ -664,6 +780,7 @@ class BridgeCore:
 
         handler = {
             "help": self._cmd_help,
+            "setup": self._cmd_setup,
             "new": self._cmd_new,
             "reset": self._cmd_new,
             "stop": self._cmd_stop,
@@ -702,6 +819,52 @@ class BridgeCore:
 
     def _cmd_help(self, conversation_id: str, adapter: Adapter, args: str) -> None:
         self._send_text(conversation_id, HELP_TEXT, adapter=adapter)
+
+    def _cmd_setup(
+        self, conversation_id: str, adapter: Adapter, args: str
+    ) -> None:
+        """``/setup`` menu / ``/setup <telegram|slack|discord|1|2|3>`` guide."""
+        token = args.strip().split(None, 1)[0] if args.strip() else ""
+        if not token:
+            self._send_setup_menu(conversation_id, adapter)
+            return
+        platform = _SETUP_ALIASES.get(token.lower())
+        if platform is None:
+            self._send_text(
+                conversation_id, SETUP_INVALID_TEXT, kind="error",
+                adapter=adapter,
+            )
+            return
+        self._send_text(
+            conversation_id, _setup_guide(platform), kind="text",
+            adapter=adapter,
+        )
+
+    def _send_setup_menu(self, conversation_id: str, adapter: Adapter) -> None:
+        """Plain-text chooser + inline buttons (best effort, never raises).
+
+        ``send`` only carries text; Telegram attaches the keyboard through
+        ``edit``, so the menu is sent first and then re-edited with buttons.
+        A failed button edit simply leaves the (already usable) text menu.
+        """
+        handle = self._send_text(
+            conversation_id, SETUP_MENU_TEXT, kind="text", adapter=adapter
+        )
+        if handle is None:
+            return
+        out = Outbound(
+            conversation_id=conversation_id,
+            text=SETUP_MENU_TEXT,
+            kind="text",
+            buttons=tuple(
+                Button(label=label, data=f"setup:{key}")
+                for key, label in _SETUP_BUTTON_LABELS
+            ),
+        )
+        try:
+            adapter.edit(handle, out)
+        except Exception:
+            logger.exception("attaching /setup inline buttons failed")
 
     def _cmd_new(self, conversation_id: str, adapter: Adapter, args: str) -> None:
         self._drop_session(conversation_id)
@@ -766,7 +929,7 @@ class BridgeCore:
         if not args:
             self._send_text(
                 conversation_id,
-                "用法: /cd <目录>   例如 /cd D:\\work",
+                "用法: /cd <目录>   例如 /cd /data/work",
                 kind="error",
                 adapter=adapter,
             )

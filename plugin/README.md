@@ -1,0 +1,156 @@
+# opencode-bridge 插件（方案 A）
+
+让 `opencode-bridge` 随 **opencode 启动**而自动启动：opencode 加载本插件时，
+在 server 进程内拉起 `python -m opencode_bridge`（cwd = clone 下来的 bridge 目录），
+并用锁文件保证**同一时刻只有一个** bridge 子进程。
+
+插件是纯对象默认导出（不 `import "@opencode/plugin"`），与 `elapsed-timer` 同款写法，
+opencode V2 会**自动发现** `~/.config/opencode/plugins/<name>/` 下的插件，
+**不需要**在 `opencode.json` 里加 `plugins` 键（也可以加，见下文优先级）。
+
+> **可分发**：本插件不含任何本机绝对路径。`bridgeDir` 由安装器写入的 `config.json`、
+> `opencode.json` 的 `plugins` 条目选项或环境变量提供；三者都拿不到就不启动（只打一条错误日志）。
+
+## 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `index.ts` | 插件本体（唯一实现） |
+| `package.json` | 插件清单（`{"name":"opencode-bridge",...,"exports":{".":"./index.ts"}}`） |
+| `config.example.json` | 配置模板（`bridgeDir` 留空，由安装器按脚本位置填充） |
+| `install.ps1` | 一键安装到 `~\.config\opencode\plugins\bridge\`（支持 `-Force`） |
+| `harness.ts` | 独立验证脚本（bun 运行，14 个断言） |
+| `portable.spec.md` | bridgeDir 解析规则的简要规格 |
+| `README.md` | 本文件 |
+
+## 安装与布局
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1          # 已有 config.json 且含 bridgeDir 时不覆盖
+powershell -ExecutionPolicy Bypass -File install.ps1 -Force   # 强制按当前脚本位置重写 config.json
+```
+
+安装后的布局（与仓库根安装器约定一致）：
+
+```
+$HOME/.config/opencode/plugins/bridge/
+    index.ts        # 插件本体
+    package.json    # 插件清单
+    config.json     # {"bridgeDir": "<clone 目录绝对路径>", ...}
+```
+
+- Windows：clone 目录约定为 `%USERPROFILE%\.config\opencode-bridge`
+- Linux/macOS：`${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge`
+
+`install.ps1` 的 `bridgeDir` **由脚本自身所在目录推导**（`Split-Path -Parent $PSScriptRoot`
+= `plugin\` 的上级 = 仓库根），因此 clone 到任何路径都正确；生成的 `config.json`
+为 **UTF-8 with BOM**（插件读取时自动去 BOM）。脚本**不会**替你重启 opencode。
+
+启用（需手动执行，脚本不代劳）：
+
+```
+opencode service restart
+```
+
+或关闭并重新打开 opencode TUI。
+
+## bridgeDir 解析优先级
+
+每一级都容错（拿不到就落向下一级，绝不抛异常）：
+
+1. **`ctx.options.bridgeDir`** —— 来自 `opencode.json` 的 `plugins` 条目；
+2. **与 `index.ts` 同目录的 `config.json`** —— 安装器写入，**主路径**；
+   `import.meta.dirname` 在"安装形态"（`~/.config/opencode/plugins/bridge/`）与
+   "本地开发形态"（`<clone>/opencode-bridge/plugin/index.ts`）下都指向插件自身目录；
+3. **环境变量 `OPENCODE_BRIDGE_DIR`**；
+4. **以上都拿不到 → 不 spawn**：只打印
+   `[bridge-plugin] 未配置 bridgeDir，跳过启动…` 并返回 no-op cleanup，**绝不抛异常**。
+
+其它配置项（`enabled` / `python` / `args` / `logDir` / `backoffMs` / `lockName`）
+的优先级是：`ctx.options` > 同目录 `config.json` > 内置默认值。
+
+## 配置项
+
+```jsonc
+{
+  "enabled": true,                       // false = 插件什么都不做
+  "bridgeDir": "",                       // bridge 仓库(clone)目录的绝对路径；空 = 走上面的解析链，最终"未配置"则不启动
+  "python": "python",                    // 子进程可执行文件（PATH 上任意：python/node/bun...）
+  "args": ["-m", "opencode_bridge"],     // 启动参数
+  "logDir": "",                          // 空 = bridgeDir；插件日志与 bridge 输出日志目录
+  "backoffMs": 300000,                   // 子进程快速非零退出后的静默期（默认 5 分钟）
+  "lockName": ".bridge-plugin.lock"      // 锁文件名（位于 bridgeDir 下）
+}
+```
+
+字段缺失 / 类型不对 → 回退默认值并 `console.error` 提示，**绝不抛异常**。
+JSON 解析失败（含 BOM / 截断）→ 忽略该文件并提示，不抛。
+
+## 日志
+
+- `console.log` / `console.error` 统一带 `[bridge-plugin]` 前缀 → 会进
+  `~\.local\share\opencode\log\opencode.log`；
+- 同时 append 到 `<logDir>\bridge-plugin.log`，每行带 ISO 时间戳；
+- bridge 子进程的 stdout/stderr → `<logDir>\bridge-output.log`；
+- 写日志本身全程 try/catch，绝不因日志失败影响 opencode。
+
+`logDir` 默认为空 → 回退为 `bridgeDir`，即日志落在 clone 目录里。
+
+## 单例与生命周期
+
+锁文件 `<bridgeDir>\.bridge-plugin.lock`，内容形如：
+
+```json
+{ "pid": 1234, "servicePid": 5678, "startedAt": 1690000000000, "failedAt": 1690000001000 }
+```
+
+`setup(ctx)` 的判定（全部包在 try/catch 里，失败只 log）：
+
+1. `enabled === false` → 直接返回无操作 cleanup；
+2. `bridgeDir` 未配置或不存在 → log 后返回，不 spawn；
+3. 读锁：
+   - 锁存在、`pid` 存活、`servicePid === process.pid` → **同进程其它 location 已启动 → 采纳**（不 spawn、cleanup 不 kill 不删锁）；
+   - 锁存在、`pid` 存活、`servicePid !== process.pid`（如上一次 opencode 重启残留）→ **杀掉旧进程**后重新 spawn；
+   - 锁存在、`pid` 已死：若 `failedAt` 仍在 `backoffMs` 静默期内 → **保留锁**并跳过 spawn；否则删锁后 spawn；
+   - 无锁 / 锁损坏（非法 JSON）→ 清理后 spawn；
+4. spawn 前用 `fs.openSync(lockPath, "wx")`（O_EXCL）写锁，拿到 `EEXIST` 就重读锁重新判定，避免并发 location 双 spawn；
+5. `stdout`/`stderr` 都重定向到 `<logDir>\bridge-output.log`；子进程**快速（<60s）非零退出** → 锁里记录 `failedAt` 进入 backoff，否则退出时删锁；
+6. cleanup：**仅当子进程由本实例 spawn**（`ownsChild`）才 `child.kill()`，且锁 `pid` 匹配时才删锁；采纳来的进程不动。
+
+三种"多实例"语义由此覆盖：
+
+- **多 location**：同 opencode 进程内多次加载 → 第二次起采纳，不重复 spawn；
+- **opencode 重启**：上个进程残留的 bridge（`servicePid` 不同）→ 杀旧换新；
+- **快速失败 backoff**：启动后 <60s 非零退出 → 记 `failedAt`，`backoffMs` 内不再尝试（锁保留到静默期结束）。
+
+存活检测用 `process.kill(pid, 0)`，任何异常（含 Windows 上的误判）一律当作"不存活"。
+
+## 本地自检（不触碰 opencode 服务）
+
+```powershell
+cd opencode-bridge\plugin
+bun build index.ts --no-bundle        # 语法/解析检查
+bun harness.ts                        # 期望: PASS 14/14，退出码 0
+```
+
+`harness.ts` 覆盖 14 个场景：
+
+- #1~#10 生命周期：首次 spawn、同进程采纳、双 cleanup 语义、残留锁（杀旧重启）、
+  死 pid 锁、`enabled:false`、损坏锁、`bridgeDir` 缺失、快速失败 + backoff；
+- #11~#14 可移植性：同目录 `config.json` 提供 `bridgeDir`（主路径）、`ctx.options` 优先于
+  `config.json`、环境变量 `OPENCODE_BRIDGE_DIR` 兜底、三者皆缺时不 spawn 不抛；
+- 另断言 `index.ts` 源码不含 `D:\` / `D:/` 等硬编码盘符路径。
+
+harness 结束会杀掉它 spawn 的全部子进程、删临时目录与锁，并还原被它临时改写的
+`<插件目录>/config.json` 与环境变量 `OPENCODE_BRIDGE_DIR`。
+
+> 注意：harness **不会**也不该运行真实的 `python -m opencode_bridge`
+> （未配置 bot_token 时它会以退出码 1 结束，反而触发 backoff）。
+
+## 卸载
+
+```powershell
+Remove-Item -Recurse -Force "$env:USERPROFILE\.config\opencode\plugins\bridge"
+```
+
+然后重启 opencode。clone 目录本身（含日志与锁）按需自行删除。

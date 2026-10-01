@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-bridge"
+version = "0.1.0"
+description = "Bridge opencode to Telegram / Slack / Discord"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# 零第三方运行时依赖：全部基于 Python 3.10+ 标准库。
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/dubuqiangu/opencode-bridge"
+
+[tool.setuptools.packages.find]
+include = ["opencode_bridge*"]

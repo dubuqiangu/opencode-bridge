@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Byte-compile
+        run: python -m compileall opencode_bridge tests
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Shell syntax check (install.sh)
+        shell: bash
+        run: bash -n install.sh
+
+      - name: PowerShell syntax check (install.ps1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $errs = $null
+          $path = [string](Resolve-Path .\install.ps1)
+          [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errs)
+          if ($errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host $_.ToString() }
+            exit 1
+          }
+          Write-Host "install.ps1 syntax OK"
+
+  # 插件自检（离线，不连 opencode 服务）：需要 bun，单列 job
+  harness:
+    name: plugin harness (bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run plugin harness
+        working-directory: plugin
+        run: bun harness.ts

@@ -1,0 +1,6 @@
+# opencode-bridge — no third-party runtime dependencies.
+# Everything (urllib.request, http.client, json, threading, ssl, ...)
+# comes from the Python 3.10+ standard library.
+#
+# Test-only tooling (optional, not required):
+#   pytest

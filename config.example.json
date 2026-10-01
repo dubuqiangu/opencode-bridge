@@ -1,0 +1,18 @@
+{
+  "opencode_url": "",
+  "opencode_password": "",
+  "opencode_directory": ".",
+  "opencode_agent": "",
+  "permissions_mode": "ask",
+  "log_level": "INFO",
+  "state_path": "state.json",
+  "bridge": {
+    "edit_interval_seconds": 1.5,
+    "max_message_chars": 4000
+  },
+  "adapters": {
+    "telegram": { "bot_token": "", "allowed_chat_ids": [] },
+    "slack": { "bot_token": "" },
+    "discord": { "bot_token": "" }
+  }
+}

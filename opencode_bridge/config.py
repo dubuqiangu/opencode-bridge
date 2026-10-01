@@ -1,0 +1,208 @@
+"""Configuration loading for opencode-bridge (Lane A).
+
+Search order (``Config.load``):
+
+1. explicit ``path`` argument
+2. ``$OPENCODE_BRIDGE_CONFIG``
+3. ``./config.json`` (current working directory)
+
+If no candidate exists the defaults are returned (never raises).
+Environment overrides: ``OPENCODE_URL`` / ``OPENCODE_PASSWORD`` /
+``OPENCODE_DIRECTORY``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+__all__ = ["DEFAULT_CONFIG_NAME", "Config"]
+
+logger = logging.getLogger("opencode_bridge.config")
+
+DEFAULT_CONFIG_NAME = "config.json"
+
+_KNOWN_KEYS = frozenset(
+    {
+        "opencode_url",
+        "opencode_password",
+        "opencode_directory",
+        "opencode_agent",
+        "adapters",
+        "permissions_mode",
+        "log_level",
+        "state_path",
+        "bridge",
+    }
+)
+
+#: Defaults for the optional ``bridge`` sub-section (Lane C).  The values are
+#: merged with whatever the config file provides, so a partial ``bridge``
+#: object such as ``{"edit_interval_seconds": 0.5}`` still yields a complete
+#: mapping.  Invalid value types fall back to the default with a warning.
+_BRIDGE_DEFAULTS: dict[str, Any] = {
+    "edit_interval_seconds": 1.5,
+    "max_message_chars": 4000,
+}
+
+_ENV_OVERRIDES: dict[str, str] = {
+    "OPENCODE_URL": "opencode_url",
+    "OPENCODE_PASSWORD": "opencode_password",
+    "OPENCODE_DIRECTORY": "opencode_directory",
+}
+
+_STR_FIELDS = frozenset(
+    {
+        "opencode_url",
+        "opencode_password",
+        "opencode_directory",
+        "opencode_agent",
+        "permissions_mode",
+        "log_level",
+        "state_path",
+    }
+)
+
+
+@dataclass
+class Config:
+    opencode_url: str = ""  # "" => auto-discover
+    opencode_password: str = ""  # "" => auto-discover
+    opencode_directory: str = "."  # session working directory
+    opencode_agent: str = ""  # "" => server default
+    adapters: dict = field(default_factory=dict)  # {"telegram": {...}, ...}
+    permissions_mode: str = "ask"  # "ask" | "allow" | "deny"
+    log_level: str = "INFO"
+    state_path: str = "state.json"
+    bridge: dict = field(
+        default_factory=lambda: dict(_BRIDGE_DEFAULTS)
+    )  # {"edit_interval_seconds": 1.5, "max_message_chars": 4000}
+
+    # ------------------------------------------------------------------
+    # loading
+    # ------------------------------------------------------------------
+    @classmethod
+    def load(cls, path: str | None = None) -> "Config":
+        """Build a :class:`Config`.
+
+        Missing files are never an error: the search chain simply falls
+        through to the next candidate and finally to the defaults.
+        """
+        cfg = cls()
+        data: dict[str, Any] = {}
+
+        candidates: list[tuple[str, bool]] = []
+        if path is not None:
+            candidates.append((path, True))
+        env_path = os.environ.get("OPENCODE_BRIDGE_CONFIG")
+        if env_path:
+            candidates.append((env_path, True))
+        candidates.append((os.path.join(os.getcwd(), DEFAULT_CONFIG_NAME), False))
+
+        chosen: str | None = None
+        for candidate, explicit in candidates:
+            if candidate and os.path.isfile(candidate):
+                chosen = candidate
+                break
+            if explicit:
+                logger.warning("config file not found: %s", candidate)
+
+        if chosen is not None:
+            data = cls._read_file(chosen)
+
+        for key, value in data.items():
+            if key not in _KNOWN_KEYS:
+                logger.warning("ignoring unknown config key: %r", key)
+                continue
+            if not cls._coerce_ok(key, value):
+                logger.warning(
+                    "ignoring config key %r with invalid value type %s",
+                    key,
+                    type(value).__name__,
+                )
+                continue
+            setattr(cfg, key, value)
+
+        for env_name, attr in _ENV_OVERRIDES.items():
+            env_value = os.environ.get(env_name)
+            if env_value:
+                setattr(cfg, attr, env_value)
+
+        # ``bridge`` is a nested sub-section: fill in missing defaults.
+        cfg.bridge = cls._merge_bridge(cfg.bridge)
+
+        return cfg
+
+    @staticmethod
+    def _merge_bridge(raw: Any) -> dict[str, Any]:
+        """Merge the ``bridge`` config section over :data:`_BRIDGE_DEFAULTS`."""
+        merged = dict(_BRIDGE_DEFAULTS)
+        if not isinstance(raw, dict):
+            if raw is not None:
+                logger.warning(
+                    "config key 'bridge' must be a JSON object, got %s",
+                    type(raw).__name__,
+                )
+            return merged
+        for key, value in raw.items():
+            if key not in merged:
+                logger.warning("ignoring unknown bridge config key: %r", key)
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring bridge config key %r with non-numeric value %r",
+                    key,
+                    value,
+                )
+                continue
+            if number < 0 or number != number:  # negative or NaN
+                logger.warning(
+                    "ignoring bridge config key %r with invalid value %r", key, value
+                )
+                continue
+            if key == "max_message_chars":
+                number = int(round(number))
+                if number < 1:
+                    logger.warning(
+                        "ignoring bridge config key %r with invalid value %r",
+                        key,
+                        value,
+                    )
+                    continue
+            merged[key] = number
+        return merged
+
+    @staticmethod
+    def _read_file(path: str) -> dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except OSError as exc:
+            logger.warning("cannot read config file %s: %s", path, exc)
+            return {}
+        except ValueError as exc:
+            logger.warning("invalid JSON in config file %s: %s", path, exc)
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("config file %s must contain a JSON object", path)
+            return {}
+        return raw
+
+    @staticmethod
+    def _coerce_ok(key: str, value: Any) -> bool:
+        if key == "adapters":
+            return isinstance(value, dict)
+        if key == "bridge":
+            return isinstance(value, dict)
+        if key in _STR_FIELDS:
+            return isinstance(value, str)
+        return True
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)

@@ -1,0 +1,24 @@
+# 运行态 / 用户配置（绝不提交：可能含 token、密码、会话映射）
+config.json
+state.json
+plugin/config.json
+*.log
+bridge-output.log
+bridge-plugin.log
+.bridge-plugin.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node / bun
+node_modules/
+package-lock.json
+
+# 会话与系统文件
+*.session
+*.session-journal
+.DS_Store

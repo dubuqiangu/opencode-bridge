@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "bridgeDir": "",
+  "python": "python",
+  "args": ["-m", "opencode_bridge"],
+  "logDir": "",
+  "backoffMs": 300000,
+  "lockName": ".bridge-plugin.lock"
+}

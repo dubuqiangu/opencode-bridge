@@ -1,0 +1,11 @@
+{
+  "name": "opencode-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bridge opencode to Telegram / Slack / Discord",
+  "exports": { ".": "./plugin/index.ts" },
+  "files": ["plugin/index.ts", "plugin/package.json", "README.md", "LICENSE"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/dubuqiangu/opencode-bridge.git" },
+  "keywords": ["opencode", "opencode-plugin", "telegram", "bridge"]
+}

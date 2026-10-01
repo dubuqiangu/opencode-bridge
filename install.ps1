@@ -103,7 +103,10 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
     # 远程 git 源
     if (Test-Path -LiteralPath (Join-Path $BridgeDir ".git")) {
         Write-Info "[1/4] 更新已有 clone: git -C `"$BridgeDir`" pull --ff-only"
-        git -C $BridgeDir pull --ff-only
+        # git 的 stdout 属于本函数的"返回流"，会被调用方 $code = Sync-Source ... 捕获成数组，
+        # 导致 if ($code -ne 0) 对数组求值恒为真而提前返回（安装在第 1 步后静默中断）。
+        # 因此显式把 git 输出送往 host，保证返回流里只有 0/1。
+        git -C $BridgeDir pull --ff-only 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) {
             Write-Warn "       [警告] git pull 失败（本地有改动或网络问题），继续使用现有副本"
         }
@@ -133,7 +136,7 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
     }
     $parent = Split-Path -Parent $BridgeDir
     if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-    git clone $SourcePath $BridgeDir
+    git clone $SourcePath $BridgeDir 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Bad "[错误] git clone 失败 (exit code $LASTEXITCODE)"
         if ($savedCfg) {
@@ -184,8 +187,10 @@ function Invoke-Installer {
     Write-Info ""
 
     # --- 1. 同步源码 -------------------------------------------------------
-    $code = Sync-Source -SourcePath $Source -BridgeDir $bridgeDir
-    if ($code -ne 0) { return $code }
+    # Sync-Source 的返回值必须是单个 int：取最后一个输出并强制转换，
+    # 即便函数内再混入裸命令的 stdout 也不会让 if ($code -ne 0) 对数组求值。
+    $code = Sync-Source -SourcePath $Source -BridgeDir $bridgeDir | Select-Object -Last 1
+    if ([int]$code -ne 0) { return [int]$code }
 
     # --- 2. 生成 config.json（模板 = config.example.json）-------------------
     Write-Info "[2/4] 检查配置文件..."

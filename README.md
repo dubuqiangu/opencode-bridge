@@ -46,6 +46,39 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Source <本地�
 bash install.sh --source <本地目录> --force
 ```
 
+### 一行命令打不开？
+
+当 `raw.githubusercontent.com` 不可达（DNS 污染 / 被墙）时，按下面的顺序换兜底方式。
+
+**A. 标准形式**（GitHub 域名可达时）：
+
+```powershell
+iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 | iex
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.sh | bash
+```
+
+**B. 兜底：jsDelivr 镜像**（本机 `raw.githubusercontent.com` DNS 污染、jsDelivr 可达时）。
+注意：jsDelivr 对 `.ps1` 返回 `application/octet-stream`，`iwr | iex` 会按**本地 ANSI 编码**解码 UTF-8 源码导致解析失败，所以**必须**先落到临时文件再用 `-File` 执行：
+
+```powershell
+$p="$env:TEMP\ocb-install.ps1"; iwr 'https://cdn.jsdelivr.net/gh/dubuqiangu/opencode-bridge@main/install.ps1' -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p; Remove-Item $p
+```
+
+bash 对应：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/dubuqiangu/opencode-bridge@main/install.sh -o /tmp/ocb.sh && bash /tmp/ocb.sh
+```
+
+**C. 兜底：直接 git clone**（GitHub 443 可达但 raw 被墙时最简单）：
+
+```powershell
+git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.config\opencode-bridge"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.config\opencode-bridge\install.ps1" -Force
+```
+
 ## 安装后做什么
 
 1. **填 token**：编辑 bridge 目录下的 `config.json`

@@ -111,13 +111,22 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
     }
 
     $dirExists = (Test-Path -LiteralPath $BridgeDir) -and $null -ne (Get-ChildItem -LiteralPath $BridgeDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $savedCfg = $null
     if ($dirExists) {
-        if (-not $Force) {
+        # 目录非空且无 .git：区分「用户真实副本」与「运行态残留」
+        $hasSource = Test-Path -LiteralPath (Join-Path $BridgeDir 'opencode_bridge\__init__.py')
+        if (-not $Force -and $hasSource) {
             Write-Bad "[错误] $BridgeDir 已存在且不是 git 仓库。"
             Write-Bad "       加 -Force 删除后重新 clone，或改用 -Source <本地目录>。"
             return 1
         }
-        Write-Info "[1/4] -Force: 删除非 git 旧目录并重新 clone"
+        # 先把用户 config.json 存到临时文件（绝不能丢），再清理残留
+        $cfgPath = Join-Path $BridgeDir 'config.json'
+        if (Test-Path -LiteralPath $cfgPath) {
+            $savedCfg = Join-Path ([System.IO.Path]::GetTempPath()) ("opencode-bridge-config-" + [Guid]::NewGuid().ToString('N') + '.json')
+            Copy-Item -LiteralPath $cfgPath -Destination $savedCfg -Force
+        }
+        Write-Info "[1/4] 删除非 git 残留目录: $BridgeDir"
         Remove-Item -LiteralPath $BridgeDir -Recurse -Force
     } else {
         Write-Info "[1/4] git clone $SourcePath"
@@ -127,7 +136,21 @@ function Sync-Source([string]$SourcePath, [string]$BridgeDir) {
     git clone $SourcePath $BridgeDir
     if ($LASTEXITCODE -ne 0) {
         Write-Bad "[错误] git clone 失败 (exit code $LASTEXITCODE)"
+        if ($savedCfg) {
+            # clone 失败也要把用户配置还回去
+            New-Item -ItemType Directory -Force -Path $BridgeDir | Out-Null
+            Copy-Item -LiteralPath $savedCfg -Destination (Join-Path $BridgeDir 'config.json') -Force
+            Remove-Item -LiteralPath $savedCfg -Force
+            Write-Warn "       已把原 config.json 还原到: $BridgeDir\config.json"
+        }
         return 1
+    }
+    if ($savedCfg) {
+        Copy-Item -LiteralPath $savedCfg -Destination (Join-Path $BridgeDir 'config.json') -Force
+        Remove-Item -LiteralPath $savedCfg -Force
+        Write-Info "[1/4] 已清理非 git 目录中的残留并重新 clone（已保留 config.json）"
+    } elseif ($dirExists) {
+        Write-Info "[1/4] 已清理非 git 目录中的残留并重新 clone"
     }
     return 0
 }

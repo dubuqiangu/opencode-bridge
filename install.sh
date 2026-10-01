@@ -145,15 +145,38 @@ elif [ -d "$BRIDGE_DIR/.git" ]; then
     warn "       [警告] git pull 失败（本地有改动或网络问题），继续使用现有副本"
   fi
 elif [ -d "$BRIDGE_DIR" ] && [ -n "$(ls -A "$BRIDGE_DIR" 2>/dev/null || true)" ]; then
-  if [ "$FORCE" = 1 ]; then
-    log "[1/4] --force: 删除非 git 旧目录并重新 clone"
-    rm -rf "$BRIDGE_DIR"
-    mkdir -p "$(dirname "$BRIDGE_DIR")"
-    git clone "$SOURCE" "$BRIDGE_DIR"
-  else
+  # 目录非空且无 .git：区分「用户真实副本」与「运行态残留」
+  if [ -f "$BRIDGE_DIR/opencode_bridge/__init__.py" ] && [ "$FORCE" != 1 ]; then
     err "错误: $BRIDGE_DIR 已存在且不是 git 仓库。"
     err "      加 --force 删除后重新 clone，或改用 --source <本地目录>。"
     exit 1
+  fi
+  # 先把用户 config.json 存到临时文件（绝不能丢），再清理残留
+  saved_cfg=""
+  if [ -f "$BRIDGE_DIR/config.json" ]; then
+    saved_cfg="$(mktemp)"
+    cp "$BRIDGE_DIR/config.json" "$saved_cfg"
+  fi
+  log "[1/4] 删除非 git 残留目录: $BRIDGE_DIR"
+  rm -rf "$BRIDGE_DIR"
+  mkdir -p "$(dirname "$BRIDGE_DIR")"
+  if ! git clone "$SOURCE" "$BRIDGE_DIR"; then
+    if [ -n "$saved_cfg" ]; then
+      # clone 失败也要把用户配置还回去
+      mkdir -p "$BRIDGE_DIR"
+      cp "$saved_cfg" "$BRIDGE_DIR/config.json"
+      rm -f "$saved_cfg"
+      warn "      已把原 config.json 还原到: $BRIDGE_DIR/config.json"
+    fi
+    err "错误: git clone 失败"
+    exit 1
+  fi
+  if [ -n "$saved_cfg" ]; then
+    cp "$saved_cfg" "$BRIDGE_DIR/config.json"
+    rm -f "$saved_cfg"
+    log "[1/4] 已清理非 git 目录中的残留并重新 clone（已保留 config.json）"
+  else
+    log "[1/4] 已清理非 git 目录中的残留并重新 clone"
   fi
 else
   log "[1/4] git clone $SOURCE"

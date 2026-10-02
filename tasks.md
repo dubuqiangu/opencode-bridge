@@ -85,8 +85,8 @@
 
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
-| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（55 用例）；**适配器迁移未做**（见下方备注） |
-| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**适配器尚未改用它** |
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 1/9：IRC ✓**（下一个：Matrix / Nextcloud） |
+| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**迁移进度 1/9：IRC ✓**（`irc` 前缀在 `LEGACY_PREFIXES` 里映射到自身，故 `conversation_id` 字节级不变，已用断言钉死） |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
 
 ---
@@ -450,4 +450,48 @@
     早返回，**完全跳过了游标推进逻辑**，导致游标永不推进）与**一个测试 bug**
     （`Responder` 脚本耗尽后默认返回 200，把第二次 send 的失败掩盖了）。
   验证：**828 tests OK (skipped=1)**、compileall 0；ntfy 在 `--status` 实跑中自动出现。
+- **2026-10-02** **A1/A2 迁移第 1 家：IRC**（首个迁移，验证"迁移不改变行为"这个命题）：
+  - `irc.py` 删掉 `_session_loop`/`_read_loop`/`_open_socket` 与手写退避，改用
+    `TcpLineTransport`（子类只加 tick + TLS + on_close 三个接缝）；`_conversation_id`
+    改走 `identity.format_id`。
+  - **A2 在 IRC 上是零风险的**：`LEGACY_PREFIXES["irc"] == "irc"`，前缀映射到自身，
+    所以 `conversation_id` **字节级不变** —— 已落盘的 `state.json` 不受影响，
+    并用 9 类 target 的逐字节相等断言钉死。**这三个平台（irc / twitch / nextcloud）
+    迁移时都享有这个性质**，而 telegram / matrix / slack / discord 不享有。
+  - 退避接线逐项核对与迁移前等价：`min_backoff=5.0` / `max_backoff=60.0` /
+    **`reset_after=0.0`**（连上即重置 = 迁移前语义）/ `max_line_bytes=512`。
+  - **代码量只净减 42 行真实代码**（不是 lane 预期的 150 行）—— 诚实记录：省下的
+    150 行样板被"tick 接缝"吃掉了大半。真正的收益是**概念性**的：
+    `stop()` 顺序、退避封顶、重置时机这三件事以后**不可能再被写错**。
+    下一个适配器的增量成本是"两个接缝 ≈ 57 行"，不是零，但比重写 150 行循环小。
+  - ⚠️ **lane 主动标出两处真实的行为差异**，我不替它粉饰：
+    1. **出站分片跨重连**：迁移前 `send()` 一次抓一个 socket 发完所有分片，连接在
+       分片中途断掉时剩余分片写失败 → `TRANSIENT` + 部分句柄；现在每片重新读
+       `transport.connection`，后半片会发到新连接上。**我判定新行为更好**
+       （IRC 不关心 TCP 边界，每片本就是独立 PRIVMSG，能发完比报错更符合预期），
+       但它确实是差异，且**没有测试覆盖**（稳定复现需要在分片之间掐连接）。
+    2. **读超时语义**：迁移前 `recv` 超时**一定**回到读循环顶部；现在超时返回
+       `NOTHING`，若缓冲里已有整行则该轮 tick 被跳过（连续多行时 tick 间隔变短）。
+       对 30s 注册超时 / 300s 保活无影响，但若将来把 `register_timeout` 调到比
+       "一行到达间隔"还小，检测会有微小延迟。
+    另两处：shutdown 期的 `OSError` 转 `NOTHING`（避免正常停机刷 WARNING），代价是
+    真实 FIN 与本地关 socket 的竞态下可能少一行日志；`_target()` 保留手写剥前缀，
+    换成 `identity.local_of` 会改变 `"foo:bar"` 这类畸形输入的行为 —— 那是行为变更，
+    超出"零风险"授权范围。
+  - **补掉一个真实回归缺口**（lane 提出，我核实后确认成立并动手补）：此前只有
+    "默认值是 0"这个属性断言，以及"`reset_after>0` 时**不**重置"的反面用例，
+    **没有任何用例证明 `reset_after=0` 在线程里真的生效** —— 而这正是 IRC 等适配器的
+    既有依赖，且它们自己的用例是**白盒读 `_backoff`**（传输层改判定方式就集体失效）。
+    新增 `test_reset_after_zero_resets_even_a_brief_connection`：与反面用例**同一套脚本**、
+    只把 `reset_after` 从 10 改成 0，构成正反对照；判据取"退避不再越过 0.25"这个
+    **稳定**谓词，刻意不用 wall-clock 间隔（那正是本项目踩过的 flaky 坑）。连跑 5 次一致。
+  - lane 改了 6 个现有用例（`_thread`/`_sock`/`_open_socket` 这些私有字段随迁移消失）。
+    我逐条核对了 diff：**新增 55 行 assert、删除 5 行 assert**，且 5 处删除全部有
+    **更强**的替代（`assertIsNone(_thread)` → `assertIsNone(transport)` +
+    `assertFalse(running)` + 新增 `assertFalse(_registered)`）。无一条断言被削弱。
+  - lane 顺带发现：**"读超时要给适配器一个 tick"是行协议类适配器的普遍需求**
+    （Twitch 的注册超时 + 保活同款）。若 Twitch 也迁，应把这个子类提到 `transport/`
+    做成 `LineTransport(on_tick=...)`，而不是让每家各写一遍。
+  验证：**840 tests OK (skipped=1)**、compileall 0；IRC 74 例 + transport 56 + identity 24，
+  连跑 5 次无抖动。
 

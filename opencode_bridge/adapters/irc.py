@@ -1,12 +1,26 @@
 """Lane B — IRC adapter (tasks.md T3.3). Standard library only.
 
-传输层是**裸 TCP + 行协议**（不是 HTTP，也不是 WebSocket）：``socket.create_connection``
-连上服务器，之后一切都是 ``\\r\\n`` 结尾的 UTF-8 行。全部收发收敛在
-:meth:`IRCAdapter._write_line` / :meth:`IRCAdapter._read_loop` 两个方法后面，测试可以
-用本机回环的真服务器线程验证真实字节行为（见 ``tests/test_irc.py``）。
+传输层已迁到 :mod:`opencode_bridge.transport`（A1）。本文件**不再**自己管
+socket、读循环、线程与重连：这些全在
+:class:`~opencode_bridge.transport.TcpLineTransport` 里。剩下的都是 IRC 协议语义。
 
-三个 IRC 特有的点：
+传输层负责（搬走了）
+--------------------
+* ``socket.create_connection`` + 可选 TLS 包装、读超时、
+* 跨 ``recv`` 的**行缓冲**（半行 / 一次多行）与 UTF-8 ``replace`` 解码、
+  超长行丢弃、``stop()`` 的「先 shutdown 唤醒 recv、再 join 线程」三段式关闭、
+* 指数退避重连（5s 起、×2、封顶 60s；**连上就重置**）、消费线程。
 
+本文件负责（留下）
+------------------
+* IRC 行协议状态机：``CAP`` / ``AUTHENTICATE`` / ``001`` 协商、
+  ``NICK``/``USER`` → 等 ``001`` → ``JOIN`` 的顺序、
+  ``PING`` → ``PONG``（token 原样回）、服务端不 ping 时自保活、
+* 提及判定（含 nick 自身 special 字符的词边界）、控制码清洗、
+* 512 字节整行预算（按真实行形状逐字节算）、出站限速。
+
+三个 IRC 特有的点
+-----------------
 1. **512 字节行长上限**：RFC 2812 规定整行（含 ``:prefix``、命令名、``CRLF``）
    上限 512 字节。正文可用字节 = 512 − 命令开销 − 目标长度。中文一个字 3 字节，
    所以"字符数"永远推不出字节数 —— 发送前必须**按字符切、按字节校验**
@@ -19,6 +33,14 @@
 
 3. **不能编辑**：IRC 没有编辑消息的概念。:meth:`IRCAdapter.edit` 永远返回 ``False``，
    上层 ``core.py`` 会退化成"发一条新消息"—— 这正是 IRC 该有的行为。
+
+两个不能省的接缝
+----------------
+* **tick**：传输层把"读超时"表达成内部哨兵（**不派发**给用户回调），所以适配器
+  拿不到 1 秒一次的 tick；而 IRC 有两件必须靠 tick 做的事 —— 注册超时判定
+  （等不到 001 就重连）与自保活 PING。见 :class:`_IrcTransport`。
+* **TLS 包装**：``_tls_wrap`` 仍是适配器上的注入点（真 TLS 需要证书，测试里
+  替换成 no-op），由 :class:`_IrcTransport` 转接给传输层。
 """
 
 from __future__ import annotations
@@ -26,14 +48,15 @@ from __future__ import annotations
 import base64
 import logging
 import re
-import socket
 import ssl
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
+from ..transport import NOTHING, TcpLineTransport
 from .base import Adapter, register
 
 logger = logging.getLogger("opencode_bridge.adapters.irc")
@@ -196,9 +219,67 @@ def _parse_line(raw: str) -> tuple[str, str, List[str]]:
     return prefix, command, params
 
 
+# ---------------------------------------------------------------------------
+# 传输层接缝
+# ---------------------------------------------------------------------------
+class _IrcTransport(TcpLineTransport):
+    """IRC 用的 :class:`~opencode_bridge.transport.TcpLineTransport`。
+
+    只加两件事，**都留在适配器这一侧**（传输层不该知道 IRC 存在）：
+
+    1. **tick**：每次取下一行之前先调 ``tick()``。传输层把"读超时"表达成内部
+       哨兵 :data:`~opencode_bridge.transport.NOTHING`，**不会**派发给用户回调，
+       所以适配器拿不到 tick；而 IRC 有两件必须靠 tick 做的事 —— 注册超时
+       判定（等不到 ``001`` 就重连）与服务端不 ping 时的自保活。
+       ``tick()`` 抛异常 = 本次会话作废，传输层会关连接并按退避重连。
+    2. **TLS 包装**：接缝转接到适配器的 ``_tls_wrap``（测试注入点）。
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        tls_wrap: Optional[Callable[[Any], Any]] = None,
+        tick: Optional[Callable[[], None]] = None,
+        on_close: Optional[Callable[[], None]] = None,
+        **kw: Any,
+    ) -> None:
+        self._tls_wrap_fn = tls_wrap
+        self._tick_fn = tick
+        self._on_close_fn = on_close
+        super().__init__(*args, **kw)
+
+    def _wrap_tls(self, sock: Any) -> Any:
+        if self._tls_wrap_fn is not None:
+            return self._tls_wrap_fn(sock)
+        return super()._wrap_tls(sock)
+
+    def _on_close(self, conn: Any) -> None:
+        if self._on_close_fn is not None:
+            self._on_close_fn()
+
+    def _next(self, conn: Any) -> Any:
+        if self._tick_fn is not None:
+            self._tick_fn()
+        try:
+            return super()._next(conn)
+        except OSError:
+            # ``stop()`` 关掉 socket 后，阻塞中的 ``recv`` 会以 OSError 收场
+            # （Windows 上是 10038）。迁移前的读循环在这里**静默返回**；这里
+            # 转成 NOTHING 让基类走"已停止"分支，避免每次正常 shutdown 都刷一条
+            # "会话出错"告警。对端真的 FIN 仍然抛 ConnectionError（要记 log ——
+            # 那是"为什么重连"的线索）。
+            if self._stop_event.is_set():
+                return NOTHING
+            raise
+
+
 @register("irc")
 class IRCAdapter(Adapter):
-    """IRC client adapter（``PRIVMSG`` 收发 + 提及触发 + PING/PONG 保活）。"""
+    """IRC client adapter（``PRIVMSG`` 收发 + 提及触发 + PING/PONG 保活）。
+
+    线程与连接归 :class:`_IrcTransport`；:attr:`running` / :meth:`stop` 是它的
+    代理，因此"stop() 先关连接再 join"这条不变量仍然成立（迁移前由本类手写）。
+    """
 
     name = "irc"
     label = "IRC"
@@ -239,18 +320,17 @@ class IRCAdapter(Adapter):
             str(self.config.get("realname") or "").strip() or self.nick or "opencode-bridge"
         )
         # allowed_chat_ids 已由基类 _init_access() 统一解析（T1.2）
-        self._sock: socket.socket | None = None
-        self._sock_lock = threading.Lock()
-        self._send_lock = threading.Lock()
+        self._transport: Optional[_IrcTransport] = None
         self._throttle_lock = threading.Lock()
         self._last_send: dict[str, float] = {}
         self._seq_lock = threading.Lock()
         self._seq = 0
         self._registered = False
         self._registration_sent = False
-        self._rbuf = bytearray()
         self._mention_re = _make_mention_re(self.nick)
         self._sasl_state = ""
+        self._register_deadline = 0.0
+        self._last_ping = 0.0
         # 见过的对方昵称（入站时积累）：用来区分"私聊昵称"与"频道名"，
         # 否则回复私聊会被错误地补上 ``#`` 变成往频道发。
         self._known_nicks: set[str] = {self.nick.lower()} if self.nick else set()
@@ -280,27 +360,57 @@ class IRCAdapter(Adapter):
         return TLS_PORT if self.use_tls else DEFAULT_PORT
 
     # ------------------------------------------------------------------
-    # 连接与 TLS
+    # TLS 接缝
     # ------------------------------------------------------------------
-    def _default_tls_wrap(self, sock: socket.socket) -> socket.socket:
+    def _default_tls_wrap(self, sock: Any) -> Any:
         """``ssl.create_default_context().wrap_socket(...)``（默认校验证书）。"""
         context = ssl.create_default_context()
         return context.wrap_socket(sock, server_hostname=self.host)
 
-    def _open_socket(self) -> socket.socket:
-        """建 TCP 连接（必要时升级为 TLS）。抛出的异常由调用方退避重试。"""
-        sock = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT)
-        try:
-            if self.use_tls:
-                sock = self._tls_wrap(sock)
-            sock.settimeout(self.socket_timeout)
-        except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise
-        return sock
+    # ------------------------------------------------------------------
+    # 传输层
+    # ------------------------------------------------------------------
+    @property
+    def transport(self) -> Optional[_IrcTransport]:
+        """当前传输层（``start()`` 之后才有；测试与出站都看它）。"""
+        return self._transport
+
+    def _make_transport(self) -> _IrcTransport:
+        """构造本次运行用的传输层（测试注入点：TLS 包装 + tick）。"""
+        transport = _IrcTransport(
+            self.host,
+            self.port,
+            tls=self.use_tls,
+            tls_wrap=self._tls_wrap,
+            tick=self._tick,
+            # 连上之后由适配器发 PASS/CAP/NICK/USER（传输层不碰 IRC 语义）
+            on_connect=self._on_connected,
+            # 会话结束（掉线或 stop）时清掉"已注册"标记
+            on_close=self._on_disconnected,
+            connect_timeout=CONNECT_TIMEOUT,
+            io_timeout=self.socket_timeout,
+            name="irc",
+            # 退避逐字对齐迁移前：5s 起、×2、封顶 60s。
+            # reset_after=0 → 只要连上过就重置回下限，正是迁移前 irc.py 里
+            # "连上过一次就重置退避"的语义（稳定存活 N 秒才重置会改变行为）。
+            min_backoff=self.reconnect_delay,
+            max_backoff=self.max_reconnect_delay,
+            reset_after=0.0,
+        )
+        # 入站超长行仍按 RFC 2812 的 512 字节丢弃（与迁移前一致）。
+        transport.max_line_bytes = self.line_limit
+        return transport
+
+    def _connection(self) -> Any:
+        """当前底层 socket（未连接时 ``None``）。"""
+        transport = self._transport
+        return transport.connection if transport is not None else None
+
+    @property
+    def running(self) -> bool:
+        """消费线程是否活着（代理到传输层）。"""
+        transport = self._transport
+        return transport is not None and transport.running
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -319,11 +429,9 @@ class IRCAdapter(Adapter):
                 "(outbound still works)"
             )
         self._stop_event.clear()
-        thread = threading.Thread(
-            target=self._session_loop, name="irc-client", daemon=True
-        )
-        self._thread = thread
-        thread.start()
+        transport = self._make_transport()
+        self._transport = transport
+        transport.start(self._on_line)
         logger.info(
             "irc: connecting to %s:%s as %s (tls=%s, channels=%s)",
             self.host,
@@ -334,162 +442,105 @@ class IRCAdapter(Adapter):
         )
 
     def stop(self) -> None:
-        """先 shutdown socket 让阻塞中的 ``recv`` 立刻返回，再停线程。
+        """置停止位 → 关连接 → join（顺序由传输层保证，**幂等**）。
 
-        顺序不能反：基类 ``stop()`` 会 join 线程（5s 超时），而读循环的
-        ``recv`` 最长阻塞 ``socket_timeout``；不先关连接就会每次 stop 都白等。
+        迁移前这里必须手写"先 ``shutdown`` 唤醒阻塞中的 ``recv``、再让基类
+        ``join(5s)``"；现在这段样板在 :class:`_IrcTransport._close_conn` 里，
+        但语义没变：``stop()`` 不会等满读超时。
         """
-        sock = self._sock
-        self._sock = None
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
-        super().stop()
+        super().stop()                      # 置停止位（_throttle / _start_registration 依赖）
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.stop()
 
     # ------------------------------------------------------------------
-    # 会话：注册 → JOIN → 读循环 → 断线重连
+    # 会话钩子：连上 → 注册；tick → 超时判定 + 保活
     # ------------------------------------------------------------------
-    def _session_loop(self) -> None:
-        """连接 + 注册 + 收消息，任何异常都在此被吞掉并退避重连。"""
-        delay = self.reconnect_delay
-        while not self._stop_event.is_set():
-            try:
-                sock = self._open_socket()
-            except Exception as exc:
-                logger.warning("irc: connect to %s:%s failed: %s", self.host, self.port, exc)
-                if self._stop_event.wait(min(delay, self.max_reconnect_delay)):
-                    return
-                delay = min(delay * 2, self.max_reconnect_delay)
-                continue
-            with self._sock_lock:
-                self._sock = sock
-            delay = self.reconnect_delay   # 连上过一次就重置退避
-            try:
-                self._register(sock)
-                if not self._stop_event.is_set():
-                    self._join_channels(sock)
-                    self._read_loop(sock)
-            except Exception as exc:
-                logger.warning("irc: session ended: %s", exc)
-            finally:
-                self._registered = False
-                with self._sock_lock:
-                    if self._sock is sock:
-                        self._sock = None
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            if self._stop_event.wait(self.reconnect_delay):
-                return
+    def _on_connected(self, conn: Any) -> None:
+        """连上后（每次重连调一遍）：PASS / CAP(可选) / NICK+USER，并摆上 deadline。
 
-    def _register(self, sock: socket.socket) -> None:
-        """PASS / (CAP+SASL) / NICK / USER，并等待 001 (RPL_WELCOME)。
-
-        没等到 001 就抛异常，由 :meth:`_session_loop` 当成断线重连 —— 静默卡在
-        "已连上但没注册"是最难排查的故障。
+        这是传输层的 ``on_connect`` 钩子（对应迁移前 ``_register`` 的前半段）。
+        顺序是协议要求：SASL 的 ``CAP`` 必须在 ``NICK``/``USER`` **之前**
+        完成协商，否则服务器会直接断开。
         """
-        # 每次会话重置协商状态与读缓冲（读缓冲必须跨 ``_read_loop`` 调用保留，
-        # 否则"001 与第一条 PRIVMSG 在同一个 TCP 段里"时会丢掉后者）。
         self._registration_sent = False
         self._registered = False
         self._sasl_state = ""
-        self._rbuf = bytearray()
+        self._register_deadline = time.monotonic() + self.register_timeout
+        self._last_ping = time.monotonic()
         if self.server_password:
-            self._write_line(sock, f"PASS {self.server_password}")
+            self._write_line(f"PASS {self.server_password}")
         if self.bot_password:
             # SASL 必须在 NICK/USER **之前**完成协商，否则服务器会直接断开。
-            self._write_line(sock, "CAP LS 302")
+            self._write_line("CAP LS 302")
             self._sasl_state = "ls_sent"
         else:
-            self._start_registration(sock)
-        deadline = time.monotonic() + self.register_timeout
-        self._read_loop(sock, deadline=deadline)
-        if not self._registered:
-            raise TimeoutError("001 RPL_WELCOME not received in time")
+            self._start_registration()
 
-    def _start_registration(self, sock: socket.socket) -> None:
+    def _on_disconnected(self) -> None:
+        """会话结束（掉线 / 重连 / stop）时清掉"已注册"标记。
+
+        对应迁移前 ``_session_loop`` 的 ``finally``：那条 socket 作废了，
+        "已注册"就不再成立 —— 否则 :attr:`running` 之外还会出现"活着但未注册"
+        的中间态，下层判断会被误导。
+        """
+        self._registered = False
+
+    def _tick(self) -> None:
+        """每次取下一行之前跑一次：注册超时判定 + 自保活。
+
+        迁移前这两件事都挂在读循环的 ``recv`` 超时分支上（每 ``socket_timeout``
+        一次）；迁移后由 :class:`_IrcTransport` 在同一位置调本方法，时机等价。
+
+        抛异常 = 本次会话作废（传输层关连接 → 退避重连），与迁移前
+        "等不到 ``001`` 就按断线重连"完全一致。
+        """
+        now = time.monotonic()
+        if not self._registered and now >= self._register_deadline:
+            raise TimeoutError("001 RPL_WELCOME not received in time")
+        if now - self._last_ping >= self.ping_interval:
+            # 服务端不 ping 时我们自己保活，否则会被静默踢下线。
+            self._write_line(f"PING :opencode-{int(now)}")
+            self._last_ping = now
+
+    def _on_line(self, line: str) -> None:
+        """传输层交给我们的**一行**（不含 CRLF，已按 UTF-8 ``replace`` 解码）。
+
+        单行处理抛异常不许影响读循环（迁移前是 ``try/except`` + ``logger.exception``）。
+        """
+        if not line:
+            return
+        try:
+            self._handle_line(line)
+        except Exception:
+            logger.exception("irc: failed to handle line %r", line[:120])
+
+    # ------------------------------------------------------------------
+    # 注册 / JOIN
+    # ------------------------------------------------------------------
+    def _start_registration(self) -> None:
         """发 NICK/USER。幂等：CAP 协商与 SASL 两条路都会走到这里。"""
         if self._registration_sent or self._stop_event.is_set():
             return
         self._registration_sent = True
-        self._write_line(sock, f"NICK {self.nick}")
-        self._write_line(sock, f"USER {self.nick} 0 * :{self.realname}")
+        self._write_line(f"NICK {self.nick}")
+        self._write_line(f"USER {self.nick} 0 * :{self.realname}")
 
-    def _join_channels(self, sock: socket.socket) -> None:
+    def _join_channels(self) -> None:
         if not self.channels:
             return
-        self._write_line(sock, "JOIN " + ",".join(self.channels))
+        self._write_line("JOIN " + ",".join(self.channels))
         logger.info("irc: joined %s", ",".join(self.channels))
-
-    def _read_loop(
-        self, sock: socket.socket, *, deadline: Optional[float] = None
-    ) -> None:
-        """按行读取并派发，直到连接断开 / 超时 / 收到 stop。
-
-        ``deadline`` 非 None 表示处于注册阶段：到点仍未收到 001 就返回。
-
-        每轮先消化缓冲里**已有的整行**、再读新数据，且缓冲是实例字段
-        :attr:`_rbuf` 并原地修改 —— 这样"001 与第一条 PRIVMSG 在同一个 TCP 段里
-        到达"时，注册阶段读循环返回后，运行阶段会先处理遗留行再阻塞读，不会把
-        那几条消息静默吞掉。
-        """
-        buf = self._rbuf
-        last_ping = time.monotonic()
-        while not self._stop_event.is_set():
-            if deadline is not None and time.monotonic() >= deadline:
-                return
-            if b"\n" not in buf:
-                try:
-                    data: Optional[bytes] = sock.recv(4096)
-                except socket.timeout:
-                    data = None      # tick：检查保活定时器与 stop
-                except OSError:
-                    return          # socket 被 stop() 关掉了
-                if data is None:
-                    if time.monotonic() - last_ping >= self.ping_interval:
-                        # 服务端不 ping 时我们自己保活，否则会被静默踢下线。
-                        self._write_line(
-                            sock, f"PING :opencode-{int(time.monotonic())}"
-                        )
-                        last_ping = time.monotonic()
-                    continue
-                if not data:
-                    return          # 对端关闭 = 掉线，交给上层重连
-                buf += data
-                if b"\n" not in buf and len(buf) > self.line_limit:
-                    logger.warning(
-                        "irc: dropping oversized inbound line (%d bytes)", len(buf)
-                    )
-                    del buf[:]
-                    continue
-            raw, _, _rest = buf.partition(b"\n")
-            del buf[: len(raw) + 1]   # 原地删除，保持 self._rbuf 是唯一缓冲
-            line = raw.rstrip(b"\r").decode("utf-8", "replace")
-            if not line:
-                continue
-            try:
-                self._handle_line(sock, line)
-            except Exception:
-                logger.exception("irc: failed to handle line %r", line[:120])
-            if self._registered and deadline is not None:
-                return              # 001 已到，注册完成
 
     # ------------------------------------------------------------------
     # 行解析与派发
     # ------------------------------------------------------------------
-    def _handle_line(self, sock: socket.socket, line: str) -> None:
+    def _handle_line(self, line: str) -> None:
         prefix, command, params = _parse_line(line)
         if command == "PING":
             # token 原样回：``PING :abc`` → ``PONG :abc``
             token = params[0] if params else self.host
-            self._write_line(sock, f"PONG :{token}")
+            self._write_line(f"PONG :{token}")
             return
         if command == "PRIVMSG":
             self._handle_privmsg(prefix, params)
@@ -498,58 +549,59 @@ class IRCAdapter(Adapter):
             logger.warning("irc: server ERROR: %s", " ".join(params))
             return
         if command.isdigit():
-            self._handle_numeric(sock, prefix, command, params)
+            self._handle_numeric(prefix, command, params)
             return
         if command == "CAP":
-            self._handle_cap(sock, params)
+            self._handle_cap(params)
             return
         if command == "AUTHENTICATE":
-            self._handle_authenticate(sock, params)
+            self._handle_authenticate(params)
 
-    def _handle_numeric(
-        self, sock: socket.socket, prefix: str, code: str, params: List[str]
-    ) -> None:
+    def _handle_numeric(self, prefix: str, code: str, params: List[str]) -> None:
         if code == RPL_WELCOME:
             self._registered = True
             logger.info("irc: registered as %s (welcome from %s)", self.nick, prefix)
+            # 迁移前是在注册阶段的读循环返回之后才 JOIN；现在就在处理 001 的
+            # 当下 JOIN —— 线上顺序一致（001 之后、同一 TCP 段里的后续行之前）。
+            self._join_channels()
         elif code == ERR_NICKNAMEINUSE:
             logger.warning("irc: nick %s is in use", self.nick)
         elif code in (AUTH_SUCCESS, AUTH_FAILURE, AUTH_ABORTED):
             logger.info("irc: SASL result %s", code)
             # SASL 结束（无论成败）都要 CAP END 才能继续 NICK/USER，否则卡在注册。
-            self._cap_end(sock)
+            self._cap_end()
         elif code == ERR_NOMOTD:
             pass  # 无 MOTD 很正常
 
-    def _cap_end(self, sock: socket.socket) -> None:
+    def _cap_end(self) -> None:
         self._sasl_state = ""
-        self._write_line(sock, "CAP END")
-        self._start_registration(sock)
+        self._write_line("CAP END")
+        self._start_registration()
 
-    def _handle_cap(self, sock: socket.socket, params: List[str]) -> None:
+    def _handle_cap(self, params: List[str]) -> None:
         """CAP 协商：只有 SASL 一条支线，其余一律 ``CAP END`` 后进入注册。"""
         caps = params[-1] if params else ""
         if self.bot_password and self._sasl_state == "ls_sent" and "sasl" in caps.lower():
-            self._write_line(sock, "AUTHENTICATE PLAIN")
+            self._write_line("AUTHENTICATE PLAIN")
             self._sasl_state = "auth_sent"
         else:
-            self._cap_end(sock)
+            self._cap_end()
 
-    def _handle_authenticate(self, sock: socket.socket, params: List[str]) -> None:
-        """服务器回 ``AUTHENTICATE +``（同意）→ 回 base64(\\\\0user\\\\0pass)。"""
+    def _handle_authenticate(self, params: List[str]) -> None:
+        """服务器回 ``AUTHENTICATE +``（同意）→ 回 base64(\\0user\\0pass)。"""
         if not params:
             return
         if params[0] != "+":
             # "-" 表示服务器拒绝该机制：放弃 SASL，照常注册（不要卡在这里）。
             logger.info("irc: AUTHENTICATE rejected (%s)", params[0])
-            self._cap_end(sock)
+            self._cap_end()
             return
         if not self.bot_password:
             return
         payload = base64.b64encode(
             b"\0" + self.nick.encode("utf-8") + b"\0" + self.bot_password.encode("utf-8")
         ).decode("ascii")
-        self._write_line(sock, f"AUTHENTICATE {payload}")
+        self._write_line(f"AUTHENTICATE {payload}")
         self._sasl_state = "payload_sent"
 
     def _handle_privmsg(self, prefix: str, params: List[str]) -> None:
@@ -619,7 +671,12 @@ class IRCAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(target: Any) -> str:
-        return f"irc:{target}"
+        """``target`` → ``irc:target``（A2：走 :func:`~opencode_bridge.identity.format_id`）。
+
+        ``identity.LEGACY_PREFIXES["irc"] == "irc"``，所以这里的产物与迁移前
+        自造的 ``f"irc:{target}"`` **逐字节相同** —— 已落盘的 ``state.json`` 零影响。
+        """
+        return format_id("irc", target)
 
     @staticmethod
     def _target(conversation_id: Any) -> Optional[str]:
@@ -676,30 +733,27 @@ class IRCAdapter(Adapter):
             self._seq += 1
             return str(self._seq)
 
-    def _write_line(self, sock: socket.socket, line: str) -> bool:
+    def _write_line(self, line: str) -> bool:
         """发一条以 ``CRLF`` 结尾的行。**绝不在行内出现 CR/LF**。
 
         硬上限兜底：即使调用方绕过 :meth:`_outbound_pieces` 塞进超长文本，也按
-        字符边界截到 512 字节（宁可少发也不让服务器丢整条连接）。
+        字符边界截到 512 字节（宁可少发也不让服务器丢整条连接）。真正的写出
+        （连接查找、串行化、失败不抛）由传输层的 ``send_line`` 负责。
         """
         line = line.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-        encoded = f"{line}\r\n".encode("utf-8")
-        if len(encoded) > self.line_limit:
+        if len(line.encode("utf-8")) + 2 > self.line_limit:
             # 去掉 CRLF 再按字节预算裁正文，保持行首的命令/目标完整。
-            room = self.line_limit - 2
-            encoded = _fit_utf8(line, room).encode("utf-8") + b"\r\n"
+            line = _fit_utf8(line, self.line_limit - 2)
             logger.warning(
                 "irc: truncating outbound line to %d bytes (limit %d)",
-                len(encoded),
+                len(line.encode("utf-8")) + 2,
                 self.line_limit,
             )
-        try:
-            with self._send_lock:
-                sock.sendall(encoded)
-            return True
-        except Exception as exc:
-            logger.warning("irc: write failed: %s", exc)
+        transport = self._transport
+        if transport is None:
+            logger.warning("irc: write failed: transport not started")
             return False
+        return transport.send_line(line)
 
     def send(self, out: Outbound) -> MsgHandle | None:
         """``PRIVMSG <target> :<text>``（超长按 512 字节上限切成多条）。"""
@@ -713,9 +767,7 @@ class IRCAdapter(Adapter):
             self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
         target = self._normalize_target(target)
-        with self._sock_lock:
-            sock = self._sock
-        if sock is None:
+        if self._connection() is None:
             logger.warning("irc: not connected; dropping outbound message")
             self._note_send_failure(SendError.TRANSIENT, "not connected")
             return None
@@ -725,7 +777,7 @@ class IRCAdapter(Adapter):
         handle: MsgHandle | None = None
         for piece in pieces:
             self._throttle(out.conversation_id)
-            if not self._write_line(sock, f"PRIVMSG {target} :{piece}"):
+            if not self._write_line(f"PRIVMSG {target} :{piece}"):
                 self._note_send_failure(SendError.TRANSIENT, "write failed")
                 return handle if handle is not None else None
             # IRC 没有消息 id；用本地序号占位（edit 永远 False，仅供日志定位）

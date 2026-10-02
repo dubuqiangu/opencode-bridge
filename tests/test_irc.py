@@ -8,6 +8,13 @@
 覆盖：能力声明、注册时序、PING/PONG 与保活、私聊/提及入站、控制码清理、
 防回环、PRIVMSG 行形状、512 字节截断、分片、edit 恒 False、缺配置不起线程、
 断线重连、结构化发送失败、stop 立刻唤醒阻塞 recv。
+
+A1 迁移（传输层收敛到 :mod:`opencode_bridge.transport`）之后新增
+:class:`TestIRCMigrationInvariants`：把「行为不变」逐条钉死 —— 退避 5s/×2/60s
+封顶、连上即重置（``reset_after=0``）、stop 快且幂等、跨重连不重复注册/JOIN、
+``conversation_id`` 字节级不变（A2）、传输层与行处理异常不会静默杀掉线程；
+外加 :meth:`TestMentionRules.test_mention_boundary_includes_the_nicks_own_special_chars`
+把「词边界含 nick 自身 special 字符」这条易丢规则锁住。
 """
 
 from __future__ import annotations
@@ -25,8 +32,10 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
 from opencode_bridge.adapters import adapter_class, build, registered_names
 from opencode_bridge.adapters.irc import (
+    CONNECT_TIMEOUT,
     LINE_LIMIT,
     MESSAGE_LIMIT,
+    SOCKET_TIMEOUT,
     IRCAdapter,
     _byte_safe_split,
     _fit_utf8,
@@ -35,6 +44,7 @@ from opencode_bridge.adapters.irc import (
     strip_control_codes,
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
+from opencode_bridge.identity import LEGACY_PREFIXES, format_id, normalize
 
 NICK = "bot"
 CHAN = "#chan"
@@ -281,6 +291,16 @@ def make_irc(config: dict | None = None, hooks: RecordingHooks | None = None):
     return adapter, adapter.hooks
 
 
+def wait_until(pred, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    """轮询等条件成立（比裸 sleep 稳；失败信息由调用方的断言给出）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return bool(pred())
+
+
 class IRCTestCase(unittest.TestCase):
     """带真服务器线程的测试基类。"""
 
@@ -521,6 +541,26 @@ class TestMentionRules(unittest.TestCase):
         self.assertIsNone(adapter._mention("bot: hi"))
         self.assertIsNone(adapter._mention(""))
 
+    def test_mention_boundary_includes_the_nicks_own_special_chars(self):
+        """词边界 = 基础字符集 **+ nick 自己用到的 special 字符**。
+
+        nick 含 ``-`` 时 ``bot-x1`` 不算提及（``-`` 进了边界）；nick 不含 ``-``
+        时 ``bot-x`` 又要能识别（真实的频道写法）。这条极易在重写时丢掉，所以
+        在迁移这一轮钉死。
+        """
+        plain, _ = make_irc({"nick": "bot"})
+        self.assertIsNotNone(plain._mention("bot-x"), "nick 不含 - 时 bot-x 是提及")
+        dashed, _ = make_irc({"nick": "bot-x"})
+        self.assertIsNotNone(dashed._mention("bot-x: hi"))
+        self.assertIsNotNone(dashed._mention("hey bot-x"))
+        self.assertIsNone(dashed._mention("bot-x1"), "nick 含 - 时 - 也进边界")
+        self.assertIsNone(dashed._mention("xbot-x hi"))
+        bracketed, _ = make_irc({"nick": "[bot]"})
+        self.assertIsNotNone(bracketed._mention("[bot]: hi"))
+        self.assertIsNone(bracketed._mention("x[bot] hi"), "nick 含 [ ] 时它们进边界")
+        # 正则本身是 IGNORECASE + 不含裸点号：``.*`` 这类不该被误判成提及
+        self.assertIsNone(plain._mention("a.b-o.t"))
+
     def test_strip_mention_removes_prefix_and_separator(self):
         adapter, _ = make_irc({"nick": "bot"})
         cases = {
@@ -664,11 +704,11 @@ class TestIRCPingPong(IRCTestCase):
         self.assertGreater(len(server.lines), before)
 
     def test_ping_with_no_token_uses_host(self):
+        # 迁移到传输层后行处理不再收 socket 参数（写出统一走 transport.send_line）
         adapter, _ = make_irc()
-        server = self.make_server()
-        adapter._write_line = lambda sock, line: sent.append(line) or True
         sent: list[str] = []
-        adapter._handle_line(None, "PING")
+        adapter._write_line = lambda line: (sent.append(line), True)[1]
+        adapter._handle_line("PING")
         self.assertEqual(sent, ["PONG :127.0.0.1"])
 
     def test_keepalive_ping_is_sent_by_timer(self):
@@ -879,8 +919,7 @@ class TestIRCSend(IRCTestCase):
     def test_write_line_truncates_oversized_line(self):
         """绕过 send() 直接写超长行时按字符边界截到 512 字节内。"""
         adapter, _, server = self._started()
-        sock = adapter._sock
-        adapter._write_line(sock, "PRIVMSG #chan :" + "字" * 900)
+        adapter._write_line("PRIVMSG #chan :" + "字" * 900)
         lines = server.wait_privmsg(1)
         self.assertEqual(len(lines), 1)
         self.assertLessEqual(len(lines[0].encode("utf-8")) + 2, LINE_LIMIT)
@@ -891,7 +930,7 @@ class TestIRCSend(IRCTestCase):
 
     def test_write_line_strips_embedded_newlines(self):
         adapter, _, server = self._started()
-        adapter._write_line(adapter._sock, "PRIVMSG #chan :a\r\nJOIN #evil")
+        adapter._write_line("PRIVMSG #chan :a\r\nJOIN #evil")
         lines = server.wait_privmsg(1)
         self.assertEqual(lines, ["PRIVMSG #chan :a JOIN #evil"])
         self.assertEqual([x for x in server.lines if x.startswith("JOIN #evil")], [],
@@ -919,10 +958,10 @@ class TestIRCSend(IRCTestCase):
 
     def test_send_write_failure_is_structured_failure(self):
         adapter, _, server = self._started()
+        conn = adapter.transport.connection      # 迁移后由传输层持有连接
         server.drop()
-        time.sleep(0.2)
-        if adapter._sock is not None:  # 读循环还没察觉断开
-            adapter._sock.close()
+        if conn is not None:                     # 读循环还没察觉断开
+            conn.close()
         result = adapter.send_result(Outbound("irc:#chan", "hi"))
         self.assertFalse(result.ok)
         self.assertEqual(result.error_kind, SendError.TRANSIENT)
@@ -969,7 +1008,7 @@ class TestIRCLifecycle(IRCTestCase):
         with self.assertLogs("opencode_bridge.adapters.irc", level="WARNING") as cm:
             adapter.start()
         self.assertTrue(any("host" in line for line in cm.output))
-        self.assertIsNone(adapter._thread)
+        self.assertIsNone(adapter.transport)   # 连传输层都没建 → 没有线程
         self.assertFalse(adapter.running)
 
     def test_missing_nick_warns_and_does_not_start(self):
@@ -977,7 +1016,7 @@ class TestIRCLifecycle(IRCTestCase):
         with self.assertLogs("opencode_bridge.adapters.irc", level="WARNING") as cm:
             adapter.start()
         self.assertTrue(any("nick" in line for line in cm.output))
-        self.assertIsNone(adapter._thread)
+        self.assertIsNone(adapter.transport)
         self.assertFalse(adapter.running)
 
     def test_no_channels_warns_but_still_starts(self):
@@ -1049,7 +1088,7 @@ class TestIRCLifecycle(IRCTestCase):
         self.addCleanup(adapter.stop)
         time.sleep(0.4)
         self.assertTrue(adapter.running, "连不上也不能让线程退出")
-        self.assertIsNone(adapter._sock)
+        self.assertIsNone(adapter.transport.connection)
 
     def test_stop_before_start_is_harmless(self):
         adapter, _ = make_irc()
@@ -1057,11 +1096,196 @@ class TestIRCLifecycle(IRCTestCase):
         self.assertFalse(adapter.running)
 
 
+class TestIRCMigrationInvariants(IRCTestCase):
+    """A1 迁移的「行为不变」清单：逐条钉死，不是感觉。
+
+    这些断言刻意做成**白盒接线断言**（直接读传输层的退避状态机）：退避上限与
+    重置规则没法靠本机计时测（5s/60s 的真实等待没人等得起），而"接线上没接错"
+    正是迁移最容易出、也最容易被计时抖动掩盖的地方。
+    """
+
+    # -- A2：conversation_id 字节级不变 ----------------------------------
+    def test_conversation_id_is_byte_identical_to_pre_migration(self):
+        """``irc:`` 前缀映射到自身 → 走 format_id 之后字符串**逐字节相同**。"""
+        self.assertEqual(
+            LEGACY_PREFIXES["irc"], "irc",
+            "identity 里 irc 的旧前缀映射到自身，所以换实现不改字符串",
+        )
+        for target in ("#chan", "bot", "&local", "!a:b", "#中文频道"):
+            with self.subTest(target=target):
+                legacy = f"irc:{target}"                     # 迁移前的自造前缀
+                current = IRCAdapter._conversation_id(target)
+                self.assertEqual(current, legacy)
+                self.assertEqual(current.encode("utf-8"), legacy.encode("utf-8"))
+                self.assertEqual(current, format_id("irc", target))
+                # 已落盘的旧键归一后还是它自己 → state.json 零影响
+                self.assertEqual(normalize(current), current)
+                self.assertEqual(IRCAdapter._target(current), target)
+
+    # -- A1：退避 5s 起 / ×2 / 封顶 60s -----------------------------------
+    def test_backoff_is_wired_to_legacy_constants(self):
+        adapter, _ = make_irc()
+        adapter.reconnect_delay = 5.0            # make_irc() 为了跑得快调成了 0.05
+        adapter.max_reconnect_delay = 60.0
+        transport = adapter._make_transport()
+        self.assertEqual(transport.min_backoff, 5.0, "首次重连延迟必须是 5s")
+        self.assertEqual(transport.max_backoff, 60.0, "退避上限必须是 60s")
+        # 顺手把其余接线也钉住：别让传输层默认值悄悄改掉既有参数
+        self.assertEqual(transport._io_timeout, SOCKET_TIMEOUT)
+        self.assertEqual(transport._connect_timeout, CONNECT_TIMEOUT)
+        self.assertEqual(transport.max_line_bytes, LINE_LIMIT,
+                         "入站超长行仍按 512 字节丢弃")
+
+    def test_backoff_doubles_and_caps_at_60(self):
+        adapter, _ = make_irc()
+        adapter.reconnect_delay = 5.0
+        adapter.max_reconnect_delay = 60.0
+        transport = adapter._make_transport()
+        waits = [transport._next_backoff(survived=False) for _ in range(6)]
+        self.assertEqual(waits, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0],
+                         "必须是 5s 起、×2、60s 封顶（迁移前一致）")
+
+    # -- A1：连上就重置（reset_after=0）----------------------------------
+    def test_backoff_resets_as_soon_as_connected(self):
+        adapter, _ = make_irc()
+        adapter.reconnect_delay = 0.05
+        adapter.max_reconnect_delay = 0.4
+        transport = adapter._make_transport()
+        self.assertEqual(
+            transport.reset_after, 0.0,
+            "必须是 0：连上过一次就重置退避（迁移前 irc.py 的语义）；"
+            "改成'稳定存活 N 秒'会让闪断场景的退避越推越久",
+        )
+        transport._next_backoff(survived=False)      # 连不上 → 0.05，状态 → 0.1
+        transport._next_backoff(survived=False)      # → 0.1，状态 → 0.2
+        self.assertEqual(transport._backoff, 0.2)
+        # 一旦连上过（无论活了多久）→ 立刻回下限
+        self.assertEqual(transport._next_backoff(survived=True), 0.05)
+        self.assertEqual(transport._backoff, 0.05)
+
+    def test_backoff_is_reset_after_a_successful_session(self):
+        """真跑一遍：掉线 → 重连成功后，退避必须已经回到下限。"""
+        server = self.make_server()
+        adapter, _ = make_irc()
+        self.connect_adapter(adapter, server)
+        self.start_and_wait_registered(adapter, server)
+        server.drop()
+        self.assertTrue(server.wait_connections(2, timeout=5), "断线后应自动重连")
+        self.assertTrue(wait_until(lambda: adapter.transport.stats()["connects"] >= 2))
+        self.assertEqual(
+            adapter.transport._backoff, adapter.transport.min_backoff,
+            "连上过就应把退避重置回 reconnect_delay",
+        )
+
+    # -- A1：跨重连不重复注册 / 不重复 JOIN -------------------------------
+    def test_join_and_registration_sent_once_per_session(self):
+        server = self.make_server()
+        adapter, _ = make_irc()
+        self.connect_adapter(adapter, server)
+        self.start_and_wait_registered(adapter, server)
+        server.drop()
+        self.assertTrue(server.wait_connections(2, timeout=5))
+        self.assertTrue(
+            wait_until(lambda: len([x for x in server.lines if x.startswith("JOIN ")]) >= 2),
+            "第二次会话也应完成 JOIN",
+        )
+        time.sleep(0.2)                      # 多给一点时间，确认没有第三次连接
+        joins = [x for x in server.lines if x.startswith("JOIN ")]
+        nicks = [x for x in server.lines if x.startswith("NICK ")]
+        users = [x for x in server.lines if x.startswith("USER ")]
+        self.assertEqual(joins, ["JOIN #chan", "JOIN #chan"], "每条连接恰好一次 JOIN")
+        self.assertEqual(nicks, ["NICK bot", "NICK bot"], "每条连接恰好一次 NICK")
+        self.assertEqual(users, ["USER bot 0 * :bot"] * 2, "每条连接恰好一次 USER")
+        self.assertEqual(len(joins), server.connections,
+                         "JOIN 次数必须等于连接次数（不能连上却没 JOIN）")
+
+    # -- A1：传输层异常不许静默杀掉线程 -----------------------------------
+    def test_tick_exception_reconnects_and_keeps_thread_alive(self):
+        """注册超时由 tick 钩子抛异常 → 退避重连，线程必须还活着。"""
+        server = self.make_server(auto_welcome=False)
+        adapter, _ = make_irc()
+        adapter.register_timeout = 0.2
+        self.connect_adapter(adapter, server)
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(server.wait_connections(2, timeout=5), "超时后应重连")
+        self.assertTrue(wait_until(lambda: adapter.transport.stats()["errors"] >= 1))
+        self.assertTrue(adapter.running, "会话异常不得让消费线程静默退出")
+        self.assertFalse(adapter._registered, "没收到 001 就不该算已注册")
+
+    def test_line_handler_exception_does_not_kill_the_read_loop(self):
+        """行处理抛异常：这一行被吞掉，但连接与循环都得继续活着。"""
+        server = self.make_server()
+        adapter, _ = make_irc()
+        self.connect_adapter(adapter, server)
+        self.start_and_wait_registered(adapter, server)
+        original = adapter._handle_line
+        connects_before = adapter.transport.stats()["connects"]
+
+        def boom(line):
+            raise RuntimeError("handler exploded")
+
+        adapter._handle_line = boom
+        server.send("PING :boom1")
+        time.sleep(0.3)
+        self.assertIsNone(
+            server.wait_for(lambda x: x.startswith("PONG"), timeout=0.2),
+            "处理函数抛异常时这条 PING 不会被应答（这正是我们要观察的）",
+        )
+
+        adapter._handle_line = original
+        server.send("PING :after")
+        self.assertIsNotNone(
+            server.wait_for(lambda x: x == "PONG :after", timeout=5),
+            "行处理恢复后读循环必须还在工作",
+        )
+        self.assertTrue(adapter.running)
+        self.assertEqual(
+            adapter.transport.stats()["connects"], connects_before,
+            "处理单行异常不该导致重连（连接本身没问题）",
+        )
+
+    # -- A1：stop() 快且幂等 ----------------------------------------------
+    def test_stop_is_idempotent(self):
+        server = self.make_server()
+        adapter, _ = make_irc()
+        self.connect_adapter(adapter, server)
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertIsNotNone(server.wait_for(lambda x: x.startswith("JOIN ")))
+        self.assertTrue(wait_until(lambda: adapter._registered))
+        adapter.stop()
+        self.assertFalse(adapter.running)
+        self.assertIsNone(adapter.transport)
+        self.assertFalse(adapter._registered,
+                         "会话结束后必须清掉已注册标记（迁移前 finally 的语义）")
+        adapter.stop()          # 幂等：重复 stop 不该抛
+        self.assertFalse(adapter.running)
+
+    def test_missing_channels_still_reconnects_and_joins_nothing(self):
+        """无频道时仍要完成注册（并因此具备重连能力），只是不发 JOIN。"""
+        server = self.make_server()
+        adapter, _ = make_irc({"channels": []})
+        self.connect_adapter(adapter, server)
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(wait_until(lambda: adapter._registered))
+        self.assertEqual([x for x in server.lines if x.startswith("JOIN")], [])
+        server.drop()
+        self.assertTrue(server.wait_connections(2, timeout=5))
+
+
 class TestIRCTLS(unittest.TestCase):
-    """真 TLS 需要证书，这里只验证"确实走了 TLS 包装"这个接缝。"""
+    """真 TLS 需要证书，这里只验证"确实走了 TLS 包装"这个接缝。
+
+    建连已搬进传输层（:class:`opencode_bridge.transport.TcpLineTransport`），
+    所以这里直接测适配器造出来的那个传输对象的 ``_open()`` —— 仍然是真实的
+    建连路径（``socket.create_connection`` + ``_wrap_tls`` + ``settimeout``），
+    适配器只负责把 ``_tls_wrap`` 注入点接上去。
+    """
 
     class FakeSocket:
-        """只实现 ``_open_socket`` 用到的那几个方法。"""
+        """只实现建连路径用到的那几个方法。"""
 
         def __init__(self) -> None:
             self.timeout: float | None = None
@@ -1074,11 +1298,11 @@ class TestIRCTLS(unittest.TestCase):
             self.closed = True
 
     def _patched_connect(self, fake):
-        import opencode_bridge.adapters.irc as irc_mod
+        import opencode_bridge.transport.tcp_lines as tcp_mod
 
-        old = irc_mod.socket.create_connection
-        irc_mod.socket.create_connection = fake
-        self.addCleanup(setattr, irc_mod.socket, "create_connection", old)
+        old = tcp_mod.socket.create_connection
+        tcp_mod.socket.create_connection = fake
+        self.addCleanup(setattr, tcp_mod.socket, "create_connection", old)
 
     def test_use_tls_wraps_socket(self):
         adapter, _ = make_irc({"use_tls": True, "host": "irc.example.org"})
@@ -1093,7 +1317,8 @@ class TestIRCTLS(unittest.TestCase):
 
         adapter._tls_wrap = fake_wrap
         self._patched_connect(lambda addr, timeout=None: raw)
-        self.assertIs(adapter._open_socket(), wrapped)
+        transport = adapter._make_transport()
+        self.assertIs(transport._open(), wrapped)
         self.assertEqual(seen, [raw], "use_tls 时必须经过 TLS 包装")
         self.assertEqual(wrapped.timeout, adapter.socket_timeout)
 
@@ -1104,7 +1329,8 @@ class TestIRCTLS(unittest.TestCase):
             AssertionError("明文连接不应走 TLS 包装")
         )
         self._patched_connect(lambda addr, timeout=None: raw)
-        self.assertIs(adapter._open_socket(), raw)
+        transport = adapter._make_transport()
+        self.assertIs(transport._open(), raw)
 
     def test_default_tls_wrap_is_installed(self):
         adapter, _ = make_irc({"use_tls": True})
@@ -1120,8 +1346,9 @@ class TestIRCTLS(unittest.TestCase):
 
         adapter._tls_wrap = boom
         self._patched_connect(lambda addr, timeout=None: raw)
+        transport = adapter._make_transport()
         with self.assertRaises(OSError):
-            adapter._open_socket()
+            transport._open()
         self.assertTrue(raw.closed, "TLS 失败必须把底层 socket 关掉，不能泄漏 fd")
 
 

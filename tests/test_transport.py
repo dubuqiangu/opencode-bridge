@@ -834,6 +834,48 @@ class TestBaseInvariants(TransportTestCase):
         # 闸门没开 → 短命连接不会把退避打回下限
         self.assertGreaterEqual(t._backoff, 0.4, "短命连接不应触发退避重置")
 
+    def test_reset_after_zero_resets_even_a_brief_connection(self):
+        """``reset_after=0``（默认）时，**哪怕只活了几毫秒**的连接也必须重置退避。
+
+        这条补的是一个**真实缺口**：此前只断言了「默认值是 0」这个属性，以及
+        「``reset_after>0`` 时不重置」的反面 —— 却**没有任何用例证明默认语义在线程里
+        真的生效**。而这正是 IRC 等适配器的既有行为（``irc.py``「连上过一次就重置」）；
+        更麻烦的是那些适配器自己的用例是**白盒读 ``_backoff``**，一旦传输层改了判定
+        方式，它们会集体失效而没人察觉。
+
+        本用例是上条用例的**正面对照**（同一套脚本，只把 ``reset_after`` 从 10 改成 0）：
+
+        ============================  ===========================================
+        步骤                          ``reset_after=0`` 下的退避
+        ============================  ===========================================
+        open 失败                      等 0.1 → 退避 0.2
+        open 失败                      等 0.2 → 退避 0.4
+        open 成功、仅活 0.005s         **重置** → 等 0.1，退避回 0.1
+        open 失败                      等 0.1 → 退避 0.2（不再往上爬）
+        ============================  ===========================================
+
+        判据取「退避不再越过 0.25」：一旦重置生效，该值此后恒定在 0.1/0.2 之间，
+        所以这个谓词是**稳定**的，不受机器负载影响（与上条用例同理，
+        不用 wall-clock 间隔断言 —— 那正是本项目踩过的 flaky 坑）。
+        """
+        conn = _GateConn()
+        t = _ScriptedBase(
+            open_script=[OSError("boom"), OSError("boom"), conn, OSError("gone")],
+            # 每次只活 0.005s，远小于任何正数 reset_after —— 正是"短暂连接"的极端
+            next_script=[_Hang(0.005)],
+            min_backoff=0.1,
+            max_backoff=0.8,
+            reset_after=0.0,
+            idle_delay=0.005,
+            name=uniq_name("zeroreset"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: len(t.opened_at) >= 4, timeout=5.0))
+        self.assertLessEqual(
+            t._backoff, 0.25,
+            "reset_after=0 时，短暂成功连接也必须把退避打回下限",
+        )
+
     def test_invariant2_backoff_reset_threaded(self):
         """线程里也验证一次：前两次失败把退避推到 0.2s，稳定连接后退回 0.1s。"""
         conn = _GateConn()

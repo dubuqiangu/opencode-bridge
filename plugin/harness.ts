@@ -1,9 +1,10 @@
 // harness.ts — opencode-bridge 插件独立验证脚本（用 bun 跑，不触碰 opencode 服务）。
 //   cd opencode-bridge\plugin
 //   bun harness.ts
-// 覆盖 15 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析 + 1 个 exit-0 语义），全部断言通过才
-// 打印 PASS 15/15 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
-// 还原被它改动的 <插件目录>/config.json 与环境变量 OPENCODE_BRIDGE_DIR。
+// 覆盖 22 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析 + 1 个 exit-0 语义 +
+//   7 个第 4 级自举：路径推导/铺源/不覆盖 config/git clone 不碰/刷新源码/enabled 零副作用/端到端），
+//   全部断言通过才打印 PASS 22/22 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
+// 还原被它改动的 <插件目录>/config.json、OPENCODE_BRIDGE_DIR 与 home 相关环境变量。
 // 注意：全程不运行真实的 python -m opencode_bridge，也不触碰 opencode 服务。
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
@@ -11,6 +12,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import plugin from "./index.ts"
+import { deriveStableDir, ensureMaterialized } from "./index.ts"
 import type { BridgePluginOptions } from "./index.ts"
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,29 @@ const originalPluginCfg: string | null = fs.existsSync(pluginCfgPath)
   ? fs.readFileSync(pluginCfgPath, "utf8")
   : null
 const originalEnvBridgeDir: string | undefined = process.env.OPENCODE_BRIDGE_DIR
+// bridgeDir 第 4 级（自举稳定目录）按 USERPROFILE / HOME / XDG_CONFIG_HOME 推导真实用户目录。
+// 测试期间一律改指 tmpRoot，绝不碰开发者/安装器已有的 ~/.config/opencode-bridge（teardown 还原）。
+const originalHomeEnv: Record<string, string | undefined> = {
+  USERPROFILE: process.env.USERPROFILE,
+  HOME: process.env.HOME,
+  XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+}
+const FAKE_HOME = path.join(tmpRoot, "fakehome")
+
+function setFakeHome(): void {
+  process.env.USERPROFILE = FAKE_HOME
+  process.env.HOME = FAKE_HOME
+  delete process.env.XDG_CONFIG_HOME
+}
+
+/** 把 home 指向 tmpRoot 下**独立**目录（各自举场景互不污染），返回该环境下的稳定目录。 */
+function useHome(name: string): string {
+  const home = path.join(tmpRoot, name)
+  process.env.USERPROFILE = home
+  process.env.HOME = home
+  delete process.env.XDG_CONFIG_HOME
+  return deriveStableDir()
+}
 
 /** 清掉测试写入的插件目录 config.json（还原成“原本有没有”的状态）。 */
 function resetPluginCfg(): void {
@@ -219,6 +244,7 @@ async function test(n: number, name: string, fn: () => Promise<void> | void): Pr
 async function run() {
   // ---- 可移植性测试前置：清掉插件目录 config.json 与 OPENCODE_BRIDGE_DIR（teardown 还原）----
   delete process.env.OPENCODE_BRIDGE_DIR
+  setFakeHome() // 第 4 级自举的 home 推导也隔离到 tmpRoot
   try {
     fs.rmSync(pluginCfgPath, { force: true }) // 原内容已在 originalPluginCfg 中备份
   } catch {
@@ -490,10 +516,17 @@ async function run() {
   })
 
   // ---- 14: 三者皆缺 → 不 spawn、不抛、no-op cleanup（外加源码静态断言）----
-  await test(14, "三者皆缺 → 不 spawn、不抛、no-op cleanup；源码无硬编码盘符路径", async () => {
+  await test(14, "前三级皆缺且自举失败 → 不 spawn、不抛、no-op cleanup；源码无硬编码盘符路径", async () => {
     resetPluginCfg()
     delete process.env.OPENCODE_BRIDGE_DIR
     assert(!fs.existsSync(pluginCfgPath), "预检失败: 插件目录不应存在 config.json")
+    // 让第 4 级自举**确定失败**：把 home 指向一个“文件”→ 稳定目录 mkdir 必失败 → bridgeDir 保持空。
+    // （第 4 级成功的正常安装路径由 #16~#22 覆盖）
+    const blocker = path.join(tmpRoot, "t14-home-blocker")
+    fs.writeFileSync(blocker, "not a directory")
+    process.env.USERPROFILE = blocker
+    process.env.HOME = blocker
+    process.env.XDG_CONFIG_HOME = blocker
     const m14 = path.join(tmpRoot, "t14.marker")
 
     // 捕获 console.error，断言插件按约定打印“未配置 bridgeDir”而不是抛异常
@@ -588,6 +621,138 @@ async function run() {
     cleanup1()
     assert(!fs.existsSync(l15), "最终锁应被删除")
   })
+
+  // =========================================================================
+  // bridgeDir 第 4 级：默认自举稳定目录（16~22）
+  // =========================================================================
+
+  /** 造一个“包根”夹具：<root>/plugin/index.ts + opencode_bridge/ + config.example.json。 */
+  function makePkgRoot(name: string, withPy = true, withExample = true): string {
+    const root = path.join(tmpRoot, name)
+    fs.mkdirSync(path.join(root, "plugin"), { recursive: true })
+    fs.writeFileSync(path.join(root, "plugin", "index.ts"), "// fixture\n")
+    if (withPy) {
+      fs.mkdirSync(path.join(root, "opencode_bridge"), { recursive: true })
+      fs.writeFileSync(path.join(root, "opencode_bridge", "__init__.py"), "# v1\n")
+      fs.writeFileSync(path.join(root, "opencode_bridge", "__main__.py"), "# main v1\n")
+    }
+    if (withExample) {
+      fs.writeFileSync(
+        path.join(root, "config.example.json"),
+        JSON.stringify({ adapters: { telegram: { bot_token: "", allowed_chat_ids: [] } } }, null, 2),
+      )
+    }
+    return root
+  }
+
+  await test(16, "deriveStableDir：Windows / Linux(XDG) / Linux(默认) 三分支", () => {
+    const win = deriveStableDir({ USERPROFILE: "C:\\Users\\x" }, "win32")
+    assert(win === path.join("C:\\Users\\x", ".config", "opencode-bridge"), `win32 分支错误: ${win}`)
+    const xdg = deriveStableDir({ HOME: "/home/y", XDG_CONFIG_HOME: "/home/y/cfg" }, "linux")
+    assert(xdg === path.join("/home/y/cfg", "opencode-bridge"), `XDG 分支错误: ${xdg}`)
+    const dflt = deriveStableDir({ HOME: "/home/y" }, "linux")
+    assert(dflt === path.join("/home/y", ".config", "opencode-bridge"), `默认分支错误: ${dflt}`)
+  })
+
+  await test(17, "自举：全新稳定目录铺入 Python 源码 + 由 example 生成 config.json", () => {
+    const pkg = makePkgRoot("pkg17")
+    const stable = useHome("home17")
+    assert(!fs.existsSync(stable), "预检失败: 稳定目录应尚不存在")
+    const r = ensureMaterialized(stable, pkg)
+    // 目录本身由 copyTree 的 mkdirSync 顺带创建，故 created 只在“本函数创建了空目录”时为 true；
+    // 这里关注的是源码与 config 落盘，created 不作断言（见 #22 端到端覆盖目录建立）。
+    assert(r.copiedSource, "应铺入 Python 源码")
+    assert(r.wroteConfig, "应由 config.example.json 生成 config.json")
+    assert(r.hasSource, "结束时应有 Python 源码")
+    assert(fs.existsSync(path.join(stable, "opencode_bridge", "__init__.py")), "源码文件应落盘")
+    assert(!fs.existsSync(path.join(stable, "opencode_bridge", "__pycache__")), "不应拷贝 __pycache__")
+  })
+
+  await test(18, "自举：已有 config.json 绝不覆盖（token 安全核心断言）", () => {
+    const pkg = makePkgRoot("pkg18")
+    const stable = useHome("home18")
+    fs.mkdirSync(stable, { recursive: true })
+    const sentinel = JSON.stringify({ adapters: { telegram: { bot_token: "SENTINEL-TOKEN" } } })
+    fs.writeFileSync(path.join(stable, "config.json"), sentinel)
+    const r = ensureMaterialized(stable, pkg)
+    assert(r.copiedSource, "仍应铺入 Python 源码")
+    assert(!r.wroteConfig, "不应重写已存在的 config.json")
+    assert(
+      fs.readFileSync(path.join(stable, "config.json"), "utf8") === sentinel,
+      "config.json 内容必须逐字节不变",
+    )
+  })
+
+  await test(19, "自举：稳定目录是 git clone → 一个字节都不碰", () => {
+    const pkg = makePkgRoot("pkg19")
+    const stable = useHome("home19")
+    fs.mkdirSync(path.join(stable, "opencode_bridge"), { recursive: true })
+    fs.writeFileSync(path.join(stable, "opencode_bridge", "__init__.py"), "# git v1\n")
+    fs.mkdirSync(path.join(stable, ".git"), { recursive: true })
+    const r = ensureMaterialized(stable, pkg)
+    assert(r.gitCloneUntouched, "应识别为 git clone 并跳过")
+    assert(!r.copiedSource && !r.refreshedSource, "不应拷贝/刷新源码")
+    assert(
+      fs.readFileSync(path.join(stable, "opencode_bridge", "__init__.py"), "utf8") === "# git v1\n",
+      "git clone 内源码不得被改写",
+    )
+  })
+
+  await test(20, "自举：非 git 已有源码 → 刷新 .py（plugin update 语义）且保留 config.json", () => {
+    const pkg = makePkgRoot("pkg20")
+    const stable = useHome("home20")
+    fs.mkdirSync(path.join(stable, "opencode_bridge"), { recursive: true })
+    fs.writeFileSync(path.join(stable, "opencode_bridge", "__init__.py"), "# old v1\n")
+    const sentinel = JSON.stringify({ keep: true })
+    fs.writeFileSync(path.join(stable, "config.json"), sentinel)
+    const r = ensureMaterialized(stable, pkg)
+    assert(r.refreshedSource, "应刷新源码")
+    assert(!r.gitCloneUntouched, "不应被当作 git clone")
+    assert(
+      fs.readFileSync(path.join(stable, "opencode_bridge", "__init__.py"), "utf8") === "# v1\n",
+      "源码应被刷新为包内版本",
+    )
+    assert(fs.readFileSync(path.join(stable, "config.json"), "utf8") === sentinel, "config.json 必须不变")
+  })
+
+  await test(21, "enabled=false 时自举零副作用（稳定目录不被创建）", () => {
+    const stable = useHome("home21")
+    const m21 = path.join(tmpRoot, "t21.marker")
+    const cleanup = plugin.setup({
+      options: { enabled: false, logDir: logsDir, python: RUNNER, args: evalArgs(liveCode(m21)) },
+    })
+    cleanups.push(cleanup)
+    assert(typeof cleanup === "function", "setup 应返回 cleanup 函数")
+    assert(!fs.existsSync(stable), "enabled=false 不应创建稳定目录")
+    assert(markerCount(m21) === 0, "不应 spawn 子进程")
+  })
+
+  await test(22, "第 4 级端到端：无 bridgeDir 时自举到稳定目录并正常 spawn", async () => {
+    // 独立 fake home，避免与 #17~#20 复用同一稳定目录
+    const home22 = path.join(tmpRoot, "t22home")
+    process.env.USERPROFILE = home22
+    process.env.HOME = home22
+    delete process.env.XDG_CONFIG_HOME
+    const stable = deriveStableDir()
+    assert(!fs.existsSync(stable), "预检失败: t22 稳定目录应尚不存在")
+    const m22 = path.join(tmpRoot, "t22.marker")
+    // 只给 logDir/python/args：bridgeDir 四级全靠插件自己解析（第 4 级自举）
+    const cleanup = plugin.setup({
+      options: { logDir: logsDir, python: RUNNER, args: evalArgs(liveCode(m22)) } satisfies BridgePluginOptions,
+    })
+    cleanups.push(cleanup)
+    seenLockPids.push(path.join(stable, ".bridge-plugin.lock"))
+    assert(
+      fs.existsSync(path.join(stable, "opencode_bridge", "__init__.py")),
+      "setup 应已把包内 Python 源码铺到稳定目录",
+    )
+    await waitFor(() => markerCount(m22) >= 1, 5000, "自举后的 bridge 子进程已启动")
+    const lock = readLock(path.join(stable, ".bridge-plugin.lock"))
+    assert(lock, "锁应生成在自举出的稳定目录下")
+    const pid = lock!.pid as number
+    cleanup()
+    await waitFor(() => !isAlive(pid), 5000, "子进程被 cleanup 终止")
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +796,11 @@ async function teardown() {
   resetPluginCfg()
   if (originalEnvBridgeDir === undefined) delete process.env.OPENCODE_BRIDGE_DIR
   else process.env.OPENCODE_BRIDGE_DIR = originalEnvBridgeDir
+  // 第 4 级自举测试改过 home 相关 env，一并还原
+  for (const [k, v] of Object.entries(originalHomeEnv)) {
+    if (v === undefined) delete process.env[k]
+    else process.env[k] = v
+  }
 
   // 5) 等待退出，再删临时目录
   const end = Date.now() + 5000

@@ -7,7 +7,21 @@
 
 ## 🚀 一行安装
 
-**推荐：把这行发给你的 AI Agent（跨平台，由 Agent 按文档执行）：**
+### OpenCode 原生插件命令（推荐）
+
+```text
+opencode plugin add github:dubuqiangu/opencode-bridge
+opencode plugin update github:dubuqiangu/opencode-bridge
+opencode plugin remove github:dubuqiangu/opencode-bridge
+```
+
+- `opencode plugin add <package>` 的 package 参数是 **npm registry or Git package specifier**；`update` / `remove` 都用**同一条完整 specifier**（上面这条，不是短 id）。安装 = 把本仓库作为插件包装进全局配置。
+- **装完只剩两步**：填 bot token → `opencode service restart`（重启会打断当前会话，**需你点头同意**才执行）。
+- 插件**首次启动自动自举**：把包内 Python 源码与 `config.example.json` 铺到稳定 bridge 目录（Windows `%USERPROFILE%\.config\opencode-bridge`，Unix `${XDG_CONFIG_HOME:-$HOME}/.config/opencode-bridge`），已有 `config.json` **绝不覆盖**——无需任何安装脚本。
+- **更新**用 `opencode plugin update github:dubuqiangu/opencode-bridge`（**建议在用户主目录 `~` 下执行**；工作区目录偶发 `Plugin is not configured`，换到 `~` 重试即可）；`plugin list` 显示的 commit 可能落后 update 一拍，再执行一次 update / list 对齐。
+- Python **3.10+ 仍需本机自带**（插件不安装 Python）。
+
+**AI Agent 一行（跨平台，由 Agent 按文档执行）：**
 
 ```
 帮我安装 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/install.md
@@ -19,7 +33,7 @@
 帮我更新 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/update.md
 ```
 
-**不想用 Agent？直接跑安装脚本（Windows PowerShell 5.1+）：**
+**不想用原生命令？直接跑安装脚本（Windows PowerShell 5.1+）：**
 
 **Windows（PowerShell 5.1+，直接粘贴回车）：**
 

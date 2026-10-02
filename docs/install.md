@@ -2,7 +2,17 @@
 
 ## For Humans
 
-中文：
+原生插件命令（推荐）：
+
+```text
+opencode plugin add github:dubuqiangu/opencode-bridge
+opencode plugin update github:dubuqiangu/opencode-bridge
+opencode plugin remove github:dubuqiangu/opencode-bridge
+```
+
+`add` 装好后只需填 bot token + `opencode service restart`（重启需用户点头）。
+
+中文（发给 AI Agent）：
 
 ```
 帮我安装 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/install.md
@@ -47,7 +57,21 @@ Python 3.10+ **仅标准库**，安装过程**不得 pip install 任何东西**�
 
 ### Step 1: 安装
 
-按顺序尝试，成功即停。
+#### 方式 1：原生 `plugin add`（首选，一条命令）
+
+```text
+opencode plugin add github:dubuqiangu/opencode-bridge
+```
+
+- `add <package>` 的 package 参数是 **npm registry or Git package specifier**；后续 `opencode plugin update github:dubuqiangu/opencode-bridge` / `opencode plugin remove github:dubuqiangu/opencode-bridge` 用**同一条完整 specifier**（不是短 id）。安装 = 把本仓库作为插件包装进全局配置。
+- **自举**：插件首次启动会自动把包内 Python 源码与 `config.example.json` 铺到稳定 bridge 目录（Windows `%USERPROFILE%\.config\opencode-bridge`，Unix `${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge`），已有 `config.json` **绝不覆盖**；若稳定目录本身是 git clone（脚本装法），自举**完全不碰它**（走安装器 / `git pull`）。
+- **装完只剩两步**：① 按 Step 2 填 bot token；② `opencode service restart`（重启会打断会话，**需用户点头**）。
+- **Python 3.10+ 仍需本机自带**（插件不安装 Python）。
+- 建议在用户主目录 `~` 下执行 `plugin update`（工作区目录偶发 `Plugin is not configured`，换目录重试即可）；`plugin list` 显示的 commit 可能落后 update 一拍，再执行一次 update / list 对齐。
+
+方式 1 失败或不可用时，用下面的脚本兜底（按顺序尝试，成功即停）。
+
+#### 方式 2：安装脚本兜底（A/B/C）
 
 **A. 标准（GitHub 域名可达时）**
 
@@ -181,6 +205,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
    ```
 
    期望 `Ran 113 tests` / `OK (skipped=1)`（若版本更新后数字变化，以 `OK` 为准，且 0 FAIL/ERROR）。
+   注：`tests/` 与 `opencode_bridge/` 已随包分发；方式 1 自举到稳定 bridge 目录后，`python -m unittest discover -s tests` 用法不变（把目录指向稳定 bridge 目录执行即可）。
 
 3. （可选）插件自检（离线，不碰 opencode 服务）：
 
@@ -209,6 +234,9 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 | 操作 | 命令 / 说明 |
 |---|---|
+| 原生安装（首选） | `opencode plugin add github:dubuqiangu/opencode-bridge` |
+| 原生更新 | `opencode plugin update github:dubuqiangu/opencode-bridge`（建议在 `~` 下执行） |
+| 原生卸载 | `opencode plugin remove github:dubuqiangu/opencode-bridge` |
 | 连通性自检 | `cd <bridge 目录> ; python -m opencode_bridge --check` |
 | 调试日志 | `python -m opencode_bridge --verbose` |
 | 手动运行 | `cd <bridge 目录> ; python -m opencode_bridge` |

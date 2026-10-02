@@ -68,15 +68,19 @@ opencode service restart
 
 ## bridgeDir 解析优先级
 
-每一级都容错（拿不到就落向下一级，绝不抛异常）：
+每级都容错（拿不到就落向下一级，绝不抛异常）。四级解析链：
 
-1. **`ctx.options.bridgeDir`** —— 来自 `opencode.json` 的 `plugins` 条目；
-2. **与 `index.ts` 同目录的 `config.json`** —— 安装器写入，**主路径**；
-   `import.meta.dirname` 在"安装形态"（`~/.config/opencode/plugins/bridge/`）与
-   "本地开发形态"（`<clone>/opencode-bridge/plugin/index.ts`）下都指向插件自身目录；
+1. **`ctx.options`** —— 来自 `opencode.json` 的 `plugins` 条目选项；
+2. **`<插件目录>/config.json`** —— 与 `index.ts` 同目录，安装器写入，**主路径**（`import.meta.dirname` 在"安装形态"与"本地开发形态"下都指向插件自身目录）；
 3. **环境变量 `OPENCODE_BRIDGE_DIR`**；
-4. **以上都拿不到 → 不 spawn**：只打印
-   `[bridge-plugin] 未配置 bridgeDir，跳过启动…` 并返回 no-op cleanup，**绝不抛异常**。
+4. **默认自举稳定目录** —— 前三级都拿不到时，落到插件首启自动自举的稳定 bridge 目录：
+
+   | 平台 | 路径 |
+   | --- | --- |
+   | Windows | `%USERPROFILE%\.config\opencode-bridge` |
+   | macOS / Linux | `${XDG_CONFIG_HOME:-$HOME}/.config/opencode-bridge` |
+
+   自举时已有 `config.json` **绝不覆盖**；稳定目录本身是 git clone（脚本装法）时**完全不碰它**；`enabled: false` 时**零副作用**（不自举、不 spawn）。
 
 其它配置项（`enabled` / `python` / `args` / `logDir` / `backoffMs` / `lockName`）
 的优先级是：`ctx.options` > 同目录 `config.json` > 内置默认值。

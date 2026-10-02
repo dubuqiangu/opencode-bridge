@@ -4,13 +4,15 @@
 
 import { spawn, type ChildProcess } from "node:child_process"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 
 const TAG = "[bridge-plugin]"
 
 type LogLevel = "log" | "error"
 
-/** 插件可配置项（ctx.options > <插件目录>/config.json > 内置默认值）。 */
+/** 插件可配置项（ctx.options > <插件目录>/config.json > 环境变量 OPENCODE_BRIDGE_DIR >
+ *  默认自举稳定目录 > 内置默认值）。 */
 export interface BridgePluginOptions {
   enabled?: boolean
   bridgeDir?: string
@@ -41,8 +43,9 @@ interface LockInfo {
 
 const DEFAULTS: ResolvedConfig = {
   enabled: true,
-  // 空 = 未配置：只允许来自 ctx.options / <插件目录>/config.json / 环境变量 OPENCODE_BRIDGE_DIR，
-  // 绝不内置任何本机绝对路径（插件必须可分发到任意机器 / 任意 clone 位置）。
+  // 空 = 未配置：只允许来自 ctx.options / <插件目录>/config.json / 环境变量 OPENCODE_BRIDGE_DIR /
+  // 运行时推导的稳定目录（见 bootstrapBridgeDir），绝不内置任何本机绝对路径
+  // （插件必须可分发到任意机器 / 任意 clone 位置）。
   bridgeDir: "",
   python: "python",
   args: ["-m", "opencode_bridge"],
@@ -98,6 +101,162 @@ function pluginDir(): string {
   return process.cwd()
 }
 
+/** 插件所在「包根目录」= index.ts 的上一级。
+ *  - `opencode plugin add github:<owner>/<repo>` 形态：包根 = npm/git cache 里的包目录，
+ *    里面带着 opencode_bridge/ 源码与 config.example.json（见 package.json 的 files 字段）。
+ *  - 脚本安装形态：上一级 = plugins/ 目录，没有这些文件 → 自举跳过拷贝，仅用稳定目录。 */
+export function packageRoot(): string {
+  return path.resolve(pluginDir(), "..")
+}
+
+/** 稳定 bridge 目录（与 install.ps1 / install.sh 的 BridgeDir 推导保持一致）：
+ *  - Windows: `%USERPROFILE%\.config\opencode-bridge`
+ *  - 其他:    `${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge`
+ *  env / platform 可注入，便于 harness 跨平台断言。 */
+export function deriveStableDir(
+  env: Record<string, string | undefined> = process.env,
+  platform: string = process.platform,
+): string {
+  if (platform === "win32") {
+    const home = env.USERPROFILE || env.HOME || os.homedir()
+    return path.join(home, ".config", "opencode-bridge")
+  }
+  const home = env.HOME || os.homedir()
+  const base = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0 ? env.XDG_CONFIG_HOME : path.join(home, ".config")
+  return path.join(base, "opencode-bridge")
+}
+
+const PY_PKG = "opencode_bridge"
+const PY_INIT = path.join(PY_PKG, "__init__.py")
+const EXAMPLE_CFG = "config.example.json"
+
+/** <root>/opencode_bridge/__init__.py 是否存在。 */
+function hasPythonSource(root: string): boolean {
+  try {
+    return fs.existsSync(path.join(root, PY_INIT))
+  } catch {
+    return false
+  }
+}
+
+function isGitRepo(dir: string): boolean {
+  try {
+    return fs.existsSync(path.join(dir, ".git"))
+  } catch {
+    return false
+  }
+}
+
+/** 递归拷贝目录（跳过 __pycache__ / *.pyc），已存在的文件会被覆盖。 */
+function copyTree(src: string, dest: string): void {
+  fs.mkdirSync(dest, { recursive: true })
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    if (entry.name === "__pycache__" || entry.name.endsWith(".pyc")) continue
+    const s = path.join(src, entry.name)
+    const d = path.join(dest, entry.name)
+    if (entry.isDirectory()) copyTree(s, d)
+    else fs.copyFileSync(s, d)
+  }
+}
+
+export interface MaterializeResult {
+  stable: string
+  created: boolean // 本次新建了稳定目录
+  copiedSource: boolean // 首次铺入 opencode_bridge/
+  refreshedSource: boolean // 已有源码（非 git clone）时刷新了 .py
+  wroteConfig: boolean // 由 config.example.json 生成了 config.json
+  gitCloneUntouched: boolean // 稳定目录是 git clone → 完全没碰
+  hasSource: boolean // 结束时稳定目录里有可运行的 Python 源码
+}
+
+/** 把包内 Python 运行时铺到稳定 bridge 目录（幂等）。
+ *  A. 包内有源 + stable 缺源 → 铺源码 + 由 example 生成 config.json（仅当目标不存在）
+ *  B. stable 已有源 → 是 git clone 就**完全不碰**（脚本安装，更新走安装器/git pull）；
+ *     非 git 则刷新 .py（这就是 `plugin update` 刷新 Python 侧的机制），config.json 永不覆盖
+ *  C. 包内无源（脚本安装形态）→ 不拷，直接把 stable 当 bridgeDir
+ *  硬规则：绝不覆盖 config.json / state.json / 日志 / 锁，绝不删除任何东西，
+ *  绝不写 stable 以外（pkgRoot 只读）；fs 异常只记 log 不抛。 */
+export function ensureMaterialized(stable: string, pkgRoot: string): MaterializeResult {
+  const res: MaterializeResult = {
+    stable,
+    created: false,
+    copiedSource: false,
+    refreshedSource: false,
+    wroteConfig: false,
+    gitCloneUntouched: false,
+    hasSource: false,
+  }
+  const pkgHasPy = hasPythonSource(pkgRoot)
+  const dstPy = path.join(stable, PY_PKG)
+  const stableHasPy = hasPythonSource(stable)
+
+  // B-git：脚本安装的 git clone 优先判定 → 一个字节都不改
+  if (stableHasPy && isGitRepo(stable)) {
+    res.gitCloneUntouched = true
+    res.hasSource = true
+    warn(`稳定目录是 git clone (${stable})，自举不修改任何文件（更新请用安装器或 git pull）`)
+    return res
+  }
+
+  if (pkgHasPy && !stableHasPy) {
+    try {
+      copyTree(path.join(pkgRoot, PY_PKG), dstPy)
+      res.copiedSource = true
+      emit(null, "log", `自举：已铺设 Python 运行时 → ${dstPy}`)
+    } catch (e) {
+      warn(`自举铺设 Python 运行时失败: ${String(e)}`)
+    }
+  } else if (pkgHasPy && stableHasPy) {
+    // B-nongit：plugin update 刷新 Python 侧（config.json 等用户数据不在 opencode_bridge/ 内，不受影响）
+    try {
+      copyTree(path.join(pkgRoot, PY_PKG), dstPy)
+      res.refreshedSource = true
+      emit(null, "log", `自举：已刷新 Python 运行时 → ${dstPy}`)
+    } catch (e) {
+      warn(`自举刷新 Python 运行时失败: ${String(e)}`)
+    }
+  }
+
+  // config.json：只在目标缺失时由 example 生成（用户 token 永不被覆盖）
+  const dstCfg = path.join(stable, "config.json")
+  try {
+    if (!fs.existsSync(dstCfg)) {
+      const src = path.join(pkgRoot, EXAMPLE_CFG)
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, dstCfg)
+        res.wroteConfig = true
+        emit(null, "log", `自举：已生成 config.json（需填写 bot_token）→ ${dstCfg}`)
+      }
+    }
+  } catch (e) {
+    warn(`自举生成 config.json 失败: ${String(e)}`)
+  }
+
+  res.hasSource = hasPythonSource(stable)
+  return res
+}
+
+/** 解析链第 4 级：默认稳定目录自举。仅当前三级（options / config.json / 环境变量）全落空、
+ *  且 enabled=true 时执行；失败不抛、也不强行设置 bridgeDir（交给既有“未配置”分支）。 */
+function bootstrapBridgeDir(cfg: ResolvedConfig): void {
+  try {
+    const stable = deriveStableDir()
+    const r = ensureMaterialized(stable, packageRoot())
+    if (r.gitCloneUntouched || r.copiedSource || r.refreshedSource || r.created) {
+      cfg.bridgeDir = stable
+      emit(null, "log", `使用自举稳定目录作为 bridgeDir: ${stable}`)
+    } else if (fs.existsSync(stable)) {
+      // C：目录已存在（如脚本安装但没有包内源）→ 直接用
+      cfg.bridgeDir = stable
+      emit(null, "log", `使用已存在的稳定目录作为 bridgeDir: ${stable}`)
+    } else {
+      warn(`自举未能建立稳定目录: ${stable}`)
+    }
+  } catch (e) {
+    warn(`自举稳定目录失败: ${String(e)}`)
+  }
+}
+
 /** 去掉 UTF-8 BOM：安装器按约定用 UTF-8 with BOM 写 config.json，
  *  而 JSON.parse 不接受以 U+FEFF 开头的字符串。 */
 function stripBom(s: string): string {
@@ -139,7 +298,8 @@ function mergeInto(cfg: ResolvedConfig, src: unknown, origin: string): void {
   }
 }
 
-/** 优先级：ctx.options > <插件目录>/config.json > 环境变量 OPENCODE_BRIDGE_DIR(仅 bridgeDir) > 内置默认值。绝不抛异常。 */
+/** 优先级：ctx.options > <插件目录>/config.json > 环境变量 OPENCODE_BRIDGE_DIR(仅 bridgeDir) >
+ *  默认自举稳定目录（仅 enabled 时，惰性副作用）> 内置默认值。绝不抛异常。 */
 function resolveConfig(options: unknown): ResolvedConfig {
   const cfg: ResolvedConfig = { ...DEFAULTS, args: [...DEFAULTS.args] }
   // 2) 与 index.ts 同目录的 config.json（安装器写入，bridgeDir 的主来源）
@@ -161,7 +321,7 @@ function resolveConfig(options: unknown): ResolvedConfig {
   } catch (e) {
     warn(`ctx.options 解析失败(${String(e)})，该来源已忽略`)
   }
-  // 3) 环境变量：仅在前两者都没给出 bridgeDir 时兜底；拿不到就留空 → setup 判定“未配置”
+  // 3) 环境变量：仅在前两者都没给出 bridgeDir 时兜底
   if (!cfg.bridgeDir) {
     try {
       const envDir = process.env.OPENCODE_BRIDGE_DIR
@@ -170,6 +330,8 @@ function resolveConfig(options: unknown): ResolvedConfig {
       /* ignore */
     }
   }
+  // 4) 默认自举稳定目录：仅前三级全落空且 enabled 时执行（惰性副作用，enabled=false 零副作用）
+  if (!cfg.bridgeDir && cfg.enabled) bootstrapBridgeDir(cfg)
   if (!cfg.logDir) cfg.logDir = cfg.bridgeDir
   return cfg
 }
@@ -255,10 +417,14 @@ export default {
       return noop
     }
 
-    // bridgeDir 三级解析（options > 同目录 config.json > OPENCODE_BRIDGE_DIR）全落空：
-    // 不 spawn、不抛异常，只打一条错误日志后返回 no-op cleanup。
+    // bridgeDir 四级解析（options > 同目录 config.json > OPENCODE_BRIDGE_DIR > 自举稳定目录）
+    // 全落空：不 spawn、不抛异常，只打一条错误日志后返回 no-op cleanup。
     if (!cfg.bridgeDir) {
-      log("未配置 bridgeDir，跳过启动…", "error")
+      log(
+        "未配置 bridgeDir，跳过启动…（可用任一方式恢复：`opencode plugin add github:dubuqiangu/opencode-bridge` " +
+          "一行安装自举，或在插件目录写 config.json 指定 bridgeDir，或设置环境变量 OPENCODE_BRIDGE_DIR）",
+        "error",
+      )
       return noop
     }
 

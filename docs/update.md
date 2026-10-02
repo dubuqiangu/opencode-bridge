@@ -2,7 +2,17 @@
 
 ## For Humans
 
-中文：
+原生插件更新（推荐，建议在用户主目录 `~` 下执行）：
+
+```text
+opencode plugin update github:dubuqiangu/opencode-bridge
+opencode plugin add github:dubuqiangu/opencode-bridge
+opencode plugin remove github:dubuqiangu/opencode-bridge
+```
+
+`update` / `remove` 与 `add` 使用同一条完整 specifier；`plugin list` 显示的 commit 可能落后一拍，再执行一次 update/list 对齐。
+
+中文（发给 AI Agent）：
 
 ```
 帮我更新 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/update.md
@@ -64,6 +74,21 @@ git ls-remote origin refs/heads/main
 
 ### Step 2: 更新
 
+#### 方式 1：原生 `plugin update`（首选，建议在 `~` 下执行）
+
+```text
+opencode plugin update github:dubuqiangu/opencode-bridge
+```
+
+- `update` 使用与 `add` 相同的完整 specifier（不是短 id）。
+- **建议在用户主目录 `~` 下执行**：工作区目录偶发 `Plugin is not configured`，换到 `~` 重试即可。
+- `plugin list` 显示的 commit 可能落后 update 一拍，再执行一次 update / list 对齐。
+- 刷新语义：非 git 的自举目录 → 刷新 `opencode_bridge/` 源码、保留用户 config / state / 日志；git clone 目录 → 走安装器 / `git pull`。
+
+方式 1 不可用时，方式 2 兜底。
+
+#### 方式 2：重跑安装器
+
 重跑安装器（按 install 文档的 A/B 兜底顺序，Windows / macOS 各给对应命令）——它内部就是 `git pull --ff-only` + 拷插件：
 
 **A. 标准**：
@@ -96,6 +121,8 @@ curl -fsSL https://cdn.jsdelivr.net/gh/dubuqiangu/opencode-bridge@main/install.s
 - **不要**删除或重建用户的 `config.json` / `state.json`（只有卸载才动它们）
 - **不要**随手加 `-Force`（`-Force` 只在修 `bridgeDir` 时需要）
 - **不要** `git reset --hard` / 删 clone 目录来「重装」，除非用户明确要求
+- 自举刷新只覆盖 `opencode_bridge/` 源码，用户 `config.json` / `state.json` **永不覆盖**
+- 稳定目录本身是 git clone 时，自举**不碰它**（走安装器 / `git pull`）
 
 ### Step 4: 验证
 

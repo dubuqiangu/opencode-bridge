@@ -63,6 +63,9 @@ class SlackAdapter(Adapter):
     supports_inbound = True                    # Socket Mode 入站（需另配 app_token）
     supports_inline_buttons = False            # blocks 未实现
     supports_media = False
+    # 入站必需 app_token：缺它会静默降级为"只发出站"，所以必须声明出来，
+    # 让 --status / --setup --json 不会把这种情况报成"已配置"。
+    required_tokens = ("bot_token", "app_token")
 
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
@@ -179,7 +182,8 @@ class SlackAdapter(Adapter):
                     raw = ws.recv()
                     if raw is None:
                         break  # 对端关闭 → 走重连
-                    self._handle_envelope(ws, raw)
+                    if not self._handle_envelope(ws, raw):
+                        break  # 服务端要求重连（WSS URL 过期）→ 走重连
             except Exception as exc:
                 logger.warning("slack: inbound error: %s", exc)
             finally:
@@ -192,36 +196,56 @@ class SlackAdapter(Adapter):
             if self._stop_event.wait(RECONNECT_DELAY):
                 break
 
-    def _handle_envelope(self, ws, raw: str) -> None:
-        """处理一个 envelope：**先 ack 再过滤**（漏 ack 会让 Slack 无限重发）。"""
+    def _handle_envelope(self, ws, raw: str) -> bool:
+        """处理一个 envelope，返回 ``False`` 表示应立即重连。
+
+        **先 ack 再过滤**（漏 ack 会让 Slack 无限重发）。
+
+        Socket Mode 的 WSS URL 约 1 小时过期。Slack 会在过期前发
+        ``{"type": "disconnect", "reason": "warning"}``，也可能不给预警直接发
+        ``reason: "refresh_requested"``。所以这里**主动**返回重连信号，而不是
+        被动等对端关闭 socket —— 后者依赖对端行为，不够稳。
+        """
         try:
             env = json.loads(raw)
         except Exception:
-            return
+            return True
         if not isinstance(env, dict):
-            return
+            return True
+        env_type = str(env.get("type") or "")
         envelope_id = env.get("envelope_id")
         if envelope_id:
             try:
                 ws.send(json.dumps({"envelope_id": envelope_id}))
             except Exception as exc:
                 logger.warning("slack: ack failed for %s: %s", envelope_id, exc)
-        if env.get("type") == "hello":
-            return
+        if env_type == "disconnect":
+            # 不重连就会在 URL 过期后收不到任何事件；重连时重新取 URL 即可。
+            logger.info(
+                "slack: server requested reconnect (reason=%s)",
+                env.get("reason") or "?",
+            )
+            return False
+        if env_type == "hello":
+            return True
         payload = env.get("payload")
         event = payload.get("event") if isinstance(payload, dict) else None
         if not isinstance(event, dict) or event.get("type") != "message":
-            return
-        if event.get("bot_id") or event.get("subtype"):
-            return  # bot 自己的回声 / message_changed 等
+            return True
+        # bot 自己的消息也会以事件形式回到我们（否则会无限回环）；官方指定的
+        # 判别字段是 bot_id / bot_profile，不是 subtype。
+        if event.get("bot_id") or event.get("bot_profile"):
+            return True
+        if event.get("subtype"):
+            return True  # message_changed / channel_join / thread_broadcast 等噪声
         text = str(event.get("text") or "")
         channel = str(event.get("channel") or "")
         if not text or not channel:
-            return
+            return True
         # 授权闸门必须在最前：未授权者的消息不许进入上层（否则能用命令/审批字绕过）
         if not self.admits(channel):
             logger.info("slack: dropping message from non-whitelisted channel %s", channel)
-            return
+            return True
         try:
             self.hooks.on_inbound(
                 Inbound(
@@ -236,6 +260,7 @@ class SlackAdapter(Adapter):
             )
         except Exception as exc:
             logger.exception("slack: on_inbound failed: %s", exc)
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle teardown

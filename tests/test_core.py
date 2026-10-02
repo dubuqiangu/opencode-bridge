@@ -429,13 +429,25 @@ class SetupCommandTests(unittest.TestCase):
             self.assertIn("123456789:AA", text)
             self.assertEqual(client.prompts, [])
 
-    def test_setup_slack_guide_mentions_xoxb_and_inbound_todo(self):
+    def test_setup_slack_guide_covers_both_tokens_and_socket_mode(self):
+        """Slack 引导必须同时讲清两枚 token 的分工（已核实 Slack 官方文档）。"""
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "/setup slack"))
             text = adapter.sent[-1].text
+            # xoxb- 出站必需、xapp- 入站必需
             self.assertIn("xoxb-", text)
-            self.assertIn("conversations.history", text)
+            self.assertIn("xapp-", text)
+            # Socket Mode 的关键步骤与 scope
+            self.assertIn("Enable Socket Mode", text)
+            self.assertIn("connections:write", text)
+            # 官方按钮名是 Add Bot User Event（不是 Add Bot Token Event）
+            self.assertIn("Add Bot User Event", text)
+            # 收发双向的前提：bot 必须被邀请进频道（它无法自己加群）
+            self.assertIn("/invite", text)
+            # 「入站尚未接入」这个说法已失效，不得复活成假话
+            self.assertNotIn("conversations.history", text)
+            self.assertNotIn("双向对话", text.replace("无法在 Slack 里与 bot 双向对话", ""))
             self.assertEqual(client.prompts, [])
 
     def test_setup_discord_guide_mentions_intent_and_dev_portal(self):

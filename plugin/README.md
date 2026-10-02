@@ -60,7 +60,7 @@ opencode service restart
 完整的分步引导见仓库根 [`README.md`](../README.md) 的「接入平台引导」一节（三个平台各一份，含配置文件路径），这里只给一句话概述：
 
 - **Telegram**：`@BotFather` 建 bot 拿 token、`@userinfobot` 查 chat id，填进 `adapters.telegram` → 支持双向对话；
-- **Slack**：`api.slack.com/apps` 建 App 拿 `xoxb-` token（Event Subscriptions 保持关闭）→ v1 仅能主动发送；
+- **Slack**：建 App 后开 Socket Mode 拿 `xapp-` app-level token、再取 `xoxb-` bot token，两枚都填进 `adapters.slack` → 支持双向对话；
 - **Discord**：开发者后台建 Application、开 MESSAGE CONTENT INTENT、用 URL Generator 邀请进服务器 → v1 仅能主动发送。
 
 填好 token 并 `opencode service restart` 之后，可在 bot 内发送 **`/setup`** 查看 / 重温这套引导

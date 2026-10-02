@@ -547,6 +547,75 @@ class TestSlackInbound(unittest.TestCase):
         adapter.start()
         self.assertFalse(adapter.running, "缺 app_token 时不应起入站线程")
 
+    def test_handle_envelope_returns_true_for_ordinary_traffic(self):
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        self.assertTrue(adapter._handle_envelope(ws, self._envelope("e1", etype="hello")))
+        self.assertTrue(
+            adapter._handle_envelope(ws, self._envelope("e2", event=self._msg()))
+        )
+        self.assertTrue(adapter._handle_envelope(ws, "not json{"))
+
+    def test_disconnect_envelope_requests_reconnect(self):
+        """WSS URL 约 1 小时过期，Slack 会发 disconnect —— 必须据此主动重连，
+        而不是被动等对端关 socket。"""
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        for reason in ("warning", "refresh_requested"):
+            env = json.dumps(
+                {"type": "disconnect", "reason": reason, "envelope_id": "d-" + reason}
+            )
+            self.assertFalse(
+                adapter._handle_envelope(ws, env), f"reason={reason} 应要求重连"
+            )
+
+    def test_disconnect_drops_old_connection_and_reconnects(self):
+        """端到端：disconnect 之后旧连接上的消息必须丢弃（否则等于静默丢消息），
+        新连接上的消息照常处理，且确实重新取了 URL。"""
+        import opencode_bridge.adapters.slack as slack_mod
+
+        old_delay = slack_mod.RECONNECT_DELAY
+        slack_mod.RECONNECT_DELAY = 0.01
+        try:
+            hooks = RecordingHooks()
+            adapter = self._adapter(hooks)
+            sockets = [
+                # 旧连接：先收到 disconnect，其后的消息属于已失效的连接
+                FakeWS([self._envelope("d1", etype="disconnect"),
+                        self._envelope("e1", event=self._msg(channel="C_OLD"))]),
+                FakeWS([self._envelope("e2", event=self._msg(channel="C_NEW",
+                                                                text="重连后收到"))]),
+            ]
+            created: list[FakeWS] = []
+            urls: list[str] = []
+
+            def factory(url):
+                s = sockets[len(created)]
+                created.append(s)
+                return s
+
+            def open_url():
+                urls.append("wss://example/ws")
+                if len(urls) > 3:
+                    raise RuntimeError("测试到此为止")
+                return "wss://example/ws"
+
+            adapter._ws_factory = factory
+            adapter._open_socket_url = open_url
+            adapter.start()
+            deadline = time.time() + 3
+            while not hooks.inbounds and time.time() < deadline:
+                time.sleep(0.01)
+            adapter.stop()
+
+            self.assertEqual(len(hooks.inbounds), 1, "只应处理重连后那条")
+            self.assertEqual(hooks.inbounds[0].conversation_id, "channel:C_NEW")
+            self.assertGreaterEqual(len(urls), 2, "disconnect 后应重新取 URL 重连")
+        finally:
+            slack_mod.RECONNECT_DELAY = old_delay
+
     def test_loop_reconnects_and_stop_closes_socket(self):
         import opencode_bridge.adapters.slack as slack_mod
 

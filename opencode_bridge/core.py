@@ -76,7 +76,7 @@ HELP_TEXT = """\
 SETUP_MENU_TEXT = """\
 选择要接入的平台：
 1) Telegram —— 支持双向对话
-2) Slack —— v1 仅支持主动发送
+2) Slack —— 支持双向对话
 3) Discord —— v1 仅支持主动发送
 
 回复 /setup 1、/setup 2 或 /setup 3 也可直接查看。"""
@@ -85,7 +85,7 @@ SETUP_MENU_TEXT = """\
 SETUP_INVALID_TEXT = """\
 无法识别的平台。可接入的平台有：
 1) Telegram —— 支持双向对话
-2) Slack —— v1 仅支持主动发送
+2) Slack —— 支持双向对话
 3) Discord —— v1 仅支持主动发送
 
 用法: /setup 1|2|3 或 /setup telegram|slack|discord"""
@@ -143,15 +143,25 @@ _SETUP_GUIDES = {
 6. 在 Telegram 给你的 bot 发一句 hi，收到回复即成功""",
     "slack": """\
 1. 打开 https://api.slack.com/apps → Create New App → From scratch → 选 workspace
-2. 左侧 OAuth & Permissions → Bot User OAuth Token（xoxb- 开头）→ 复制
-3. Event Subscriptions 先保持关闭（v1 入站轮询尚未接入）
-4. 编辑配置文件：
-     "adapters": { "slack": { "bot_token": "xoxb-..." } }
-5. 左侧 Install App → Install to Workspace，把 App 邀请进目标频道
-6. 执行 opencode service restart
+2. 左侧 Socket Mode → 打开 Enable Socket Mode
+3. 左侧 Basic Information → App-Level Tokens → Generate Token and Scopes
+   → 命名 → 勾选 connections:write → 复制（xapp- 开头，入站必需）
+4. 左侧 OAuth & Permissions → Scopes → Bot Token Scopes → Add an OAuth Scope，添加
+   chat:write、channels:history、im:history
+   （要 @ 才响应加 app_mentions:read；用私有频道加 groups:history）
+5. 同页顶部 Install to Workspace → Allow → 复制 Bot User OAuth Token（xoxb- 开头）
+   注意：之后每改一次 scope，都要回来点一次 Reinstall to Workspace
+6. 左侧 Event Subscriptions → 打开 Enable Events
+   → Subscribe to bot events → Add Bot User Event → 添加 message.channels、message.im
+7. 编辑配置文件：
+     "adapters": { "slack": { "bot_token": "xoxb-...", "app_token": "xapp-..." } }
+8. 在目标频道输入 /invite @你的bot（私有频道同样用 /invite；私聊可直接发消息）
+9. 执行 opencode service restart
+10. 在频道里发一句普通文字，收到回复即成功
 
-能力说明：v1 仅实现主动 send/edit，入站轮询（conversations.history）为 TODO，
-当前无法在 Slack 里与 bot 双向对话。""",
+两个常见坑：
+· Event Subscriptions 没打开、或事件没加在 bot events 下，会「静默收不到」且不报错
+· 只填 bot_token 也能启动，但那只发不收（入站必须有 app_token）""",
     "discord": """\
 1. 打开 https://discord.com/developers/applications → New Application → 左侧 Bot
 2. Reset Token → 复制 token

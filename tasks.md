@@ -98,7 +98,7 @@
 | 波次 | 平台 | 入站机制 | 难度 | 关键点 / 风险 |
 |---|---|---|---|---|
 | **B1** | ntfy | HTTP 拉取（`poll=1` + `since` 游标） | S | 已完成。**偏离原计划**：不用长连接流而用一次性拉取 —— 持久流在 `urllib` 下无法干净打断（`stop()` 会白等超时，见 Nextcloud 的教训）。启动用 `since=<当前时间戳>` **不重放历史缓存**（否则首次启动会把最多 10MB 缓存全当新消息触发 agent）；之后游标推进到 **message id** |
-| **B1** | email | IMAP 轮询（`imaplib`） | S | `imaplib`/`smtplib` 全标准库，协议通用永不废弃；需专用邮箱或 app password；不支持编辑 |
+| **B1** | email | IMAP 轮询（`UID` 游标） | S | 已完成。`imaplib`/`smtplib` 全标准库，协议通用永不废弃；**必须用专用邮箱 + app 专用密码**；**无用户身份**（任何能发信给你的人都能驱动 agent）→ 必须用 `allowed_chat_ids` 限定发件人；不支持编辑 |
 | **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 方向与其他平台相反；默认 bind 127.0.0.1 **天然满足"不需公网"**；Hermes 已验证纯 `http.server` 无需 SDK |
 | **B2** | qqbot | WebSocket 网关 | M | 协议是 Discord 风格变体（op 码 + intents + `heartbeat_interval`），可直接复用 `ws.py`；防回环天然（bot 消息不推回给自己） |
 | **B2** | homeassistant | WebSocket 事件总线（本机） | M | WS 极简；HA 极活跃。**但它是设备事件管道不是 IM**，取决于定位是否要收 |
@@ -494,4 +494,39 @@
     做成 `LineTransport(on_tick=...)`，而不是让每家各写一遍。
   验证：**840 tests OK (skipped=1)**、compileall 0；IRC 74 例 + transport 56 + identity 24，
   连跑 5 次无抖动。
+- **2026-10-02** **B1 email 完成**（第十个平台，第二个建在传输层上的新平台）：
+  `adapters/email.py`（1015 行，真实代码约 728）+ 111 个用例，IMAP 收 / SMTP 发。
+  **比 ntfy 大 3 倍是有理由的**：IMAP + SMTP + MIME 构造与解析 + TLS 配置 + 线程引用 +
+  有界去重 + SMTP 错误分类。逐个方法核过，未发现多余抽象或范围膨胀。
+  - **防回环（本平台最致命的一处）**：自己发出的信会回到收件箱，处理不好就是
+    **agent 无限自问自答**。三条判据按优先级：① `Message-ID` 命中已发集合（精确）
+    → ② 剥掉 `Re:`/`Fw:` 链后主题带 `[opencode]` 前缀**且**这封信不是对我们那封的
+    回复（`In-Reply-To`/`References` 都没命中）→ ③ 其余**放行**，所以用户点"回复"
+    能正常追问。**任何情况下都不查 From 地址** —— 那会误伤用户多地址互发。
+    `echo_prefix` **刻意不可配成空串**（空前缀 = 关掉防回环），非法值回落默认值 + 告警。
+  - **游标用 `UID` 而非 `UNSEEN`**：flag 会和人工读信冲突（用户在手机点开一封，桥接就
+    再也看不见它），且 flag 语义各服务端不一致；UID 单调不漂移，是唯一可靠的增量游标。
+    **首次连接只取水位线、一封正文都不取**（与 ntfy 的 `since=<当前时间>` 同构）。
+    游标**先推进再处理**（at-most-once，与 telegram offset / matrix next_batch 同取舍）；
+    取不到正文时**停在连续前缀末尾**，绝不跳过失败的那封。
+  - **不改用户的邮箱状态**：取信用 `BODY.PEEK[]` 而非 `BODY[]` —— 后者**隐式设 `\Seen`**，
+    等于替用户把邮件标已读、手机端未读数突然少一封。**绝不主动发 `STORE`**。
+  - **不用 IMAP IDLE**（长连接在标准库下无法干净打断，ntfy 与 Nextcloud 已各踩一次），
+    每轮新建并关闭一次连接，60s 轮询下握手开销可忽略。
+  - **TLS 默认安全且非法值回落成加密**：`imap_security`/`smtp_security` 默认 `ssl`，
+    **非法值回落加密、绝不回落明文**；`verify_tls` 默认 `True`，非法值回落 `True` + 告警，
+    关掉时打显式警告。这套"非法值回落成安全值 + 告警"的纪律是 lane 自己提出的。
+  - `imap_host`/`smtp_host` **无默认值**，因此如实列进 `required_tokens`
+    （我给 lane 的示例只写了 address/password，它改宽了 —— **这个改动是对的**：
+    按地址域名猜 `imap.gmail.com` 对自建/企业邮箱是错的启发式）。宁可报
+    `missing: imap_host`，也不要给一个含混的连接失败。
+  - 单行上限 **998 是 RFC 5322 硬上限**（真实约束是**行长**而非正文总长，正文可多行）。
+  - 复核确认禁用项只在注释里出现、代码零调用：`IDLE` / `STORE` / `\Seen`。
+    测试全程注入假 IMAP/SMTP、**零真实 socket**。
+  - ⚠️ **lane 主动交代了一个我早先观察到的异常**：它为重算基线把两个文件临时`move`
+    到 `_hold/`，我的采样正好落在那个窗口，一度看到"email 文件不存在"。解释与我的
+    观察吻合；它也承认该用 copy 而非 move（一次计数不该动工作树上的文件）。
+  - 关于基线数字：lane 报的"基线 853"里**包含 Matrix lane 正在改的测试**，
+    我提交 IRC 后的 840 才是准确值 —— 不是真分歧。
+  验证：**111 用例 OK**、`--status` 实跑出现 `Email`、compileall 0。
 

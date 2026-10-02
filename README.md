@@ -132,7 +132,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**九个平台全部支持双向对话**）：
+各平台当前能力一览（**十个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -143,6 +143,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Mattermost | ✅ WebSocket | ✅ | ✅ 原生 | 消息上限运行时从服务端读取 |
 | Nextcloud Talk | ✅ HTTP 长轮询 | ✅ | ✅ 原生（24 小时内） | 上限 32000 字符是源码硬编码常量 |
 | ntfy | ✅ HTTP `poll=1` + `since` 游标 | ✅ | ❌ 无 | 上限 4096 **字节**；**无用户身份**，务必用私有话题 + token |
+| email | ✅ IMAP `UID` 游标 | ✅ SMTP | ❌ 无 | 上限 998 是**单行**（RFC 5322）；**无用户身份**，任何能发信给你的人都能驱动 agent |
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 
@@ -379,6 +380,41 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **不会重放历史**：启动时游标设为当前时间，之前缓存里的通知不会被当成新消息触发 agent。
 > - `echo_tag` 只用于**防回环**，不是身份认证 —— 别指望它挡住别人。
 
+### email（支持双向对话 · IMAP + SMTP，无需公网地址）
+
+1. **准备一个专用邮箱**（不要用主邮箱），并开 **app 专用密码**。
+   Gmail / Outlook 都需要先在账号设置里启用两步验证才能生成 app password。
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "email": {
+     "address": "mybot@example.com", "password": "abcd efgh ijkl mnop",
+     "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com"
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 给 `mybot@example.com` 发一封邮件，收到回复即成功
+
+> ⚠️ **信任模型（重要）**：邮件**没有用户身份概念** —— 任何能给这个地址发信的人
+> 都会被当作用户。所以**必须**用 `allowed_chat_ids` 限定具体发件人地址，否则等于
+> 把 agent 暴露给任何知道你邮箱地址的人（爬虫、钓鱼、垃圾邮件都会驱动它执行
+> 权限范围内的操作）。**强烈建议用专用邮箱。**
+>
+> ⚠️ **凭据即完整信箱权限**：配置里的密码能读**整个**邮箱（不只是桥接那个文件夹）。
+> 所以要用 **app 专用密码**而不是主密码 —— 万一泄漏，损失被限制在那一个账号，
+> 且可单独吊销。
+>
+> 其它要点：
+> - **不重放历史**：首次连接只记录当前邮件水位线，一封旧邮件都不取。
+> - **不碰你的已读状态**：取信用 `BODY.PEEK[]` 而不是 `BODY[]`，后者会隐式标记已读，
+>   你手机端的未读数会突然少一封。
+> - **不会自己回自己**：出站 Subject 带 `[opencode]` 前缀并记下 `Message-ID`，入站见到
+>   就丢。你**回复**它时不会被误丢（那是真提问）。前缀不可配成空串。
+> - 单行上限 **998 字符**（RFC 5322 硬上限）；正文按行折行，超限自动分片。
+> - **不支持编辑邮件**（SMTP 没有这个概念），长任务的进度更新会退化成连续发多封。
+> - 用的是 `UID` 游标而非 `UNSEEN` 标记 —— 你在手机上点开一封，桥接仍然能看见它。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -559,6 +595,17 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.ntfy.user` / `password` | `""` | 也可用 Basic 认证（与 `token` 二选一，`token` 优先） |
 | `adapters.ntfy.echo_tag` | `"opencode-bridge"` | 出站打这个 tag，入站见到即丢弃（**防回环**，不是身份认证） |
 | `adapters.ntfy.poll_interval` | `5.0` | 轮询间隔（秒） |
+| `adapters.email.address` | `""` | 桥接自己的邮箱地址（**必填**）；`allowed_chat_ids` 填对方地址 |
+| `adapters.email.password` | `""` | **app 专用密码**（不是主密码！）（**必填**） |
+| `adapters.email.imap_host` | `""` | IMAP 服务器（**必填，无默认值** —— 按域名猜对自建/企业邮箱是错的） |
+| `adapters.email.smtp_host` | `""` | SMTP 服务器（**必填**，同上） |
+| `adapters.email.imap_security` / `smtp_security` | `"ssl"` | `ssl`（隐式 TLS，通常 465）或 `starttls`（587）。**非法值回落成加密**，不会回落明文 |
+| `adapters.email.imap_port` / `smtp_port` | `""` | 留空则按上面选的方式取默认端口 |
+| `adapters.email.mailbox` | `"INBOX"` | 监听哪个文件夹 |
+| `adapters.email.verify_tls` | `true` | 校验证书链与主机名。关掉必须显式配（自建/实验环境），会打警告 |
+| `adapters.email.echo_prefix` | `"[opencode]"` | 出站 Subject 加此前缀，入站见到即丢。**不可配成空串** —— 空前缀等于关掉防回环 |
+| `adapters.email.poll_interval` | `60.0` | 轮询间隔（秒）；每轮新建一次 IMAP 连接 |
+| `adapters.email.dedupe_capacity` | `2048` | 已处理 Message-ID 的记忆上限（FIFO 淘汰，防无界增长） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

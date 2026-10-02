@@ -68,8 +68,9 @@ opencode service restart
 - **Twitch**：开发者控制台取 OAuth Token 与频道名，填 `adapters.twitch` 的 `token` / `channel`。
 - **Nextcloud Talk**：Nextcloud「设置 → 安全 → 设备专属密码」生成 app password，填 `adapters.nextcloud` 的 `base_url` / `username` / `password`。
 - **ntfy**：填 `adapters.ntfy` 的 `topic` 与 read token；⚠️ **ntfy 无用户身份，公共话题等于把 agent 暴露给全网，务必用私有话题 + token**。
+- **email**：填 `adapters.email` 的 `address` / `password` / `imap_host` / `smtp_host`；⚠️ 用 **app 专用密码**（凭据即完整信箱权限），且**必须**用 `allowed_chat_ids` 限定发件人 —— 任何能给你发信的人都能驱动 agent。
 
-以上九个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
+以上十个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
 
 填好 token 并 `opencode service restart` 之后，可在 bot 内发送 **`/setup`** 查看 / 重温这套引导
 （`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台）。

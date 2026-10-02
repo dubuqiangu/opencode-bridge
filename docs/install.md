@@ -324,8 +324,34 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > 其它：`allowed_chat_ids` 填**话题名**；上限 **4096 是字节不是字符**（中文约 1365 字）；
 > **不支持编辑消息**，长任务进度会退化成连续发多条通知；**启动不重放历史缓存**。
 
+#### email（支持双向对话 · IMAP + SMTP，无需公网地址）
+
+1. 准备一个**专用邮箱**，并开 **app 专用密码**（Gmail / Outlook 都需先启用两步验证）
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "email": {
+     "address": "mybot@example.com", "password": "abcd efgh ijkl mnop",
+     "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com"
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 给 `mybot@example.com` 发一封邮件，收到回复即成功
+
+> ⚠️ **邮件没有用户身份概念** —— 任何能给这个地址发信的人都会被当作用户，**必须**用
+> `allowed_chat_ids` 限定发件人，否则等于把 agent 暴露给任何知道你邮箱地址的人。
+>
+> ⚠️ **凭据即完整信箱权限** —— 用 **app 专用密码**而非主密码：泄漏时损失被限制在
+> 那一个账号，且可单独吊销。
+>
+> 其它：`imap_host` / `smtp_host` **无默认值**（按域名猜对自建/企业邮箱是错的）；
+> **不重放历史**（首连只记水位线）；**不碰已读状态**（用 `BODY.PEEK[]`）；出站 Subject
+> 带 `[opencode]` 且记 `Message-ID` 做**防回环**（你回复它不会被误丢）；单行上限 998
+> （RFC 5322）；**不支持编辑邮件**；用 `UID` 游标而非 `UNSEEN`（你在手机点开仍能被看见）。
+
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
-> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### Step 3: 激活（需要用户点头）
 

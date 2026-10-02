@@ -142,21 +142,41 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 > ⚠️ **`allowed_chat_ids` 是安全边界**：留空 = 任何人都能驱动你的 agent（任意能给 bot 发消息的人可以以用户权限执行操作）。务必填入用户自己的纯数字 chat id。
 
-#### Slack（⚠️ v1 仅支持主动发送）
+#### Slack（支持双向对话 · Socket Mode，无需公网地址）
 
 1. 打开 <https://api.slack.com/apps> → **Create New App** → **From scratch** → 选 workspace
-2. 左侧 **OAuth & Permissions** → **Bot User OAuth Token**（`xoxb-` 开头）→ 复制
-3. **Event Subscriptions 先保持关闭**（v1 入站轮询尚未接入）
-4. 编辑配置文件（路径见上面的「配置文件位置」）：
+2. 左侧 **Socket Mode** → 打开 **Enable Socket Mode**
+3. 左侧 **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**
+   → 命名 → 勾选 `connections:write` → 复制（`xapp-` 开头，**入站必需**）
+4. 左侧 **OAuth & Permissions** → **Scopes** → **Bot Token Scopes** → **Add an OAuth Scope**，添加：
 
-   ```json
-   "adapters": { "slack": { "bot_token": "xoxb-..." } }
+   ```
+   chat:write
+   channels:history
+   im:history
    ```
 
-5. 左侧 **Install App** → **Install to Workspace**，把 App 邀请进目标频道
-6. 执行 `opencode service restart`
+   （要 `@` 才响应加 `app_mentions:read`；用私有频道加 `groups:history`）
 
-> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`conversations.history`）为 TODO，当前**无法在 Slack 里与 bot 双向对话**。
+5. 同页顶部 **Install to Workspace** → **Allow** → 复制 **Bot User OAuth Token**（`xoxb-` 开头）
+   ⚠️ 之后**每改一次 scope 都要回来点一次 Reinstall to Workspace**
+6. 左侧 **Event Subscriptions** → 打开 **Enable Events**
+   → **Subscribe to bot events** → **Add Bot User Event** → 添加 `message.channels`、`message.im`
+7. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "slack": { "bot_token": "xoxb-...", "app_token": "xapp-..." } }
+   ```
+
+8. 在目标频道输入 `/invite @你的bot`（私有频道同样用 `/invite`；私聊可直接发消息）
+9. 执行 `opencode service restart`
+10. 在频道里发一句普通文字，收到回复即成功
+
+> **两个常见坑**
+> - **Event Subscriptions 没打开、或事件没加在 *bot events* 下，会「静默收不到」且不报错**。事件必须用 **Add Bot User Event** 添加。
+> - **只填 `bot_token` 也能启动，但那只发不收**：入站必须有 `app_token`（`xapp-`），桥接会记一条 warning。
+>
+> `allowed_chat_ids` 白名单同样适用：Slack 侧没有"谁能跟 bot 说话"的原生白名单，只能靠频道邀请与本桥接自己的白名单。
 
 #### Discord（⚠️ v1 仅支持主动发送）
 
@@ -175,7 +195,34 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 > 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`GET /channels/{id}/messages`）为 TODO，当前**无法在 Discord 里与 bot 双向对话**。
 
-> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温这套引导；`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
+#### Matrix（支持双向对话 · `/sync` 长轮询，无需公网地址）
+
+Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账号（或一个专门的服务账号）**作为对端。
+
+1. 拿到 `access_token` 与自己的 user id，二者任一途径都能取到：
+   - **Element Web**：登录后 F12 → **Application → Local Storage**，`access_token` 与 `user_id` 都在里面
+   - **直接登录**：`POST /_matrix/client/v3/login`（`{"type":"m.login.password", ...}`），响应里的 `access_token` / `user_id`
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "matrix": {
+     "homeserver": "https://matrix.example.org",
+     "access_token": "syt_...",
+     "user_id": "@me:example.org"
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 私聊这个账号，或在**它已经加入**的房间发一句 `hi`，收到回复即成功
+
+> **`user_id` 必须填对** —— 它是过滤自己回声的依据。留空或填错会让桥接把自己发出的消息
+> 当成入站消息收回来，形成**无限回环**（表现为自己跟自己对话）。
+>
+> `allowed_chat_ids` 填**房间 id**（形如 `!abcDEF:example.org`），不是 user id。
+> 编辑消息用 MSC2676 兼容写法（多发一条带 `* ` 前缀与 `m.replace` 关系的事件），
+> 不支持该写法的客户端会当成一条新消息 —— 内容不丢，但会多一条。
+
+> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温上面三平台的引导；`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台。**Matrix 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全可用 `--status` 核对。
 
 ### Step 3: 激活（需要用户点头）
 

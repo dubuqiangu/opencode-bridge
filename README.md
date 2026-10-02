@@ -167,21 +167,42 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 5. 执行 `opencode service restart`
 6. 在 Telegram 给你的 bot 发一句 `hi`，收到回复即成功
 
-### Slack（⚠️ v1 仅支持主动发送）
+### Slack（支持双向对话 · Socket Mode，无需公网地址）
 
 1. 打开 <https://api.slack.com/apps> → **Create New App** → **From scratch** → 选 workspace
-2. 左侧 **OAuth & Permissions** → **Bot User OAuth Token**（`xoxb-` 开头）→ 复制
-3. **Event Subscriptions 先保持关闭**（v1 入站轮询尚未接入）
-4. 编辑配置文件（路径见上面的「配置文件位置」）：
+2. 左侧 **Socket Mode** → 打开 **Enable Socket Mode**
+3. 左侧 **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**
+   → 命名 → 勾选 `connections:write` → 复制（`xapp-` 开头，**入站必需**）
+4. 左侧 **OAuth & Permissions** → **Scopes** → **Bot Token Scopes** → **Add an OAuth Scope**，添加：
 
-   ```json
-   "adapters": { "slack": { "bot_token": "xoxb-..." } }
+   ```
+   chat:write
+   channels:history
+   im:history
    ```
 
-5. 左侧 **Install App** → **Install to Workspace**，把 App 邀请进目标频道
-6. 执行 `opencode service restart`
+   （要 `@` 才响应加 `app_mentions:read`；用私有频道加 `groups:history`；
+   要往尚未加入的公开频道主动发言再加 `chat:write.public`）
 
-> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`conversations.history`）为 TODO，当前**无法在 Slack 里与 bot 双向对话**。
+5. 同页顶部 **Install to Workspace** → **Allow** → 复制 **Bot User OAuth Token**（`xoxb-` 开头）
+   ⚠️ 之后**每改一次 scope 都要回来点一次 Reinstall to Workspace**，否则新 scope 不生效
+6. 左侧 **Event Subscriptions** → 打开 **Enable Events**
+   → **Subscribe to bot events** → **Add Bot User Event** → 添加 `message.channels`、`message.im`
+7. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "slack": { "bot_token": "xoxb-...", "app_token": "xapp-..." } }
+   ```
+
+8. 在目标频道输入 `/invite @你的bot`（私有频道同样用 `/invite`；私聊可直接发消息）
+9. 执行 `opencode service restart`
+10. 在频道里发一句普通文字，收到回复即成功
+
+> **两个常见坑**
+> - **Event Subscriptions 没打开、或事件没加在 *bot events* 下，会「静默收不到」且不报错** —— 最常见的问题。事件必须用 **Add Bot User Event** 添加（不是 user event）。
+> - **只填 `bot_token` 也能启动，但那只发不收**：入站必须有 `app_token`（`xapp-`）。桥接会在日志里记一条 warning。
+>
+> 另外：开启 Socket Mode 后事件 100% 走 WebSocket，即使之前填过 Request URL 也不会走 HTTP（两者互斥）；Socket Mode 也不需要校验签名。
 
 ### Discord（⚠️ v1 仅支持主动发送）
 
@@ -199,6 +220,34 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 7. 执行 `opencode service restart`
 
 > 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`GET /channels/{id}/messages`）为 TODO，当前**无法在 Discord 里与 bot 双向对话**。
+
+### Matrix（支持双向对话 · `/sync` 长轮询，无需公网地址）
+
+Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直接用**你的账号（或一个专门的服务账号）**作为对端，所以第 1 步是取这个账号的凭据。
+
+1. 拿到 `access_token` 与自己的 user id，二者任一都能取到：
+   - **Element Web**：登录后 F12 → **Application → Local Storage**，`access_token` 与 `user_id` 都在里面
+   - **直接登录**：`POST /_matrix/client/v3/login`（`{"type":"m.login.password", ...}`），响应里的 `access_token` / `user_id`
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "matrix": {
+     "homeserver": "https://matrix.example.org",
+     "access_token": "syt_...",
+     "user_id": "@me:example.org"
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 私聊这个账号，或在**它已经加入**的房间发一句 `hi`，收到回复即成功
+
+> **`user_id` 必须填对** —— 它是过滤自己回声的依据。留空或填错时，桥接会把自己发出的消息
+> 当成入站消息收回来，形成无限回环（表现为自己跟自己对话）。排查时看日志里的
+> `slack/matrix: dropping ...` 与入站条数是否异常增多。
+>
+> `allowed_chat_ids` 填**房间 id**（形如 `!abcDEF:example.org`），不是 user id。
+> 另：编辑消息用的是 MSC2676 兼容写法（多发一条带 `* ` 前缀与 `m.replace` 关系的事件），
+> 不支持该写法的客户端会当成一条新消息 —— 内容不丢，但会多一条。
 
 ## npm 方式（占位 / 待发布）
 
@@ -351,7 +400,11 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：空数组 = 全部允许；非空则只响应列表内的 chat id |
-| `adapters.slack.bot_token` | `""` | Slack bot token（v1 仅支持主动发送，见"已知限制"） |
+| `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
+| `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
+| `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
+| `adapters.matrix.access_token` | `""` | Matrix access token（入站与出站都必需） |
+| `adapters.matrix.user_id` | `""` | 自己的 Matrix user id（如 `@me:example.org`）：用于**过滤自己的回声**，留空会把自己发的消息当入站消息收到（无限回环） |
 | `adapters.discord.bot_token` | `""` | Discord bot token（v1 仅支持主动发送，见"已知限制"） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
@@ -374,7 +427,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 ## 8. 已知限制
 
 - 流式显示依赖服务端事件 `session.text.delta`；若服务端不推送该事件，只能在任务结束时（`session.execution.succeeded` / `session.idle`）一次性收到结果。
-- **Slack / Discord 的接收端为简化实现（TODO）**：v1 只实现了主动 `send` / `edit`，入站轮询（`conversations.history`、`GET /channels/{id}/messages` 增量回放）尚未接入，因此当前只有 Telegram 可以双向对话。
+- **Discord 的接收端尚未接入**：只实现了主动 `send` / `edit`，入站轮询（`GET /channels/{id}/messages` 增量回放）为 TODO，因此当前只有 Telegram 与 Slack 可以双向对话。
 - 长任务在 IM 侧只有"一条进度消息 + 节流编辑"，**没有**中间逐步流式；工具调用只记录进内部 `tool_trace`，不会逐条推送（避免刷屏）。
 - 权限请求 v1 只发文字提示，不使用 inline buttons（跨平台行为不一致）。
 - 一条进度消息编辑失败时不会降级为重复发送（避免刷屏），定稿消息才具备 `send` 兜底。

@@ -48,7 +48,7 @@
 
 | # | 平台 | 难度 | 传输方式 | 状态 |
 |---|---|---|---|---|
-| T3.1 | Matrix | S | `/sync` 长轮询 + `next_batch` 游标 | ☐ |
+| T3.1 | Matrix | S | `/sync` 长轮询 + `next_batch` 游标 | ☑ |
 | T3.2 | Mattermost | S | WebSocket + `authentication_challenge` + ping | ☐ |
 | T3.3 | IRC | S | `socket` 手写客户端 + PING/PONG + 仅响应提及 | ☐ |
 | T3.4 | Twitch | S | WebSocket IRC + IRCv3 tags + 限速节流 | ☐ |
@@ -150,3 +150,37 @@
     真服务器 + 真 `ws.connect` 跑通 握手 → 收包 → 授权 → Inbound → ack 掩码帧回到服务器。
   - 验证：**257 tests OK (skipped=1)**、compileall 0、两种跑法（`discover -s tests` 的顶层
     模块名 与 `python -m unittest tests.test_x` 的包名）导入均正常。
+- **2026-10-02** 接入文案纠错（先核实再写，不凭记忆）：`/setup 2` 的冻结文案此前写着
+  「v1 入站轮询尚未接入」「当前无法在 Slack 里与 bot 双向对话」——T2.1 落地后这已经是
+  **假话**，用户照着走会以为入站不可用、也不会知道要配 `app_token`。经查 Slack 官方文档
+  （2026 年已迁至 `docs.slack.dev`）重写为 Socket Mode 流程：app-level token
+  （`connections:write` → `xapp-`）、bot scopes（`chat:write` + `channels:history` +
+  `im:history`）、`Add Bot User Event`、以及「每改一次 scope 要重新 Install」和
+  「事件没加在 bot events 下会静默收不到」两个坑。核实过程**纠正了我两处想当然**
+  （按钮名不是 "Add Bot Token Event"；发私有频道不需要 `groups:write`），并**证伪了
+  我记忆里的「Show bot metadata」**（官方文档零命中，刻意不写进文案）。
+  README / docs/install.md 同步镜像；把断言旧说法的测试改成断言新事实 + 反向断言
+  （防止假话复活）。
+- **2026-10-02** 修掉一个**静默失败点**：`--setup --json` 与 `--status` 原本只看
+  `bot_token`，于是 Slack 只填 `bot_token`、缺入站必需的 `app_token` 时仍报
+  `configured: true` —— 用户会以为双向对话已经通了。改为由适配器**声明**
+  `required_tokens`，状态视图据此判定，并区分 `outbound_ready` / `inbound_ready` /
+  `inbound_implemented`（入站要"已实现"且"配置齐备"两个条件同时成立）。
+  同时把平台清单改为**从注册表自动发现**（`registered_names()` 扫包内模块），
+  新增平台不必改核心文件即出现在状态视图；冻结的 `/setup` 菜单仍刻意只列三平台。
+  新增 `tests/test_cli.py`（14 个用例）覆盖这些语义。
+- **2026-10-02** Socket Mode 加固：WSS URL 约 1 小时过期，Slack 会先发
+  `{"type":"disconnect"}`，原实现被动等对端关 socket 才重连。现改为收到 disconnect
+  **主动重连**（重新取 URL），并断言 disconnect 之后旧连接上的消息被丢弃
+  （否则等于静默丢消息）。
+- **2026-10-02** T3.1 Matrix 完成：`adapters/matrix.py`（`/sync` 长轮询 + `next_batch`
+  游标跨调用保存，42 个用例）。游标**先推进再分发**（与 telegram 的 offset 一致），
+  失败时不动游标。事件过滤 8 条（自己发的回声、非 `m.text`、含 `m.relates_to` 的
+  编辑/回复/表情、白名单外的房间等）。编辑用 MSC2676 兼容近似
+  （`"* "` 前缀 + `m.new_content` + `m.relates_to{rel_type:"m.replace"}`），
+  超限退化为普通发送。
+  复核时**推翻了 lane 的偏差说明**：它称"兄弟适配器都返回 `MsgHandle | None`"，
+  实测 `base.py` 与 telegram/slack/discord 三家都声明 `-> bool`，且 `core.py` 只对
+  `edit()` 判真假 —— 是它自己偏离了契约，已改回 `bool`（而非反过来改契约迁就它）。
+  验证：Matrix 在 `--status` 实跑中**自动出现**，全程未改任何平台注册代码。
+  全量 **318 tests OK (skipped=1)**、compileall 0。

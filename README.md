@@ -3,9 +3,9 @@
 [![CI](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-把 **11 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+把 **12 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
 
-支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a —— **十一个全部支持双向对话**。
+支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot —— **十二个全部支持双向对话**。
 
 > **a2a 是唯一方向相反的平台**：前十个都是我们主动连出去（长轮询 / WebSocket / IMAP），
 > **a2a 是我们被调方** —— 起一个本机 HTTP 服务让外部 agent 调我们。因此它**默认无鉴权**，
@@ -150,7 +150,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**十一个平台全部支持双向对话**）：
+各平台当前能力一览（**十二个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -165,6 +165,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 | a2a | ✅ 本机 HTTP（**我们被调方**） | ✅ 回给等待方 | ❌ 无 | 默认 bind `127.0.0.1` + **默认无鉴权**；上限 1 MiB（规范未规定，自行声明） |
+| QQ Bot | ✅ WebSocket 网关 | ✅ REST | ❌ 无 | 上限 2000（**官方未给数字**，保守自定）；群/私聊/频道三种作用域 |
 
 > 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
 >
@@ -468,6 +469,28 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **不支持编辑**（回复发给正在等待的那个 HTTP 请求），长任务进度会退化成连续多条消息。
 > - 未实现与真实 A2A 客户端的互操作验证（协议事实已逐条对照官方规范 v1.0.0）。
 
+### QQ Bot（支持双向对话 · WebSocket 网关，无需公网地址）
+
+1. 在 [QQ 开放平台](https://bot.q.qq.com/) 建机器人，拿 **AppID** 与 **AppSecret**
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "qqbot": { "app_id": "102xxxxx", "app_secret": "xxxx" } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在开放平台后台把机器人加进群 / 频道，或直接私聊它
+
+> 其它要点：
+> - 支持**群聊、私聊（C2C）、频道**三种作用域，`allowed_chat_ids` 填对应作用域前缀
+>   （`qqbot:group:...` / `qqbot:c2c:...` / `qqbot:channel:...`）。
+> - **主动消息在群里会失败**（`40034105`，除非开被动回复窗口），所以桥接会带上入站的
+>   `msg_id` 与 `msg_seq`；被动回复有时效与次数上限（群 5 分钟 5 次、私聊 1 小时 4 次），
+>   超了会可观测地报错。
+> - **不支持编辑消息**：官方只有撤回（DELETE），频道那个 PATCH 改的是 keyboard 富文本
+>   而不是正文，所以 `edit()` 诚实返回 `False`，长任务进度会退化成连续多条消息。
+> - **未实现与真实 QQ 客户端的互操作验证**（协议事实已逐条对照官方文档）。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -664,6 +687,10 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.a2a.auth_token` | `""` | Bearer token。**留空 = 无鉴权**，此时务必确认 `bind_host` 是回环地址 |
 | `adapters.a2a.reply_timeout` | `300.0` | 外部 agent 等待回复的超时（秒） |
 | `adapters.a2a.max_turns` | `20` | 单个任务的最大往返轮数，防无限对话 |
+| `adapters.qqbot.app_id` | `""` | QQ 开放平台的 AppID（**必填**） |
+| `adapters.qqbot.app_secret` | `""` | AppSecret（**必填**）；用它换 `access_token`，日志里会打码 |
+| `adapters.qqbot.api_base` | `https://api.bot.qq.com` | API 基址。**沙箱域名未在官方文档中核实**，默认走正式环境 |
+| `adapters.qqbot.gateway_url` | `""` | 留空则启动时 `GET /gateway` 自动取 |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

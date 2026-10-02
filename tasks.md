@@ -104,7 +104,7 @@
 | **B1** | ntfy | HTTP 拉取（`poll=1` + `since` 游标） | S | 已完成。**偏离原计划**：不用长连接流而用一次性拉取 —— 持久流在 `urllib` 下无法干净打断（`stop()` 会白等超时，见 Nextcloud 的教训）。启动用 `since=<当前时间戳>` **不重放历史缓存**（否则首次启动会把最多 10MB 缓存全当新消息触发 agent）；之后游标推进到 **message id** |
 | **B1** | email | IMAP 轮询（`UID` 游标） | S | 已完成。`imaplib`/`smtplib` 全标准库，协议通用永不废弃；**必须用专用邮箱 + app 专用密码**；**无用户身份**（任何能发信给你的人都能驱动 agent）→ 必须用 `allowed_chat_ids` 限定发件人；不支持编辑 |
 | **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 已完成。方向与其他平台相反；`httpsrv.py` 是**可复用共用模块**（A3 的地基，第一个使用方是 a2a）；默认 bind 127.0.0.1；**无凭据可填** → 需要 `config_optional`（见阶段 A 备注） |
-| **B2** | qqbot | WebSocket 网关 | M | 协议是 Discord 风格变体（op 码 + intents + `heartbeat_interval`），可直接复用 `ws.py`；防回环天然（bot 消息不推回给自己） |
+| **B2** | qqbot | WebSocket 网关 | M | 已完成。⚠️ **原描述两处需更正**：① "Discord 风格变体"只对了一半 —— opcode 表像，但**鉴权完全不同**（QQ 握手**不带凭据**，靠 op 2 Identify 传 `QQBot {token}`）；② **"防回环天然"不成立** —— `GROUP_MESSAGE_CREATE` 文档写的是"群里的**每一条**消息"、**不承诺排除 bot**。改用平台签发字段（`author.bot` / `author.id`）。心跳 `heartbeat_interval` 单位是**毫秒**（与 Discord 同坑） |
 | **B2** | homeassistant | WebSocket 事件总线（本机） | M | WS 极简；HA 极活跃。**但它是设备事件管道不是 IM**，取决于定位是否要收 |
 | **B3** | feishu / lark | WebSocket 长连接 | M | 官方明确"免内网穿透、**事件明文免解密**"；代价是 SDK 的 WS 握手 + `app_ticket` 刷新要自己实现；⚠️ **无 fromMe 字段**，防回环需自己记 message_id |
 | **B3** | wecom | WebSocket（`openws.work.weixin.qq.com`） | M | 必须选"智能机器人"（自建应用只有 callback 模式，要 AES 加解密 + 公网）；流式回复 `streamId` 机制较复杂 |
@@ -728,4 +728,46 @@
     `python -O` 下会被剥掉（所有 assert 都如此，真要硬保证应改显式 `raise`；
     matrix/telegram 同款，保持一致故未改）。
   验证：**test_slack 29 OK**、跨平台 **644 OK**、compileall 0。
+- **2026-10-03** **B2 qqbot 完成**（第十二个平台）+ **修掉一个高影响真 bug：`ws.py` 丢首帧**
+  - qqbot（1094 行 + 113 用例，走 `WebSocketTransport` + 自研 `ws.py`）。
+    **我在派单时的两条推断都被证伪，已在阶段 B 表格里更正**：
+    ① "Discord 风格变体"只对一半——opcode 表像，但**鉴权完全不同**：QQ 的握手
+       **不带任何凭据**（匿名），靠连接后 op 2 Identify 传 `QQBot {token}`；
+    ② **"防回环天然"不成立** —— `GROUP_AT_MESSAGE_CREATE`/`C2C_MESSAGE_CREATE`
+       确实是"用户→bot"，但 `GROUP_MESSAGE_CREATE`（同一 intent、另一个后台开关）
+       文档写的是"群里的**每一条**消息"，**不承诺排除 bot**。改用平台签发字段：
+       `author.bot === true` 或 `author.id == READY.user.id`（**绝不用内容启发式**）。
+    - **`heartbeat_interval` 单位是毫秒**（与 Discord 同一个坑），lane 用**三层证据**确认：
+      官方文档两处明写毫秒 + 同一 `45000` 示例；代码里换算时**同时打印原值与折算值**；
+      真服务器上**双向**验证（400ms 必须出第二拍、45000ms 必须不出）。另加了
+      `[100, 600000] ms` 的钳制（我自己定的范围，文档未给，防止 0 变忙等）。
+    - **诚实标注为"推断"而非事实**：沙箱域名（文档只有图片，查不到）、消息长度上限
+      （**官方根本没给数字也没给单位**，`MESSAGE_LIMIT=2000` 是自行保守取值并在代码里
+      标注 + 用测试守住那句免责声明）、close 码语义、群/私聊 `author.id` 与 READY id
+      空间不同（故只在 guild 范围依赖该比较）。真实溢出会映射成
+      `SendError.TOO_LONG`，**可观测、不静默**。
+  - ⚠️ **高影响真bug（本轮最重要的收获，来自 lane 对 `ws.py` 的越权举报）**：
+    `_read_http_response()` 为找 `\r\n\r\n` 会多读出后面的字节，而 `_check_handshake()`
+    只在"握手被拒"分支用到它们 —— **走101 成功路径时直接丢弃**。
+    于是服务端若把 101 响应与第一帧放进**同一个 TCP 段**（**流水线化**），
+    那一帧被**静默吞掉**，客户端连得上却**永远收不到消息**，直到读超时。
+    **症状是"平台连上了但一条消息都收不到"，且不报错** —— 极难定位。
+    影响 **Discord / Slack / Mattermost**（Discord 网关确实会流水化第一帧）。
+    - **我没有采信它的结论，自己复现**：真 socket 服务器一次 `sendall` 发
+      握手 + 第一帧 → `recv()` **1.5s 后超时**；对照延迟 50ms 单独发 → **0.046s 拿到**。
+    - 修法：`connect()` 把多读字节存进 `_prefetch`，`_read_frame` 经`_read_bytes()`
+      **优先消费**它。修复后同一复现脚本 **0.000s** 拿到帧。
+    - 回归测试 `tests/test_ws.py::TestPipelinedFirstFrame`（4 条），其中一条专门断言
+      预读缓冲**恰好消费完、不丢也不重复** —— 重复是最隐蔽的失败模式（同一条消息被处理
+      两次，例如触发两次 agent 运行）。
+    - **顺带暴露并修掉一个测试反模式**：`test_mattermost.py` 用
+      `WebSocketClient.__new__()` **绕过 `__init__`** 再手工赋 13 个私有属性，
+      于是我新增一个实例字段就让它`AttributeError` 挂掉 —— 而挂掉原因与它测的
+      ping/pong 保证毫无关系。已改用正式 `__init__`（它本来就不做连接），
+      13 行手工赋值缩成 2 行，**这个地雷从根上拆掉**。
+    - **顺带退役一处 workaround**：qqbot 测试里的 `FIRST_FRAME_DELAY = 0.05`
+      正是为绕开此bug 加的，而那条守卫用例还**断言"设成 0 就会失败"**——
+      它锁定的正是现已修好的 bug。已把延时置 0（**让 qqbot 整套真服务器测试顺带
+      覆盖"同段"这条路径，即现实里服务端的行为**）并把守卫用例**反转**为正向断言。
+  验证：**qqbot 113 OK**、**全量 1296 tests OK (skipped=1)**、compileall 0、12 个平台。
 

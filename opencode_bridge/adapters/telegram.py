@@ -81,6 +81,11 @@ class TelegramAdapter(Adapter):
     """Long-polling ``getUpdates`` Telegram adapter."""
 
     name = "telegram"
+    label = "Telegram"
+    max_message_length = MESSAGE_LIMIT          # Bot API: 4096 字符
+    supports_inbound = True
+    supports_inline_buttons = True
+    supports_media = True
 
     # Class-level knobs (tests may override them on the instance).
     message_limit = MESSAGE_LIMIT
@@ -90,8 +95,7 @@ class TelegramAdapter(Adapter):
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
         self.bot_token: str = str(self.config.get("bot_token") or "").strip()
-        raw_allowed = self.config.get("allowed_chat_ids") or []
-        self.allowed_chat_ids = {str(x) for x in raw_allowed}
+        # allowed_chat_ids 已由基类 _init_access() 统一解析（T1.2）
         self.poll_long_timeout = int(
             self.config.get("poll_timeout") or POLL_LONG_TIMEOUT
         )
@@ -454,9 +458,8 @@ class TelegramAdapter(Adapter):
             return None
 
     def _allowed(self, chat_id: Any) -> bool:
-        if not self.allowed_chat_ids:
-            return True
-        return str(chat_id) in self.allowed_chat_ids
+        """入站闸门：委托基类统一判定（T1.2，语义与旧实现一致）。"""
+        return self.admits(chat_id)
 
     def send(self, out: Outbound) -> MsgHandle | None:
         """Send text (split at 4096); returns the handle of the LAST chunk."""

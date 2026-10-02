@@ -35,6 +35,11 @@ class DiscordAdapter(Adapter):
     """Discord REST adapter (outbound-first skeleton, runnable)."""
 
     name = "discord"
+    label = "Discord"
+    max_message_length = MESSAGE_LIMIT          # 消息内容上限 2000 字符
+    supports_inbound = False                   # v1 仅出站（入站见 tasks.md T2.2）
+    supports_inline_buttons = False            # components 未实现
+    supports_media = False
 
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL

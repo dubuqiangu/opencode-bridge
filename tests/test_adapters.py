@@ -470,5 +470,96 @@ class TestBuildRegistry(unittest.TestCase):
             build("nope", {}, RecordingHooks())
 
 
+class TestCapabilities(unittest.TestCase):
+    """T1.1 — 能力显式声明：调用方据此判断，不再靠 try/except 猜。"""
+
+    def test_capabilities_truthful_per_platform(self):
+        hooks = RecordingHooks()
+        expected = {
+            "telegram": {"max_message_length": 4096, "supports_inbound": True,
+                         "supports_inline_buttons": True, "supports_media": True},
+            "slack": {"max_message_length": 40000, "supports_inbound": False,
+                      "supports_inline_buttons": False, "supports_media": False},
+            "discord": {"max_message_length": 2000, "supports_inbound": False,
+                        "supports_inline_buttons": False, "supports_media": False},
+        }
+        for name, want in expected.items():
+            caps = build(name, {"bot_token": "t"}, hooks).capabilities()
+            self.assertEqual(caps["name"], name)
+            self.assertTrue(caps["label"], f"{name} 应声明展示名")
+            for key, value in want.items():
+                self.assertEqual(caps[key], value, f"{name}.{key} 声明不实")
+
+    def test_capabilities_snapshot_keys(self):
+        caps = build("telegram", {"bot_token": "t"}, RecordingHooks()).capabilities()
+        self.assertEqual(
+            set(caps),
+            {"name", "label", "max_message_length", "supports_inbound",
+             "supports_inline_buttons", "supports_media", "typed_command_prefix",
+             "running"},
+        )
+
+    def test_command_prefix_declared(self):
+        for name in ("telegram", "slack", "discord"):
+            adapter = build(name, {"bot_token": "t"}, RecordingHooks())
+            self.assertEqual(adapter.typed_command_prefix, "/", name)
+
+
+class TestAccessGate(unittest.TestCase):
+    """T1.2 — 授权闸门统一到基类，三平台同一套判定。"""
+
+    def test_empty_allowlist_admits_all(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        self.assertTrue(adapter.admits(55))
+        self.assertTrue(adapter.admits("任意 chat"))
+
+    def test_allowlist_filters(self):
+        adapter = build(
+            "telegram", {"bot_token": "t", "allowed_chat_ids": [55, "66"]},
+            RecordingHooks(),
+        )
+        self.assertTrue(adapter.admits(55))
+        self.assertTrue(adapter.admits("66"))
+        self.assertFalse(adapter.admits(77))
+
+    def test_allowlist_accepts_int_and_str_and_strips(self):
+        adapter = build(
+            "telegram", {"bot_token": "t", "allowed_chat_ids": [" 55 "]},
+            RecordingHooks(),
+        )
+        self.assertEqual(adapter.allowed_chat_ids, {"55"})
+        self.assertTrue(adapter.admits(55))
+        self.assertTrue(adapter.admits(" 55 "))
+
+    def test_alternative_allowlist_keys(self):
+        for key in ("allowed_chats", "allowlist"):
+            adapter = build(
+                "telegram", {"bot_token": "t", key: [55]}, RecordingHooks()
+            )
+            self.assertTrue(adapter.admits(55), key)
+            self.assertFalse(adapter.admits(66), key)
+
+    def test_scalar_allowlist_value(self):
+        adapter = build("telegram", {"bot_token": "t", "allowed_chat_ids": 55},
+                        RecordingHooks())
+        self.assertTrue(adapter.admits(55))
+        self.assertFalse(adapter.admits(66))
+
+    def test_telegram_allowed_delegates_to_base(self):
+        adapter = build(
+            "telegram", {"bot_token": "t", "allowed_chat_ids": [55]},
+            RecordingHooks(),
+        )
+        self.assertEqual(adapter._allowed(55), adapter.admits(55))
+        self.assertEqual(adapter._allowed(77), adapter.admits(77))
+
+    def test_all_platforms_share_the_same_gate(self):
+        hooks = RecordingHooks()
+        for name in ("telegram", "slack", "discord"):
+            adapter = build(name, {"bot_token": "t", "allowed_chat_ids": [55]}, hooks)
+            self.assertEqual(adapter.admits(55), True, name)
+            self.assertEqual(adapter.admits(77), False, name)
+
+
 if __name__ == "__main__":
     unittest.main()

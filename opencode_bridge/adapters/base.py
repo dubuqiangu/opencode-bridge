@@ -38,15 +38,76 @@ class Adapter(abc.ABC):
     Lifecycle: ``start()`` spawns a poller thread (non-blocking, never raises
     to the caller); ``stop()`` sets the stop flag and joins the thread with a
     5 second timeout.
+
+    能力以**类属性显式声明**（T1.1），调用方据此判断"能不能发按钮 / 该不该分片"，
+    不再靠 try/except 撞运气。取值必须与各平台官方限制一致。
     """
 
     name: str = ""
+
+    # --- capabilities（显式声明；子类必须按平台真值覆盖）------------------
+    #: 展示名（状态视图 / /setup 引导用），如 ``"Telegram"``。
+    label: str = ""
+    #: 单条消息的字符上限；出站分片（T1.4）以此为阈值。
+    max_message_length: int = 4000
+    #: 是否具备入站（接收）能力。False = 只能主动发送。
+    supports_inbound: bool = False
+    #: 是否支持 inline 按钮 / 卡片式交互。
+    supports_inline_buttons: bool = False
+    #: 是否支持发送图片 / 文件等媒体。
+    supports_media: bool = False
+    #: 命令前缀（Telegram/Slack 用 ``/``，部分平台习惯 ``!``）。
+    typed_command_prefix: str = "/"
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         self.config: dict = dict(config or {})
         self.hooks = hooks
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self.allowed_chat_ids: set[str] = set()
+        self._init_access()
+
+    # --- capabilities ----------------------------------------------------
+    def capabilities(self) -> Dict[str, object]:
+        """Machine-readable capability snapshot (``--status`` / 状态视图消费）。"""
+        return {
+            "name": self.name,
+            "label": self.label or self.name,
+            "max_message_length": self.max_message_length,
+            "supports_inbound": self.supports_inbound,
+            "supports_inline_buttons": self.supports_inline_buttons,
+            "supports_media": self.supports_media,
+            "typed_command_prefix": self.typed_command_prefix,
+            "running": self.running,
+        }
+
+    # --- 授权闸门（T1.2：统一到基类，所有平台同一套判定）-------------------
+    def _init_access(self) -> None:
+        """从配置读 ``allowed_chat_ids`` 到统一形态（三种键名都认）。"""
+        raw: object = None
+        for key in ("allowed_chat_ids", "allowed_chats", "allowlist"):
+            if key in self.config:
+                raw = self.config.get(key)
+                break
+        items: list[object] = []
+        if isinstance(raw, (list, tuple, set)):
+            items = list(raw)
+        elif raw not in (None, ""):
+            items = [raw]
+        self.allowed_chat_ids = {str(x).strip() for x in items if str(x).strip()}
+
+    def admits(self, principal: object) -> bool:
+        """入站闸门：**任何**入站消息（文本 / 命令 / 回调）都必须先过这里。
+
+        语义（v1 保持现状）：白名单为空 = 全部允许；非空 = 只放行列表内的 chat。
+
+        ⚠️ 调用顺序要求（对照 dsh 的反面教训）：授权判定必须在**命令解析与
+        审批应答之前**，否则未授权者能用 ``/approve`` 这类命令字绕过闸门。
+        入站适配器应在本方法返回 False 时**直接丢弃**，不要把消息交给上层。
+        """
+        if not self.allowed_chat_ids:
+            return True
+        return str(principal).strip() in self.allowed_chat_ids
 
     # --- lifecycle -----------------------------------------------------
     @abc.abstractmethod

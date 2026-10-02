@@ -35,6 +35,11 @@ class SlackAdapter(Adapter):
     """Slack Web API adapter (outbound-first skeleton, runnable)."""
 
     name = "slack"
+    label = "Slack"
+    max_message_length = MESSAGE_LIMIT          # chat.postMessage 文本上限 40000
+    supports_inbound = False                   # v1 仅出站（入站见 tasks.md T2.1）
+    supports_inline_buttons = False            # blocks 未实现
+    supports_media = False
 
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL

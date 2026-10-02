@@ -15,8 +15,8 @@ import urllib.error
 import urllib.request
 from typing import Any, List, Optional, Tuple
 
-from ..hooks import Hooks, MsgHandle, Outbound
-from .base import Adapter, register
+from ..hooks import Hooks, MsgHandle, Outbound, SendError
+from .base import Adapter, classify_http, register
 from .telegram import split_text
 
 logger = logging.getLogger("opencode_bridge.adapters.slack")
@@ -28,6 +28,28 @@ MESSAGE_LIMIT = 40000        # Slack hard-truncates beyond ~40k characters
 MIN_SEND_INTERVAL = 1.2      # per-conversation send/edit throttle (seconds)
 SOCKET_TIMEOUT = 30.0
 MAX_RETRY_AFTER = 60.0
+
+
+def _classify_slack_error(status: int, error: str) -> SendError:
+    """Slack 用 ``ok:false`` + 字符串 ``error`` 报失败（多为 HTTP 200），
+    所以先按 Slack 官方错误串判定，再回落到通用 HTTP 分类（T1.3）。"""
+    low = (error or "").lower()
+    if status == 429 or "rate_limited" in low or "ratelimited" in low:
+        return SendError.RATE_LIMITED
+    if "not_found" in low or "is_archived" in low:
+        return SendError.NOT_FOUND
+    if (
+        "invalid_auth" in low
+        or "not_authed" in low
+        or "token_revoked" in low
+        or "missing_scope" in low
+        or "no_permission" in low
+        or "forbidden" in low
+    ):
+        return SendError.FORBIDDEN
+    if "no_text" in low or "invalid_arg" in low or "too_large" in low or "too_long" in low:
+        return SendError.TOO_LONG if ("too_large" in low or "too_long" in low) else SendError.BAD_FORMAT
+    return classify_http(status, error)
 
 
 @register("slack")
@@ -134,9 +156,11 @@ class SlackAdapter(Adapter):
         channel = self._channel_id(out.conversation_id)
         if not channel:
             logger.warning("slack: bad conversation_id %r", out.conversation_id)
+            self._note_send_failure(SendError.BAD_FORMAT, "bad conversation_id")
             return None
         if not out.text:
             logger.warning("slack: refusing to send empty text")
+            self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
         chunks: List[str] = split_text(out.text, self.message_limit)
         if len(chunks) > 1:
@@ -148,11 +172,13 @@ class SlackAdapter(Adapter):
                 "POST", "chat.postMessage", {"channel": channel, "text": chunk}
             )
             if not data.get("ok"):
+                err = str(data.get("error") or "")
                 logger.warning(
                     "slack: chat.postMessage failed (HTTP %s): %s",
                     status,
                     data.get("error"),
                 )
+                self._note_send_failure(_classify_slack_error(status, err), err)
                 return handle if handle is not None else None
             handle = MsgHandle(
                 conversation_id=out.conversation_id,

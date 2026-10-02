@@ -14,7 +14,7 @@ from opencode_bridge.adapters import Adapter, AdapterError, build
 from opencode_bridge.adapters.discord import DiscordAdapter
 from opencode_bridge.adapters.slack import SlackAdapter
 from opencode_bridge.adapters.telegram import TelegramAdapter, split_text
-from opencode_bridge.hooks import Button, Inbound, MsgHandle, Outbound
+from opencode_bridge.hooks import Button, Inbound, MsgHandle, Outbound, SendError
 
 
 class RecordingHooks:
@@ -452,6 +452,106 @@ class TestDiscordAdapter(unittest.TestCase):
             adapter.start()
 
 
+class TestSendResult(unittest.TestCase):
+    """T1.3 — 出站错误分类：失败从"静默 None"变成结构化可观测数据。"""
+
+    def test_classify_http_mapping(self):
+        from opencode_bridge.adapters.base import classify_http
+
+        self.assertEqual(classify_http(0), SendError.TRANSIENT)       # 传输层失败
+        self.assertEqual(classify_http(429), SendError.RATE_LIMITED)
+        self.assertEqual(classify_http(401), SendError.FORBIDDEN)
+        self.assertEqual(classify_http(403), SendError.FORBIDDEN)
+        self.assertEqual(classify_http(404), SendError.NOT_FOUND)
+        self.assertEqual(classify_http(413), SendError.TOO_LONG)
+        self.assertEqual(classify_http(400), SendError.BAD_FORMAT)
+        self.assertEqual(classify_http(400, "message is too long"), SendError.TOO_LONG)
+        self.assertEqual(classify_http(500), SendError.TRANSIENT)
+        self.assertEqual(classify_http(503), SendError.TRANSIENT)
+        self.assertEqual(classify_http(302), SendError.UNKNOWN)
+
+    def test_send_result_ok(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        adapter.send = lambda out: MsgHandle("c", "1", "telegram")
+        r = adapter.send_result(Outbound(conversation_id="chat:1", text="hi"))
+        self.assertTrue(r.ok)
+        self.assertFalse(r.partial)
+        self.assertIsNotNone(r.handle)
+        self.assertEqual(r.error_kind, SendError.UNKNOWN)  # ok 时无意义
+
+    def test_send_result_failure_uses_noted_kind(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        adapter.send = lambda out: None
+
+        def _fail(out):
+            adapter._note_send_failure(SendError.RATE_LIMITED, "429 too many", retry_after=7.0)
+            return None
+
+        adapter.send = _fail
+        r = adapter.send_result(Outbound(conversation_id="chat:1", text="hi"))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, SendError.RATE_LIMITED)
+        self.assertEqual(r.retry_after, 7.0)
+        self.assertEqual(r.error_detail, "429 too many")
+
+    def test_send_result_partial_when_handle_returned_after_failure(self):
+        """分片"部分成功"：有句柄但过程记过失败 → 必须标 partial，不能记成全成功。"""
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+
+        def _partial(out):
+            adapter._note_send_failure(SendError.TRANSIENT, "chunk 3 failed")
+            return MsgHandle("c", "2", "telegram")
+
+        adapter.send = _partial
+        r = adapter.send_result(Outbound(conversation_id="chat:1", text="hi"))
+        self.assertTrue(r.ok)
+        self.assertTrue(r.partial)
+        self.assertEqual(r.error_kind, SendError.TRANSIENT)
+
+    def test_send_result_does_not_propagate_exception(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+
+        def _boom(out):
+            raise RuntimeError("boom")
+
+        adapter.send = _boom
+        r = adapter.send_result(Outbound(conversation_id="chat:1", text="hi"))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, SendError.TRANSIENT)
+
+    def test_send_result_unknown_when_send_returns_none_without_note(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        adapter.send = lambda out: None
+        r = adapter.send_result(Outbound(conversation_id="chat:1", text="hi"))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, SendError.UNKNOWN)
+
+    def test_last_send_error_property_tracks(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        self.assertIsNone(adapter.last_send_error)
+        adapter._note_send_failure(SendError.FORBIDDEN, "no rights")
+        self.assertEqual(adapter.last_send_error, SendError.FORBIDDEN)
+        adapter._clear_send_failure()
+        self.assertIsNone(adapter.last_send_error)
+
+    def test_slack_error_classification(self):
+        from opencode_bridge.adapters.slack import _classify_slack_error
+
+        self.assertEqual(_classify_slack_error(200, "rate_limited"), SendError.RATE_LIMITED)
+        self.assertEqual(_classify_slack_error(200, "channel_not_found"), SendError.NOT_FOUND)
+        self.assertEqual(_classify_slack_error(200, "invalid_auth"), SendError.FORBIDDEN)
+        self.assertEqual(_classify_slack_error(200, "missing_scope"), SendError.FORBIDDEN)
+        self.assertEqual(_classify_slack_error(200, "no_text"), SendError.BAD_FORMAT)
+        self.assertEqual(_classify_slack_error(429, ""), SendError.RATE_LIMITED)
+        self.assertEqual(_classify_slack_error(200, "weird_thing"), SendError.UNKNOWN)
+
+    def test_bad_conversation_id_classified(self):
+        adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
+        r = adapter.send_result(Outbound(conversation_id="not-a-chat", text="hi"))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, SendError.BAD_FORMAT)
+
+
 class TestBuildRegistry(unittest.TestCase):
     def test_build_known_adapters(self):
         hooks = RecordingHooks()
@@ -496,7 +596,7 @@ class TestCapabilities(unittest.TestCase):
             set(caps),
             {"name", "label", "max_message_length", "supports_inbound",
              "supports_inline_buttons", "supports_media", "typed_command_prefix",
-             "running"},
+             "allowed_chat_ids_count", "running"},
         )
 
     def test_command_prefix_declared(self):

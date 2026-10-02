@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import Sequence
 
 from .adapters import build
@@ -82,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="与 --setup 搭配：输出机器可读 JSON（配置路径 + 各平台是否已配 token）",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="汇总服务连通性 / 各平台配置与能力 / bridge 运行态证据，然后退出",
     )
     return parser
 
@@ -146,6 +152,137 @@ def _has_configured_adapter(cfg: Config) -> bool:
         if token is not None and str(token).strip():
             return True
     return False
+
+
+def _bridge_dir() -> str:
+    """手动运行时 cwd 通常就是 bridge 目录；``OPENCODE_BRIDGE_CONFIG`` 指向别处时用其目录。"""
+    env_path = (os.environ.get("OPENCODE_BRIDGE_CONFIG") or "").strip()
+    if env_path and os.path.isfile(env_path):
+        return os.path.dirname(os.path.abspath(env_path)) or os.getcwd()
+    return os.getcwd()
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否存活（Windows 上 os.kill(pid, 0) 可用）。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+class _NullHooks:
+    """只为读取适配器能力快照而存在：不消费任何事件。"""
+
+    def on_inbound(self, inbound: object) -> None:  # pragma: no cover - 空实现
+        return None
+
+    def on_callback(self, conversation_id: str, data: str, query_id: str) -> None:  # pragma: no cover
+        return None
+
+
+def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, dict]]:
+    """``(key, label, configured, capabilities)``；能力来自 T1.1 的显式声明。"""
+    from .adapters import build
+
+    entries = cfg.adapters if isinstance(cfg.adapters, dict) else {}
+    rows: list[tuple[str, str, bool, dict]] = []
+    for key, label in setup_platforms():
+        raw = entries.get(key)
+        entry = raw if isinstance(raw, dict) else {}
+        token = entry.get("bot_token")
+        configured = bool(token is not None and str(token).strip())
+        caps: dict = {}
+        try:
+            caps = build(key, entry, _NullHooks()).capabilities()
+        except Exception as exc:  # 能力读取失败不该让 --status 崩
+            caps = {"error": str(exc)[:80]}
+        rows.append((key, label, configured, caps))
+    return rows
+
+
+def _runtime_state(bridge_dir: str) -> tuple[str, str]:
+    """从锁文件推断 bridge 运行态，返回 ``(state, detail)``。
+
+    只用**可验证的证据**：锁文件 + pid 存活 + failedAt。
+    ``--status`` 是独立进程，看不到 bridge 进程内状态，因此这里刻意保守。
+    """
+    from .status import ChannelState
+
+    lock_path = os.path.join(bridge_dir, ".bridge-plugin.lock")
+    if not os.path.isfile(lock_path):
+        return ChannelState.DISABLED.value, "无锁文件：bridge 未在运行"
+    try:
+        with open(lock_path, "r", encoding="utf-8-sig") as fh:
+            lock = json.load(fh)
+    except Exception as exc:
+        return ChannelState.ERROR.value, f"锁文件不可读（{exc}）"
+    pid = int(lock.get("pid") or 0)
+    failed_at = lock.get("failedAt")
+    if pid and _pid_alive(pid):
+        return ChannelState.CONNECTED.value, f"bridge 运行中 (pid={pid})"
+    if isinstance(failed_at, (int, float)):
+        wait = max(0, int(300 - (time.time() - failed_at)))
+        return (
+            ChannelState.ERROR.value,
+            f"上次快速失败于 {time.strftime('%H:%M:%S', time.localtime(failed_at))}，"
+            f"backoff 中（约剩 {wait}s）",
+        )
+    return ChannelState.DEGRADED.value, f"锁存在但 pid={pid} 已不存在（上次异常退出）"
+
+
+def run_status(cfg: Config) -> int:
+    """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。"""
+    bridge_dir = _bridge_dir()
+    print("== opencode 服务 ==")
+    try:
+        endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
+        client = OpenCodeClient(endpoint)
+        try:
+            info = client.info()
+        finally:
+            client.close()
+        print(f"  状态   : OK  version={info.get('version', '?')} pid={info.get('pid', '?')}")
+        print(f"  地址   : {endpoint.url}")
+    except Exception as exc:
+        print(f"  状态   : 不可达 —— {exc}")
+
+    print("")
+    print("== 渠道配置与能力 ==")
+    print("  说明：「配置」= 是否已填 bot_token；不代表连接状态（连接状态见下方运行态）")
+    print(f"  {'平台':<12}{'配置':<8}{'入站':<6}{'按钮':<6}{'媒体':<6}{'长度上限':<10}白名单")
+    for key, label, configured, caps in _channel_config_rows(cfg):
+        if caps.get("error"):
+            print(f"  {label:<12}{'已配置' if configured else '未配置':<8}能力读取失败：{caps['error']}")
+            continue
+        allowed = caps.get("allowed_chat_ids_count")
+        wl = "未设(全开)" if not allowed else f"{allowed} 项"
+        print(
+            f"  {label:<12}"
+            f"{'已配置' if configured else '未配置':<8}"
+            f"{'是' if caps.get('supports_inbound') else '否':<6}"
+            f"{'是' if caps.get('supports_inline_buttons') else '否':<6}"
+            f"{'是' if caps.get('supports_media') else '否':<6}"
+            f"{str(caps.get('max_message_length')):<10}{wl}"
+        )
+
+    print("")
+    print("== bridge 运行态 ==")
+    print(f"  bridge 目录 : {bridge_dir}")
+    state, detail = _runtime_state(bridge_dir)
+    print(f"  状态        : {state} —— {detail}")
+    for name in ("bridge-plugin.log", "bridge-output.log", "config.json", "state.json"):
+        p = os.path.join(bridge_dir, name)
+        if os.path.isfile(p):
+            size = os.path.getsize(p)
+            mtime = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+            print(f"  {name:<20} {size:>8} 字节  最后修改 {mtime}")
+    print("  注：--status 是独立进程，看不到 bridge 进程内状态；进程内健康请看 bridge-plugin.log")
+    return 0
 
 
 def run_check(cfg: Config) -> int:
@@ -230,6 +367,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # --setup 走最前：不连 opencode、不需要 token，接入前也能看引导
         if args.setup is not None:
             return run_setup(cfg, args.setup, bool(args.json))
+        if args.status:
+            return run_status(cfg)
         return run_bridge(cfg)
     except KeyboardInterrupt:
         logger.info("已中断")

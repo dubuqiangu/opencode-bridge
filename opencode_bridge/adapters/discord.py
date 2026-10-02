@@ -15,8 +15,8 @@ import urllib.error
 import urllib.request
 from typing import Any, List, Optional, Tuple
 
-from ..hooks import Hooks, MsgHandle, Outbound
-from .base import Adapter, register
+from ..hooks import Hooks, MsgHandle, Outbound, SendError
+from .base import Adapter, classify_http, register
 from .telegram import split_text
 
 logger = logging.getLogger("opencode_bridge.adapters.discord")
@@ -164,9 +164,11 @@ class DiscordAdapter(Adapter):
         channel = self._channel_id(out.conversation_id)
         if not channel:
             logger.warning("discord: bad conversation_id %r", out.conversation_id)
+            self._note_send_failure(SendError.BAD_FORMAT, "bad conversation_id")
             return None
         if not out.text:
             logger.warning("discord: refusing to send empty text")
+            self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
         chunks: List[str] = split_text(out.text, self.message_limit)
         if len(chunks) > 1:
@@ -177,10 +179,18 @@ class DiscordAdapter(Adapter):
         for chunk in chunks:
             status, data = self._send_chunk(channel, chunk, out.conversation_id)
             if status < 200 or status >= 300 or "id" not in data:
+                detail = str(data.get("message") or data.get("code") or "")
                 logger.warning(
                     "discord: send failed (HTTP %s): %s",
                     status,
                     data.get("message") or data.get("code"),
+                )
+                # Discord 在 429 的响应体里给 retry_after（秒，float）
+                retry_after = data.get("retry_after")
+                self._note_send_failure(
+                    classify_http(status, detail),
+                    detail,
+                    retry_after=float(retry_after) if isinstance(retry_after, (int, float)) else None,
                 )
                 return handle if handle is not None else None
             handle = MsgHandle(

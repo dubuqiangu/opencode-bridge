@@ -14,8 +14,8 @@ import threading
 import time
 from typing import Any, List, Optional
 
-from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound
-from .base import Adapter, register
+from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
+from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
 
@@ -466,9 +466,11 @@ class TelegramAdapter(Adapter):
         chat_id = self._chat_id(out.conversation_id)
         if chat_id is None:
             logger.warning("telegram: bad conversation_id %r", out.conversation_id)
+            self._note_send_failure(SendError.BAD_FORMAT, "bad conversation_id")
             return None
         if not out.text:
             logger.warning("telegram: refusing to send empty text")
+            self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
         chunks = split_text(out.text, self.message_limit)
         if len(chunks) > 1:
@@ -484,11 +486,25 @@ class TelegramAdapter(Adapter):
             }
             data = self._api(out.conversation_id, "sendMessage", payload)
             if not isinstance(data, dict) or data.get("ok") is not True:
+                code = data.get("error_code") if isinstance(data, dict) else 0
+                desc = (data.get("description") if isinstance(data, dict) else "") or ""
                 logger.warning(
                     "telegram: sendMessage failed (code=%s): %s",
-                    data.get("error_code") if isinstance(data, dict) else "?",
-                    data.get("description") if isinstance(data, dict) else data,
+                    code if code is not None else "?",
+                    desc or data,
                 )
+                params = data.get("parameters") if isinstance(data, dict) else None
+                retry_after = None
+                if isinstance(params, dict):
+                    retry_after = params.get("retry_after")
+                try:
+                    self._note_send_failure(
+                        classify_http(int(code or 0), str(desc)),
+                        str(desc),
+                        retry_after=float(retry_after) if retry_after else None,
+                    )
+                except (TypeError, ValueError):
+                    self._note_send_failure(SendError.UNKNOWN, str(desc))
                 if handle is None:
                     return None
                 return handle  # partial send: keep the last good handle

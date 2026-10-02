@@ -40,13 +40,58 @@ class TestPlatformStatusSemantics(unittest.TestCase):
         self.assertTrue(row["inbound_ready"])
         self.assertEqual(row["missing"], [])
 
-    def test_discord_inbound_not_implemented_even_when_configured(self):
-        """入站要"已实现"且"配置齐备"两个条件，不能只看 token。"""
+    def test_discord_inbound_ready_when_configured(self):
         cfg = Config(adapters={"discord": {"bot_token": "t"}})
         row = status_of(cfg, "discord")
         self.assertTrue(row["configured"])
-        self.assertFalse(row["inbound_implemented"])
-        self.assertFalse(row["inbound_ready"], "未实现的入站不能报就绪")
+        self.assertTrue(row["inbound_implemented"])
+        self.assertTrue(row["inbound_ready"])
+
+    def test_inbound_not_implemented_stays_not_ready_even_when_configured(self):
+        """"已实现"与"配置齐备"是两个条件，不能只看 token。
+
+        真实平台目前都实现了入站，所以这个分支用**合成适配器**守护 ——
+        否则将来某个平台只做出站时，这层语义就没有测试了。
+        """
+        import importlib.machinery
+        import sys
+        import types
+
+        from opencode_bridge.adapters import base as base_mod
+
+        pkg = base_mod.__package__ or "opencode_bridge.adapters"
+        mod_name = f"{pkg}.outboundonlyplat"
+        module = types.ModuleType(mod_name)
+        module.__spec__ = importlib.machinery.ModuleSpec(mod_name, None)
+
+        class OutboundOnlyAdapter(base_mod.Adapter):
+            name = "outboundonlyplat"
+            label = "OutboundOnly"
+            supports_inbound = False   # 假设只做出站
+            required_tokens = ("bot_token",)
+
+            def start(self) -> None:
+                return None
+
+            def send(self, out):
+                return None
+
+            def edit(self, handle, out) -> bool:
+                return False
+
+        module.OutboundOnlyAdapter = OutboundOnlyAdapter
+        sys.modules[mod_name] = module
+        base_mod._REGISTRY.pop("outboundonlyplat", None)
+        try:
+            base_mod.register("outboundonlyplat")(OutboundOnlyAdapter)
+            cfg = Config(adapters={"outboundonlyplat": {"bot_token": "t"}})
+            row = status_of(cfg, "outboundonlyplat")
+            self.assertTrue(row["configured"], "token 齐备就算配好")
+            self.assertFalse(row["inbound_implemented"])
+            self.assertFalse(row["inbound_ready"], "入站未实现时不能报就绪")
+        finally:
+            sys.modules.pop(mod_name, None)
+            base_mod._REGISTRY.pop("outboundonlyplat", None)
 
     def test_telegram_single_token_is_enough(self):
         cfg = Config(adapters={"telegram": {"bot_token": "t"}})

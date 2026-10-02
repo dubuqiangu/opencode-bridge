@@ -900,7 +900,7 @@ class TestCapabilities(unittest.TestCase):
                          "supports_inline_buttons": True, "supports_media": True},
             "slack": {"max_message_length": 40000, "supports_inbound": True,
                       "supports_inline_buttons": False, "supports_media": False},
-            "discord": {"max_message_length": 2000, "supports_inbound": False,
+            "discord": {"max_message_length": 2000, "supports_inbound": True,
                         "supports_inline_buttons": False, "supports_media": False},
         }
         for name, want in expected.items():

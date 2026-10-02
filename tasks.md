@@ -40,7 +40,7 @@
 |---|---|---|---|---|
 | T2.0 | **最小 WebSocket 客户端**（纯标准库，RFC 6455） | M | `T2.1`/`T2.2` 的共同前置：项目零第三方依赖（Node 有内置 `WebSocket`，我们必须自研）。握手（`Sec-WebSocket-Key` + `Upgrade` 校验）、客户端掩码、分片与控制帧（ping/pong/close）、`recv()` 返回完整文本消息 | ☑ |
 | T2.1 | **Slack 入站** | M | Socket Mode：`apps.connections.open`（需 **app-level token `xapp-`**）换 WSS URL；**每个 envelope 必须 ack**（否则 Slack 重发）；3s 重连；`message`/`app_mention` → `Inbound`，先过 `admits()` 闸门 | ☑ |
-| T2.2 | **Discord 入站** | M | Gateway v10 WS + heartbeat + 事件去重；REST 侧复用现有发送 | ☐ |
+| T2.2 | **Discord 入站** | M | Gateway v10 WS + heartbeat + 事件去重；REST 侧复用现有发送 | ☑ |
 
 ---
 
@@ -184,3 +184,27 @@
   `edit()` 判真假 —— 是它自己偏离了契约，已改回 `bool`（而非反过来改契约迁就它）。
   验证：Matrix 在 `--status` 实跑中**自动出现**，全程未改任何平台注册代码。
   全量 **318 tests OK (skipped=1)**、compileall 0。
+- **2026-10-02** T2.2 Discord 入站完成：Gateway v10 over WebSocket，47 个用例（假 WS 注入，
+  零真实网络）。协议常量全部来自**官方文档 + 源码级核实**，其中纠正了若干凭记忆会写错的
+  地方：`heartbeat_interval` 单位是**毫秒**（按秒用会让心跳快 1000 倍、瞬间触发 4008
+  限流）；心跳的 `d` 键**不能省**（未收到事件时也要发 `{"op":1,"d":null}`）；网关主机名
+  已是 `gateway.discord.gg`，**必须**用 `GET /gateway/bot` 返回的 URL 而非硬编码；
+  `Resume` 必须用 READY 里的 `resume_gateway_url`（用错会显著提高断线率）。
+  另：invalid token 是 **4004** 而不是常被误传的 4010（4010 是 shard 参数错）；**4013 是
+  intent 位值非法、4014 是 intent 未在后台开启**，两者都属"停止重连"集合。
+  实现要点：
+  - intents 用位值表达式 `512|4096|32768`（=37376）而非裸数字：MESSAGE_CONTENT
+    (1<<15) 必须在 Developer Portal → **Bot 页 → Privileged Gateway Intents** 勾选，
+    否则 close 4014。
+  - 停止重连的判定：`{4004,4010,4011,4012,4013,4014}` → 打**带具体原因**的
+    error 后直接退出，不做无脑 while True 重连。
+  - 防回环**只用** `author.id == 自己的 user id`（READY 里缓存），**不用** `author.bot`
+    ——后者会把别的 bot 的消息也全丢掉。另有关 `author.bot` 键可能整个不存在。
+  - 事件过滤 7 条（含 IS_CROSSPOST 去重、`type != 0` 系统消息、webhook 消息）。
+  - 主动断开一律用 close 4000 而非 1000，保住 Resume 能力。
+  - `stop()` 三段式：停心跳线程 → 关 WS 唤醒阻塞 recv → 才 join。
+  顺带核实：现有 REST 出站**已有** `User-Agent` 且已显式 `/api/v10/`，无既有缺陷。
+  复核时处理了 lane 诚实报告的两条**旧断言**（它们描述的正是 T2.2 要废掉的 v1 状态）：
+  改为断言新事实；由于**所有真实平台现在都实现了入站**，"入站未实现"这一分支改用
+  **合成适配器**守护，否则该层语义将失去测试。
+  验证：**366 tests OK (skipped=1)**、compileall 0、`--status` 自动列出全部五个平台。

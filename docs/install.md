@@ -304,8 +304,28 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 >
 > 其它：`allowed_chat_ids` 填**会话 token**；消息上限 **32000 字符是源码硬编码常量、不可配置**（超限 413）；**支持编辑消息**但**超 24 小时不能改**；`poll_timeout` **上限就是 30**（源码 clamp）；`@提及` 不做渲染（模板串原样透传）。
 
+#### ntfy（支持双向对话 · HTTP 拉取，无需公网地址）
+
+1. 建一个话题（topic）
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "ntfy": {
+     "server": "https://ntfy.sh", "topic": "my-private-topic", "token": "tk_..."
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 往话题发一条通知（`curl -d "hi" ntfy.sh/my-private-topic`），收到回复即成功
+
+> ⚠️ **ntfy 没有用户身份概念** —— 任何能往话题发消息的人都会被当作用户。用**公共话题**
+> 等于把 agent 暴露给全网。**务必**用私有话题 + read token（或自建服务器开 access control）。
+>
+> 其它：`allowed_chat_ids` 填**话题名**；上限 **4096 是字节不是字符**（中文约 1365 字）；
+> **不支持编辑消息**，长任务进度会退化成连续发多条通知；**启动不重放历史缓存**。
+
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
-> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### Step 3: 激活（需要用户点头）
 

@@ -132,7 +132,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**八个平台全部支持双向对话**）：
+各平台当前能力一览（**九个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -142,6 +142,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Matrix | ✅ `/sync` 长轮询 | ✅ | ⚠️ 兼容近似 | 无标准编辑 API，见该节说明 |
 | Mattermost | ✅ WebSocket | ✅ | ✅ 原生 | 消息上限运行时从服务端读取 |
 | Nextcloud Talk | ✅ HTTP 长轮询 | ✅ | ✅ 原生（24 小时内） | 上限 32000 字符是源码硬编码常量 |
+| ntfy | ✅ HTTP `poll=1` + `since` 游标 | ✅ | ❌ 无 | 上限 4096 **字节**；**无用户身份**，务必用私有话题 + token |
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 
@@ -351,6 +352,33 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - `max_concurrent_polls`（默认 5）别调大：每个长轮询请求会占住一个服务端 worker 30 秒。`poll_timeout` **上限就是 30**（源码 clamp，填更大也会被服务端压回）。
 > - `@提及` 不做渲染：`message` 字段是含 `{mention-call1}` 占位符的模板串，v1 原样透传。
 
+### ntfy（支持双向对话 · HTTP 拉取，无需公网地址）
+
+1. 建一个话题（topic）。**强烈建议用私有话题 + read token**，理由见下面的信任模型。
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "ntfy": {
+     "server": "https://ntfy.sh", "topic": "my-private-topic",
+     "token": "tk_..."
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 往这个话题发一条通知（`curl -d "hi" ntfy.sh/my-private-topic`），收到回复即成功
+
+> ⚠️ **信任模型（重要）**：ntfy **没有用户身份概念** —— 任何能往话题发消息的人都会被当作用户。
+> 用公共话题（`ntfy.sh/<topic>`）等于**把你的 agent 暴露给全网**，任何人都能驱动它执行
+> 权限范围内的操作。**务必**用私有话题 + read token，或自建服务器开 access control。
+>
+> 其它要点：
+> - `allowed_chat_ids` 填**话题名**。
+> - 消息上限 **4096 是字节不是字符**（服务端受 FCM/APNS 约 4KB 约束），中文一字 3 字节，
+>   所以实际能放的中文字数约为 1365。桥接按字节切分，不会切出半个字符。
+> - **不支持编辑消息**（ntfy 没有 edit 端点），长任务的进度更新会退化成连续发多条通知。
+> - **不会重放历史**：启动时游标设为当前时间，之前缓存里的通知不会被当成新消息触发 agent。
+> - `echo_tag` 只用于**防回环**，不是身份认证 —— 别指望它挡住别人。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -525,6 +553,12 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.nextcloud.user_id` | `""` | 自己的 Nextcloud user id（**大小写敏感**）；留空则启动时自动调 `cloud/user` 取 |
 | `adapters.nextcloud.max_concurrent_polls` | `5` | 同时长轮询的会话数上限；每个长轮询会占住一个服务端 worker 30 秒，不宜过大 |
 | `adapters.nextcloud.poll_timeout` | `30` | 服务端长轮询秒数，**上限就是 30**（源码 clamp，再大也被服务端压回） |
+| `adapters.ntfy.server` | `"https://ntfy.sh"` | ntfy 服务器地址（可用自建） |
+| `adapters.ntfy.topic` | `""` | 订阅的话题名（**必填**）；`allowed_chat_ids` 填的就是它 |
+| `adapters.ntfy.token` | `""` | read token（`tk_…`）；私有话题必填 |
+| `adapters.ntfy.user` / `password` | `""` | 也可用 Basic 认证（与 `token` 二选一，`token` 优先） |
+| `adapters.ntfy.echo_tag` | `"opencode-bridge"` | 出站打这个 tag，入站见到即丢弃（**防回环**，不是身份认证） |
+| `adapters.ntfy.poll_interval` | `5.0` | 轮询间隔（秒） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

@@ -672,5 +672,82 @@ class TestFrameValidation(WsTestCase):
         self.assertFalse(ws.closed, "超时不代表连接已关闭")
 
 
+# ----------------------------------------------------------------------
+# 回归：握手与第一帧被服务端流水化（同一个 TCP 段）
+# ----------------------------------------------------------------------
+def _server_frame(opcode: int, payload: bytes | str) -> bytes:
+    """服务端 -> 客户端的帧字节（**不加掩码**，RFC 6455 只要求客户端帧加掩码）。"""
+    data = payload.encode("utf-8") if isinstance(payload, str) else payload
+    head = bytes([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        head += bytes([n])
+    else:
+        head += bytes([126]) + n.to_bytes(2, "big")
+    return head + data
+
+
+class TestPipelinedFirstFrame(WsTestCase):
+    """服务端把 101 响应与第一帧放进**同一次 sendall** 时，第一帧不能被吞。
+
+    ⚠️ 这是一条**真实丢帧**回归：``_read_http_response`` 为找 ``\\r\\n\\r\\n``
+    会多读出后面的字节，而 ``_check_handshake`` 曾经把它们丢掉（它只在
+    "握手被拒"的分支用到那段字节做错误提示）。于是客户端连得上、却**永远收不到
+    任何消息**，直到读超时——**且不报错**。
+
+    影响面：Discord 网关确实会把第一帧与握手流水化，Slack / Mattermost 同理；
+    症状是"平台连上了但一条消息都收不到"，极难定位。
+
+    修复：``connect()`` 把多读的字节存进 ``_prefetch``，``_read_frame`` 优先消费它。
+    """
+
+    #: 两个流水线帧，用来验证多帧与缓冲边界
+    _FRAMES = (
+        _server_frame(_OP_TEXT, "pipelined-1")
+        + _server_frame(_OP_TEXT, "pipelined-2")
+    )
+
+    @staticmethod
+    def responder(request_head: bytes) -> bytes:
+        """握手响应**里就带上第一帧** —— 模拟服务端流水化。"""
+        return make_response(request_head) + TestPipelinedFirstFrame._FRAMES
+
+    def test_first_frame_pipelined_with_handshake_is_not_lost(self) -> None:
+        """修复前：这一行会一直等到读超时（帧被静默丢弃）。"""
+        ws = self.connect_client(timeout=2.0)
+        self.assertEqual(ws.recv(), "pipelined-1")
+
+    def test_both_pipelined_frames_arrive_in_order(self) -> None:
+        """一次流水两帧时，两帧都要收到且顺序不乱。"""
+        ws = self.connect_client(timeout=2.0)
+        self.assertEqual(ws.recv(), "pipelined-1")
+        self.assertEqual(ws.recv(), "pipelined-2")
+
+    def test_pipelined_frames_do_not_break_normal_send(self) -> None:
+        """消费预读字节之后，后续的读**与写**仍要正常（缓冲边界没接错）。"""
+        ws = self.connect_client(timeout=2.0)
+        # 一次流水了**两**帧，两帧都要先取走
+        self.assertEqual(ws.recv(), "pipelined-1")
+        self.assertEqual(ws.recv(), "pipelined-2")
+        # 预读缓冲到此耗尽，之后应回到"从 socket 读"的正常路径
+        send_text(self.server_conn(), "after-pipeline")
+        self.assertEqual(ws.recv(), "after-pipeline")
+        ws.send("still-alive")
+        self.assertEqual(recv_masked_text(self.server_conn()), "still-alive")
+
+    def test_prefetch_is_fully_consumed_not_duplicated(self) -> None:
+        """预读缓冲必须被**恰好**消费完：既不丢也不重复。
+
+        重复是最隐蔽的失败模式 —— 同一条消息被处理两次（例如触发两次 agent 运行），
+        所以这条断言比"能收到"更重要。
+        """
+        ws = self.connect_client(timeout=2.0)
+        self.assertEqual(ws.recv(), "pipelined-1")
+        self.assertEqual(ws.recv(), "pipelined-2")
+        # 预读缓冲此时应为空；再收一条新发的，若预读没清空就会出现重复内容
+        send_text(self.server_conn(), "third")
+        self.assertEqual(ws.recv(), "third")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

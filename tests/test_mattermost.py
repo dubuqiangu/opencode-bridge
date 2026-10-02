@@ -1130,19 +1130,15 @@ class TestPingPongGuarantee(unittest.TestCase):
         reader.start()
         self.addCleanup(stop.set)
 
-        cli = ws_mod.WebSocketClient.__new__(ws_mod.WebSocketClient)
-        cli._url = "ws://local"
-        cli._timeout = 2.0
-        cli._extra_headers = {}
+        # 用正式的 __init__ 构造，再把已建好的 socketpair 塞进去绕过真实握手。
+        #
+        # 此前这里是 ``WebSocketClient.__new__(...)`` + 手工逐个赋值 13 个私有属性。
+        # 那是个**地雷**：``WebSocketClient`` 每新增一个实例属性（如``_prefetch``），
+        # 这个测试就会因 AttributeError 挂掉——而它挂掉的原因与被测的 ping/pong
+        # 保证毫无关系。``__init__`` 本身不做连接，所以这里没有理由绕过它。
+        cli = ws_mod.WebSocketClient("ws://local", timeout=2.0)
         cli._sock = client
         cli._closed = False
-        cli._close_sent = False
-        cli._close_received = False
-        cli._close_code = None
-        cli._close_reason = ""
-        cli._frag_opcode = None
-        cli._frag_buf = bytearray()
-        cli._send_lock = threading.Lock()
 
         for frame in frames:
             server.sendall(frame)

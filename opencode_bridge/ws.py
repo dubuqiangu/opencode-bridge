@@ -242,6 +242,10 @@ class WebSocketClient:
         self._close_received = False
         self._close_code: int | None = None
         self._close_reason = ""
+        # 握手阶段**已经读到 socket 里**、但不属于 HTTP 响应的字节。
+        # 见 connect() 里那段说明——服务端把 101 响应与第一帧放进同一个 TCP 段时，
+        # 这些字节就是第一帧；不消费掉就会静默丢帧。
+        self._prefetch: bytes = b""
 
         # 分片聚合状态：_frag_opcode 非 None 表示一条消息正在接收中
         self._frag_opcode: int | None = None
@@ -280,6 +284,8 @@ class WebSocketClient:
         request = self._build_request(target, key)
 
         raw: socket.socket | None = None
+        #: 握手时多读到的字节（可能是第一帧），握手成功后交给 _read_bytes 消费
+        prefetched: bytes = b""
         try:
             try:
                 raw = socket.create_connection((target.host, target.port), timeout=self._timeout)
@@ -293,6 +299,12 @@ class WebSocketClient:
                 sock.sendall(request)
                 head, body = _read_http_response(sock)
                 self._check_handshake(head, body, key)
+                # ⚠️ ``body`` 是 HTTP 响应头之后**已经躺在 socket 里**的字节。
+                # 服务端若把 101 响应与第一帧放进同一个 TCP 段（**流水线化**），
+                # 那它就是第一帧。此前这里把它丢掉了，于是客户端会一直干等到
+                # 读超时——症状是"连上了但收不到任何消息"，且**不报错**。
+                # Discord 网关确实会这么干，Slack / Mattermost 同理。
+                prefetched = body
             except WebSocketError:
                 raise
             except OSError as exc:
@@ -302,6 +314,7 @@ class WebSocketClient:
             raise
 
         self._sock = sock
+        self._prefetch = prefetched
         self._closed = False
         logger.debug("websocket 握手完成 %s", target.host_header)
 
@@ -421,10 +434,26 @@ class WebSocketClient:
                 return _decode_text(data)
             raise WebSocketError(f"未知 opcode: 0x{opcode:x}")
 
+    def _read_bytes(self, sock: socket.socket, size: int) -> bytes:
+        """读满 ``size`` 字节，**优先消费握手阶段多读进来的那些字节**。
+
+        服务端可能把 101 响应与第一帧放进同一个 TCP 段（流水线化）。那些字节在
+        :meth:`connect` 时就已经从 socket 里读出来了，若不从 ``_prefetch`` 里取回，
+        就会**静默丢帧** —— 症状是"连上了但永远收不到消息"。
+        """
+        if not self._prefetch:
+            return _recv_exact(sock, size)
+        if len(self._prefetch) >= size:
+            out, self._prefetch = self._prefetch[:size], self._prefetch[size:]
+            return out
+        out = self._prefetch + _recv_exact(sock, size - len(self._prefetch))
+        self._prefetch = b""
+        return out
+
     def _read_frame(self) -> tuple[bool, int, bytes]:
         """读一帧，返回 ``(fin, opcode, payload)``（payload 已解掩码）。"""
         sock = self._require_sock()
-        head = _recv_exact(sock, 2)
+        head = self._read_bytes(sock, 2)
         b0, b1 = head[0], head[1]
         fin = bool(b0 & 0x80)
         if b0 & 0x70:
@@ -433,9 +462,9 @@ class WebSocketClient:
         masked = bool(b1 & 0x80)
         size = b1 & 0x7F
         if size == 126:
-            size = int.from_bytes(_recv_exact(sock, 2), "big")
+            size = int.from_bytes(self._read_bytes(sock, 2), "big")
         elif size == 127:
-            size = int.from_bytes(_recv_exact(sock, 8), "big")
+            size = int.from_bytes(self._read_bytes(sock, 8), "big")
             if size >= 1 << 63:
                 raise WebSocketError("64 位长度最高位必须为 0（RFC 6455 §5.2）")
         if opcode & 0x08:
@@ -443,8 +472,8 @@ class WebSocketClient:
                 raise WebSocketError("控制帧不允许分片（FIN 必须为 1）")
             if size > _MAX_CONTROL_PAYLOAD:
                 raise WebSocketError(f"控制帧 payload 超过 {_MAX_CONTROL_PAYLOAD} 字节")
-        mask = _recv_exact(sock, 4) if masked else b""
-        payload = _recv_exact(sock, size)
+        mask = self._read_bytes(sock, 4) if masked else b""
+        payload = self._read_bytes(sock, size)
         if masked:
             # 服务端本不该掩码；真出现了也按 RFC 还原（宽容处理，不静默出错）
             payload = _mask(payload, mask)

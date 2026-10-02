@@ -89,7 +89,7 @@
 
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
-| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 3/10：IRC ✓ Matrix ✓ Telegram ✓**（下一个：Slack / Discord） |
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 4/11：IRC ✓ Matrix ✓ Telegram ✓ Slack ✓**（下一个：Discord） |
 | A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**迁移进度 1/9：IRC ✓**（`irc` 前缀在 `LEGACY_PREFIXES` 里映射到自身，故 `conversation_id` 字节级不变，已用断言钉死） |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
 
@@ -693,4 +693,39 @@
     这种诚实标注比"全绿即完成"有价值得多。
   验证：**1150 tests OK (skipped=1)**、compileall 0；`--status` 实跑**11 个平台**，
   a2a 自动出现且显示"已配置"，其余 10 个仍如实"未配置"。
+- **2026-10-03** **A1 迁移第 4 家：Slack**（29 个新用例，`+225/−60`）：
+  - 迁移前退避已确认是**常数**（`RECONNECT_DELAY = 3.0` 字面量），
+    `min_backoff`/`max_backoff` 接同值 + `reset_after=0.0`。
+  - **Socket Mode 四条铁律全部保住**（每条都是本项目踩过的坑）：
+    ① `disconnect` **主动重连**（重取 WSS URL —— 它约 1 小时过期）；② **每个 envelope
+    都必须 ack，包括被过滤掉的**（漏 ack → Slack **无限重发**）；③ 授权闸门在最前，
+    但**被丢弃的 envelope 仍要 ack**；④ **先 ack 再过滤**。
+    机制上：`ReconnectNow` 放在**传输层的 `on_message` 钩子**里而不是塞进读循环，
+    基类捕获后 `immediate=True` **跳过退避**；而 `_handle_envelope` **函数体逐字未动**
+    （已核对 diff 确认），ack 仍写在第一个 `return` 之前，所以每个提前 return 的分支
+    都已 ack。**旧连接消息被丢弃是结构保证**（连接已被 `_close_conn` 关掉，`_pump`
+    不会再 `_next` 它），用例断言旧 WS 的 `recv_calls` **冻结**在 1。
+  - **⚠️ 一处真实的行为差异（我核实后确认并如实记录）**：迁移前 disconnect 走
+    `wait(RECONNECT_DELAY)` **等 3 秒**才重连；迁移后走 `ReconnectNow` **立刻重连
+    （零等待）**。既有测试把 `RECONNECT_DELAY` patch 成 0.01，**分辨不出**这个差异，
+    所以靠代码注释 + 新用例（`RECONNECT_DELAY=30` 时仍立刻重连）留痕。
+    **我的判断**：这是改善而非退化 —— `disconnect` 意味着 WSS URL 即将失效、
+    本来就必须换一条连接，等 3 秒没有意义。但它确实是差异，**不该被静默接受**。
+  - **顺带修掉一个真bug**：迁移前 `start()` 漏了 `_stop_event.clear()`，
+    所以 **stop 后重启同一实例会静默不工作**。已补（irc/matrix/telegram 迁移时也补了）。
+  - **零改动既有测试**：`git diff --stat` 只有 `slack.py` 一个文件，`tests/` 零改动、
+    **零断言被删**。既有 Slack 相关 59 条用例全绿 —— 靠的是保留了
+    `_handle_envelope(ws, raw) -> bool` 等注入点签名。
+  - **一处必要的结构决定**：`WebSocketTransport` 会把同一帧**既给 `on_message` 又给
+    `on_event`**，而既有测试钉死了 `_handle_envelope` 的签名，所以全部语义走
+    `on_message`，`on_event` 是**显式空实现 + 长注释**；并专门加了"一帧只投递一次"
+    的用例证明**没有双重投递**。
+  - **代码量**：净 +165 行，但按 tokenize 拆开，**其中 140 行是 docstring**，
+    **真实代码只多了 4 行**（277 → 281）。删掉的样板 49 行、加的接缝 97 行。
+    与 Matrix / Telegram 同向"变多"，但这家的增量**几乎全在解释"为什么"**。
+  - lane 主动标注的诚实项：`stop()` 时会多一条 `transport[slack]: 会话出错` WARNING
+    （唤醒阻塞 `recv()` 以异常收场，**功能无影响**）；防走偏前缀的 `assert` 在
+    `python -O` 下会被剥掉（所有 assert 都如此，真要硬保证应改显式 `raise`；
+    matrix/telegram 同款，保持一致故未改）。
+  验证：**test_slack 29 OK**、跨平台 **644 OK**、compileall 0。
 

@@ -33,6 +33,7 @@ from typing import Any, Callable
 from .adapters import Adapter
 from .config import DEFAULT_CONFIG_NAME, Config
 from .hooks import Button, Inbound, MsgHandle, Outbound  # BridgeCore implements Hooks
+from .identity import LEGACY_PREFIXES
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .state import StateStore
 
@@ -411,21 +412,66 @@ class BridgeCore:
     def _route_by_prefix(
         self, conversation_id: str, adapters: list[Adapter]
     ) -> Adapter:
+        """按 ``conversation_id`` 的平台段猜适配器 —— **兜底路径，不是主路径**。
+
+        ⚠️ **主路径是 :meth:`_remember_platform`**：入站时产生这条消息的适配器
+        自己就知道自己是谁（``Inbound.platform``），那里没有不确定性。这里只在
+        "这个目标从未收到过入站消息"（例如让agent 主动往某个 chat 发消息）时才会被走到。
+
+        **为什么这里必须覆盖全部前缀**：A1 迁移打掉了"按调用线程判断归属"那层保护
+        —— 已迁移的适配器不再持有 ``_thread``，``_adapter_for`` 里的线程匹配恒不命中。
+        而本方法此前只硬编码了 ``chat:`` 与 ``channel:`` 两种，其余一律
+        ``adapters[0]``；``attach()`` 的顺序就是**配置文件里的字典顺序**（用户可控），
+        于是多平台用户可能把回复发到**错误的平台** —— 且不报错。
+        """
         def named(name: str) -> Adapter | None:
             for adapter in adapters:
                 if adapter.name == name:
                     return adapter
             return None
 
-        if conversation_id.startswith("chat:"):
-            return named("telegram") or adapters[0]
-        if conversation_id.startswith("channel:"):
-            rest = conversation_id[len("channel:"):]
-            # Discord channel ids are numeric, Slack ids start with "C..."
+        cid = str(conversation_id or "")
+        head, sep, rest = cid.partition(":")
+
+        # 旧别名以 identity 的登记表为准，避免这里变成第二份真相。
+        # 值为 None 表示**歧义**前缀（``channel:`` 被 slack/discord/mattermost 共用）。
+        legacy = LEGACY_PREFIXES.get(head, "missing")
+        if legacy is None:
+            # 歧义前缀只能启发式：Slack id 以 C/D 开头、Discord 是纯数字、
+            # Mattermost 是 26 位 base32。**这仍然可能猜错** —— 真正的确定性来自
+            # :meth:`_remember_platform`，这里只是没有别的办法时的兜底。
             if rest.isdigit():
                 return named("discord") or named("slack") or adapters[0]
             return named("slack") or named("discord") or adapters[0]
+        if legacy != "missing" and legacy != head:
+            # 真正的别名（``chat``→telegram、``room``→matrix）
+            hit = named(legacy)
+            if hit is not None:
+                return hit
+
+        # 新格式 ``platform:local_id``（以及映射到自身的 irc/twitch/nextcloud）：
+        # **平台段本身就是答案**，不需要任何猜测。
+        if sep:
+            hit = named(head)
+            if hit is not None:
+                return hit
         return adapters[0]
+
+    def _remember_platform(self, conversation_id: str, platform: str) -> None:
+        """记下"这个会话属于哪个适配器" —— 用的是**准确**信息。
+
+        产生这条入站消息的适配器就是它自己（``Inbound.platform``），所以这一步
+        没有不确定性。对比 :meth:`_route_by_prefix` 的前缀猜测：猜错的后果是把回复
+        发到**另一个平台**，且不报错、只表现为"用户发现回复跑错了地方"。
+
+        A1 迁移之前这里还有第二个来源 —— "调用线程是否等于某适配器的 ``_thread``"。
+        迁移后该字段恒为 ``None``，那条路失效了，所以必须靠本方法兜住。
+        """
+        name = str(platform or "").strip()
+        if not name or not conversation_id:
+            return
+        with self._lock:
+            self._conv_adapter[conversation_id] = name
 
     def _adapter_for(self, conversation_id: str) -> Adapter | None:
         """Pick the adapter that owns ``conversation_id``.
@@ -463,11 +509,15 @@ class BridgeCore:
     # ------------------------------------------------------------------
     def on_inbound(self, inbound: Inbound) -> None:
         try:
+            conversation_id = str(inbound.conversation_id or "")
+            # ⚠️ 必须**先**记映射、再处理 is_callback 早退 —— 按钮回调那条路
+            # 本身会return 掉，若在这里记就漏了它，后续 :meth:`on_callback` 只能靠
+            # 前缀去猜是哪个适配器。
+            self._remember_platform(conversation_id, inbound.platform)
             if inbound.is_callback:
                 # Lane B fires on_inbound(kind="callback") *before*
                 # on_callback(); handling it here as well would double-send.
                 return
-            conversation_id = str(inbound.conversation_id or "")
             text = _clean(inbound.text).strip()
             if not conversation_id or not text:
                 return

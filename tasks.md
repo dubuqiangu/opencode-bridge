@@ -89,7 +89,7 @@
 
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
-| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 2/10：IRC ✓ Matrix ✓**（下一个：Telegram / Slack） |
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 3/10：IRC ✓ Matrix ✓ Telegram ✓**（下一个：Slack / Discord） |
 | A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**迁移进度 1/9：IRC ✓**（`irc` 前缀在 `LEGACY_PREFIXES` 里映射到自身，故 `conversation_id` 字节级不变，已用断言钉死） |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
 
@@ -605,4 +605,50 @@
     收益是**概念性**的（不变量由一份实现 + 独立测试守住），不是行数。
   - 验证：14 条 markdown 内部链接**零断链**（第一次的检查脚本自身有 bug，误报 8 条
     BROKEN，改正后为 0）；**无任何测试读取 markdown**（故改文档不影响测试）；compileall 0。
+- **2026-10-03** **A1 迁移第 3 家：Telegram**（34 个新用例），并因此**发现并修掉一个
+  A1迁移自己引入的跨平台误路由回归**：
+  - Telegram 侧：删掉 `_poll_loop()`（手写循环 + 字面量 `wait(2.0)` + 建线程），
+    改用 `PollingTransport`。前缀**保持 `chat:` 不变**并加两条显式断言钉住，其中一条
+    真写 `StateStore` 再重开，**证明切前缀会让键成孤儿**。
+    - **迁移前是常数退避**（`_poll_loop` 里一个字面量 `wait(2.0)`，无任何增长），
+      所以 `min_backoff` 与 `max_backoff` **接成同值** → 传输层退避恒定。若只设
+      `min_backoff` 而不管 `max_backoff`，传输层默认会把它变成**指数退避**。
+      用例锁在"连续 4 次全是2.0"。
+    - **长轮询超时的两层关系**：socket 超时必须 **>** 服务端 `timeout`（25 → 40），
+      否则会在服务端返回前先本地超时；并验证它**跟着 `poll_timeout` 走**（不是常数 40）。
+    - **按钮能力不许丢**（Telegram 是仓库里唯一 `supports_inline_buttons=True`）：
+      5 条用例，含"回调 hook 崩了**仍**在 `finally` 里应答 callback query"。
+    - **`allowed_updates`（服务端侧订阅范围）与客户端入站过滤是两处不同机制**，
+      刻意分开断言 —— 迁移极易把两者搞混。
+    - **一个现有用例都没改**：Telegram 的既有用例住在 `tests/test_adapters.py`（未动），
+      11 个全绿。靠的是保留了 `_post`/`_flush_pending`/`_poll_once`/`_dispatch_update`
+      这些注入点与签名。
+    - 代码量**变多 +50 行真实代码**（第三次同向）：删的只是 5~10 行胶水，加的是必须逐条
+      说明"迁移前是什么"的接缝与docstring。**迁移的收益是概念性的，不是行数。**
+  - ⚠️ **回归（本轮最重要的收获）**：Telegram lane 报告 `core.py::_adapter_for` 靠
+    `getattr(adapter, "_thread")` 匹配**调用线程**来判定归属，而迁移后该字段恒为
+    `None` → 这层保护失效，落到了 `_route_by_prefix`。我核实后发现**问题比它报告的更严重**：
+    1. `Inbound` **本来就有 `platform` 字段**（适配器自己知道是谁），却从没用过；
+    2. 旧 `_route_by_prefix` **只硬编码了 `chat:` 与 `channel:` 两种前缀**，其余一律
+       `return adapters[0]` —— 而 `attach()` 顺序就是**配置文件字典顺序**（用户可控）；
+    3. `_adapter_for` 会把**猜出来的**名字写进 `_conv_adapter` 缓存，**第一次猜错会粘住**
+       后续所有查找；
+    4. **`_adapter_for` / `_route_by_prefix` / `_conv_adapter`此前零测试覆盖** ——
+       这就是回归能活下来的原因。
+    **用旧逻辑复刻验证**（挂载顺序 matrix 在前）：`irc:#chan`、`room:!a:b`、
+    `ntfy:topic`、`email:bot@x.com`、`chat:55` 五个里有**四个**被路由到**错误的适配器**。
+    即：用户配了 Matrix + IRC，**IRC 收到的消息回复会发到 Matrix**，且不报错。
+    连 `chat:` 也不安全 —— 旧逻辑 `named("telegram") or adapters[0]`，telegram 未挂载时
+    照样落到别人。
+    - **修法（两层）**：① 新增 `_remember_platform()`，在 `on_inbound` 里用
+      `Inbound.platform`（**准确**信息）种下映射 —— 且必须**在 `is_callback` 早退之前**，
+      否则按钮回调那条路会漏；② 重写 `_route_by_prefix` 覆盖**全部**前缀，借
+      `identity.LEGACY_PREFIXES` 解析（旧别名为 `None` 即歧义，保留启发式并注明它只是兜底），
+      避免此处变成第二份真相。
+    - 新增 `tests/test_routing.py`（17 用例）补上这块的**零覆盖**。其中回归本体那条
+      **故意把挂载顺序设成与前缀相反**（先matrix 后 irc）。
+    - 我**没有**只靠"新用例通过"就收工 —— 通过不等于有效，所以额外**复刻旧逻辑验证过
+      它确实会错**。过程中我自己的一个断言也写错了（把"缓存里有键"当成污染，
+      实际那是 `_adapter_for` 本来就会做的正确缓存行为），已改为守更精确的不变量：
+      **空 `platform` 不许覆盖已有的准确映射**。
 

@@ -1,6 +1,10 @@
 # opencode-bridge 路线图 · tasks.md
 
 > 本文件是**执行台账**：每完成一项就地勾选并追加进度日志。
+>
+> **本文件是"做到哪一步了"，不是"这项目长什么样"。** 想理解架构看
+> [`docs/architecture.md`](docs/architecture.md)（分层、数据流、以及**踩坑总结出的关键不变量**）；
+> 想**加一个新平台**看 [`docs/adding-a-platform.md`](docs/adding-a-platform.md)（八步 + 坑清单）。
 > 设计依据见 [`docs/platform-design-reference.md`](docs/platform-design-reference.md)（Hermes / dsh-im-gateway 三方对比）。
 > 扩展前稳定点：tag `backup/pre-platform-expansion-20261002`（`06a7d2f`）。
 
@@ -576,4 +580,29 @@
     `assertIsNone(adapter._thread)`（线程归传输层后该字段**恒为 None**，断言它等于断言
     恒真），已替换为`assertIsNone(adapter.transport)` + `not running`。
   验证：**965 tests OK (skipped=1)**、compileall 0、`--status` 十个平台。
+- **2026-10-03** **补上两份缺失的文档**（用户提出"是否一边实现一边记录、方便以后了解项目"，
+  清点后确认记录一直在做，但**有两个真实缺口**）：
+  -清点结论：记录机制**已存在且够细** —— 本台账579 行、每个 commit 带完整实现理由、
+    模块docstring 写了协议事实与踩坑。**缺的是两样**：
+    ①**没有架构总览** —— 想理解"分层怎么搭起来"只能读本台账 579 行**按时间排**的日志；
+    ② **没有"如何加一个平台"指南** —— 而这正是整个重构的立身目标，目前只散落在
+    本台账与 commit 里。
+  - **`docs/architecture.md`（164 行）**：分层图、入站/出站两条完整数据流、模块职责表
+    （含"**不该出现在这里的东西**"一列，防止职责漂移）、以及最有价值的
+    **16 条关键不变量** —— 每条都是踩坑后定下的（契约类 4 条、会话标识 3 条、传输层 3 条、
+    与外部系统打交道 6 条、测试 2 条），并标注了编号供其它文档引用。
+  - **`docs/adding-a-platform.md`（192 行）**：**筛选闸门**（三条准入，任一不满足就停）
+    → **八步**（查证协议事实 / 声明能力 / 声明凭据 / 接线传输层 / 授权闸门在最前 /
+    防回环 / 出站 / 用户可见的四处文档）→ **坑清单**（按类分，含"防回环只能用平台签发
+    字段"对照表：ntfy 用 `tags` 不可用 `title`、email 用 `Message-ID` 不可用 `From`、
+    Discord 用 `author.id` 不可用 `author.bot`）→ 测试要求与验收命令。
+  - 两份文档都写明了**用户可见的四处**（README / install.md / plugin/README.md /
+    tasks.md 进度日志），并特别标注 **`/setup` 引导是刻意维护的冻结文案、默认不要动**。
+  - **顺手修掉一处过时说法**：README 第一句仍写"把 Telegram / Slack / Discord 的消息
+    桥接"，而实际已是**十个平台全部双向对话** —— 这正是"新增平台时顺手核对旧说法"那条
+    纪律要防的事 itself，与历史上"9 处文档仍写仅支持主动发送"同类。
+  - 文档也写了**迁移的诚实结论**：IRC 迁移真实代码净减 42 行、**Matrix 反而多 8 行** ——
+    收益是**概念性**的（不变量由一份实现 + 独立测试守住），不是行数。
+  - 验证：14 条 markdown 内部链接**零断链**（第一次的检查脚本自身有 bug，误报 8 条
+    BROKEN，改正后为 0）；**无任何测试读取 markdown**（故改文档不影响测试）；compileall 0。
 

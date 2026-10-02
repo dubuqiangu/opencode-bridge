@@ -3,7 +3,20 @@
 [![CI](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-把 Telegram / Slack / Discord 的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+把 **10 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+
+支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch —— **十个全部支持双向对话**。
+
+## 📖 文档
+
+| 想知道 | 看哪 |
+|---|---|
+| 每个平台怎么配、怎么验证 | [`docs/install.md`](docs/install.md) |
+| **这项目是怎么搭起来的** | [`docs/architecture.md`](docs/architecture.md) |
+| **怎么加一个新平台** | [`docs/adding-a-platform.md`](docs/adding-a-platform.md) |
+| 做到哪一步了、为什么这样选 | [`tasks.md`](tasks.md) |
+| 与 Hermes / dsh-im-gateway 的对比 | [`docs/platform-design-reference.md`](docs/platform-design-reference.md) |
+| 如何更新已安装的版本 | [`docs/update.md`](docs/update.md) |
 
 ## 🚀 一行安装
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import unittest
@@ -32,6 +33,30 @@ class RecordingHooks:
     def on_callback(self, conversation_id: str, data: str, query_id: str) -> None:
         self.callbacks.append((conversation_id, data, query_id))
         self.events.append(("callback", conversation_id, data, query_id))
+
+
+class FakeWS:
+    """最小假 WebSocket：按脚本逐条吐出文本，脚本空则返回 None 表示对端关闭。
+
+    只实现 Slack 入站用到的三个方法（recv / send / close），用于验证协议层逻辑，
+    不涉及真实 socket —— 真实 RFC 6455 收发由 ``tests/test_ws.py`` 用真服务器覆盖。
+    """
+
+    def __init__(self, script=None):
+        self.script = list(script or [])
+        self.sent: list[str] = []
+        self.closed = False
+
+    def recv(self):
+        if self.script:
+            return self.script.pop(0)
+        return None
+
+    def send(self, text: str) -> None:
+        self.sent.append(text)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def make_telegram(config: dict | None = None, hooks: RecordingHooks | None = None):
@@ -426,6 +451,212 @@ class TestDiscordAdapter(unittest.TestCase):
             adapter.start()
 
 
+class TestSlackInbound(unittest.TestCase):
+    """T2.1 — Slack Socket Mode 入站：先 ack 再过滤、授权闸门在最前、断线重连。"""
+
+    @staticmethod
+    def _envelope(env_id="e1", event=None, etype="events_api"):
+        env = {"envelope_id": env_id, "type": etype}
+        if event is not None:
+            env["payload"] = {"event": event}
+        return json.dumps(env)
+
+    @staticmethod
+    def _msg(text="hi", channel="C1", user="U1", ts="111.222", **extra):
+        ev = {"type": "message", "text": text, "channel": channel, "user": user, "ts": ts}
+        ev.update(extra)
+        return ev
+
+    def _adapter(self, hooks, **cfg):
+        base = {"bot_token": "xoxb-t", "app_token": "xapp-t"}
+        base.update(cfg)
+        adapter = build("slack", base, hooks)
+        adapter.min_interval = 0
+        return adapter
+
+    def test_message_event_becomes_inbound(self):
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        adapter._handle_envelope(ws, self._envelope(event=self._msg()))
+        self.assertEqual(len(hooks.inbounds), 1)
+        ib = hooks.inbounds[0]
+        self.assertEqual(ib.conversation_id, "channel:C1")
+        self.assertEqual(ib.text, "hi")
+        self.assertEqual(ib.user_id, "U1")
+        self.assertEqual(ib.message_id, "111.222")
+        self.assertEqual(ib.platform, "slack")
+
+    def test_every_envelope_is_acked_before_filtering(self):
+        """漏 ack 会让 Slack 无限重发；连 hello / 无关事件也必须 ack。"""
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        adapter._handle_envelope(ws, self._envelope("e-hello", etype="hello"))
+        adapter._handle_envelope(ws, self._envelope("e-noise", event={"type": "reaction_added"}))
+        self.assertEqual(len(ws.sent), 2, ws.sent)
+        self.assertEqual(json.loads(ws.sent[0]), {"envelope_id": "e-hello"})
+        self.assertEqual(json.loads(ws.sent[1]), {"envelope_id": "e-noise"})
+        self.assertEqual(hooks.inbounds, [])
+
+    def test_authorization_gate_runs_before_inbound(self):
+        """未授权频道必须被丢弃 —— 授权在入站最前，命令/审批字不能绕过。"""
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks, allowed_chat_ids=["C_allow"])
+        ws = FakeWS()
+        adapter._handle_envelope(ws, self._envelope(event=self._msg(channel="C_other")))
+        self.assertEqual(hooks.inbounds, [])
+        self.assertEqual(len(ws.sent), 1, "被丢弃的 envelope 仍需 ack")
+
+        adapter._handle_envelope(ws, self._envelope("e2", event=self._msg(channel="C_allow")))
+        self.assertEqual(len(hooks.inbounds), 1)
+
+    def test_empty_allowlist_admits_all(self):
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)  # 未设白名单 = 全开（v1 语义）
+        ws = FakeWS()
+        adapter._handle_envelope(ws, self._envelope(event=self._msg(channel="C_any")))
+        self.assertEqual(len(hooks.inbounds), 1)
+
+    def test_bot_echo_and_subtype_ignored(self):
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        adapter._handle_envelope(ws, self._envelope(event=self._msg(bot_id="B1")))
+        adapter._handle_envelope(ws, self._envelope("e2", event=self._msg(subtype="message_changed")))
+        self.assertEqual(hooks.inbounds, [])
+
+    def test_malformed_and_empty_payloads_ignored(self):
+        hooks = RecordingHooks()
+        adapter = self._adapter(hooks)
+        ws = FakeWS()
+        adapter._handle_envelope(ws, "not json{")
+        adapter._handle_envelope(ws, "[]")
+        adapter._handle_envelope(ws, self._envelope(event=self._msg(text="")))
+        adapter._handle_envelope(ws, self._envelope(event=self._msg(channel="")))
+        self.assertEqual(hooks.inbounds, [])
+
+    def test_capability_now_declares_inbound(self):
+        adapter = self._adapter(RecordingHooks())
+        self.assertTrue(adapter.supports_inbound)
+        self.assertIn("app_token", str(adapter.config))
+
+    def test_start_without_app_token_is_outbound_only(self):
+        hooks = RecordingHooks()
+        adapter = build("slack", {"bot_token": "xoxb-t"}, hooks)
+        adapter.start()
+        self.assertFalse(adapter.running, "缺 app_token 时不应起入站线程")
+
+    def test_loop_reconnects_and_stop_closes_socket(self):
+        import opencode_bridge.adapters.slack as slack_mod
+
+        old_delay = slack_mod.RECONNECT_DELAY
+        slack_mod.RECONNECT_DELAY = 0.01  # 别让测试等 3s
+        try:
+            hooks = RecordingHooks()
+            adapter = self._adapter(hooks)
+            sockets: list[FakeWS] = []
+
+            def factory(url):
+                s = FakeWS()          # 立刻返回 None → 触发重连
+                sockets.append(s)
+                return s
+
+            adapter._ws_factory = factory
+            adapter._open_socket_url = lambda: "wss://example/ws"
+            adapter.start()
+            deadline = time.time() + 3
+            while len(sockets) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            adapter.stop()
+            self.assertGreaterEqual(len(sockets), 2, "断开后应重连")
+            self.assertTrue(sockets[0].closed, "stop 应关闭活动连接")
+            self.assertFalse(adapter.running)
+        finally:
+            slack_mod.RECONNECT_DELAY = old_delay
+
+
+class TestSlackInboundRealWebSocket(unittest.TestCase):
+    """T2.0↔T2.1 接缝的**真 socket 联调**。
+
+    前面 ``TestSlackInbound`` 用假 WS 验证协议层、``test_ws.py`` 用裸服务器验证
+    传输层，但"``ws.connect`` 出来的对象能不能被 ``_handle_envelope`` 正常 ack"
+    这个接缝此前没有任何测试覆盖。这里用真服务器线程 + 真 WebSocket 客户端跑通
+    完整链路：握手 → 收包 → 授权 → Inbound → ack 掩码帧回到服务器。
+    """
+
+    @staticmethod
+    def _load_ws_test_helpers():
+        # ``unittest discover -s tests`` 以顶层模块名导入，``python -m unittest
+        # tests.test_x`` 则以包名导入 —— 两种跑法都得能用。
+        try:
+            from tests.test_ws import Server, recv_masked_text, send_text
+        except ImportError:
+            from test_ws import Server, recv_masked_text, send_text
+        return Server, recv_masked_text, send_text
+
+    def test_end_to_end_over_real_websocket(self):
+        from opencode_bridge.ws import connect as ws_connect
+
+        Server, recv_masked_text, send_text = self._load_ws_test_helpers()
+
+        hooks = RecordingHooks()
+        adapter = build("slack", {"bot_token": "xoxb-t", "app_token": "xapp-t"}, hooks)
+        adapter.min_interval = 0
+
+        server = Server()
+        self.addCleanup(server.stop)
+
+        calls = []
+
+        def open_url():
+            # 只允许建一次连接：否则 stop 之后重连会挂在新连接上等握手超时。
+            if calls:
+                raise RuntimeError("测试只允许建一次连接")
+            calls.append(server.url)
+            return server.url
+
+        adapter._open_socket_url = open_url
+        adapter._ws_factory = lambda url: ws_connect(url)   # 走真实实现，不用假 WS
+
+        server.start_server()
+        adapter.start()
+        try:
+            conn = server.wait_handshake()
+            send_text(
+                conn,
+                json.dumps(
+                    {
+                        "envelope_id": "E1",
+                        "type": "events_api",
+                        "payload": {
+                            "event": {
+                                "type": "message",
+                                "text": "真 socket 联调",
+                                "channel": "C_REAL",
+                                "user": "U_REAL",
+                                "ts": "1700000000.000100",
+                            }
+                        },
+                    }
+                ),
+            )
+
+            deadline = time.time() + 5
+            while not hooks.inbounds and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(hooks.inbounds), 1, "真 WS 收到消息后应产生 Inbound")
+            self.assertEqual(hooks.inbounds[0].conversation_id, "channel:C_REAL")
+            self.assertEqual(hooks.inbounds[0].text, "真 socket 联调")
+            self.assertEqual(hooks.inbounds[0].user_id, "U_REAL")
+            self.assertEqual(hooks.inbounds[0].platform, "slack")
+
+            # ack 必须以「客户端掩码帧」回到服务器；recv_masked_text 会校验 MASK 位
+            self.assertEqual(json.loads(recv_masked_text(conn)), {"envelope_id": "E1"})
+        finally:
+            adapter.stop()
+
+
 class TestSendResult(unittest.TestCase):
     """T1.3 — 出站错误分类：失败从"静默 None"变成结构化可观测数据。"""
 
@@ -552,7 +783,7 @@ class TestCapabilities(unittest.TestCase):
         expected = {
             "telegram": {"max_message_length": 4096, "supports_inbound": True,
                          "supports_inline_buttons": True, "supports_media": True},
-            "slack": {"max_message_length": 40000, "supports_inbound": False,
+            "slack": {"max_message_length": 40000, "supports_inbound": True,
                       "supports_inline_buttons": False, "supports_media": False},
             "discord": {"max_message_length": 2000, "supports_inbound": False,
                         "supports_inline_buttons": False, "supports_media": False},

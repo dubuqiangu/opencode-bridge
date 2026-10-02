@@ -38,7 +38,8 @@
 
 | # | 任务 | 难度 | 要点 | 状态 |
 |---|---|---|---|---|
-| T2.1 | **Slack 入站** | M | Socket Mode（`apps.connections.open` 换 WSS）；**每个 envelope 必须 ack**（否则 Slack 重发）；3s 重连 | ☐ |
+| T2.0 | **最小 WebSocket 客户端**（纯标准库，RFC 6455） | M | `T2.1`/`T2.2` 的共同前置：项目零第三方依赖（Node 有内置 `WebSocket`，我们必须自研）。握手（`Sec-WebSocket-Key` + `Upgrade` 校验）、客户端掩码、分片与控制帧（ping/pong/close）、`recv()` 返回完整文本消息 | ☑ |
+| T2.1 | **Slack 入站** | M | Socket Mode：`apps.connections.open`（需 **app-level token `xapp-`**）换 WSS URL；**每个 envelope 必须 ack**（否则 Slack 重发）；3s 重连；`message`/`app_mention` → `Inbound`，先过 `admits()` 闸门 | ☑ |
 | T2.2 | **Discord 入站** | M | Gateway v10 WS + heartbeat + 事件去重；REST 侧复用现有发送 | ☐ |
 
 ---
@@ -132,3 +133,20 @@
   两处维护同一行为。验证：200 tests OK、compileall 0、ZWJ 守恒（1800 个 ZWJ / 82 段无孤立
   ZWJ 开头）、国旗与键帽未拆。
 - **阶段 1 完成**（T1.1~T1.5 全部 ☑）。下一阶段：T2.1 Slack 入站。
+- **2026-10-02** T2.0 + T2.1 完成（同一个 commit，两者必须一起落地）：
+  - **T2.0** `opencode_bridge/ws.py`（531 行，RFC 6455，纯标准库）：握手三重校验
+    （`101` / `Upgrade` / `Sec-WebSocket-Accept = base64(sha1(key+GUID))`）、客户端强制掩码、
+    分片聚合、控制帧可插在分片中间（ping 自动回 pong）、`recv()` 只在收到对端 close 时返回
+    `None`（超时/裸断都抛 `WebSocketError`，**不用 `None` 混淆"关闭"与"超时"**）。
+    47 个用例用**真 socket 服务器线程**（绑 `127.0.0.1:0`）跑，**0 mock**；测试里服务端用
+    一份独立实现算 `Accept`，两边各算一遍握手才有意义。
+  - **T2.1** Slack Socket Mode 入站：新增 `app_token`（`xapp-`）配置；**先 ack 再过滤**
+    （`hello` 与无关事件也要回 `envelope_id`，漏 ack 会让 Slack 无限重发）；授权闸门
+    `admits(channel)` 在最前（被丢弃的 envelope 仍 ack）；丢弃 bot 回声与 `subtype`；
+    3s 重连；`stop()` **先关 WS 再停线程**（否则基类 join 5s 而 `recv()` 可能阻塞 30s）；
+    缺 `app_token` 时降级为"只发出站"并告警。
+  - **补上了一个真实覆盖缺口**：`TestSlackInbound` 用假 WS 测协议层、`test_ws.py` 用裸服务器
+    测传输层，但"两者对接处"此前无任何覆盖。新增 `TestSlackInboundRealWebSocket`：
+    真服务器 + 真 `ws.connect` 跑通 握手 → 收包 → 授权 → Inbound → ack 掩码帧回到服务器。
+  - 验证：**257 tests OK (skipped=1)**、compileall 0、两种跑法（`discover -s tests` 的顶层
+    模块名 与 `python -m unittest tests.test_x` 的包名）导入均正常。

@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from typing import Any, List, Optional, Tuple
 
-from ..hooks import Hooks, MsgHandle, Outbound, SendError
+from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
 from .base import Adapter, classify_http, register
 
@@ -28,6 +28,7 @@ MESSAGE_LIMIT = 40000        # Slack hard-truncates beyond ~40k characters
 MIN_SEND_INTERVAL = 1.2      # per-conversation send/edit throttle (seconds)
 SOCKET_TIMEOUT = 30.0
 MAX_RETRY_AFTER = 60.0
+RECONNECT_DELAY = 3.0        # Socket Mode 断开后的重连间隔（秒）
 
 
 def _classify_slack_error(status: int, error: str) -> SendError:
@@ -59,7 +60,7 @@ class SlackAdapter(Adapter):
     name = "slack"
     label = "Slack"
     max_message_length = MESSAGE_LIMIT          # chat.postMessage 文本上限 40000
-    supports_inbound = False                   # v1 仅出站（入站见 tasks.md T2.1）
+    supports_inbound = True                    # Socket Mode 入站（需另配 app_token）
     supports_inline_buttons = False            # blocks 未实现
     supports_media = False
 
@@ -69,6 +70,10 @@ class SlackAdapter(Adapter):
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
         self.bot_token: str = str(self.config.get("bot_token") or "").strip()
+        # Socket Mode 入站需要 app-level token（xapp-…）；缺它时仍可只发出站。
+        self.app_token: str = str(self.config.get("app_token") or "").strip()
+        self._ws_factory = None      # 测试注入点：Callable[[str], WebSocketClient]
+        self._ws = None              # 当前连接，stop() 时关掉
         self._throttle_lock = threading.Lock()
         self._last_send: dict[str, float] = {}
 
@@ -128,15 +133,127 @@ class SlackAdapter(Adapter):
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
+        """启动入站（Socket Mode）。缺 app_token 时降级为"只发出站"。"""
         if not self.bot_token:
             logger.warning("slack: bot_token missing; adapter not started")
             return
-        # v1: inbound polling (conversations.list + conversations.history
-        # incremental replay) is intentionally not implemented yet.
-        logger.warning(
-            "slack: inbound polling not implemented in v1 (TODO); "
-            "outbound send/edit only"
+        if not self.app_token:
+            logger.warning(
+                "slack: app_token (xapp-) missing; inbound disabled, outbound only"
+            )
+            return
+        thread = threading.Thread(
+            target=self._inbound_loop, name="slack-inbound", daemon=True
         )
+        self._thread = thread
+        thread.start()
+
+    # ------------------------------------------------------------------
+    # Inbound (Socket Mode)
+    # ------------------------------------------------------------------
+    def _open_socket_url(self) -> str:
+        """``apps.connections.open`` → 本次连接用的 WSS URL。"""
+        status, data = self._request("POST", "apps.connections.open", {})
+        if not data.get("ok") or not data.get("url"):
+            err = str(data.get("error") or "no url")
+            raise RuntimeError(f"apps.connections.open failed: {err}")
+        return str(data["url"])
+
+    def _make_ws(self, url: str):
+        """建 WS 连接；``_ws_factory`` 为测试注入点，生产走标准库实现。"""
+        factory = self._ws_factory
+        if factory is None:
+            from ..ws import connect as factory  # 延迟导入：未装 WebSocket 时也能只发
+        return factory(url)
+
+    def _inbound_loop(self) -> None:
+        """连接 → 收包 → 断开重连，直到 stop。"""
+        while not self._stop_event.is_set():
+            ws = None
+            try:
+                url = self._open_socket_url()
+                ws = self._make_ws(url)
+                self._ws = ws
+                logger.info("slack: Socket Mode connected")
+                while not self._stop_event.is_set():
+                    raw = ws.recv()
+                    if raw is None:
+                        break  # 对端关闭 → 走重连
+                    self._handle_envelope(ws, raw)
+            except Exception as exc:
+                logger.warning("slack: inbound error: %s", exc)
+            finally:
+                self._ws = None
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            if self._stop_event.wait(RECONNECT_DELAY):
+                break
+
+    def _handle_envelope(self, ws, raw: str) -> None:
+        """处理一个 envelope：**先 ack 再过滤**（漏 ack 会让 Slack 无限重发）。"""
+        try:
+            env = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(env, dict):
+            return
+        envelope_id = env.get("envelope_id")
+        if envelope_id:
+            try:
+                ws.send(json.dumps({"envelope_id": envelope_id}))
+            except Exception as exc:
+                logger.warning("slack: ack failed for %s: %s", envelope_id, exc)
+        if env.get("type") == "hello":
+            return
+        payload = env.get("payload")
+        event = payload.get("event") if isinstance(payload, dict) else None
+        if not isinstance(event, dict) or event.get("type") != "message":
+            return
+        if event.get("bot_id") or event.get("subtype"):
+            return  # bot 自己的回声 / message_changed 等
+        text = str(event.get("text") or "")
+        channel = str(event.get("channel") or "")
+        if not text or not channel:
+            return
+        # 授权闸门必须在最前：未授权者的消息不许进入上层（否则能用命令/审批字绕过）
+        if not self.admits(channel):
+            logger.info("slack: dropping message from non-whitelisted channel %s", channel)
+            return
+        try:
+            self.hooks.on_inbound(
+                Inbound(
+                    conversation_id=self._conversation_id(channel),
+                    text=text,
+                    kind="text",
+                    user_id=str(event.get("user") or "") or None,
+                    message_id=str(event.get("ts") or "") or None,
+                    platform=self.name,
+                    raw=event,
+                )
+            )
+        except Exception as exc:
+            logger.exception("slack: on_inbound failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Lifecycle teardown
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """先关 WS 让 ``recv()`` 立刻返回，再停线程。
+
+        顺序不能反：基类 ``stop()`` 会 join 线程（5s 超时），而 ``recv()``
+        最多阻塞 SOCKET_TIMEOUT(30s)，不先关连接就会每次 stop 都等满超时。
+        """
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception as exc:
+                logger.debug("slack: ws close during stop failed: %s", exc)
+        super().stop()
 
     # ------------------------------------------------------------------
     # Outbound

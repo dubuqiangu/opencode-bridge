@@ -339,7 +339,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 
-插件目录下的 `config.json`（由安装脚本生成）：
+插件目录下的 `config.json`（**仅脚本安装方式**由安装脚本生成；原生 `plugin add` 安装不产生它，插件改用自举稳定目录）：
 
 | 键 | 说明 |
 |---|---|
@@ -361,6 +361,9 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 - 长任务在 IM 侧只有"一条进度消息 + 节流编辑"，**没有**中间逐步流式；工具调用只记录进内部 `tool_trace`，不会逐条推送（避免刷屏）。
 - 权限请求 v1 只发文字提示，不使用 inline buttons（跨平台行为不一致）。
 - 一条进度消息编辑失败时不会降级为重复发送（避免刷屏），定稿消息才具备 `send` 兜底。
+- **同一种安装方式只能选一种**（原生 `plugin add` 与脚本安装并存会重复加载），切换方式需先清理旧的那份，见「11. 卸载」。
+- 若稳定 bridge 目录是**脚本安装留下的 git clone**，第 4 级自举按设计完全不碰它 —— 此时 `opencode plugin update` 只更新插件壳，Python 侧需自行 `git -C <稳定目录> pull`。
+- `bridge-output.log` 由 Python 按系统代码页写出（中文 Windows = GBK），非 UTF-8 环境用文本编辑器直接打开会显示乱码。
 
 ## 9. 故障排查
 
@@ -374,6 +377,10 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中 |
 | 会话行为异常 / 想清空上下文 | 发送 `/new`（或 `/reset`）重建 session |
 | 插件没拉起 bridge | 看 `<bridgeDir>\bridge-plugin.log` 与 `<bridgeDir>\.bridge-plugin.lock`；确认插件目录里的 `config.json` 中 `bridgeDir` 指向真实存在的目录 |
+| 原生安装后日志里找不到「自举」字样 | 自举发生在配置解析阶段（`logDir` 还没确定），按设计只进 opencode 主日志：`~/.local/share/opencode/log/opencode.log` 搜 `[bridge-plugin]`。可直接检查稳定目录是否已铺好：`<稳定目录>\opencode_bridge\__init__.py` 是否存在 |
+| `opencode plugin check …` 报 `Plugin is not configured` | 刚 `add` / `remove` 后偶发的瞬态错误，**重跑一次即可**；`opencode plugin list` 显示的版本才是权威状态 |
+| `opencode plugin list` 里出现两条 `opencode-bridge` | 说明脚本安装产物与原生条目并存，见「11. 卸载」末尾的说明，只保留一种 |
+| `bridge-output.log` 打开是乱码 | 该文件由 Python 按**系统代码页**写出（中文 Windows = GBK/cp936）。用 GBK 打开即可；这是既有行为，不影响功能 |
 | 想看插件在 opencode 里的日志 | `~/.local/share/opencode/log/opencode.log` 中搜 `[bridge-plugin]` |
 
 ## 10. 开发与测试
@@ -382,7 +389,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 # Python 单元测试（标准库 unittest，无需安装任何依赖）
 python -m unittest discover -s tests -v
 
-# 插件自检（10 个生命周期场景，离线运行，不碰 opencode 服务）
+# 插件自检（22 个场景：生命周期 + bridgeDir 四级解析 + 自举铺装；离线运行，不碰 opencode 服务）
 cd plugin
 bun harness.ts
 
@@ -398,6 +405,21 @@ CI（GitHub Actions）会在 `ubuntu-latest` / `windows-latest` × Python 3.10 /
 
 ## 11. 卸载
 
+**原生方式（首选，一条命令）：**
+
+```bash
+opencode plugin remove github:dubuqiangu/opencode-bridge
+```
+
+它只把插件从全局配置里摘掉并清掉包缓存，**不动**稳定 bridge 目录（`config.json` / `state.json` / 日志都在里面）。彻底删除：
+
+```powershell
+Remove-Item -Recurse -Force "$env:USERPROFILE\.config\opencode-bridge"     # Windows
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge"                 # macOS / Linux
+```
+
+**脚本安装方式的卸载（若你是用 install.ps1 / install.sh 装的）：**
+
 ```powershell
 # Windows（删除插件目录）
 Remove-Item -Recurse -Force "$env:USERPROFILE\.config\opencode\plugins\bridge"
@@ -412,12 +434,9 @@ rm -rf "$HOME/.config/opencode/plugins/bridge"
 curl -fsSL https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.sh | bash -s -- --uninstall
 ```
 
-卸载后执行 `opencode service restart`（或重开 TUI）让插件停用。bridge 目录（含 `config.json` / `state.json`）会保留，如需彻底删除：
+卸载后执行 `opencode service restart`（或重开 TUI）让插件停用。bridge 目录（含 `config.json` / `state.json`）会保留，如需彻底删除：见上方「原生方式」末尾的命令。
 
-```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.config\opencode-bridge"     # Windows
-rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge"                 # macOS / Linux
-```
+> ⚠️ **同一种安装方式只用一种**：不要让 `~/.config/opencode/plugins/bridge/`（脚本安装产物）与 `plugins[]` 里的 `github:dubuqiangu/opencode-bridge`（原生）同时存在。虽然插件有单例锁不会起两个 bridge 进程，但会重复加载、升级时也要两边同步。从脚本安装切到原生：删掉 `plugins/bridge/` 后执行一次 `opencode plugin add github:dubuqiangu/opencode-bridge`。
 
 ## License
 

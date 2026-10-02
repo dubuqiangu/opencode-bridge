@@ -149,24 +149,35 @@ bun build index.ts --no-bundle        # 语法/解析检查
 bun harness.ts                        # 期望: PASS 14/14，退出码 0
 ```
 
-`harness.ts` 覆盖 14 个场景：
+`harness.ts` 覆盖 22 个场景：
 
 - #1~#10 生命周期：首次 spawn、同进程采纳、双 cleanup 语义、残留锁（杀旧重启）、
   死 pid 锁、`enabled:false`、损坏锁、`bridgeDir` 缺失、快速失败 + backoff；
 - #11~#14 可移植性：同目录 `config.json` 提供 `bridgeDir`（主路径）、`ctx.options` 优先于
-  `config.json`、环境变量 `OPENCODE_BRIDGE_DIR` 兜底、三者皆缺时不 spawn 不抛；
+  `config.json`、环境变量 `OPENCODE_BRIDGE_DIR` 兜底、三级皆缺且自举失败时不 spawn 不抛；
+- #15 快速 `exit(0)`（未配置 adapter 的正常退出）不记 `failedAt`、不进 backoff、可 respawn；
+- #16~#22 第 4 级自举：`deriveStableDir` 三分支、全新目录铺源并生成 `config.json`、
+  已有 `config.json` 绝不覆盖、稳定目录是 git clone 时不碰、非 git 目录刷新 `.py`、
+  `enabled:false` 零副作用、无 `bridgeDir` 时端到端自举 + 正常 spawn；
 - 另断言 `index.ts` 源码不含 `D:\` / `D:/` 等硬编码盘符路径。
 
 harness 结束会杀掉它 spawn 的全部子进程、删临时目录与锁，并还原被它临时改写的
-`<插件目录>/config.json` 与环境变量 `OPENCODE_BRIDGE_DIR`。
+`<插件目录>/config.json`、`OPENCODE_BRIDGE_DIR` 与 `USERPROFILE` / `HOME` / `XDG_CONFIG_HOME`。
+自举相关用例各自使用独立的临时 home，互不污染，也绝不触碰真实的 `~/.config/opencode-bridge`。
 
 > 注意：harness **不会**也不该运行真实的 `python -m opencode_bridge`
 > （未配置 bot_token 时它会以退出码 1 结束，反而触发 backoff）。
 
 ## 卸载
 
+```bash
+# 原生安装（首选）：只摘配置 + 清包缓存，稳定目录（config.json / 日志）保留
+opencode plugin remove github:dubuqiangu/opencode-bridge
+```
+
 ```powershell
+# 脚本安装产物：删除插件目录
 Remove-Item -Recurse -Force "$env:USERPROFILE\.config\opencode\plugins\bridge"
 ```
 
-然后重启 opencode。clone 目录本身（含日志与锁）按需自行删除。
+然后重启 opencode。clone 目录本身（含日志与锁）按需自行删除。两种安装方式不要并存。

@@ -15,6 +15,7 @@ import time
 from typing import Any, List, Optional
 
 from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..split import split_text  # 统一分片实现（T1.4b），此处再导出保持向后兼容
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
@@ -31,32 +32,6 @@ POLL_LONG_TIMEOUT = 25        # getUpdates long-poll seconds
 POLL_SOCKET_TIMEOUT = 40.0    # socket timeout must be > POLL_LONG_TIMEOUT
 DEFAULT_SOCKET_TIMEOUT = 30.0
 MAX_RETRY_AFTER = 60.0        # cap for Telegram 429 retry_after sleeps
-
-
-def split_text(text: str, limit: int = MESSAGE_LIMIT) -> List[str]:
-    """Split ``text`` into chunks of at most ``limit`` characters.
-
-    Cuts at newline boundaries when possible (the newline stays with the
-    leading chunk so that ``"".join(chunks) == text``); falls back to a hard
-    cut when a segment contains no newline inside the limit.
-    """
-    if len(text) <= limit:
-        return [text]
-    chunks: List[str] = []
-    rest = text
-    while len(rest) > limit:
-        idx = rest.rfind("\n", 0, limit)  # newline strictly inside the window
-        if idx < 0:
-            cut = limit                   # no boundary -> hard cut
-        else:
-            cut = idx + 1                 # keep the newline with this chunk
-        if cut <= 0:
-            cut = limit
-        chunks.append(rest[:cut])
-        rest = rest[cut:]
-    if rest:
-        chunks.append(rest)
-    return chunks
 
 
 def _retry_after(data: Any) -> Optional[float]:
@@ -472,7 +447,10 @@ class TelegramAdapter(Adapter):
             logger.warning("telegram: refusing to send empty text")
             self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
-        chunks = split_text(out.text, self.message_limit)
+        # prefix_fmt="" 保持既有出站行为（分段不加「（i/n）」前缀，且
+        # "".join(chunks) == text）。前缀编号是 split.py 的可选能力，
+        # 是否默认开启见 tasks.md T1.4 的后续决策。
+        chunks = split_text(out.text, self.message_limit, prefix_fmt="")
         if len(chunks) > 1:
             logger.info(
                 "telegram: splitting outbound message into %d chunks", len(chunks)

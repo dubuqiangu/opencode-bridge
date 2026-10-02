@@ -13,7 +13,7 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 from opencode_bridge.adapters import Adapter, AdapterError, build
 from opencode_bridge.adapters.discord import DiscordAdapter
 from opencode_bridge.adapters.slack import SlackAdapter
-from opencode_bridge.adapters.telegram import TelegramAdapter, split_text
+from opencode_bridge.adapters.telegram import TelegramAdapter
 from opencode_bridge.hooks import Button, Inbound, MsgHandle, Outbound, SendError
 
 
@@ -53,32 +53,6 @@ def message_update(update_id=5, chat_id=55, message_id=9, text="hello", **msg_ex
     }
     message.update(msg_extra)
     return {"update_id": update_id, "message": message}
-
-
-class TestSplitText(unittest.TestCase):
-    def test_short_text_single_chunk(self):
-        self.assertEqual(split_text("abc"), ["abc"])
-        self.assertEqual(split_text("x" * 4096), ["x" * 4096])
-
-    def test_4000_plus_split_at_newlines(self):
-        text = ("L" * 50 + "\n") * 100  # 5100 chars
-        self.assertGreater(len(text), 4000)
-        chunks = split_text(text)
-        self.assertGreater(len(chunks), 1)
-        for chunk in chunks:
-            self.assertLessEqual(len(chunk), 4096)
-            self.assertGreater(len(chunk), 0)
-        # non-final chunks should end on a newline boundary
-        for chunk in chunks[:-1]:
-            self.assertTrue(chunk.endswith("\n"), "cut not on newline boundary")
-        self.assertEqual("".join(chunks), text)
-
-    def test_hard_cut_without_newlines(self):
-        chunks = split_text("A" * 5000)
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(len(chunks[0]), 4096)
-        self.assertEqual(len(chunks[1]), 904)
-        self.assertEqual("".join(chunks), "A" * 5000)
 
 
 class TestTelegramPolling(unittest.TestCase):

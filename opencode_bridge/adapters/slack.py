@@ -16,8 +16,8 @@ import urllib.request
 from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, MsgHandle, Outbound, SendError
+from ..split import split_text
 from .base import Adapter, classify_http, register
-from .telegram import split_text
 
 logger = logging.getLogger("opencode_bridge.adapters.slack")
 
@@ -162,7 +162,7 @@ class SlackAdapter(Adapter):
             logger.warning("slack: refusing to send empty text")
             self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
-        chunks: List[str] = split_text(out.text, self.message_limit)
+        chunks: List[str] = split_text(out.text, self.message_limit, prefix_fmt="")
         if len(chunks) > 1:
             logger.info("slack: splitting outbound message into %d chunks", len(chunks))
         handle: MsgHandle | None = None

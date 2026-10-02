@@ -1,8 +1,18 @@
-"""T3.1 Matrix adapter tests（无网络：HTTP 层替换 ``_request``）。"""
+"""T3.1 Matrix adapter tests（无网络：HTTP 层替换 ``_request``）。
+
+A1 迁移（轮询循环收敛到 :mod:`opencode_bridge.transport.PollingTransport`）之后
+新增 :class:`TestMatrixMigrationInvariants`：把「行为不变」逐条钉死 —— 退避接线值
+（2s **恒定**，不是指数）、``reset_after=0``、stop 快且不泄漏线程、游标先推进再分发、
+失败时游标不动、事件过滤 8 条一条不少；以及一条**防呆**用例把 ``room:`` 前缀钉死
+（本轮刻意不切 ``matrix:``，切换的前置条件是 ``state.py`` 的键迁移）。
+"""
 
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -14,16 +24,38 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
 from opencode_bridge.adapters import build
 from opencode_bridge.adapters.matrix import (
+    BACKOFF_INTERVAL,
     MESSAGE_LIMIT,
+    ROOM_MSG_TYPE,
+    SYNC_SOCKET_TIMEOUT,
+    SYNC_TIMEOUT_MS,
     MatrixAdapter,
     _classify_matrix_error,
     _retry_after_seconds,
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
+from opencode_bridge.identity import (
+    LEGACY_PREFIXES,
+    InvalidConversationId,
+    is_valid,
+    normalize,
+    parse_id,
+)
+from opencode_bridge.state import StateStore
 
 ROOM = "!abc:example.org"
 ROOM_CID = "room:!abc:example.org"
 BOT = "@bot:example.org"
+
+
+def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    """轮询等条件成立（比裸 sleep 稳；失败信息由调用方的断言给出）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
 
 
 class RecordingHooks:
@@ -119,7 +151,7 @@ class TestMatrixLifecycle(unittest.TestCase):
         with self.assertLogs("opencode_bridge.adapters.matrix", level="WARNING") as cm:
             adapter.start()  # must not raise
         self.assertTrue(any("homeserver" in line for line in cm.output))
-        self.assertIsNone(adapter._thread)
+        self.assertIsNone(adapter.transport)   # 传输层压根没建 → 没有线程
         self.assertFalse(adapter.running)
 
     def test_missing_access_token_warns_and_does_not_start(self):
@@ -127,7 +159,7 @@ class TestMatrixLifecycle(unittest.TestCase):
         with self.assertLogs("opencode_bridge.adapters.matrix", level="WARNING") as cm:
             adapter.start()
         self.assertTrue(any("access_token" in line for line in cm.output))
-        self.assertIsNone(adapter._thread)
+        self.assertIsNone(adapter.transport)
         self.assertFalse(adapter.running)
 
     def test_start_spawns_thread_and_stop_joins(self):
@@ -347,15 +379,32 @@ class TestMatrixInbound(unittest.TestCase):
         finally:
             adapter.stop()
 
-    def test_inbound_loop_never_raises(self):
+    def test_consumer_loop_never_raises_even_if_fetch_always_throws(self):
+        """迁移后没有 ``_inbound_loop`` 了；这里改成**更强**的断言。
+
+        原来只是"预置停止位后调用循环方法不抛异常"。现在验证真实的消费线程：
+        fetch 每轮都抛异常时，异常不逃出线程、线程不会静默死掉、而且会**持续**
+        按退避重试（而不是重试一次就退出）。
+        """
         adapter, _ = make_matrix()
+        adapter._since = ""
+        attempts: list[str] = []
 
         def boom(*a, **k):
+            attempts.append("x")
             raise ValueError("always fails")
 
-        adapter._sync_once = boom
-        adapter._stop_event.set()  # 进来就退出
-        adapter._inbound_loop()  # must not raise
+        adapter._request = boom
+        adapter.start()
+        try:
+            self.assertTrue(
+                wait_until(lambda: len(attempts) >= 3), "应持续按退避重试"
+            )
+            self.assertTrue(adapter.running, "线程不得静默退出")
+            self.assertEqual(adapter._since, "", "全程失败 → 游标一字不动")
+            self.assertGreaterEqual(adapter.transport.stats()["errors"], 1)
+        finally:
+            adapter.stop()
 
     def test_hook_exception_is_contained(self):
         class ExplodingHooks(RecordingHooks):
@@ -510,6 +559,366 @@ class TestMatrixSend(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertFalse(result.partial)
         self.assertEqual(result.handle.message_id, "$evt1")
+
+
+class TestMatrixMigrationInvariants(unittest.TestCase):
+    """A1 迁移的「行为不变」清单：逐条钉死。
+
+    退避/重置这类语义没法靠本机计时证明（迁移前就是 2s 这个量级），所以退避
+    部分做成**白盒接线断言**（直接读传输层的退避状态机）：迁移最容易出错的
+    恰恰是"接线值对不对"，而那正是这些用例要守的东西。
+    """
+
+    # ------------------------------------------------------------------
+    # 前缀：本轮**刻意不切**
+    # ------------------------------------------------------------------
+    def test_conversation_id_still_uses_legacy_room_prefix(self):
+        """显式防呆：有人在本轮偷偷把 ``room:`` 换成 ``matrix:`` 时这里会红。
+
+        ``room`` 在 :data:`identity.LEGACY_PREFIXES` 里是**指向别的平台的旧别名**
+        （映射到 ``matrix``），所以现在的 id **不是**合法的新格式 —— 这一点本身
+        就是"前缀还没切"的证据。切换的前置条件是 ``state.py`` 的键迁移，见
+        ``matrix.py`` 模块 docstring。
+        """
+        self.assertEqual(LEGACY_PREFIXES["room"], "matrix",
+                         "room 是旧别名，映射到 matrix")
+        self.assertEqual(MatrixAdapter._conversation_id(ROOM), ROOM_CID)
+        for room in ("!abc:example.org", "!x.y:host:8443", "+plus:example.org"):
+            with self.subTest(room=room):
+                self.assertEqual(MatrixAdapter._conversation_id(room), f"room:{room}")
+        # 仍是旧格式：parse_id 拒绝它，normalize 才知道怎么归一
+        self.assertFalse(is_valid(ROOM_CID))
+        with self.assertRaises(InvalidConversationId):
+            parse_id(ROOM_CID)
+        self.assertEqual(normalize(ROOM_CID, platform_hint="matrix"), f"matrix:{ROOM}")
+        self.assertEqual(MatrixAdapter._room_id(ROOM_CID), ROOM)
+
+    def test_switching_prefix_now_would_orphan_stored_sessions(self):
+        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
+
+        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
+        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
+        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            cid = MatrixAdapter._conversation_id(ROOM)
+            store = StateStore(path)
+            store.set_session(cid, "sess-1")
+            reopened = StateStore(path)          # 模拟进程重启
+            self.assertEqual(reopened.get_session(cid), "sess-1",
+                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
+            future = f"matrix:{ROOM}"
+            self.assertNotEqual(future, cid)
+            self.assertIsNone(
+                reopened.get_session(future),
+                "切前缀后同一个房间是另一个不透明键 → 会话映射直接丢失",
+            )
+
+    # ------------------------------------------------------------------
+    # 退避接线：2s 恒定（不是指数）
+    # ------------------------------------------------------------------
+    def test_backoff_wiring_matches_legacy_constant(self):
+        adapter, _ = make_matrix()
+        adapter.backoff_interval = BACKOFF_INTERVAL      # 2.0（make_irc 风格默认值）
+        transport = adapter._make_transport()
+        self.assertEqual(transport.min_backoff, BACKOFF_INTERVAL)
+        self.assertEqual(transport.max_backoff, BACKOFF_INTERVAL,
+                         "max == min ⇒ 退避恒定；迁移前本来就没有指数退避")
+        self.assertEqual(transport._idle_delay(), BACKOFF_INTERVAL,
+                         "HTTP 失败（fetch 返回 NOTHING）后的重试间隔 = 2s")
+        self.assertEqual(transport.reset_after, 0.0,
+                         "必须 0：fetch 成功一次就重置退避（连上即重置）")
+
+    def test_backoff_is_constant_not_exponential(self):
+        adapter, _ = make_matrix()
+        adapter.backoff_interval = BACKOFF_INTERVAL
+        transport = adapter._make_transport()
+        waits = [transport._next_backoff(survived=False) for _ in range(4)]
+        self.assertEqual(waits, [2.0, 2.0, 2.0, 2.0],
+                         "连续失败也必须恒定 2s（迁移前只有一个常数 backoff）")
+
+    def test_failed_sync_is_retried_after_the_backoff_interval(self):
+        """端到端：HTTP 失败后确实等了一个 backoff_interval 才重试。"""
+        adapter, _ = make_matrix()
+        adapter.backoff_interval = 0.1
+        at: list[float] = []
+
+        def failing(method, path, payload=None, *, timeout=None):
+            at.append(time.monotonic())
+            return 500, {"errcode": "M_UNKNOWN", "error": "boom"}
+
+        adapter._request = failing
+        adapter.start()
+        try:
+            self.assertTrue(wait_until(lambda: len(at) >= 3))
+            gaps = [b - a for a, b in zip(at, at[1:])]
+            for gap in gaps:
+                self.assertGreaterEqual(gap, 0.09, f"失败后没退避：{gaps}")
+        finally:
+            adapter.stop()
+
+    def test_successful_sync_is_not_delayed_by_the_backoff(self):
+        """成功的一轮**不等** backoff（否则入站会被 2s 拖死）。"""
+        adapter, _ = make_matrix()
+        adapter.backoff_interval = 5.0                 # 故意设很大：一旦生效就会超时
+        at: list[float] = []
+
+        def ok(method, path, payload=None, *, timeout=None):
+            at.append(time.monotonic())
+            return 200, sync_payload([], next_batch="s1")
+
+        adapter._request = ok
+        adapter.start()
+        try:
+            self.assertTrue(wait_until(lambda: len(at) >= 5, timeout=3.0),
+                            "成功轮次之间不应有 5s 的等待")
+            gaps = [b - a for a, b in zip(at, at[1:])]
+            self.assertLess(max(gaps), 1.0, f"成功轮次被退避拖住了：{gaps}")
+        finally:
+            adapter.stop()
+
+    # ------------------------------------------------------------------
+    # stop()：快（打断退避等待）+ 不泄漏线程
+    # ------------------------------------------------------------------
+    def test_stop_interrupts_the_backoff_wait(self):
+        """失败轮正在 2s 退避等待里时 stop() 必须立刻返回。"""
+        adapter, _ = make_matrix()
+        adapter.backoff_interval = 5.0
+        attempts: list[float] = []
+
+        def failing(method, path, payload=None, *, timeout=None):
+            attempts.append(time.monotonic())
+            return 500, {"errcode": "M_UNKNOWN", "error": "boom"}
+
+        adapter._request = failing
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(wait_until(lambda: len(attempts) >= 1))
+        began = time.monotonic()
+        adapter.stop()
+        self.assertLess(time.monotonic() - began, 2.0,
+                        "stop() 没打断退避等待（会白等满 backoff）")
+        self.assertFalse(adapter.running)
+        self.assertIsNone(adapter.transport)
+        adapter.stop()                                 # 幂等
+        self.assertFalse(adapter.running)
+
+    def test_stop_during_inflight_sync_does_not_leak_the_thread(self):
+        """已知限制（迁移前就有）：stop() 打不断在挂起的 ``/sync``。
+
+        至少保证不会永久泄漏线程：这一轮返回后消费线程自然退出。
+        """
+        adapter, _ = make_matrix()
+        started = threading.Event()
+
+        def slow(method, path, payload=None, *, timeout=None):
+            started.set()
+            time.sleep(0.3)
+            return 200, sync_payload([], next_batch="s1")
+
+        adapter._request = slow
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        transport = adapter.transport
+        self.assertTrue(started.wait(3), "没进到 /sync")
+        adapter.stop()
+        self.assertTrue(wait_until(lambda: not transport.running, timeout=5),
+                        "在途请求返回后线程必须退出")
+
+    # ------------------------------------------------------------------
+    # 游标语义：先推进再分发 / 失败不动
+    # ------------------------------------------------------------------
+    def test_cursor_advances_before_dispatch_even_if_dispatch_explodes(self):
+        """铁律：分发崩了游标也必须**已经**推进（否则整页事件被无限重放）。
+
+        注意 ``_sync_once`` 让分发异常继续往上抛（迁移前也是这样：异常由循环体
+        的 try/except 接住），所以这里断言的是**游标状态**，不是返回值。
+        """
+        adapter, _ = make_matrix()
+        adapter._since = ""
+        paths: list[str] = []
+
+        def ok(method, path, payload=None, *, timeout=None):
+            paths.append(path)
+            return 200, sync_payload([text_event(text="hi", event_id="$e1")],
+                                     next_batch="s42")
+
+        adapter._request = ok
+
+        def boom(data):
+            raise RuntimeError("dispatch exploded")
+
+        adapter._dispatch_sync = boom
+        with self.assertRaises(RuntimeError):
+            adapter._sync_once()
+        self.assertEqual(adapter._since, "s42", "游标必须先推进（分发崩了也一样）")
+        # 恢复后下一次请求必须带上 s42 ⇒ 服务器不会把那页事件再发一遍
+        adapter._dispatch_sync = lambda data: None
+        self.assertTrue(adapter._sync_once())
+        query = urllib.parse.parse_qs(paths[-1].split("?", 1)[1])
+        self.assertEqual(query["since"], ["s42"], "必须带上已推进的游标（否则重放）")
+
+    def test_cursor_advance_survives_a_dispatch_blip_in_the_running_loop(self):
+        """同一件事在真实消费线程上的版本：分发抛异常不许把线程带走。"""
+        adapter, _ = make_matrix()
+        adapter._since = ""
+        paths: list[str] = []
+
+        def ok(method, path, payload=None, *, timeout=None):
+            paths.append(path)
+            return 200, sync_payload([text_event(text="hi", event_id="$e1")],
+                                     next_batch="s42")
+
+        adapter._request = ok
+
+        def boom(data):
+            raise RuntimeError("dispatch exploded")
+
+        adapter._dispatch_sync = boom
+        adapter.start()
+        try:
+            self.assertTrue(wait_until(lambda: len(paths) >= 2, timeout=3.0),
+                            "分发异常后仍应继续轮询")
+            query = urllib.parse.parse_qs(paths[-1].split("?", 1)[1])
+            self.assertEqual(query["since"], ["s42"],
+                             "游标已推进 ⇒ 这页事件不会被重放")
+            self.assertTrue(adapter.running, "分发异常不得让线程静默退出")
+        finally:
+            adapter.stop()
+
+    def test_transport_level_failure_leaves_cursor_untouched(self):
+        """fetch 抛异常（传输层故障）时游标也不能动。"""
+        adapter, _ = make_matrix()
+        adapter._since = "s7"
+
+        def boom(*a, **k):
+            raise RuntimeError("socket died")
+
+        adapter._request = boom
+        self.assertFalse(adapter._sync_once())
+        self.assertEqual(adapter._since, "s7")
+
+    def test_cursor_never_moves_on_http_failure_through_the_transport(self):
+        """整条链路（传输层线程）上验证：连续失败时游标不动、线程仍重试。"""
+        adapter, _ = make_matrix()
+        adapter._since = "s7"
+        calls: list[str] = []
+
+        def failing(method, path, payload=None, *, timeout=None):
+            calls.append(path)
+            return 503, {"errcode": "M_UNKNOWN", "error": "unavailable"}
+
+        adapter._request = failing
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(wait_until(lambda: len(calls) >= 3, timeout=5),
+                        "HTTP 失败后必须继续轮询")
+        self.assertEqual(adapter._since, "s7", "失败时游标一字不动")
+        for path in calls:
+            query = urllib.parse.parse_qs(path.split("?", 1)[1])
+            self.assertEqual(query.get("since"), ["s7"], "失败时也不能换游标")
+        self.assertTrue(adapter.running)
+
+    # ------------------------------------------------------------------
+    # 长轮询超时值
+    # ------------------------------------------------------------------
+    def test_long_poll_timeouts_are_unchanged(self):
+        """``timeout=30000`` 与 socket 超时 35s 都不能被迁移改动。
+
+        两者的大小关系是**功能约束**：socket 超时必须大于长轮询挂起时长，
+        否则每一轮都会在拿到数据前被本地掐断。
+        """
+        self.assertEqual(SYNC_TIMEOUT_MS, 30000)
+        self.assertEqual(SYNC_SOCKET_TIMEOUT, 35.0)
+        self.assertGreater(
+            SYNC_SOCKET_TIMEOUT, SYNC_TIMEOUT_MS / 1000.0,
+            "socket 超时必须 > 长轮询挂起时长（35s > 30s）",
+        )
+        adapter, _ = make_matrix()
+        seen: dict = {}
+
+        def cap(method, path, payload=None, *, timeout=None):
+            seen["timeout"] = timeout
+            return 200, sync_payload([], next_batch="s1")
+
+        adapter._request = cap
+        adapter._request_sync()
+        self.assertEqual(seen["timeout"], SYNC_SOCKET_TIMEOUT,
+                         "轮询请求必须把 35s 的 socket 超时传下去")
+        query = urllib.parse.parse_qs(adapter._sync_path().split("?", 1)[1])
+        self.assertEqual(query["timeout"], ["30000"])
+
+    # ------------------------------------------------------------------
+    # 事件过滤：8 条一条不少
+    # ------------------------------------------------------------------
+    def test_all_eight_event_filters_still_apply(self):
+        """一条事件对应一个过滤条件，全塞进同一页，只有一条该被投递。
+
+        过滤条件（与迁移前逐字一致）：① 事件不是 dict ② ``type`` 不是
+        ``m.room.message`` ③ ``content`` 不是 dict ④ ``msgtype`` 不是
+        ``m.text`` ⑤ 自己发的回声 ⑥ 带 ``m.relates_to``（编辑/回复/表情）
+        ⑦ ``body`` 非字符串或为空 ⑧ 房间不在白名单。
+        """
+        hooks = RecordingHooks()
+        adapter, _ = make_matrix({"allowed_chat_ids": [ROOM]}, hooks)
+        good = text_event(text="真消息", event_id="$keep")
+        stranger = text_event(text="别的房间", event_id="$other")
+        adapter._request = lambda *a, **k: (
+            200,
+            {
+                "next_batch": "s1",
+                "rooms": {
+                    "join": {
+                        ROOM: {
+                            "timeline": {
+                                "events": [
+                                    "not-a-dict",                                   # ①
+                                    {"type": "m.room.member", "event_id": "$m",      # ②
+                                     "content": {"msgtype": "m.text", "body": "x"}},
+                                    {"type": ROOM_MSG_TYPE, "event_id": "$c",       # ③
+                                     "content": "not-a-dict"},
+                                    text_event(text="图", event_id="$img",          # ④
+                                               content={"msgtype": "m.image",
+                                                        "body": "x", "url": "u"}),
+                                    text_event(text="通知", event_id="$n",          # ④
+                                               content={"msgtype": "m.notice",
+                                                        "body": "n"}),
+                                    text_event(text="回声", sender=BOT,            # ⑤
+                                               event_id="$self"),
+                                    text_event(text="编辑", event_id="$ed",          # ⑥
+                                               content={"msgtype": "m.text", "body": "ed",
+                                                        "m.relates_to": {
+                                                            "rel_type": "m.replace",
+                                                            "event_id": "$old"}}),
+                                    text_event(text="回复", event_id="$rp",          # ⑥
+                                               content={"msgtype": "m.text", "body": "rp",
+                                                        "m.relates_to": {
+                                                            "rel_type": "m.in_reply_to",
+                                                            "event_id": "$old"}}),
+                                    {"type": "m.reaction", "event_id": "$an",      # ⑥
+                                     "sender": "@alice:example.org",
+                                     "content": {"m.relates_to": {
+                                         "rel_type": "m.annotation"}}},
+                                    text_event(text="", event_id="$empty"),         # ⑦
+                                    text_event(text=None, event_id="$nonstr",       # ⑦
+                                               content={"msgtype": "m.text",
+                                                        "body": 123}),
+                                    good,
+                                ]
+                            }
+                        },
+                        "!stranger:example.org": {                                    # ⑧
+                            "timeline": {"events": [stranger]}
+                        },
+                    }
+                },
+            },
+        )
+        self.assertTrue(adapter._sync_once())
+        self.assertEqual([ib.text for ib in hooks.inbounds], ["真消息"])
+        self.assertEqual(hooks.inbounds[0].conversation_id, ROOM_CID)
+        self.assertEqual(hooks.inbounds[0].message_id, "$keep")
 
 
 class TestMatrixEdit(unittest.TestCase):

@@ -85,7 +85,7 @@
 
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
-| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 1/9：IRC ✓**（下一个：Matrix / Nextcloud） |
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 2/10：IRC ✓ Matrix ✓**（下一个：Telegram / Slack） |
 | A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**迁移进度 1/9：IRC ✓**（`irc` 前缀在 `LEGACY_PREFIXES` 里映射到自身，故 `conversation_id` 字节级不变，已用断言钉死） |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
 
@@ -529,4 +529,51 @@
   - 关于基线数字：lane 报的"基线 853"里**包含 Matrix lane 正在改的测试**，
     我提交 IRC 后的 840 才是准确值 —— 不是真分歧。
   验证：**111 用例 OK**、`--status` 实跑出现 `Email`、compileall 0。
+- **2026-10-03** **A1 迁移第 2 家：Matrix**（42 → 56 用例），并修掉一个 flaky 用例：
+  - **前缀刻意保持 `room:` 不变**（派单时明确划的界）。`room:` 在 `LEGACY_PREFIXES` 里是
+    **指向别的平台的旧别名**，切前缀会改变 `conversation_id` 格式，而 `StateStore` 拿它
+    当**不透明键** → 已落盘 `state.json` 的键全部变孤儿，用户**一次性丢失会话映射**且
+    不报错（只表现为"agent 突然记错上下文"）。模块 docstring 写清了前置条件：
+    切换必须与 `state.py` 的键迁移一起发。用例显式断言 `_conversation_id(room) == f"room:{room}"`，
+    **防止有人在后续迁移里偷偷切前缀**。
+  - **游标先推进再分发**守住：`_on_sync` 里 `self._since = next_batch` 在 `_dispatch_sync`
+    之前逐字照搬迁移前顺序，并加了两条用例（分发抛异常 / 真实消费线程上分发抖动，均断言
+    下一次请求带新游标 = 不重放）。**失败时游标一字不动**也有用例（连续 3 次 503 期间
+    每次请求都带旧游标）。
+  - **退避是常数不是指数** —— 核实迁移前 `BACKOFF_INTERVAL = 2.0` 就是一个常数，
+    所以 `idle_sleep` / `min_backoff` / `max_backoff` **三者同为 2.0**（`max==min` ⇒恒定不增长）
+    + `reset_after=0.0`。**若只设 `min_backoff=2.0` 而不管 `max_backoff`，传输层默认会把它
+    变成指数退避** —— 那是行为变更。lane 还钉了一条"不许被顺手优化成指数"的用例。
+  - **事件过滤 8 条**用一个 payload 装 12 个事件做总断言，并**补上了此前没被测的第 ③ 条**
+    （`content` 不是 dict）。`_handle_event` 一个字符未改。
+  - ⚠️ **一处真实行为变化：成功路径的 0.01s 限速消失了**。迁移前每次成功都有
+    `wait(0.01)`（同时是让 `stop()` 能立刻退出的手段），现在成功轮直接进下一轮。
+    判断生产影响可忽略：`/sync` 挂起 30s 才返回，提前返回意味着"有事件"，频率上限是
+    事件到达率。**但若某个不合规的 homeserver 立刻返回空批次，就会变成对本机
+    homeserver 的热循环** —— 迁移前那个 0.01 恰好是兜底。修它需要传输层加 pacing
+    （属于 `transport/` 的事），本轮没做，已记为已知限制。
+  - **代码量这次是变多的**（真实代码 +8 行）：删掉的样板只有 22 行（`_inbound_loop` 17 +
+    建线程 5），新增接缝约 30 行 —— 因为"继承基类 1 行"变成"显式 10 行"，且轮询要拆
+    `_request_sync`/`_on_sync` 两个接缝。诚实结论：**Matrix 这家迁移的收益是概念性的、
+    不是行数的**；下一家轮询适配器能直接复用，边际成本约 15 行，不需要付这次
+    "游标拆分"的额外成本（那部分本就是 Matrix 业务逻辑，迁不迁都得写）。
+  - **Nextcloud 不适合迁移**（我复核后调整了原计划）：它是 **5 worker 轮转池**（在飞的长
+    轮询数恒 ≤ worker 数），映射不到 `PollingTransport` 的单`fetch` 回调模型，硬迁会破坏
+    结构。所以迁移顺序从"IRC → Matrix/Nextcloud"改为 IRC → Matrix → （Telegram / Slack）。
+  - **修掉一个 flaky 用例**（lane 报告、属我的文件、我核实后确认成立）：
+    `test_invariant2_backoff_reset_threaded` 高负载下 15 次里间歇失败 1 次
+    （墙钟差分测到 0.172，标称 0.1，旧断言 `assertAlmostEqual(delta=0.06)`）。
+    根因不是实现（等待只会**比标称更长**），而是**断言形状错了** —— 带容差的墙钟差分
+    既会在机器慢时误报，又**抓不到**"等待比标称更短"这类真bug。
+    **我没有按建议只放宽容差**，而是给 `_ScriptedBase` 加了 `backoff_at_open`（每次 `_open`
+    时刻的退避快照），把断言换成**确定性状态序列** `0.1 → 0.2 → 0.4 → 0.1 → 0.2`
+    （涨、涨、**重置**、再涨）。第 4 项是核心，第 5 项防止"用永不重置来让第 4 项成立"；
+    重置若坏掉序列会变成 `0.1,0.2,0.4,0.8,0.8` 立刻失败。墙钟只保留**下界**断言。
+    压测：**静默 0/20 失败，人为负载下 0/12 失败**。
+    ⚠️ 这已经是本项目第三次因墙钟断言踩坑（前两次：transport reset 用例、IRC 退避），
+    **教训应固化为规范**：凡是断言"等了多久"的用例，一律优先断言内部状态。
+  - lane 改了 3 个现有用例。核对 diff：**新增 54 行 assert、删除 2 行**，删除的两行都是
+    `assertIsNone(adapter._thread)`（线程归传输层后该字段**恒为 None**，断言它等于断言
+    恒真），已替换为`assertIsNone(adapter.transport)` + `not running`。
+  验证：**965 tests OK (skipped=1)**、compileall 0、`--status` 十个平台。
 

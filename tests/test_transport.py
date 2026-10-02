@@ -77,6 +77,12 @@ class _ScriptedBase(Transport):
         self._idle_gap = idle_delay
         self.opens = 0
         self.opened_at: list[float] = []
+        #: 每次 ``_open`` **发生时刻**的退避状态快照。
+        #: 比 ``opened_at`` 的 wall-clock 差分**更可靠**：等待只会比标称值更长
+        #: （机器忙时线程调度只会加延迟），所以墙钟差分需要容差、容差不够就 flaky；
+        #: 而"连上过一次之后退避确实回到下限"这件事本身就是确定性的状态转移，
+        #: 直接快照下来既不含容差、又能抓住"退避不再重置"这个真bug。
+        self.backoff_at_open: list[float] = []
         self.on_open_calls: list[Any] = []
         self.on_close_calls: list[Any] = []
         super().__init__(**kw)
@@ -84,6 +90,7 @@ class _ScriptedBase(Transport):
     def _open(self):
         self.opens += 1
         self.opened_at.append(time.monotonic())
+        self.backoff_at_open.append(self._backoff)
         if self._open_script:
             item = self._open_script.pop(0)
             if isinstance(item, BaseException):
@@ -877,7 +884,29 @@ class TestBaseInvariants(TransportTestCase):
         )
 
     def test_invariant2_backoff_reset_threaded(self):
-        """线程里也验证一次：前两次失败把退避推到 0.2s，稳定连接后退回 0.1s。"""
+        """线程里也验证一次：两次失败把退避推到 0.4s，稳定连接后退回下限0.1s。
+
+        ⚠️ **这个用例以前是 flaky 的**（实测高负载下 15 次里失败 1 次：墙钟差分
+        测到 0.172 而标称 0.1，旧断言是 ``assertAlmostEqual(0.1, delta=0.06)``）。
+        根因不是实现问题（等待只会**比标称更长**，机器忙时线程调度只会加延迟），
+        而是**断言形状错了**：用带容差的墙钟差分，既会在机器慢时误报，又**抓不到**
+        "等待比标称更短"这类真bug。
+
+        改为断言 ``backoff_at_open`` 这个**确定性状态序列**，不含任何容差：
+
+        ==================  ==========  ==========================================
+        第几次 open          退避快照     含义
+        ==================  ==========  ==========================================
+        1                   0.1         初始下限
+        2                   0.2         失败一次 →×2
+        3                   0.4         失败两次 → ×2
+        4                   **0.1**     **连上过一次（活了 0.05s ≥ reset_after）→ 重置**
+        5                   0.2         重置后重新开始涨（不是永远钉在下限）
+        ==================  ==========  ==========================================
+
+        第4 项是本用例的核心断言；第 5 项防止"用永远不重置来让第 4 项成立"。
+        若重置逻辑坏掉，序列会变成 ``0.1, 0.2, 0.4, 0.8, 0.8`` 而立刻失败。
+        """
         conn = _GateConn()
         t = _ScriptedBase(
             open_script=[OSError("boom"), OSError("boom"), conn, OSError("gone")],
@@ -889,13 +918,17 @@ class TestBaseInvariants(TransportTestCase):
             name=uniq_name("bo"),
         )
         self.start_transport(t)
-        self.assertTrue(wait_until(lambda: len(t.opened_at) >= 4, timeout=5.0))
-        gaps = [b - a for a, b in zip(t.opened_at, t.opened_at[1:])]
-        self.assertAlmostEqual(gaps[0], 0.1, delta=0.06)
-        self.assertAlmostEqual(gaps[1], 0.2, delta=0.12)
-        # 第三次重连发生在"稳定连接"之后 → 应回到下限（明显小于上一段）
-        self.assertAlmostEqual(gaps[2], 0.1, delta=0.06)
-        self.assertLess(gaps[2], gaps[1])
+        self.assertTrue(wait_until(lambda: len(t.opened_at) >= 5, timeout=5.0))
+        seen = [round(v, 6) for v in t.backoff_at_open[:5]]
+        for got, want in zip(seen, [0.1, 0.2, 0.4, 0.1, 0.2]):
+            self.assertAlmostEqual(got, want, places=6)
+        # 附带：确实真的等了（墙钟只做**下界**断言 —— 等待只会更长，绝不会更短）
+        gaps = [b - a for a, b in zip(t.opened_at, t.opened_at[1:5])]
+        for index, gap in enumerate(gaps):
+            self.assertGreaterEqual(
+                gap, 0.09,
+                f"第 {index + 1} 段间隔 {gap:.3f}s 低于下限，说明退避压根没等",
+            )
 
     def test_invariant3_open_exception_never_escapes(self):
         boom = ConnectionError("always down")

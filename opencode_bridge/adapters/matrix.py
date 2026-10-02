@@ -3,12 +3,33 @@
 传输层用 ``urllib.request``（零第三方依赖），全部调用收敛在单个可覆写的
 ``_request`` 方法后面，测试只需替换它即可离线验证协议层逻辑。
 
+A1：轮询循环 / 退避 / 线程 / ``stop()`` 语义已迁到
+:class:`~opencode_bridge.transport.PollingTransport`。本文件只留 Matrix 语义：
+增量同步游标、事件过滤、授权闸门、编辑的 MSC2676 近似、出站分片。
+
+⚠️ ``conversation_id`` 前缀**本轮刻意仍是 ``room:``**，不要"顺手改好"
+------------------------------------------------------------------------
+``identity.LEGACY_PREFIXES`` 里 ``room`` → ``matrix`` 是**指向别的平台的旧别名**
+（语法上 ``room`` 本身是合法平台名，所以光看字符串判不出来）。
+
+把 ``_conversation_id`` 改成 ``matrix:...`` 会改变 ``conversation_id`` 的字符串
+格式，而 :class:`~opencode_bridge.state.StateStore` 拿它当**不透明键**存
+``conversation_id ↔ session_id`` 映射 —— 于是**已落盘 ``state.json`` 里的所有
+``room:`` 键会一次性变成孤儿**，用户会在迁移后一次性"忘记"所有历史会话映射。
+这种故障**不报错**，只表现为"agent 突然记错上下文"，比直接失败难查得多。
+
+所以前缀切换必须是一个**单独的变更**，且必须与 ``state.py`` 的键迁移
+（旧键 → 新键的显式重写 + 版本门控）**一起**发。在那之前
+``_conversation_id`` 必须逐字节保持 ``room:`` 前缀 ——
+``tests/test_matrix.py`` 里有专门的用例把这一点钉死。
+
 两个平台特有的点：
 
 1. **增量同步游标**：``/_matrix/client/v3/sync`` 返回的 ``next_batch`` 是下一次
    增量同步的**唯一**凭据（不存在"拿最近 N 条"这种回放接口）。它保存在实例字段
    :attr:`MatrixAdapter._since` 上，跨多次调用存活；每次请求都带上，所以既不会
-   漏消息也不会无限重放。
+   漏消息也不会无限重放。**顺序铁律：先推进游标，再分发事件** —— 否则分发里
+   一条事件抛异常就会让整页事件被无限重放。
 
 2. **"编辑"消息**：Matrix 基础协议里**没有**编辑消息的 API。本适配器走业界兼容
    近似写法（见 :meth:`MatrixAdapter.edit`）：再发一条 ``m.room.message``，
@@ -32,6 +53,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
+from ..transport import NOTHING, PollingTransport
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.matrix")
@@ -95,7 +117,15 @@ def _error_detail(data: Any) -> str:
 
 @register("matrix")
 class MatrixAdapter(Adapter):
-    """Matrix Client-Server API adapter（``/sync`` 入站 + ``send`` 出站）。"""
+    """Matrix Client-Server API adapter（``/sync`` 入站 + ``send`` 出站）。
+
+    线程与退避归 :class:`~opencode_bridge.transport.PollingTransport`；
+    :attr:`running` / :meth:`stop` 是它的代理。
+
+    ⚠️ ``_conversation_id`` 刻意仍产出 ``room:`` 前缀 —— 见模块 docstring
+    「``conversation_id`` 前缀本轮刻意仍是 ``room:``」一节（切换的前置条件是
+    ``state.py`` 的键迁移，本轮不做）。
+    """
 
     name = "matrix"
     label = "Matrix"
@@ -128,6 +158,7 @@ class MatrixAdapter(Adapter):
         )
         #: ``next_batch`` 游标 —— Matrix 增量同步的核心，跨调用保存在实例上。
         self._since: str = str(self.config.get("since") or "").strip()
+        self._transport: Optional[PollingTransport] = None
         self._throttle_lock = threading.Lock()
         self._last_send: dict[str, float] = {}
 
@@ -205,6 +236,35 @@ class MatrixAdapter(Adapter):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    @property
+    def transport(self) -> Optional[PollingTransport]:
+        """当前传输层（``start()`` 之后才有）。"""
+        return self._transport
+
+    @property
+    def running(self) -> bool:
+        """轮询线程是否活着（代理到传输层）。"""
+        transport = self._transport
+        return transport is not None and transport.running
+
+    def _make_transport(self) -> PollingTransport:
+        """构造本次运行用的传输层（测试注入点：退避接线值）。"""
+        # 三处间隔都取 ``backoff_interval``，因为迁移前就是**一个**常数：
+        #   * idle_sleep     —— HTTP 失败（fetch 返回 NOTHING）后的重试间隔；
+        #   * min_backoff    —— fetch 抛异常（传输层错误）后的重试间隔；
+        #   * max_backoff    —— 与 min 相同 ⇒ 退避**恒定**、不会指数增长
+        #                        （迁移前没有指数退避，这里不能顺手"优化"）。
+        # reset_after=0 ⇒ 只要 fetch 成功过一次就重置退避（连上即重置）。
+        backoff = float(self.backoff_interval)
+        return PollingTransport(
+            self._request_sync,
+            idle_sleep=backoff,
+            name="matrix",
+            min_backoff=backoff,
+            max_backoff=backoff,
+            reset_after=0.0,
+        )
+
     def start(self) -> None:
         """缺 ``homeserver`` / ``access_token`` 时只告警并返回（不抛异常）。
 
@@ -217,12 +277,26 @@ class MatrixAdapter(Adapter):
             logger.warning("matrix: access_token missing; adapter not started")
             return
         self._stop_event.clear()
-        thread = threading.Thread(
-            target=self._inbound_loop, name="matrix-inbound", daemon=True
-        )
-        self._thread = thread
-        thread.start()
+        transport = self._make_transport()
+        self._transport = transport
+        transport.start(self._on_sync)
         logger.info("matrix: sync loop started (since=%r)", self._since)
+
+    def stop(self) -> None:
+        """置停止位 → 关传输层 → join（**幂等**）。
+
+        迁移前是 ``Adapter.stop()`` 置位 + join 5s；退避等待用
+        ``_stop_event.wait(backoff)``，所以能被立刻打断。现在这两段都在
+        :class:`~opencode_bridge.transport.PollingTransport` 里，语义不变。
+
+        ⚠️ 已知限制（迁移前就有，不是本次引入的）：``stop()`` **打不断**正在挂起
+        的 ``/sync`` HTTP 请求 —— 最长要等 ``SYNC_SOCKET_TIMEOUT``（35s）那一轮
+        自己返回，join 会在 5s 处超时返回，线程（daemon）随后自然退出。
+        """
+        super().stop()                      # 置停止位（_throttle 依赖它）
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.stop()
 
     # ------------------------------------------------------------------
     # Inbound (/sync long polling)
@@ -234,24 +308,14 @@ class MatrixAdapter(Adapter):
             query["since"] = self._since
         return f"{SYNC_PATH}?{urllib.parse.urlencode(query)}"
 
-    def _inbound_loop(self) -> None:
-        """长轮询循环。**任何**单次异常都在此被捕获 —— 绝不让线程静默死掉。"""
-        backoff = getattr(self, "backoff_interval", BACKOFF_INTERVAL)
-        while not self._stop_event.is_set():
-            try:
-                ok = self._sync_once()
-            except Exception:
-                logger.exception("matrix: sync cycle failed")
-                ok = False
-            if not ok:
-                if self._stop_event.wait(backoff):
-                    break
-            elif self._stop_event.wait(0.01):
-                # 打桩 / 短响应时兜底限速，同时让 stop() 能立刻退出。
-                break
+    def _request_sync(self) -> Any:
+        """一轮 ``/sync`` 的**原始结果**：成功返回响应 dict，失败返回 :data:`NOTHING`。
 
-    def _sync_once(self) -> bool:
-        """一次 ``/sync``。返回 True 表示成功（游标已推进）。"""
+        HTTP 失败（4xx/5xx/带 errcode）**不抛异常**，而是返回 :data:`NOTHING` ——
+        轮询语义下"这一轮没拿到"就是"没有"，由传输层按 ``idle_sleep`` 退避后重试。
+        抛异常在传输层里表示"传输层故障"（会走另一条退避路径 + 记一条告警），
+        而 Matrix 的 429/403 是**正常的业务响应**，不该被当成故障。
+        """
         status, data = self._request(
             "GET",
             self._sync_path(),
@@ -264,12 +328,36 @@ class MatrixAdapter(Adapter):
                 status,
                 _error_detail(data) or data.get("errcode"),
             )
-            return False
-        # 先推进游标再分发：分发里的单条异常不会让这条消息被无限重放。
+            return NOTHING
+        return data
+
+    def _on_sync(self, data: Any) -> None:
+        """传输层交给我们的**一份成功响应**。
+
+        **顺序铁律：先推进游标，再分发事件。** 这样分发里单条事件抛异常也不会让
+        这一页事件被无限重放（下次 ``/sync`` 已经带着新的 ``next_batch``）。
+        游标推进在最前，也意味着即使 :meth:`_dispatch_sync` 整体崩了，
+        游标也不会倒退或丢失。
+        """
         next_batch = str(data.get("next_batch") or "").strip()
         if next_batch:
             self._since = next_batch
         self._dispatch_sync(data)
+
+    def _sync_once(self) -> bool:
+        """跑完一轮同步（请求 → 推进游标 → 分发）。返回 True 表示成功。
+
+        这是 :meth:`_request_sync` + :meth:`_on_sync` 的"永不抛异常"组合形态，
+        供测试与手动诊断（拉一次看看游标对不对）使用；常驻轮询走传输层。
+        """
+        try:
+            data = self._request_sync()
+        except Exception:
+            logger.exception("matrix: sync cycle failed")
+            return False
+        if data is NOTHING:
+            return False                      # 失败：游标一字不动
+        self._on_sync(data)
         return True
 
     def _dispatch_sync(self, data: dict) -> None:
@@ -339,6 +427,12 @@ class MatrixAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(room_id: Any) -> str:
+        """``room_id`` → ``room:...``。
+
+        ⚠️ **不要**改成 ``identity.format_id("matrix", room_id)``。``room`` 在
+        :data:`identity.LEGACY_PREFIXES` 里是旧别名，切换会让已落盘 ``state.json``
+        的会话映射键全部失效 —— 前置条件是 ``state.py`` 的键迁移。见模块 docstring。
+        """
         return f"room:{room_id}"
 
     @staticmethod

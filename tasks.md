@@ -6,8 +6,14 @@
 
 ## 目标
 
-**breadth 优先**：把 opencode-bridge 做成能接通各大消息平台的桥。
-横向前提（授权 / 能力声明 / 分片 / 可观测）是"加平台"的杠杆，不是可选项。
+**融合两个参考项目的平台覆盖面**（Hermes 22 个 + dsh-im-gateway 22 个，取并集 ≈ 31 个），
+每个平台按**难度由易到难**实现，整体架构足够清晰完整，使"再加一个平台"变成低成本的声明式工作。
+
+参考项目的平台清单（权威来源已核对，非记忆）：
+- **Hermes**（`hermes-agent/plugins/platforms/`，每家带 `plugin.yaml`）：a2a / buzz / dingtalk / discord / email / feishu / google_chat / homeassistant / irc / line / matrix / mattermost / ntfy / photon / raft / simplex / slack / sms / teams / telegram / wecom / whatsapp
+- **dsh-im-gateway**（`ref-dsh-im-gateway/src/channels/`）：discord / irc / line / matrix / mattermost / msteams / nextcloud / googlechat / nostr / qqbot / signal / slack / synology / telegram / twitch / wechat / wecom / whatsapp / zalo / imessage / feishu / dingtalk
+
+**关键约束（本项目的立身之本）**：Python 3.10+ **仅标准库**、**纯本机运行**、不要求公网回调地址。
 
 ## 难度口径
 
@@ -16,6 +22,25 @@
 | **S** | 纯函数或局部改动，不破坏现有行为 |
 | **M** | 跨文件 + 新抽象 + 测试 |
 | **L** | 破坏性迁移或跨层状态机 |
+
+---
+
+## 架构 · 让"加平台"降为声明式工作
+
+已完成的地基：能力显式声明（`capabilities()`）、统一授权闸门（`admits()`）、
+平台注册表**动态发现**（`registered_names()`，新增平台不改核心文件）、
+凭据声明（`required_tokens` / `outbound_tokens`，且有 `outbound ⊆ required` 不变量）。
+
+**还缺的、决定了后续加平台成本的三件事**（阶段 A 补齐）：
+
+| # | 缺口 | 现状 | 目标 |
+|---|---|---|---|
+| A1 | **传输层抽象** | 每个适配器各自手写"连接 + 收包 + 退避重连 + 停止"循环（8 份重复逻辑） | 抽出可复用 transport：HTTP 长轮询 / HTTP 短轮询 / WebSocket / TCP 行协议。基类统一生命周期、指数退避、**stop 语义（先关连接再 join，否则每次 stop 等满超时）** |
+| A2 | **会话标识不统一** | 逐平台临时约定：`chat:` / `channel:` / `room:` / `irc:` / `nextcloud:` 各不相同，且没有解析与校验入口 | 统一为 `platform:local_id`；提供 `format` / `parse` / `platform_of` / 合法性校验，并**向后兼容**已写入 `state.json` 的旧格式 |
+| A3 | **缺 inbound-push（webhook）入口** | 架构只有 outbound（我们主动连/拉），所以**7 个 webhook-only 平台根本接不进来**（line / teams / sms / synology / zalo / google_chat / whatsapp官方）——而 Hermes（`webhook.py` + `shared_ingress.py`）与 dsh（各 channel 起本地 HTTP server）**两家都有这条路径** | 单端口 HTTP 服务 + 按路径路由到各适配器；平台侧只需声明"我的 webhook 路径 + 我要验签/解密"，传输与生命周期由基类管 |
+
+**加一个平台的目标形态**：写一个 ~150 行适配器（凭据键 + 能力 + 字段映射 + 事件过滤），
+复用 transport 的生命周期；不写连接循环、不写退避、不写线程管理。
 
 ---
 
@@ -56,50 +81,93 @@
 
 ---
 
-## 阶段 4 · 横向增强（平台越多越值钱）
+## 阶段 A · 架构地基（决定后续每加一个平台的成本，必须先做）
+
+| # | 任务 | 难度 | 验收 | 状态 |
+|---|---|---|---|---|
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（55 用例）；**适配器迁移未做**（见下方备注） |
+| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**适配器尚未改用它** |
+| A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
+
+---
+
+## 阶段 B · 平台接入波次（按难度由易到难，全部来自两家清单的并集）
+
+难度判据：**纯标准库可行 + 不需公网回调 + 活跃度** 三者同时满足才进 B 组。
+
+| 波次 | 平台 | 入站机制 | 难度 | 关键点 / 风险 |
+|---|---|---|---|---|
+| **B1** | ntfy | HTTP 流式订阅（`/json`） | S | 唯一零妥协项：4096 **字节**上限（受 FCM/APNOTES 限制）；防回环靠**自定义 tag**（ntfy 无用户身份，`title` 是发布者可控的，**不可用于鉴权**）；不支持编辑 |
+| **B1** | email | IMAP 轮询（`imaplib`） | S | `imaplib`/`smtplib` 全标准库，协议通用永不废弃；需专用邮箱或 app password；不支持编辑 |
+| **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 方向与其他平台相反；默认 bind 127.0.0.1 **天然满足"不需公网"**；Hermes 已验证纯 `http.server` 无需 SDK |
+| **B2** | qqbot | WebSocket 网关 | M | 协议是 Discord 风格变体（op 码 + intents + `heartbeat_interval`），可直接复用 `ws.py`；防回环天然（bot 消息不推回给自己） |
+| **B2** | homeassistant | WebSocket 事件总线（本机） | M | WS 极简；HA 极活跃。**但它是设备事件管道不是 IM**，取决于定位是否要收 |
+| **B3** | feishu / lark | WebSocket 长连接 | M | 官方明确"免内网穿透、**事件明文免解密**"；代价是 SDK 的 WS 握手 + `app_ticket` 刷新要自己实现；⚠️ **无 fromMe 字段**，防回环需自己记 message_id |
+| **B3** | wecom | WebSocket（`openws.work.weixin.qq.com`） | M | 必须选"智能机器人"（自建应用只有 callback 模式，要 AES 加解密 + 公网）；流式回复 `streamId` 机制较复杂 |
+| **B3** | dingtalk | WebSocket Stream 模式 | L | 二进制帧 + 签名校验，自己实现成本高；出站 `sessionWebhook` 是会话内下发的 URL，须做 **hostname 白名单**防 SSRF |
+| **B4** | wechat / weixin | 官方长轮询（`ilink`） | L | HTTP 层可标准库做，**纯文本不需要加密**（媒体才需自写 AES-128-ECB）；代价是**扫码登录流程要自己实现**（二维码 → 状态轮询 → token 持久化）；**仅私聊、一账号一 poller**，须专用小号 |
+| **B4** | nostr | WebSocket relay | L | 传输可标准库做，但 **NIP-04/44 要 secp256k1**（NIP-44 是继任者，同样要）→ 要自己实现约 500 行椭圆曲线算术，或接受明文 kind-1（无加密无隐私）；主仓 2025-06 后停滞、dsh 自标"实验性" |
+
+---
+
+## 阶段 C · 横向增强（平台越多越值钱）
 
 | # | 任务 | 难度 | 收益 | 状态 |
 |---|---|---|---|---|
-| T4.1 | **入站合并窗口** `..`/`!!` + 5s 超时 + 长输入回执（**含快照落盘**） | M | 手机长按拆条不再变成 N 次提问 | ☐ |
-| T4.2 | **prompt hint 注入**（借 `ctx.session.hook("context")`） | S | agent 知道消息长度上限 / 无 markdown 渲染 / 回复非即时 | ☐ |
-| T4.3 | **脱敏引擎** | M | 手机号 / token / chat id 不再明文进日志与 `state.json` | ☐ |
-| T4.4 | **审批超时回落 + 迟到回答去重** | S | 窗口关闭后随口一句不会被误当批准 | ☐ |
+| C1 | **prompt hint 注入**（借 `ctx.session.hook("context")`） | S | agent 知道自己在 400 字符的 IRC 上说话，还是 40000 的 Slack；无 markdown 渲染；回复非即时 | ☐ |
+| C2 | **脱敏引擎** | M | 手机号 / token / chat id 不再明文进日志与 `state.json`（横跨 8+ 个平台） | ☐ |
+| C3 | **入站合并窗口** `..`/`!!` + 5s 超时 + 长输入回执（含快照落盘） | M | 手机长按拆条不再变成 N 次提问 | ☐ |
+| C4 | **审批超时回落 + 迟到回答去重** | S | 窗口关闭后随口一句不会被误当批准 | ☐ |
 
 ---
 
-## 阶段 5 · 主动能力
+## 阶段 D · 主动能力
 
 | # | 任务 | 难度 | 依赖 | 状态 |
 |---|---|---|---|---|
-| T5.1 | 渠道地址簿（"我在哪些群"，仅索引已连接平台） | M | — | ☐ |
-| T5.2 | 主动发送 `bridge_send` 工具 | M | T5.1 | ☐ |
-| T5.3 | 富交互按钮覆盖三平台 | M | T1.1 | ☐ |
-| T5.4 | 定时任务绑 chatId（**opencode 无 cron，需自建日历 + tick + 落盘**） | L | T5.1 | ☐ |
+| D1 | 渠道地址簿（"我在哪些群"，仅索引已连接平台） | M | A2 | ☐ |
+| D2 | 主动发送 `bridge_send` 工具 | M | D1 | ☐ |
+| D3 | 富交互按钮覆盖多平台（目前**只有 Telegram** `supports_inline_buttons=True`） | M | T1.1 | ☐ |
+| D4 | 定时任务绑 chatId（**opencode 无 cron，需自建日历 + tick + 落盘**） | L | D1 | ☐ |
 
 ---
 
-## TODO · 有真实门槛，暂不排期
+## 阶段 E · 需公网回调的 7 家（**必须先有 A3**，且需隧道/域名）
 
-| # | 项 | 门槛 | 状态 |
+⚠️ 这 7 家经核实**全部是 webhook-only 且无官方轮询替代**。要接就必须有一个可达的回调地址
+（cloudflared 隧道 / 备案域名），这**违背本项目"纯本机"的立身约束** —— 所以它们不是"排期问题"，
+而是**要不要放宽约束**的决策点。未放宽前不做。
+
+| 平台 | 出站可行 | 入站 | 备注 |
 |---|---|---|---|
-| TODO-1 | **WhatsApp** | 官方无 Bot API；dsh 依赖 `baileys`（Node 生态重型库）。Python 侧需另选方案（自研 WebSocket 逆向 / 第三方网关服务 / 桌面端桥），**未评估可行性** | ☐ |
-| TODO-2 | LINE / Google Chat / Zalo / Teams | 需**公网回调地址**（隧道 / 备案域名），非纯本地可解 | ☐ |
-| TODO-3 | 飞书 / 钉钉 / 企微 | 官方签名校验与加解密，各自 1~2 天 | ☐ |
-| TODO-4 | 微信 | 需专用账号 + 设备扫码，账号风险自负 | ☐ |
-| TODO-5 | iMessage | 仅 macOS，依赖 `imsg`/`osascript` | ☐ |
+| WhatsApp（**Meta 官方 Cloud API**） | ✅ Graph API `POST /{PHONE_NUMBER_ID}/messages` | ❌ webhook | ⚠️ **修正此前记录**：官方 API 是存在的（`whatsapp_cloud.py` 首行即 Meta 官方 Business Platform）。两家走的是**另一条**路 —— dsh 与 Hermes 都用 `@whiskeysockets/baileys`（Node，非官方 Web 客户端，有封号风险），Hermes 还要 Node 桥进程 |
+| LINE | ✅ `/v2/bot/message/reply`（5000 字符/bubble 硬上限，每次 ≤5 bubble） | ❌ webhook | 无轮询替代 |
+| Teams / msteams | ✅ Bot Framework `/v3/conversations/{id}/activities` | ❌ webhook | Bot Framework 无轮询替代 |
+| SMS（Twilio） | ✅ | ❌ webhook | Twilio 入站只有 webhook |
+| Synology Chat | ✅ | ❌ webhook | 群晖私有，需把 outgoing webhook 指向本机公网地址 |
+| Zalo | ✅ `openapi.zalo.me/v3.0/im/oa/message` | ❌ webhook | 活跃度未确认 |
+| Google Chat | ✅ | ❌ webhook | 唯一非 webhook 替代是 GCP Pub/Sub pull，但需 GCP 项目 + 服务账号 + `google-cloud-pubsub` 库（**双重违背零依赖**） |
 
 ---
 
-## 不做（已决策）
+## 不做（已决策，附理由）
 
 | 项 | 原因 |
 |---|---|
 | 配对码（陌生人配对流程） | 一整套限流/TTL/锁定状态机；等到真要在群里开放给陌生人再上 |
 | 25 渠道全量 / 平台插件化 | 方向是"做深"不是"做多" |
 | 实例锁 | 纯插件进程，无共享 home 概念 |
-| 默认改显式 opt-in | 会破坏"配好即用"现状；若要改需单独决策（迁移期 + 警告期） |
+| 默认改显式 opt-in（`allowed_chat_ids` 空=全开 → 默认拒绝） | 会破坏"配好即用"现状；若要改需单独决策（迁移期 + 警告期）。⚠️ **但平台从 1 个变 8+ 个后风险面显著变大，这项应尽快决** |
+| **Signal** | 需 `signal-cli`（Java 二进制）+ **单独注册号**（不能复用主号，有封号风险）；Signal 官方无 bot API |
+| **imessage** | macOS 专有 + `imsg`/`osascript`，非 macOS 直接出局 |
+| **simplex** | WS 协议简单但必须跑 Haskell 守护进程 —— 只是把重型依赖换个地方装 |
+| **photon**（Photon Spectrum） | SDK 是 TypeScript-only，必须 Node ≥18.17 sidecar；商业服务 |
+| **buzz**（Block，Nostr 之上） | 需 Rust CLI 二进制 + Nostr secp256k1 签名；README 自列大量"🚧 Being wired up" |
+| **raft** | 需 `raft` CLI；消息体根本不过我们的进程（只有"wake"提示），是"挂到别人平台"而非 IM 网关 |
+| **whatsapp（baileys 路线）** | 需 Node 运行时 + npm 动态安装；违背零依赖；非官方客户端有封号风险 |
 
 ---
+
 
 ## 进度日志
 
@@ -300,3 +368,53 @@
   - 复核要点：源码里唯一的 `ocs/v1.php` 出现在**模块 docstring 的告诫文字**里（"不要用
     `ocs/v1.php`"），`_url()` 只拼 `{base_url}/ocs/v2.php/...` —— 抽查脚本报 False 是误报。
   验证：**703 tests OK (skipped=1)**、compileall 0、表格对齐实测正确。
+- **2026-10-02** 路线图按"Hermes × dsh 融合"重写（A1/A2/A3 + B/C/D/E 阶段）：
+  - 从**权威来源**核对两份平台清单（Hermes 22 个来自 `plugins/platforms/*/plugin.yaml`；
+    dsh 22 个来自 `src/channels/*.ts`），并对 23 个候选平台逐个定性。
+  - ⚠️ **推翻了原 TODO-1 的前提**：我原写"WhatsApp 官方无 Bot API、未评估可行性"是**错的**。
+    官方 **Meta WhatsApp Cloud API** 存在（`whatsapp_cloud.py` 首行即"official Meta WhatsApp
+    Business Platform"）。但**入站必须公网 webhook 且无轮询替代**；而 dsh 与 Hermes 走的
+    其实是**另一条路** —— `@whiskeysockets/baileys`（Node 非官方客户端，两家都依赖，有封号风险）。
+  - 真正的分类轴不是"难/易"而是 **"入站是否需要公网回调"**：23 个候选里 **7 个是
+    webhook-only 且无官方替代**（WhatsApp官方 / LINE / Teams / SMS / Synology / Zalo /
+    Google Chat）。要接这 7 家必须先有 A3 的 webhook 入口，且**需要可达的回调地址** ——
+    这违背本项目"纯本机"的立身约束，所以列为**约束决策点**（阶段 E），不是排期问题。
+  - 新增阶段 B 波次（按难度由易到难）：B1 `ntfy` / `email` / `a2a` → B2 `qqbot` /
+    `homeassistant` → B3 `feishu` / `wecom` → B4 `dingtalk` / `wechat` / `nostr`。
+  - 新增"不做"条目并附理由：Signal（需单独注册号，有封号风险）、imessage（macOS 专有）、
+    simplex（须跑 Haskell 守护进程）、photon（SDK 仅 TypeScript）、buzz（Rust CLI + secp256k1）、
+    raft（消息体不过本进程）。
+- **2026-10-02** A1 传输层 + A2 会话标识（**包已建成，适配器迁移未做**）：
+  - **A1** `opencode_bridge/transport/`：`Transport` 基类把"连接 → 收包 → 退避重连 →
+    线程 → 停止"这套 8 份重复样板收敛掉；`PollingTransport` / `WebSocketTransport` /
+    `TcpLineTransport` 三个具体实现 + `EventQueue`（批量 fetch → 一次一条）。55 个用例。
+    基类 6 条不变量各有测试，其中"**先关连接再 join**"是用**事件顺序**（不是"stop 有没有
+    返回"）证明的 —— 那是 8 个适配器都踩过的坑。
+  - **两处我拍板的语义修正**（lane 主动指出，抓到了会破坏"行为不变"的真问题）：
+    1. `reset_after` 原默认 60s = "稳定存活 60s 才重置退避"，而现有适配器是
+       **"连上过一次就重置"**（`irc.py:372` 明写）。直接迁移会让网络闪断时退避一路涨到
+       上限。**改为默认 `reset_after=0`（连上就重置 = 行为不变）**，保守模式改为显式可选，
+       并加两条用例：默认值为 0 的承诺、正数时确由调用点闸门生效（防它退化成死参数）。
+    2. `_next` 一次只交付一条，而 Telegram/Matrix/Nextcloud 一轮返回**多条** →
+       新增 `EventQueue` 共用件，而不是让每个适配器各写一遍闭包队列。
+  - **A2** `opencode_bridge/identity.py`：统一 `platform:local_id`。发现并修掉两个真 bug：
+    1. `channel:` 被 **slack / discord / mattermost 三家共用**，而 `StateStore` 用
+       `conversation_id` 当不透明键存会话映射 → 两平台出现相同 local id 就会**共用会话**
+       （用户在 A 平台的对话串到 B 平台）。迁移后不可能撞车。
+    2. `channel:` 属歧义前缀且**无法从字符串判断来源**，所以 `normalize()` **缺
+       `platform_hint` 就抛错、绝不猜** —— 猜错会把用户映射到别人的会话，
+       这类错误不报错、只表现为"agent 突然记错上下文"，比直接失败难查得多。
+  - 过程中自己的测试抓到**两个我自己引入的 bug**：`is_valid("chat:55")` 原本返回 `True`
+    （`chat` 在语法上是合法平台名，故旧格式与新格式无法区分）—— 改为以 legacy 登记表
+    为准，旧别名一律拒绝并指向 `normalize`；以及 `_check_local` 禁冒号会**炸掉 Matrix 的
+    真实房间 id** `!abcDEF:example.org`。
+  - 另修一条**测试自身**的缺陷：`reset_after` 用例原本断言 wall-clock 间隔，
+    **单独跑通过、全量跑失败**（机器忙时线程调度抖动）→ 改为断言内部退避状态，
+    确定性与负载无关，连跑 3 次无 flaky。
+  - ⚠️ **待办**：A1/A2 目前只是**包**，八个适配器**还没迁过来**，所以运行时行为零变化。
+    迁移是有风险的一步（会让 `conversation_id` 变格式、进而影响已落盘的 `state.json`），
+    按 lane 建议的顺序逐步迁：IRC（最干净）→ Matrix/Nextcloud（轮询）→ Slack
+    （`ReconnectNow` 有真实收益但**属行为变更，要单列**）→ Discord（需"周期钩子"跑心跳）
+    → Twitch（IRC-over-WS，需 WS 行子类，最后迁或考虑不迁）。
+  验证：**782 tests OK (skipped=1)**、compileall 0、transport 与 identity 连跑 3 次无 flaky。
+

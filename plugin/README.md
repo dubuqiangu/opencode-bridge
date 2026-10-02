@@ -149,7 +149,7 @@ bun build index.ts --no-bundle        # 语法/解析检查
 bun harness.ts                        # 期望: PASS 14/14，退出码 0
 ```
 
-`harness.ts` 覆盖 22 个场景：
+`harness.ts` 覆盖 25 个场景：
 
 - #1~#10 生命周期：首次 spawn、同进程采纳、双 cleanup 语义、残留锁（杀旧重启）、
   死 pid 锁、`enabled:false`、损坏锁、`bridgeDir` 缺失、快速失败 + backoff；
@@ -159,6 +159,9 @@ bun harness.ts                        # 期望: PASS 14/14，退出码 0
 - #16~#22 第 4 级自举：`deriveStableDir` 三分支、全新目录铺源并生成 `config.json`、
   已有 `config.json` 绝不覆盖、稳定目录是 git clone 时不碰、非 git 目录刷新 `.py`、
   `enabled:false` 零副作用、无 `bridgeDir` 时端到端自举 + 正常 spawn；
+- #23~#25 opencode 内接入引导面：工具 `bridge_setup` 与命令 `/bridge-setup` 注册、
+  工具把 `platform` 透传给 `--setup` 子进程并返回引导 + 状态、命令经 `session.prompt`
+  把引导原文送达；
 - 另断言 `index.ts` 源码不含 `D:\` / `D:/` 等硬编码盘符路径。
 
 harness 结束会杀掉它 spawn 的全部子进程、删临时目录与锁，并还原被它临时改写的

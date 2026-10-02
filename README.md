@@ -317,6 +317,23 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 
 普通文本直接发送即可；权限请求也会以文字形式推送（形如 `🔐 权限请求 … 回复: /approve xxx`），用上面的命令回复。
 
+### 在 opencode 里问接入引导（不用先进 bot 窗口）
+
+接入前 bot 还没起不来，所以引导在 **opencode 内**也能拿——两种等价入口：
+
+- **工具 `bridge_setup`**：会话里直接问「怎么接 Telegram / bot_token 填哪里 / 桥接配好了吗」，agent 会调用它，返回**配置状态（✓/✗ 各平台）+ 真实配置文件路径 + 该平台分步引导**。
+- **命令 `/bridge-setup [平台]`**：出现在 opencode 斜杠命令面板（`/bridge-setup telegram`）。
+
+命令行等价物（供脚本/文档引用）：
+
+```bash
+python -m opencode_bridge --setup                 # 平台菜单
+python -m opencode_bridge --setup telegram        # 单平台分步引导
+python -m opencode_bridge --setup --json          # {config_path, platforms:[{key,label,configured}]}
+```
+
+三处入口共用 `core.py` 的同一份冻结文案（`setup_reply()`），不复制副本；`--setup` 不连接 opencode、不需要 token，因此在配置之前就能运行。
+
 ## 6. 配置项说明
 
 `config.json`（模板见 [`config.example.json`](config.example.json)）：
@@ -389,7 +406,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 # Python 单元测试（标准库 unittest，无需安装任何依赖）
 python -m unittest discover -s tests -v
 
-# 插件自检（22 个场景：生命周期 + bridgeDir 四级解析 + 自举铺装；离线运行，不碰 opencode 服务）
+# 插件自检（25 个场景：生命周期 + bridgeDir 四级解析 + 自举铺装 + opencode 内引导面；离线运行，不碰 opencode 服务）
 cd plugin
 bun harness.ts
 

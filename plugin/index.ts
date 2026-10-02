@@ -21,6 +21,8 @@ export interface BridgePluginOptions {
   logDir?: string
   backoffMs?: number
   lockName?: string
+  /** `--setup` 引导用的子进程命令前缀（默认 `-m opencode_bridge --setup`）；仅供测试覆盖。 */
+  setupCommand?: string[]
 }
 
 interface ResolvedConfig {
@@ -31,6 +33,7 @@ interface ResolvedConfig {
   logDir: string
   backoffMs: number
   lockName: string
+  setupCommand: string[]
 }
 
 /** <bridgeDir>\<lockName> 的内容。 */
@@ -52,6 +55,7 @@ const DEFAULTS: ResolvedConfig = {
   logDir: "", // 空 = bridgeDir
   backoffMs: 300000,
   lockName: ".bridge-plugin.lock",
+  setupCommand: ["-m", "opencode_bridge", "--setup"],
 }
 
 /** 子进程存活时间低于该值的非零退出视为“快速失败”，记录 failedAt 触发 backoff。 */
@@ -296,6 +300,11 @@ function mergeInto(cfg: ResolvedConfig, src: unknown, origin: string): void {
     if (typeof s.lockName === "string" && s.lockName.length > 0) cfg.lockName = s.lockName
     else warn(`${origin}.lockName 类型无效(需非空字符串)，保留 ${cfg.lockName}`)
   }
+  if ("setupCommand" in s) {
+    if (Array.isArray(s.setupCommand) && s.setupCommand.every((x) => typeof x === "string"))
+      cfg.setupCommand = s.setupCommand as string[]
+    else warn(`${origin}.setupCommand 类型无效(需字符串数组)，保留默认值`)
+  }
 }
 
 /** 优先级：ctx.options > <插件目录>/config.json > 环境变量 OPENCODE_BRIDGE_DIR(仅 bridgeDir) >
@@ -334,6 +343,169 @@ function resolveConfig(options: unknown): ResolvedConfig {
   if (!cfg.bridgeDir && cfg.enabled) bootstrapBridgeDir(cfg)
   if (!cfg.logDir) cfg.logDir = cfg.bridgeDir
   return cfg
+}
+
+// ---------------------------------------------------------------------------
+// opencode 内接入引导：bridge_setup 工具 + /bridge-setup 命令
+// 文案不在 TS 侧复制 —— 一律 spawn `python -m opencode_bridge --setup`，
+// 与 bot 内 /setup、CLI --setup 共用 core.py 的同一份冻结文案。
+// ---------------------------------------------------------------------------
+
+const SETUP_PLATFORMS = ["telegram", "slack", "discord"] as const
+
+/** 跑一次 `python -m opencode_bridge --setup [platform] [--json]` 并拿 stdout。 */
+function runSetup(cfg: ResolvedConfig, platform: string | null, asJson: boolean): Promise<string> {
+  return new Promise((resolve) => {
+    const args = [...cfg.setupCommand]
+    if (asJson) args.push("--json")
+    if (platform) args.push(platform)
+    let out = ""
+    let c: ChildProcess
+    try {
+      c = spawn(cfg.python, args, { cwd: cfg.bridgeDir, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+    } catch (e) {
+      resolve(`[bridge-plugin] 无法启动引导命令(${cfg.python} ${args.join(" ")}): ${String(e)}`)
+      return
+    }
+    const timer = setTimeout(() => {
+      try {
+        c.kill()
+      } catch {
+        /* ignore */
+      }
+      resolve(out.trim() || "[bridge-plugin] 引导命令超时无输出")
+    }, 20000)
+    c.stdout?.on("data", (d: Buffer) => {
+      out += d.toString("utf8")
+    })
+    c.on("error", (err) => {
+      clearTimeout(timer)
+      resolve(`[bridge-plugin] 引导命令失败：${err.message}`)
+    })
+    c.on("close", (code) => {
+      clearTimeout(timer)
+      const text = out.trim()
+      if (!text) resolve(`[bridge-plugin] 引导命令无输出 (code=${String(code)})`)
+      else if (code === 0) resolve(text)
+      else resolve(`${text}\n[bridge-plugin] 引导命令返回 code=${String(code)}`)
+    })
+  })
+}
+
+/** 工具 + 命令注册。ctx 缺 tool/command 能力时静默跳过，绝不抛。 */
+async function registerSetupSurfaces(
+  ctx: unknown,
+  cfg: ResolvedConfig,
+  log: (msg: string, level?: LogLevel) => void,
+): Promise<void> {
+  const c = ctx as
+    | {
+        tool?: {
+          transform: (
+            cb: (editor: {
+              add: (t: {
+                name: string
+                description: string
+                input: { type: "string"; properties: Record<string, unknown>; required?: string[] }
+                execute: (input: Record<string, unknown>) => Promise<{ content: string }>
+              }) => void
+            }) => void,
+          ) => unknown
+        }
+        command?: {
+          transform: (
+            cb: (editor: {
+              add: (d: {
+                name: string
+                description?: string
+                execute: (input: { sessionID: string; prompt: unknown; delivery: string }) => Promise<void>
+              }) => void
+            }) => void,
+          ) => unknown
+        }
+        session?: { prompt: (input: { sessionID: string; text: string; delivery?: string }) => unknown }
+      }
+    | undefined
+  if (!c) return
+
+  const norm = (v: unknown): string | null => {
+    const t = String(v ?? "").trim().toLowerCase()
+    if (!t) return null
+    const map: Record<string, string> = { "1": "telegram", "2": "slack", "3": "discord" }
+    const key = map[t] ?? t
+    return (SETUP_PLATFORMS as readonly string[]).includes(key) ? key : null
+  }
+
+  // ---- 工具：模型可在会话里直接问「怎么配 Telegram」 ----
+  if (typeof c.tool?.transform === "function") {
+    try {
+      c.tool.transform((editor) => {
+        if (typeof editor?.add !== "function") return
+        editor.add({
+          name: "bridge_setup",
+          description:
+            "opencode-bridge（Telegram/Slack/Discord 消息桥）的接入引导与配置状态。" +
+            "回答用户「怎么接入 Telegram / Slack / Discord」「bot_token 填哪里」" +
+            "「桥接配置好了吗」这类问题时调用。不带参数返回平台菜单与配置路径；" +
+            "带 platform 返回该平台分步引导。",
+          input: {
+            type: "string",
+            properties: {
+              platform: {
+                type: "string",
+                enum: [...SETUP_PLATFORMS],
+                description: "可选；只查某个平台。省略则返回平台菜单与配置文件路径。",
+              },
+            },
+          },
+          execute: async (input) => {
+            const key = norm((input as { platform?: unknown }).platform)
+            const platform = key ?? null
+            const text = await runSetup(cfg, platform, false)
+            const status = await runSetup(cfg, null, true)
+            const head = platform
+              ? `opencode-bridge 接入引导（${platform}）`
+              : "opencode-bridge 接入引导（平台菜单）"
+            return {
+              content: [`# ${head}`, "", "## 当前配置状态", "", "```", status, "```", "", text].join("\n"),
+            }
+          },
+        })
+      })
+      log("已注册工具 bridge_setup（opencode 内可直接问接入引导）")
+    } catch (e) {
+      warn(`注册 bridge_setup 工具失败: ${String(e)}`)
+    }
+  }
+
+  // ---- 命令：/bridge-setup [平台] 出现在 opencode 斜杠命令面板 ----
+  if (typeof c.command?.transform === "function" && typeof c.session?.prompt === "function") {
+    try {
+      c.command.transform((editor) => {
+        if (typeof editor?.add !== "function") return
+        editor.add({
+          name: "bridge-setup",
+          description: "opencode-bridge 接入引导（Telegram / Slack / Discord），可选参数：平台",
+          execute: async (input) => {
+            const raw = String((input as { prompt?: unknown }).prompt ?? "")
+            const m = raw.match(/bridge-setup\s+(\S+)/i)
+            const key = m ? norm(m[1]) : null
+            const text = await runSetup(cfg, key, false)
+            await c.session!.prompt({
+              sessionID: input.sessionID,
+              text:
+                `用户请求 opencode-bridge 接入引导。请**原样**把下面内容展示给用户，` +
+                `不要改写、不要补充其它内容：\n\n${text}`,
+              delivery: input.delivery === "queue" ? "queue" : "steer",
+            })
+          },
+        })
+      })
+      log("已注册命令 /bridge-setup（opencode 斜杠命令面板）")
+    } catch (e) {
+      warn(`注册 /bridge-setup 命令失败: ${String(e)}`)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +588,9 @@ export default {
       log("enabled=false，不启动 bridge")
       return noop
     }
+
+    // opencode 内接入引导面（工具 + 命令）：不依赖 bridge 是否起得来，注册失败也只 log
+    void registerSetupSurfaces(ctx, cfg, log)
 
     // bridgeDir 四级解析（options > 同目录 config.json > OPENCODE_BRIDGE_DIR > 自举稳定目录）
     // 全落空：不 spawn、不抛异常，只打一条错误日志后返回 no-op cleanup。

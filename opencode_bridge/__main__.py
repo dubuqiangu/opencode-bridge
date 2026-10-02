@@ -3,9 +3,14 @@
 Usage::
 
     python -m opencode_bridge [--config PATH] [--verbose] [--check]
+    python -m opencode_bridge --setup [平台] [--json]
 
 * ``--check`` only resolves the endpoint and calls ``GET /api/info`` — it
   never creates a session and never starts an adapter.
+* ``--setup`` prints the frozen per-platform onboarding copy and exits: it
+  contacts nothing and needs no ``bot_token``, so it also works *before* the
+  bridge is configured. It is the single source of truth behind both the
+  in-bot ``/setup`` command and the ``bridge_setup`` plugin tool inside OpenCode.
 * The normal run builds every configured adapter, starts the SSE reader and
   blocks until ``Ctrl+C``; shutdown always goes through ``BridgeCore.stop()``.
 """
@@ -13,14 +18,16 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 import threading
 from typing import Sequence
 
 from .adapters import build
-from .config import Config
-from .core import BridgeCore
+from .config import Config, DEFAULT_CONFIG_NAME
+from .core import BridgeCore, setup_platforms, setup_reply
 from .opencode_client import OpenCodeClient, discover_endpoint
 from .state import StateStore
 
@@ -60,7 +67,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只做与 opencode 服务的连通性自检，然后退出",
     )
+    parser.add_argument(
+        "--setup",
+        nargs="?",
+        const="",
+        metavar="平台",
+        default=None,
+        help=(
+            "打印接入引导后退出（telegram|slack|discord 或 1|2|3；不带参数则打印平台菜单）。"
+            "不需要连接 opencode，也不需要配置 token"
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="与 --setup 搭配：输出机器可读 JSON（配置路径 + 各平台是否已配 token）",
+    )
     return parser
+
+
+def _platform_status(cfg: Config) -> list[dict[str, object]]:
+    """Per-platform ``{key,label,configured}`` for ``--setup --json``.
+
+    ``configured`` mirrors the run-time pre-flight: a non-empty ``bot_token``.
+    """
+    entries = cfg.adapters if isinstance(cfg.adapters, dict) else {}
+    out: list[dict[str, object]] = []
+    for key, label in setup_platforms():
+        entry = entries.get(key)
+        token = entry.get("bot_token") if isinstance(entry, dict) else None
+        out.append(
+            {
+                "key": key,
+                "label": label,
+                "configured": bool(token is not None and str(token).strip()),
+            }
+        )
+    return out
+
+
+def run_setup(cfg: Config, platform: str, as_json: bool) -> int:
+    """Print the frozen onboarding copy. Never contacts opencode."""
+    if as_json:
+        payload = {
+            "config_path": _config_file_in_use(),
+            "platforms": _platform_status(cfg),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(setup_reply(platform))
+    return 0
+
+
+def _config_file_in_use() -> str:
+    """Absolute path of the config the bridge would load right now."""
+    env_path = (os.environ.get("OPENCODE_BRIDGE_CONFIG") or "").strip()
+    if env_path and os.path.isfile(env_path):
+        return os.path.abspath(env_path)
+    cwd_path = os.path.join(os.getcwd(), DEFAULT_CONFIG_NAME)
+    if os.path.isfile(cwd_path):
+        return os.path.abspath(cwd_path)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), DEFAULT_CONFIG_NAME)
 
 
 def _has_configured_adapter(cfg: Config) -> bool:
@@ -160,6 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.check:
             return run_check(cfg)
+        # --setup 走最前：不连 opencode、不需要 token，接入前也能看引导
+        if args.setup is not None:
+            return run_setup(cfg, args.setup, bool(args.json))
         return run_bridge(cfg)
     except KeyboardInterrupt:
         logger.info("已中断")

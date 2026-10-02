@@ -1,9 +1,10 @@
 // harness.ts — opencode-bridge 插件独立验证脚本（用 bun 跑，不触碰 opencode 服务）。
 //   cd opencode-bridge\plugin
 //   bun harness.ts
-// 覆盖 22 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析 + 1 个 exit-0 语义 +
-//   7 个第 4 级自举：路径推导/铺源/不覆盖 config/git clone 不碰/刷新源码/enabled 零副作用/端到端），
-//   全部断言通过才打印 PASS 22/22 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
+// 覆盖 25 个场景（10 个生命周期 + 4 个可移植性/bridgeDir 解析 + 1 个 exit-0 语义 +
+//   7 个第 4 级自举：路径推导/铺源/不覆盖 config/git clone 不碰/刷新源码/enabled 零副作用/端到端、
+//   3 个 opencode 内接入引导面：工具+命令注册/工具透传平台/命令经 session.prompt 送达），
+//   全部断言通过才打印 PASS 25/25 并退出 0；任一失败退出码 1。结束时杀掉所有子进程、删临时目录与锁、
 // 还原被它改动的 <插件目录>/config.json、OPENCODE_BRIDGE_DIR 与 home 相关环境变量。
 // 注意：全程不运行真实的 python -m opencode_bridge，也不触碰 opencode 服务。
 
@@ -752,6 +753,100 @@ async function run() {
     const pid = lock!.pid as number
     cleanup()
     await waitFor(() => !isAlive(pid), 5000, "子进程被 cleanup 终止")
+  })
+
+  // =========================================================================
+  // opencode 内接入引导面：bridge_setup 工具 + /bridge-setup 命令（23~25）
+  // =========================================================================
+
+  /** 假 setup 子进程：把收到的 argv 打到 stdout，模拟 `python -m opencode_bridge --setup`。 */
+  function setupEchoCode(): string {
+    return `process.stdout.write('ARGV='+process.argv.slice(1).join(' '))`
+  }
+
+  /** 收集 ctx.tool.transform / ctx.command.transform 注册物的假 ctx。 */
+  function fakeCtx() {
+    const tools: Array<Record<string, unknown>> = []
+    const commands: Array<Record<string, unknown>> = []
+    const prompts: Array<Record<string, unknown>> = []
+    return {
+      tools,
+      commands,
+      prompts,
+      ctx: {
+        tool: { transform: (cb: (e: { add: (t: Record<string, unknown>) => void }) => void) => cb({ add: (t) => tools.push(t) }) },
+        command: {
+          transform: (cb: (e: { add: (d: Record<string, unknown>) => void }) => void) => cb({ add: (d) => commands.push(d) }),
+        },
+        session: { prompt: (i: Record<string, unknown>) => prompts.push(i) },
+      },
+    }
+  }
+
+  await test(23, "注册 bridge_setup 工具 + /bridge-setup 命令；无 bridgeDir 时不抛", async () => {
+    const home23 = useHome("home23")
+    const f = fakeCtx()
+    plugin.setup({ ...f.ctx, options: { logDir: logsDir } })
+    // 注册是异步的（等第一次 spawn 落盘），给点时间
+    await waitFor(() => f.tools.length > 0 && f.commands.length > 0, 8000, "工具与命令完成注册")
+    assert(f.tools.some((t) => t.name === "bridge_setup"), "应注册 bridge_setup 工具")
+    assert(f.commands.some((c) => c.name === "bridge-setup"), "应注册 /bridge-setup 命令")
+    assert(home23.length > 0, "stable 路径应可推导")
+  })
+
+  await test(24, "bridge_setup.execute 透传 platform 并返回引导 + 状态", async () => {
+    const stable24 = useHome("home24")
+    assert(stable24.length > 0, "stable 路径应可推导")
+    const f = fakeCtx()
+    // setupCommand 覆盖为假命令：记录 argv，验证平台确实被传下去
+    plugin.setup({
+      ...f.ctx,
+      options: {
+        logDir: logsDir,
+        python: RUNNER,
+        setupCommand: evalArgs(setupEchoCode()),
+      } satisfies BridgePluginOptions,
+    })
+    await waitFor(() => f.tools.length > 0, 8000, "工具注册完成")
+    const tool = f.tools.find((t) => t.name === "bridge_setup") as
+      | { execute: (i: Record<string, unknown>) => Promise<{ content: string }> }
+      | undefined
+    assert(tool, "工具应存在")
+
+    const res = await tool!.execute({ platform: "telegram" })
+    const content = String(res.content)
+    assert(content.includes("接入引导"), "返回应含「接入引导」")
+    assert(content.includes("当前配置状态"), "返回应含「当前配置状态」")
+    assert(content.includes("ARGV="), "应包含 setup 子进程输出")
+
+    // 无参 → 平台菜单路径（不应抛）
+    const res2 = await tool!.execute({})
+    assert(String(res2.content).includes("接入引导"), "无参调用也应返回引导")
+
+    // 非法平台不应抛（归一化为菜单）
+    const res3 = await tool!.execute({ platform: "nope" })
+    assert(String(res3.content).includes("接入引导"), "非法平台应降级为菜单，不抛")
+  })
+
+  await test(25, "/bridge-setup 命令把引导原文经 session.prompt 送达", async () => {
+    useHome("home25")
+    const f = fakeCtx()
+    plugin.setup({
+      ...f.ctx,
+      options: { logDir: logsDir, python: RUNNER, setupCommand: evalArgs(setupEchoCode()) } satisfies BridgePluginOptions,
+    })
+    await waitFor(() => f.commands.length > 0, 8000, "命令注册完成")
+    const cmd = f.commands.find((c) => c.name === "bridge-setup") as
+      | { execute: (i: Record<string, unknown>) => Promise<void> }
+      | undefined
+    assert(cmd, "命令应存在")
+    await cmd!.execute({ sessionID: "ses_test", prompt: "/bridge-setup slack", delivery: "steer" })
+    await waitFor(() => f.prompts.length > 0, 5000, "session.prompt 被调用")
+    const p = f.prompts[0]
+    assert(p.sessionID === "ses_test", "prompt 应带 sessionID")
+    assert(String(p.text).includes("原样"), "prompt 应要求原样展示")
+    assert(String(p.text).includes("slack"), "prompt 应包含平台参数")
+    assert(String(p.text).includes("ARGV="), "prompt 应含 setup 子进程的实际输出")
   })
 }
 

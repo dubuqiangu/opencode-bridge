@@ -36,7 +36,15 @@ from .hooks import Button, Inbound, MsgHandle, Outbound  # BridgeCore implements
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .state import StateStore
 
-__all__ = ["BridgeCore", "HELP_TEXT", "NO_OUTPUT_TEXT", "ruleset_for", "SETUP_MENU_TEXT"]
+__all__ = [
+    "BridgeCore",
+    "HELP_TEXT",
+    "NO_OUTPUT_TEXT",
+    "ruleset_for",
+    "SETUP_MENU_TEXT",
+    "setup_reply",
+    "setup_platforms",
+]
 
 logger = logging.getLogger("opencode_bridge.core")
 
@@ -166,6 +174,25 @@ def _setup_guide(platform: str) -> str:
         "改完后执行： opencode service restart\n\n"
         + _SETUP_GUIDES[platform]
     )
+
+
+def setup_reply(platform: str | None = None) -> str:
+    """Public entry for the ``/setup`` onboarding copy.
+
+    Reused by :mod:`opencode_bridge.__main__` (``--setup``) so the CLI and the
+    in-bot command share **one** source of truth. ``platform`` may be ``None``
+    (menu), a canonical key or any alias in :data:`_SETUP_ALIASES`.
+    """
+    token = (platform or "").strip()
+    if not token:
+        return SETUP_MENU_TEXT
+    key = _SETUP_ALIASES.get(token.lower())
+    return _setup_guide(key) if key is not None else SETUP_INVALID_TEXT
+
+
+def setup_platforms() -> tuple[tuple[str, str], ...]:
+    """``(key, label)`` pairs for the platform chooser, in menu order."""
+    return _SETUP_BUTTON_LABELS
 
 
 def _clean(text: Any) -> str:

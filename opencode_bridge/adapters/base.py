@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import abc
+import importlib
+import importlib.util
 import logging
 import threading
 from typing import Dict, Type
@@ -241,17 +243,42 @@ class Adapter(abc.ABC):
         )
 
 
+def _ensure_loaded(name: str) -> None:
+    """确保 ``name`` 对应的适配器模块已被导入（导入即自我注册）。
+
+    **新增平台不再需要改本文件**：只要新建 ``adapters/<name>.py`` 并加上
+    ``@register("<name>")``，``build("<name>")`` 就能找到它。阶段 3 要批量加
+    Matrix / Mattermost / IRC / Twitch 等平台，这里硬编码模块名会让"每加一个
+    平台改一次核心文件"成为固定摩擦。
+
+    名字不是合法标识符、或没有同名模块时，退回导入既有三家（保持"一次 import
+    全部"的老行为），随后由调用方抛出 ``KeyError``。
+    """
+    if name in _REGISTRY:
+        return
+    if not name.isidentifier():
+        return
+    dotted = f"{__package__}.{name}"
+    try:
+        found = importlib.util.find_spec(dotted) is not None
+    except (ImportError, AttributeError, ValueError):
+        found = False
+    if found:
+        # 故意不吞异常：模块存在但导入失败要报真实原因，不能伪装成"未知适配器"。
+        importlib.import_module(dotted)
+        return
+    from . import discord, slack, telegram  # noqa: F401  (side effect)
+
+
 def build(name: str, config: dict, hooks: Hooks) -> Adapter:
-    """Registry lookup: ``telegram`` / ``slack`` / ``discord``.
+    """Registry lookup: ``telegram`` / ``slack`` / ``discord`` / ...
 
     Unknown ``name`` raises :class:`KeyError`. Adapter modules are imported
     lazily on first use so that importing this module alone stays free of
     circular imports.
     """
     key = str(name)
-    if key not in _REGISTRY:
-        # Deferred import: the adapter modules register themselves on import.
-        from . import discord, slack, telegram  # noqa: F401  (side effect)
+    _ensure_loaded(key)
 
     if key not in _REGISTRY:
         raise KeyError(f"unknown adapter: {name!r}")

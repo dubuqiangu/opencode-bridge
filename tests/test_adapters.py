@@ -774,6 +774,52 @@ class TestBuildRegistry(unittest.TestCase):
         with self.assertRaises(KeyError):
             build("nope", {}, RecordingHooks())
 
+    def test_build_rejects_dotted_and_non_identifier_names(self):
+        """名字会进 importlib，必须挡住点号/非标识符，避免越出 adapters 包。"""
+        hooks = RecordingHooks()
+        for bad in ("os.path", "a.b", "", "not-an-identifier", "../base"):
+            with self.subTest(name=bad):
+                with self.assertRaises(KeyError):
+                    build(bad, {}, hooks)
+
+    def test_brand_new_adapter_needs_no_change_to_base(self):
+        """新增平台的成本应只是新建一个模块文件 —— 核心注册表不得硬编码平台名。"""
+        import importlib.machinery
+        import sys
+        import types
+
+        from opencode_bridge.adapters import base as base_mod
+
+        pkg = base_mod.__package__ or "opencode_bridge.adapters"
+        mod_name = f"{pkg}.faketestplat"
+        module = types.ModuleType(mod_name)
+        module.__spec__ = importlib.machinery.ModuleSpec(mod_name, None)
+
+        class FakePlatAdapter(Adapter):
+            name = "faketestplat"
+            label = "FakePlat"
+
+            def start(self) -> None:
+                return None
+
+            def send(self, out):
+                return None
+
+            def edit(self, handle, out):
+                return None
+
+        module.FakePlatAdapter = FakePlatAdapter
+        sys.modules[mod_name] = module
+        base_mod._REGISTRY.pop("faketestplat", None)
+        try:
+            base_mod.register("faketestplat")(FakePlatAdapter)
+            adapter = base_mod.build("faketestplat", {}, RecordingHooks())
+            self.assertIsInstance(adapter, FakePlatAdapter)
+            self.assertEqual(adapter.capabilities()["name"], "faketestplat")
+        finally:
+            sys.modules.pop(mod_name, None)
+            base_mod._REGISTRY.pop("faketestplat", None)
+
 
 class TestCapabilities(unittest.TestCase):
     """T1.1 — 能力显式声明：调用方据此判断，不再靠 try/except 猜。"""

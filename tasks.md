@@ -103,7 +103,7 @@
 |---|---|---|---|---|
 | **B1** | ntfy | HTTP 拉取（`poll=1` + `since` 游标） | S | 已完成。**偏离原计划**：不用长连接流而用一次性拉取 —— 持久流在 `urllib` 下无法干净打断（`stop()` 会白等超时，见 Nextcloud 的教训）。启动用 `since=<当前时间戳>` **不重放历史缓存**（否则首次启动会把最多 10MB 缓存全当新消息触发 agent）；之后游标推进到 **message id** |
 | **B1** | email | IMAP 轮询（`UID` 游标） | S | 已完成。`imaplib`/`smtplib` 全标准库，协议通用永不废弃；**必须用专用邮箱 + app 专用密码**；**无用户身份**（任何能发信给你的人都能驱动 agent）→ 必须用 `allowed_chat_ids` 限定发件人；不支持编辑 |
-| **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 方向与其他平台相反；默认 bind 127.0.0.1 **天然满足"不需公网"**；Hermes 已验证纯 `http.server` 无需 SDK |
+| **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 已完成。方向与其他平台相反；`httpsrv.py` 是**可复用共用模块**（A3 的地基，第一个使用方是 a2a）；默认 bind 127.0.0.1；**无凭据可填** → 需要 `config_optional`（见阶段 A 备注） |
 | **B2** | qqbot | WebSocket 网关 | M | 协议是 Discord 风格变体（op 码 + intents + `heartbeat_interval`），可直接复用 `ws.py`；防回环天然（bot 消息不推回给自己） |
 | **B2** | homeassistant | WebSocket 事件总线（本机） | M | WS 极简；HA 极活跃。**但它是设备事件管道不是 IM**，取决于定位是否要收 |
 | **B3** | feishu / lark | WebSocket 长连接 | M | 官方明确"免内网穿透、**事件明文免解密**"；代价是 SDK 的 WS 握手 + `app_ticket` 刷新要自己实现；⚠️ **无 fromMe 字段**，防回环需自己记 message_id |
@@ -589,8 +589,10 @@
     本台账与 commit 里。
   - **`docs/architecture.md`（164 行）**：分层图、入站/出站两条完整数据流、模块职责表
     （含"**不该出现在这里的东西**"一列，防止职责漂移）、以及最有价值的
-    **16 条关键不变量** —— 每条都是踩坑后定下的（契约类 4 条、会话标识 3 条、传输层 3 条、
-    与外部系统打交道 6 条、测试 2 条），并标注了编号供其它文档引用。
+    **关键不变量清单** —— 每条都是踩坑后定下的（契约类 6 条、会话标识 3 条、传输层 3 条、
+    与外部系统打交道 5 条、测试 2 条，共 19 条），并标注了编号供其它文档引用。
+    ⚠️ 写成"16 条"过时了 —— a2a 落地时新增了两条（`config_optional`、默认只bind 回环）
+    与一条修正（入站归属靠 `Inbound.platform` 而非猜）。
   - **`docs/adding-a-platform.md`（192 行）**：**筛选闸门**（三条准入，任一不满足就停）
     → **八步**（查证协议事实 / 声明能力 / 声明凭据 / 接线传输层 / 授权闸门在最前 /
     防回环 / 出站 / 用户可见的四处文档）→ **坑清单**（按类分，含"防回环只能用平台签发
@@ -651,4 +653,44 @@
       它确实会错**。过程中我自己的一个断言也写错了（把"缓存里有键"当成污染，
       实际那是 `_adapter_for` 本来就会做的正确缓存行为），已改为守更精确的不变量：
       **空 `platform` 不许覆盖已有的准确映射**。
+- **2026-10-03** **B1 a2a 完成**（第十一个平台，本项目**第一个方向相反**的平台：我们是被调方）
+  + **新增共用模块 `httpsrv.py`**（A3 的地基）+ **新增 `Adapter.config_optional`**：
+  - `httpsrv.py`（674 行）：`HttpServer`/`Route`/`HttpRequest`/`HttpResponse`。
+    线程、优雅停机（`shutdown→server_close→join→等在途请求`）、异常隔离、请求体上限、
+    **鉴权 fail-closed**（声明要鉴权却没给 `authenticate` → 401+ERROR，
+    **绝不允许配置错误悄悄变成"完全敞开"**）全在共用层。a2a 只提供"路径 + 处理器"。
+    **这正是派单时要求"不许埋在适配器内部"的价值** —— A3 将来只需 `add_route()`。
+  - `a2a.py`（1311 行）：Agent Card（`/.well-known/agent-card.json`）、`/health`、
+    JSON-RPC（`SendMessage`/`GetTask`/`ListTasks`/`CancelTask`）。
+    **能力只声明已实现的**：流式与 push 在 Agent Card 里如实写 `false`，
+    未实现的方法返回规范要求的 `-32004`/`-32003`，**不做半成品接口面**。
+  - 协议事实**逐条查官方规范**（v1.0.0）而非凭记忆，几个反直觉点：
+    方法名是 **PascalCase**（`message/send` 那种斜杠名**在 v1.0 已不存在**，属pre-1.0）；
+    `GetTask`/`CancelTask` 的参数叫 **`id` 而不是 `taskId`**；
+    认证失败是 **HTTP 401 且规范没定义对应 JSON-RPC code**。
+    规范**没有**任何消息长度上限（只有 §13.4 的 SHOULD），所以自行声明 1 MiB 请求体
+    上限并写明理由，**没有编造一个权威数字**。
+  - **`config_optional`（本轮第二个收获，由复核 a2a 时发现）**：
+    lane 把 `required_tokens = outbound_tokens = ("bind_port",)`，并诚实标注了
+    "否则状态视图会显示 `missing: ['bind_port']` 这种**误导性**文案"。
+    我核实后发现问题**比这更严重**：**只配 a2a 的用户被桥接拒绝启动**
+    （实测 `preflight=False`）—— 与当年 Matrix/IRC/Mattermost 被拒启动**同一类**bug。
+    根因是仓库那条"两个 token 列表必须非空"的守卫把两件事混为一谈：
+    **必须声明**配置面 vs **必须显式配置**才能跑。a2a 满足前者、不满足后者。
+    **修法**：新增 `Adapter.config_optional`（默认 `False`），a2a 置 `True`；
+    显式豁免 preflight 与**两个**状态视图判定点（`_platform_status` /
+    `_channel_config_rows`），**但不豁免声明义务**（两个列表仍须非空）。
+    另有 4 条新用例守边界：默认必须是 False（防被人顺手默认成 True 而拆掉所有门槛）、
+    豁免不影响声明义务、以及**普通平台的拒绝路径仍必须有效**（4 个残缺配置实测仍 False）。
+    验证：修复后 `只配 a2a（空配置）→ preflight=True`，`--status` 里 A2A 显示"已配置"。
+  - **一处断言被我反转并留下痕迹**：`test_configured_when_only_the_port_is_set`
+    原本断言 `assertFalse(... "缺 bind_port 时不该被判成配置齐备")` —— 它守的其实是
+    **那个真bug**；lane 当时没有第二个选项才这么写。已改为断言"空配置即放行"，
+    并在 docstring 里写清**为什么反转**，防止有人"顺手改回去"。
+  - lane 主动列出**它不确定的 6 处**（未与真实 A2A 客户端对过 interop、
+    `SecurityRequirement` 形状只照规范示例抄、同 peer 并发任务按 FIFO、
+    `pageToken` 是整数偏移而非真游标、重启后内存态丢失、非回环暴露未测）——
+    这种诚实标注比"全绿即完成"有价值得多。
+  验证：**1150 tests OK (skipped=1)**、compileall 0；`--status` 实跑**11 个平台**，
+  a2a 自动出现且显示"已配置"，其余 10 个仍如实"未配置"。
 

@@ -916,8 +916,11 @@ class TestCapabilities(unittest.TestCase):
             set(caps),
             {"name", "label", "max_message_length", "supports_inbound",
              "supports_inline_buttons", "supports_media", "typed_command_prefix",
-             "allowed_chat_ids_count", "running"},
+             "allowed_chat_ids_count", "config_optional", "running"},
         )
+        # config_optional 默认 False —— 除"无凭据且默认值安全"的平台（如 a2a）外，
+        # 都必须显式配置才放行。守卫它在默认侧，防止有人顺手把它默认成 True。
+        self.assertFalse(caps["config_optional"])
 
     def test_command_prefix_declared(self):
         for name in ("telegram", "slack", "discord"):

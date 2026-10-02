@@ -106,6 +106,19 @@ class Adapter(abc.ABC):
     #: （Matrix 用 homeserver/access_token、IRC 用 host/nick、Mattermost 用 site_url/token），
     #: 否则状态视图会把它们一律报成"发不出去"。
     outbound_tokens: tuple[str, ...] = ("bot_token",)
+    #: **本平台是否"无需任何显式配置即可运行"** ——默认 False。
+    #:
+    #: ``required_tokens`` 回答的是"**你必须声明**你的配置面"（`test_cli` 守这条，
+    #: 它抓到过 Matrix 忘了声明 ``required_tokens`` 导致配得完全正确的用户被判成
+    #: 没配的真bug）；而 preflight 与 ``--status`` 回答的是"**用户必须显式配了**
+    #: 才能跑"。这两件事此前被混为一谈，于是 a2a 被迫把 ``bind_port`` 填进
+    #: ``required_tokens``，而它空配置本来就能跑（bind 127.0.0.1 + 端口由系统分配）——
+    #: 结果是**只配 a2a 的用户被桥接拒绝启动**，与当年 Matrix/IRC/Mattermost
+    #: 被拒启动是同一类bug。
+    #:
+    #: 置True 表示"我没有凭据可填，且默认值是安全的"。它**不豁免任何配置声明义务**：
+    #: ``required_tokens`` 仍须非空（守那条不变量的测试照样通过）。
+    config_optional: bool = False
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         self.config: dict = dict(config or {})
@@ -128,6 +141,7 @@ class Adapter(abc.ABC):
             "supports_media": self.supports_media,
             "typed_command_prefix": self.typed_command_prefix,
             "allowed_chat_ids_count": len(self.allowed_chat_ids),
+            "config_optional": self.config_optional,
             "running": self.running,
         }
 

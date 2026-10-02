@@ -247,6 +247,79 @@ class TestPreflightAndCredentialDeclarations(unittest.TestCase):
         )
         self.assertFalse(cli._has_configured_adapter(Config(adapters={})))
 
+    def test_config_optional_platform_needs_no_explicit_config(self):
+        """★ 回归：只配 a2a（空配置）的用户曾被**拒绝启动**。
+
+        a2a bind 127.0.0.1 + 端口 0（由系统分配）+ 无鉴权也只对本机开放 ⇒
+        空配置即可运行。但preflight 只看 ``required_tokens``，而 a2a 的
+        ``required_tokens`` 里有 ``bind_port``（因为"必须声明非空"那条守卫），
+        于是报"没配任何适配器"并拒绝启动 —— 与当年 Matrix / IRC / Mattermost
+        被拒启动是**同一类** bug。
+        """
+        self.assertTrue(
+            cli._has_configured_adapter(Config(adapters={"a2a": {}})),
+            "只配 a2a 时不许拒绝启动：它空配置就能跑",
+        )
+        # 显式给了端口也一样放行（这条修复前就能过，守住别回退）
+        self.assertTrue(
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 9900}}))
+        )
+
+    def test_config_optional_defaults_to_false_for_every_other_platform(self):
+        """默认必须是 ``False`` —— 否则所有平台的配置门槛会被静默拆掉。"""
+        for name in registered_names():
+            if name == "a2a":
+                continue
+            with self.subTest(platform=name):
+                self.assertFalse(
+                    bool(getattr(adapter_class(name), "config_optional", False)),
+                    f"{name} 不该声明 config_optional —— 它确实需要凭据",
+                )
+
+    def test_config_optional_does_not_exempt_declaration_obligations(self):
+        """它豁免的是"必须**显式配置**才能跑"，**不豁免**"必须**声明**配置面"。"""
+        for name in registered_names():
+            cls = adapter_class(name)
+            with self.subTest(platform=name):
+                self.assertTrue(
+                    getattr(cls, "required_tokens", ()),
+                    f"{name}: required_tokens 必须非空（声明义务）",
+                )
+                self.assertTrue(getattr(cls, "outbound_tokens", ()))
+
+    def test_status_view_reports_config_optional_platform_as_ready(self):
+        """状态视图不许把开箱可用的平台报成"未配置"/"发不出去"。"""
+        rows = {
+            row["key"]: row
+            for row in cli._platform_status(Config(adapters={"a2a": {}}))
+        }
+        self.assertIn("a2a", rows)
+        self.assertTrue(rows["a2a"]["configured"], "a2a 空配置应显示已配置")
+        self.assertTrue(rows["a2a"]["outbound_ready"], "a2a 能发出去")
+        self.assertTrue(rows["a2a"]["inbound_ready"], "a2a 入站已实现且应就绪")
+
+    def test_channel_config_rows_respect_config_optional(self):
+        """``--check`` 的行构建走的是另一条判定路径，也必须一致。"""
+        rows = dict(
+            (key, (configured, inbound_ready))
+            for key, _label, configured, inbound_ready, _caps
+            in cli._channel_config_rows(Config(adapters={"a2a": {}}))
+        )
+        self.assertIn("a2a", rows)
+        self.assertTrue(rows["a2a"][0], "a2a 空配置应显示已配置")
+        self.assertTrue(rows["a2a"][1], "a2a 入站应就绪")
+
+    def test_incomplete_config_is_still_rejected_for_normal_platforms(self):
+        """拆掉门槛之后，普通平台的拒绝路径**必须仍然有效**。"""
+        for adapters in (
+            {"telegram": {"allowed_chat_ids": [1]}},          # 只有白名单没有凭据
+            {"matrix": {"access_token": "x"}},                # 缺 homeserver/user_id
+            {"irc": {"host": "  ", "nick": "n"}},             # 空白值
+            {"ntfy": {}},                                     # 缺 topic
+        ):
+            with self.subTest(platform=sorted(adapters)[0]):
+                self.assertFalse(cli._has_configured_adapter(Config(adapters=adapters)))
+
     def test_outbound_ready_is_true_for_correctly_configured_non_bot_platforms(self):
         """回归：出站就绪必须按各平台自己的凭据键判定。"""
         cases = {

@@ -3,15 +3,20 @@
 [![CI](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-把 **10 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+把 **11 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
 
-支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch —— **十个全部支持双向对话**。
+支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a —— **十一个全部支持双向对话**。
+
+> **a2a 是唯一方向相反的平台**：前十个都是我们主动连出去（长轮询 / WebSocket / IMAP），
+> **a2a 是我们被调方** —— 起一个本机 HTTP 服务让外部 agent 调我们。因此它**默认无鉴权**，
+> 接入前请先读 [`docs/a2a.md`](docs/a2a.md) 的风险一节。
 
 ## 📖 文档
 
 | 想知道 | 看哪 |
 |---|---|
 | 每个平台怎么配、怎么验证 | [`docs/install.md`](docs/install.md) |
+| **a2a 专属**（方向相反的本机服务、无鉴权风险、端点与握手示例） | [`docs/a2a.md`](docs/a2a.md) |
 | **这项目是怎么搭起来的** | [`docs/architecture.md`](docs/architecture.md) |
 | **怎么加一个新平台** | [`docs/adding-a-platform.md`](docs/adding-a-platform.md) |
 | 做到哪一步了、为什么这样选 | [`tasks.md`](tasks.md) |
@@ -145,7 +150,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**十个平台全部支持双向对话**）：
+各平台当前能力一览（**十一个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -159,6 +164,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | email | ✅ IMAP `UID` 游标 | ✅ SMTP | ❌ 无 | 上限 998 是**单行**（RFC 5322）；**无用户身份**，任何能发信给你的人都能驱动 agent |
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
+| a2a | ✅ 本机 HTTP（**我们被调方**） | ✅ 回给等待方 | ❌ 无 | 默认 bind `127.0.0.1` + **默认无鉴权**；上限 1 MiB（规范未规定，自行声明） |
 
 > 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
 >
@@ -428,6 +434,40 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **不支持编辑邮件**（SMTP 没有这个概念），长任务的进度更新会退化成连续发多封。
 > - 用的是 `UID` 游标而非 `UNSEEN` 标记 —— 你在手机上点开一封，桥接仍然能看见它。
 
+### a2a（支持双向对话 · **我们是被调方**，无需公网地址）
+
+这是唯一**方向相反**的平台：前十个是我们主动连出去，a2a 是**起一个本机 HTTP 服务**
+让外部 A2A agent 调我们。协议细节见 [`docs/a2a.md`](docs/a2a.md)。
+
+1. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "a2a": { "bind_host": "127.0.0.1", "bind_port": 0 } }
+   ```
+
+2. 执行 `opencode service restart`
+3. 看日志里打印的**实际端口**（`bind_port: 0` 时由系统分配），然后：
+
+   ```bash
+   curl http://127.0.0.1:<端口>/.well-known/agent-card.json   # 应返回 Agent Card
+   curl http://127.0.0.1:<端口>/health                          # 应返回 ok
+   ```
+
+> ⚠️ **默认无鉴权，请先读风险**：a2a 出站侧不需要任何凭据，所以**默认没有任何鉴权**。
+> 此时**只有本机进程能访问**（`bind_host` 默认 `127.0.0.1`），但**本机也是攻击面** ——
+> 浏览器里的恶意网页可以 POST 到 `http://127.0.0.1:<端口>/rpc`。
+> 建议：① 保持 `127.0.0.1`；② 需要被其它机器访问时**必须**配 `auth_token`。
+> ⚠️ 把 `bind_host` 改成非回环地址**且**没配 `auth_token` 时，桥接会**回落回环并告警** ——
+> 绝不因为"方便调试"就开一个无鉴权的局域网端口。
+>
+> 其它要点：
+> - **不需要配任何 token 就能用**（`config_optional`），所以只配 a2a 时桥接**能正常启动**。
+> - 端点：`/rpc`（另接受 `/` 作别名）、`/health`、`/.well-known/agent-card.json`。
+> - 只实现 `SendMessage`/`GetTask`/`ListTasks`/`CancelTask`；**流式与推送如实声明为
+>   不支持**（Agent Card 里写 `false`，调用时返回规范错误码），**不做半成品接口**。
+> - **不支持编辑**（回复发给正在等待的那个 HTTP 请求），长任务进度会退化成连续多条消息。
+> - 未实现与真实 A2A 客户端的互操作验证（协议事实已逐条对照官方规范 v1.0.0）。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -619,6 +659,11 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.email.echo_prefix` | `"[opencode]"` | 出站 Subject 加此前缀，入站见到即丢。**不可配成空串** —— 空前缀等于关掉防回环 |
 | `adapters.email.poll_interval` | `60.0` | 轮询间隔（秒）；每轮新建一次 IMAP 连接 |
 | `adapters.email.dedupe_capacity` | `2048` | 已处理 Message-ID 的记忆上限（FIFO 淘汰，防无界增长） |
+| `adapters.a2a.bind_host` | `"127.0.0.1"` | 监听地址。**非回环地址且没配 `auth_token` 时会回落回环 + 告警** —— 绝不因为方便就开一个无鉴权的局域网端口 |
+| `adapters.a2a.bind_port` | `0` | `0` = 由系统分配空闲端口（推荐，日志会打印实际端口） |
+| `adapters.a2a.auth_token` | `""` | Bearer token。**留空 = 无鉴权**，此时务必确认 `bind_host` 是回环地址 |
+| `adapters.a2a.reply_timeout` | `300.0` | 外部 agent 等待回复的超时（秒） |
+| `adapters.a2a.max_turns` | `20` | 单个任务的最大往返轮数，防无限对话 |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

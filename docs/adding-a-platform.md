@@ -69,7 +69,29 @@ outbound_tokens  = ("address", "password")                 # ⊆ required_tokens
 - **`outbound_tokens ⊆ required_tokens` 是硬不变量**，仓库里有测试守它。历史上正是在
   缺这道防线的情况下，Matrix 忘了声明 `required_tokens`，配得完全正确的用户被判成没配。
 
-### 4. 接线传输层（不变量 8、9）
+### 3b. 如果你的平台**没有凭据可填**（陷阱，务必读完）
+
+守卫测试要求两个列表**都非空**，所以你**不能**把它们留空。但如果你像 a2a 那样
+**根本没有 token**（本机服务，bind `127.0.0.1` + 端口由系统分配，空配置就能跑），
+随便填一个键会**直接造成一个 P0**：
+
+> a2a 当初填了 `bind_port`，于是**只配了 a2a 的用户被桥接拒绝启动**
+> （preflight 报"没配任何适配器"），而它本来完全能用 ——
+> 与当年 Matrix / IRC / Mattermost 被拒启动是同一类 bug。
+
+正确做法是声明 **`config_optional = True`**：
+
+```python
+required_tokens = ("bind_port",)   # 仍须非空（声明义务）
+outbound_tokens = ("bind_port",)
+config_optional = True             # 但"无需显式配置即可运行，且默认值安全"
+```
+
+它**只豁免"必须显式配置才能跑"**（preflight 与两个状态视图判定点），
+**不豁免"必须声明配置面"**。别自己实现这套逻辑——直接用这个开关，
+并给它补一条"默认必须为 False"的守卫（防止有人顺手默认成 True 而拆掉所有门槛）。
+
+### 4. 接线传输层（不变量 10、11）
 
 选一种：
 
@@ -114,7 +136,7 @@ def _on_raw(self, item):
 
 过滤顺序：**回环 → 授权闸门 → 业务过滤 → 产生 Inbound**。别把闸门放在解析之后。
 
-### 6. 防回环只用"平台签发"的字段（不变量 12）
+### 6. 防回环只用"平台签发"的字段（不变量 14）
 
 **这是自问自答死循环的源头**：自己发出的消息回到收件箱 → 触发 agent → agent 回复 →
 再回到收件箱……
@@ -136,14 +158,14 @@ def send(self, out: Outbound) -> MsgHandle | None:
     for chunk in split_text(out.text, self.max_message_length, prefix_fmt=""):
         ...
         if status_error:
-            self._note_send_failure(classify_http(status, detail), detail)  # 不变量 13
+            self._note_send_failure(classify_http(status, detail), detail)  # 不变量 15
             return handle_or_none
         handle = MsgHandle(self._conversation_id(target), mid, self.name)
     return handle
 ```
 
 - **`prefix_fmt=""`** —— 分段不加 `(i/n)` 前缀（与既有平台一致；前缀是可选项，默认不开）。
-- **失败必须记**，否则 `--status` 与日志里什么都看不到（不变量 13）。
+- **失败必须记**，否则 `--status` 与日志里什么都看不到（不变量 15）。
 - **`edit()` 老实返回 `bool`。** 没有编辑能力就返回 `False`，core 会退化成发新消息。
   假装成功会让长任务的进度更新**静默失效**。
 
@@ -165,7 +187,7 @@ def send(self, out: Outbound) -> MsgHandle | None:
 - 必须覆盖：注册表可发现、`required_tokens`/`outbound_tokens` 不变量、回环被丢、
   闸门在产生 Inbound 之前、上限单位（**中文/emoji 用例**，字节上限平台尤其要）、
   `edit()` 返回 `False`、`stop()` 干净且**断言耗时上界**、畸形输入不崩。
-- ⚠️ **本项目铁律（不变量 15）**：断言"等了多久"**一律优先断言内部状态**而不是
+- ⚠️ **本项目铁律（不变量 18）**：断言"等了多久"**一律优先断言内部状态**而不是
   wall-clock 差分。墙钟只允许做**下界**断言。这已经栽坑三次。
 - ⚠️ **测试自己会骗你**：造一个"脚本用完就返回 200"的假响应器时，它会把第二次调用的
   失败**掩盖掉** —— 本项目因此误判过一次`send_result` 的结果。凡是断言失败路径，

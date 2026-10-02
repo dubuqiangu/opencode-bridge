@@ -138,19 +138,22 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
         entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
         required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
         outbound = tuple(getattr(cls, "outbound_tokens", ("bot_token",)) or ("bot_token",))
-        missing = [k for k in required if not _token_present(entry, k)]
+        # ``config_optional``（无凭据可填、且默认值安全）→ 不看配置也能跑。
+        # 见 ``adapters/base.py`` 里该属性的说明：此前这里只看 required_tokens，
+        # 于是 a2a 空配置会被报成"未配置"/"发不出去"，而它本来就能跑。
+        optional = bool(getattr(cls, "config_optional", False))
+        missing = [] if optional else [k for k in required if not _token_present(entry, k)]
         supports_inbound = bool(getattr(cls, "supports_inbound", False))
         out.append(
             {
                 "key": key,
                 "label": str(getattr(cls, "label", "") or labels.get(key) or key),
-                # 全部必需 token 齐备才算配好（入站必需项也算在内）
+                # 全部必需 token 齐备才算配好（入站必需项也算在里面）
                 "configured": not missing,
                 # 出站凭据各平台不同（Matrix 用 homeserver/access_token、IRC 用
                 # host/nick…），必须由适配器声明，不能硬编码 bot_token。
-                "outbound_ready": all(
-                    _token_present(entry, k) for k in outbound
-                ),
+                "outbound_ready": optional
+                or all(_token_present(entry, k) for k in outbound),
                 # 入站要"能力已实现"且"配置齐备"两个条件同时成立
                 "inbound_ready": supports_inbound and not missing,
                 "inbound_implemented": supports_inbound,
@@ -202,9 +205,13 @@ def _has_configured_adapter(cfg: Config) -> bool:
     for name, entry in entries.items():
         if not isinstance(entry, dict):
             continue
-        required = tuple(
-            getattr(adapter_class(str(name)), "required_tokens", ()) or ()
-        )
+        cls = adapter_class(str(name))
+        if bool(getattr(cls, "config_optional", False)):
+            # 无凭据可填、且默认值安全的平台（a2a bind 127.0.0.1 + 端口由系统分配）
+            # —— 空配置即可运行，**不许**因为没填 required_tokens 而拒绝启动。
+            # 这与当年 Matrix/IRC/Mattermost 被拒启动是同一类 bug。
+            return True
+        required = tuple(getattr(cls, "required_tokens", ()) or ())
         if not required:
             # 未知/未注册的适配器：只要有像凭据的字段就别凭空拦住用户
             # （真正能不能用由后面的 build() 报明确的错）。
@@ -264,7 +271,10 @@ def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]
         raw = entries.get(key)
         entry = raw if isinstance(raw, dict) else {}
         required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
-        missing = [k for k in required if not _token_present(entry, k)]
+        # 同 _platform_status：config_optional 的平台不看配置也算就绪
+        missing = [] if getattr(cls, "config_optional", False) else [
+            k for k in required if not _token_present(entry, k)
+        ]
         caps: dict = {}
         try:
             caps = build(key, entry, _NullHooks()).capabilities()

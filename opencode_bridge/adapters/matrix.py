@@ -104,6 +104,12 @@ class MatrixAdapter(Adapter):
     supports_inline_buttons = False             # v1 不把 reactions 当交互
     supports_media = False                      # v1 只发 m.text
 
+    # Matrix 没有 bot_token 的概念，凭据是 homeserver + access_token。
+    # user_id 也列入必需：它是**过滤自己回声**的唯一依据，缺了会无限回环
+    # （桥接把自己发出的消息再当成入站消息收回来）。
+    required_tokens = ("homeserver", "access_token", "user_id")
+    outbound_tokens = ("homeserver", "access_token")
+
     # 类级旋钮（测试可在实例上覆盖）。
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL

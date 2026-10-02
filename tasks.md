@@ -49,8 +49,8 @@
 | # | 平台 | 难度 | 传输方式 | 状态 |
 |---|---|---|---|---|
 | T3.1 | Matrix | S | `/sync` 长轮询 + `next_batch` 游标 | ☑ |
-| T3.2 | Mattermost | S | WebSocket + `authentication_challenge` + ping | ☐ |
-| T3.3 | IRC | S | `socket` 手写客户端 + PING/PONG + 仅响应提及 | ☐ |
+| T3.2 | Mattermost | S | WebSocket + `authentication_challenge` + ping | ☑ |
+| T3.3 | IRC | S | `socket` 手写客户端 + PING/PONG + 仅响应提及 | ☑ |
 | T3.4 | Twitch | S | WebSocket IRC + IRCv3 tags + 限速节流 | ☐ |
 | T3.5 | Nextcloud Talk | S | REST 轮询 | ☐ |
 
@@ -208,3 +208,40 @@
   改为断言新事实；由于**所有真实平台现在都实现了入站**，"入站未实现"这一分支改用
   **合成适配器**守护，否则该层语义将失去测试。
   验证：**366 tests OK (skipped=1)**、compileall 0、`--status` 自动列出全部五个平台。
+- **2026-10-02** T3.2 Mattermost + T3.3 IRC 完成（同一批两个平台一起落地）：
+  - **Mattermost**（84 用例）：WS 入站复用 `ws.py`，鉴权走**握手 header**
+    `Authorization: Bearer`（不进 query）。保活最关键：服务器每 60s 发 **ping 控制帧**、
+    100s 无 pong 即断开，且**读超时只由 pong 续期**——好消息是 `ws.py` 已自动回 pong，
+    适配器一行心跳代码都不用写（并写了测试锁住这个保证，防"顺手清理"时被删掉）。
+    读超时取 75s：比 ping 周期长、比服务端 100s 短。**两个信封必须分清**：
+    事件 `{event,data,broadcast,seq}` vs 响应 `{status,seq_reply,...}`，按有无 `status` 判别。
+    **消息长度上限不硬编码**——官方没给这个数，真实上限由服务端运行时从 DB 列宽算出，
+    网上流传的 16383/4000 都不是契约；改为启动时读 `config/client` 的 `MaxPostSize`
+    （是**字符串**）细化，失败回落静态下限 4000。
+    ⚠️ **Post 对象上没有任何 bot 字段**（已核实），所以防回环**只能**用 `user_id` 比对；
+    且自己的 user id 取不到时必须**整个入站停摆**，否则每发一条回复就再触发一条。
+  - **IRC**（63 用例，本机回环**真 IRC 服务器**，不 mock）：手写行协议
+    （NICK/USER → 等 001 → JOIN），PING/PONG 原样回 token，SASL PLAIN 走完整
+    `CAP LS 302` 协商（不先协商 CAP 服务器会直接断开）。
+    **512 字节整行上限**（RFC 2812）按真实行形状逐字节算预算，再用 `_byte_safe_split`
+    **按字符累加字节**切分，切点永不落在多字节字符中间（"".join 恒等于原文）；
+    `max_message_length=400` 是扣掉前缀开销后的保守**字符**上限。
+    仅响应**提及**（正则边界含 nick 自身的 special 字符，nick 含 `-` 时
+    `foo-bar` 不算提及 `foo`）；清理颜色/格式/零宽/双向控制共 6 类；
+    `edit()` 恒 `False`（IRC 无编辑，core.py 会退化成发新消息）。
+    换行折成空格是**协议约束**（单行协议无法承载换行，原样发会被注入命令）。
+- **2026-10-02** 修掉三个**"平台实现了但用户用不了"级别**的 bug（本轮的核心收获）：
+  1. **`_has_configured_adapter` 硬编码找 `bot_token`** —— 只配了 Matrix / IRC /
+     Mattermost 的用户会被判成"没配任何适配器"，桥接**直接拒绝启动**。这三个平台
+     根本没有 `bot_token` 这个键。改为由适配器声明的 `required_tokens` 驱动。
+  2. **`outbound_ready` 硬编码 `bot_token`** —— IRC 与 Mattermost 配齐了也被报成
+     "发不出去"。新增 `outbound_tokens` 声明，各平台填自己的出站凭据。
+  3. **Matrix 根本没声明 `required_tokens`** —— 继承了基类默认的 `bot_token`，
+     于是配得完全正确的 Matrix 会被报成 `missing: ['bot_token']`。
+     顺带把 `user_id` 也列入必需：它是过滤自己回声的唯一依据，缺了会无限回环。
+  `NO_ADAPTER_MESSAGE` 也不再只提 `bot_token`（那会让这三类用户以为自己配错了）。
+  并加了一条**能在将来抓住同类 bug 的不变量**：
+  `outbound_tokens ⊆ required_tokens`（能发出去的前提一定是"已配置"的子集）——
+  这条不变量正是当初漏掉 Matrix 的那道防线。
+  验证：**520 tests OK (skipped=1)**、compileall 0；只配 Matrix / IRC / Mattermost
+  的三种配置实测 preflight 均为 True、状态视图均如实报就绪。

@@ -101,6 +101,11 @@ class Adapter(abc.ABC):
     #: 必须把**入站**必需的键也列进来：Slack 缺 ``app_token`` 会静默降级为"只发出
     #: 站"，若这里只列 ``bot_token``，状态视图就会把"入站根本没通"报成已配置。
     required_tokens: tuple[str, ...] = ("bot_token",)
+    #: 只做出站所需的凭据键（``--status`` 的 ``outbound_ready`` 消费）。
+    #: 默认与多数平台一致；**没有 bot_token 概念的平台必须覆盖**
+    #: （Matrix 用 homeserver/access_token、IRC 用 host/nick、Mattermost 用 site_url/token），
+    #: 否则状态视图会把它们一律报成"发不出去"。
+    outbound_tokens: tuple[str, ...] = ("bot_token",)
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         self.config: dict = dict(config or {})

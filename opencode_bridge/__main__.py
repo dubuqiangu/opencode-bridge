@@ -36,7 +36,14 @@ __all__ = ["main"]
 
 logger = logging.getLogger("opencode_bridge")
 
-NO_ADAPTER_MESSAGE = "没有任何可用适配器：请在 config.json 的 adapters 中配置 bot_token"
+#: 未配置任何可用适配器时的提示。**不能**只说 ``bot_token``：Matrix / IRC /
+#: Mattermost 根本没有这个键，只提它会让那三类用户以为自己配错了。
+NO_ADAPTER_MESSAGE = (
+    "没有任何可用适配器：请在 config.json 的 adapters 里配置对应平台的凭据"
+    "（Telegram/Slack/Discord 用 bot_token，Slack 入站另需 app_token，"
+    "Matrix 用 homeserver/access_token/user_id，IRC 用 host/nick/channels，"
+    "Mattermost 用 site_url/token）"
+)
 
 
 def _setup_logging(level: str) -> None:
@@ -130,6 +137,7 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
         cls = adapter_class(key)
         entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
         required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
+        outbound = tuple(getattr(cls, "outbound_tokens", ("bot_token",)) or ("bot_token",))
         missing = [k for k in required if not _token_present(entry, k)]
         supports_inbound = bool(getattr(cls, "supports_inbound", False))
         out.append(
@@ -138,7 +146,11 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 "label": str(getattr(cls, "label", "") or labels.get(key) or key),
                 # 全部必需 token 齐备才算配好（入站必需项也算在内）
                 "configured": not missing,
-                "outbound_ready": _token_present(entry, "bot_token"),
+                # 出站凭据各平台不同（Matrix 用 homeserver/access_token、IRC 用
+                # host/nick…），必须由适配器声明，不能硬编码 bot_token。
+                "outbound_ready": all(
+                    _token_present(entry, k) for k in outbound
+                ),
                 # 入站要"能力已实现"且"配置齐备"两个条件同时成立
                 "inbound_ready": supports_inbound and not missing,
                 "inbound_implemented": supports_inbound,
@@ -173,19 +185,35 @@ def _config_file_in_use() -> str:
 
 
 def _has_configured_adapter(cfg: Config) -> bool:
-    """Cheap pre-flight: does the config mention any adapter with a token?
+    """Cheap pre-flight: is any adapter in the config actually usable?
 
-    Kept deliberately simple so a broken config fails with a helpful message
-    *before* endpoint discovery is attempted.
+    由各适配器**声明的** ``required_tokens`` 判定，而不是硬编码 ``bot_token``。
+    硬编码会让"只配了 Matrix / IRC / Mattermost"的用户被判定成没配任何适配器，
+    桥接直接拒绝启动 —— 这三个平台根本没有 ``bot_token`` 这个键。
+
+    仍然刻意简单，好在 endpoint discovery 之前就给出有用的提示。
     """
     entries = cfg.adapters or {}
     if not isinstance(entries, dict) or not entries:
         return False
-    for entry in entries.values():
+
+    from .adapters import adapter_class
+
+    for name, entry in entries.items():
         if not isinstance(entry, dict):
             continue
-        token = entry.get("bot_token")
-        if token is not None and str(token).strip():
+        required = tuple(
+            getattr(adapter_class(str(name)), "required_tokens", ()) or ()
+        )
+        if not required:
+            # 未知/未注册的适配器：只要有像凭据的字段就别凭空拦住用户
+            # （真正能不能用由后面的 build() 报明确的错）。
+            if any(
+                str(v).strip() for k, v in entry.items() if k != "allowed_chat_ids"
+            ):
+                return True
+            continue
+        if all(_token_present(entry, key) for key in required):
             return True
     return False
 

@@ -170,5 +170,115 @@ class TestChannelConfigRows(unittest.TestCase):
         self.assertTrue(rows, "即使能力读取有问题也该有行输出")
 
 
+class TestPreflightAndCredentialDeclarations(unittest.TestCase):
+    """凭据声明与启动前检查。
+
+    这组测试守的是一类具体缺陷：把 ``bot_token`` 硬编码在通用代码里，会让
+    Matrix / IRC / Mattermost 这类**根本没有这个键**的平台要么被判定成
+    "没配置"（桥接拒绝启动），要么被报成"发不出去"。
+    """
+
+    def test_outbound_tokens_must_be_subset_of_required(self):
+        """不变量：能发出去的前提一定是"已配置"的子集。
+
+        这条不变量正是当初漏掉 Matrix 的那道防线 —— 它的 ``required_tokens``
+        继承了基类默认的 ``bot_token``，而出站用的是 homeserver/access_token，
+        两者互相矛盾。
+        """
+        for name in registered_names():
+            cls = adapter_class(name)
+            with self.subTest(platform=name):
+                required = set(getattr(cls, "required_tokens", ()))
+                outbound = set(getattr(cls, "outbound_tokens", ()))
+                self.assertTrue(required, f"{name} 必须声明 required_tokens")
+                self.assertTrue(outbound, f"{name} 必须声明 outbound_tokens")
+                self.assertTrue(
+                    outbound <= required,
+                    f"{name}: outbound_tokens {sorted(outbound)} 不是 "
+                    f"required_tokens {sorted(required)} 的子集",
+                )
+
+    def test_every_adapter_declares_credential_keys_as_strings(self):
+        for name in registered_names():
+            cls = adapter_class(name)
+            for attr in ("required_tokens", "outbound_tokens"):
+                keys = getattr(cls, attr)
+                with self.subTest(platform=name, attr=attr):
+                    self.assertIsInstance(keys, tuple)
+                    self.assertTrue(keys)
+                    for key in keys:
+                        self.assertIsInstance(key, str)
+                        self.assertNotIn(" ", key)
+
+    def test_preflight_accepts_config_without_any_bot_token(self):
+        """回归：只配 Matrix / IRC / Mattermost 时，桥接必须能启动。
+
+        修复前这里硬编码找 ``bot_token``，导致这三类用户被判成"没配任何
+        适配器"而直接退出。
+        """
+        cases = {
+            "matrix": {"homeserver": "https://m.example.org",
+                       "access_token": "syt", "user_id": "@a:b"},
+            "irc": {"host": "irc.example.org", "nick": "bot", "channels": ["#x"]},
+            "mattermost": {"site_url": "https://mm.example.com", "token": "tok"},
+            "telegram": {"bot_token": "t"},
+        }
+        for name, entry in cases.items():
+            with self.subTest(platform=name):
+                self.assertTrue(
+                    cli._has_configured_adapter(Config(adapters={name: entry})),
+                    f"{name} 配置齐备却被判定为未配置",
+                )
+
+    def test_preflight_rejects_incomplete_and_credential_free_configs(self):
+        # 只有一个白名单、没有凭据 —— 不能算配好了
+        self.assertFalse(
+            cli._has_configured_adapter(
+                Config(adapters={"telegram": {"allowed_chat_ids": [1]}})
+            )
+        )
+        # 缺必需项
+        self.assertFalse(
+            cli._has_configured_adapter(Config(adapters={"matrix": {"access_token": "x"}}))
+        )
+        # 空 / 空白值不算
+        self.assertFalse(
+            cli._has_configured_adapter(Config(adapters={"irc": {"host": "  ", "nick": "n"}}))
+        )
+        self.assertFalse(cli._has_configured_adapter(Config(adapters={})))
+
+    def test_outbound_ready_is_true_for_correctly_configured_non_bot_platforms(self):
+        """回归：出站就绪必须按各平台自己的凭据键判定。"""
+        cases = {
+            "matrix": ({"homeserver": "https://m", "access_token": "s", "user_id": "@a:b"},
+                       ("homeserver", "access_token")),
+            "irc": ({"host": "h", "nick": "n", "channels": ["#x"]}, ("host", "nick")),
+            "mattermost": ({"site_url": "https://mm", "token": "t"},
+                           ("site_url", "token")),
+        }
+        for name, (entry, _outbound) in cases.items():
+            with self.subTest(platform=name):
+                self.assertTrue(
+                    status_of(Config(adapters={name: entry}), name)["outbound_ready"],
+                    f"{name} 配齐了却被报成发不出去",
+                )
+
+    def test_outbound_ready_false_when_its_own_credentials_missing(self):
+        """Matrix 缺 access_token：出站不该报就绪（但 user_id 齐了也不算）。"""
+        row = status_of(
+            Config(adapters={"matrix": {"homeserver": "https://m", "user_id": "@a:b"}}),
+            "matrix",
+        )
+        self.assertFalse(row["outbound_ready"])
+        self.assertIn("access_token", row["missing"])
+
+    def test_no_adapter_message_mentions_every_platform_credential(self):
+        """提示语不能只提 bot_token，否则那三类用户以为自己配错了。"""
+        text = cli.NO_ADAPTER_MESSAGE
+        for key in ("bot_token", "app_token", "homeserver", "access_token",
+                    "host", "nick", "channels", "site_url", "token"):
+            self.assertIn(key, text, f"提示语里应说明 {key}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -132,16 +132,24 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览：
+各平台当前能力一览（**七个平台全部支持双向对话**）：
 
-| 平台 | 接收消息 | 发送消息 | 状态 |
-|---|---|---|---|
-| Telegram | ✅ 长轮询 | ✅ | 完整，可双向对话 |
-| Slack | ⬜ TODO | ✅ | 仅发送 |
-| Discord | ⬜ TODO | ✅ | 仅发送 |
+| 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
+|---|---|---|---|---|
+| Telegram | ✅ 长轮询 `getUpdates` | ✅ | ✅ 原生 | 最成熟，按钮交互已支持 |
+| Slack | ✅ Socket Mode | ✅ | ✅ 原生 | 入站需另配 `app_token`（`xapp-`） |
+| Discord | ✅ Gateway v10 | ✅ | ✅ 原生 | 需在后台开 **Message Content Intent** |
+| Matrix | ✅ `/sync` 长轮询 | ✅ | ⚠️ 兼容近似 | 无标准编辑 API，见该节说明 |
+| Mattermost | ✅ WebSocket | ✅ | ✅ 原生 | 消息上限运行时从服务端读取 |
+| IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
+| Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 
-> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温下面这套引导；
+> 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
+>
+> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导；
 > `/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
+> **Matrix / Mattermost / IRC / Twitch 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按下面各节配置；
+> 配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### 配置文件位置
 
@@ -204,11 +212,11 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >
 > 另外：开启 Socket Mode 后事件 100% 走 WebSocket，即使之前填过 Request URL 也不会走 HTTP（两者互斥）；Socket Mode 也不需要校验签名。
 
-### Discord（⚠️ v1 仅支持主动发送）
+### Discord（支持双向对话 · Gateway v10 WebSocket，无需公网地址）
 
 1. 打开 <https://discord.com/developers/applications> → **New Application** → 左侧 **Bot**
 2. **Reset Token** → 复制 token
-3. 同一页把 **Privileged Gateway Intents** 下的 **MESSAGE CONTENT INTENT** 打开（**必需**）
+3. 同一页把 **Privileged Gateway Intents** 下的 **Message Content Intent** 打开（**必需**）
 4. 左侧 **OAuth2 → URL Generator** → 勾选 scope: `bot` → Permissions: **Send Messages**
 5. 用生成的 URL 把 bot 邀请进你的服务器
 6. 编辑配置文件（路径见上面的「配置文件位置」）：
@@ -218,8 +226,11 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
    ```
 
 7. 执行 `opencode service restart`
+8. 在频道里发一句普通文字，收到回复即成功
 
-> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`GET /channels/{id}/messages`）为 TODO，当前**无法在 Discord 里与 bot 双向对话**。
+> **两个常见坑**
+> - **第 3 步的开关不开，网关会直接拒绝连接（close 4014）**，日志里会写明原因（`--status` 之外的 `bridge-plugin.log`）。该 intent 只接收 bot **已在其中**的频道的消息。
+> - **bot 必须已被邀请进频道**，否则发消息报 `not_in_channel`。
 
 ### Matrix（支持双向对话 · `/sync` 长轮询，无需公网地址）
 
@@ -248,6 +259,68 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > `allowed_chat_ids` 填**房间 id**（形如 `!abcDEF:example.org`），不是 user id。
 > 另：编辑消息用的是 MSC2676 兼容写法（多发一条带 `* ` 前缀与 `m.replace` 关系的事件），
 > 不支持该写法的客户端会当成一条新消息 —— 内容不丢，但会多一条。
+
+### Mattermost（支持双向对话 · WebSocket，无需公网地址）
+
+1. 拿一枚 token 与你自己的 user id：
+   - **个人访问令牌**（推荐，可随时吊销且不影响登录）：登录 Web UI → 左下头像 → **Profile** → **Security** → **Personal Access Tokens** → **Create New Token**
+   - 自己的 user id：桥接启动时会自动调 `GET /api/v4/users/me` 取，**无需手填**（也可在配置里用 `user_id` 显式指定）
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "mattermost": { "site_url": "https://mm.example.com", "token": "你的令牌" } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 私聊这个账号，或在**它已加入**的频道发一句 `hi`，收到回复即成功
+
+> - **必须配置 `user_id` 路径能走通**：防回环的唯一依据就是"这条消息是不是我自己发的"，靠 `users/me` 取到的 id 比对。取不到时桥接会**整个停摆入站**并在日志里提示 —— 而不是冒险进入无限回环。
+> - `allowed_chat_ids` 填 **channel id**（26 位字符串），不是 user id。
+> - **消息长度上限不在配置里**：由服务端运行时决定，桥接启动时从 `config/client` 读取 `MaxPostSize` 来分片。网上流传的 4000 / 16383 都不是契约，别照抄。
+> - 反向代理部署时若握手 404/400，先查 `ServiceSettings.WebsocketURL` / `WebsocketPort` / `WebsocketSecurePort` 与代理是否透传了 `Upgrade` 头。
+
+### IRC（支持双向对话 · TCP，无公网地址要求）
+
+1. 选一个 IRC 网络并确认端口与是否 TLS（明文常用 `6667`，TLS 常用 `6697`）
+2. 编辑配置文件：
+
+   ```json
+   "adapters": { "irc": {
+     "host": "irc.libera.chat", "nick": "你的昵称",
+     "channels": ["#你的频道"], "use_tls": true
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在频道里 **`@你的昵称` 或 `昵称:`** 发一句话，或直接私聊该昵称
+
+> - **只响应提及**（频道消息）或私聊 —— 频道很吵，不做这个会被刷屏。
+> - **`channels` 是入站前提**：留空则只能主动发（状态视图会显示"入站未就绪"）。
+> - **IRC 没有编辑消息**，`edit()` 恒 `False` —— 长任务的进度更新会退化成连续发多条消息。
+> - **正文里的换行会被折成空格**（单行协议无法承载，原样发会被注入命令）。
+> - **整行上限 512 字节**（含 `PRIVMSG` 前缀与 CRLF），桥接逐字节算预算并按字符边界切分，不会切出半个多字节字符。`max_message_length=400` 是扣掉前缀后的保守字符值。
+> - 服务器与昵称冲突（收到 `433`）会自动换名重试；`nick` 必须在该网络已注册。
+> - SASL：`bot_password` 填密码即可（走 `PASS`/`SASL PLAIN` 协商）。
+
+### Twitch（支持双向对话 · IRC over TLS WebSocket，无需公网地址）
+
+1. 打开 <https://dev.twitch.tv/console/apps> → **Register an Application** → 填 Name
+2. 复制页面上的 **OAuth Token**（这就是聊天用的 token）与 **Client ID**
+3. 编辑配置文件：
+
+   ```json
+   "adapters": { "twitch": { "token": "OAuth Token", "channel": "频道名" } }
+   ```
+
+4. 执行 `opencode service restart`
+5. 在该频道 **`@你的昵称`** 发一句话，收到回复即成功
+
+> - **token 直接粘 `OAuth Token` 的原值**，桥接会自动加 `oauth:` 前缀（不要自己加，否则会变成 `oauth:oauth:...`）。
+> - `channel` 填**小写频道名、不带 `#`**。
+> - **只响应提及**（Twitch 频道很吵）。命令前缀是 `!`。
+> - **Twitch 没有编辑消息**，`edit()` 恒 `False` —— 长任务进度会退化成连续发多条消息。
+> - 消息长度上限（默认 400 字符）与限流阈值是**社区经验值**，非官方文档公开常量。
+> - 填了 `client_id` 就能用 Helix API 取自己的 user id，回声过滤更准；不填则退回按昵称过滤。
 
 ## npm 方式（占位 / 待发布）
 
@@ -405,7 +478,18 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
 | `adapters.matrix.access_token` | `""` | Matrix access token（入站与出站都必需） |
 | `adapters.matrix.user_id` | `""` | 自己的 Matrix user id（如 `@me:example.org`）：用于**过滤自己的回声**，留空会把自己发的消息当入站消息收到（无限回环） |
-| `adapters.discord.bot_token` | `""` | Discord bot token（v1 仅支持主动发送，见"已知限制"） |
+| `adapters.discord.bot_token` | `""` | Discord bot token（出站与 Gateway 入站共用同一枚） |
+| `adapters.mattermost.site_url` | `""` | Mattermost 站点地址（如 `https://mm.example.com`）；WS 与 REST 的 scheme 由它推导 |
+| `adapters.mattermost.token` | `""` | Mattermost bot / 用户 token（`Authorization: Bearer` 用它） |
+| `adapters.irc.host` | `""` | IRC 服务器地址（如 `irc.libera.chat`） |
+| `adapters.irc.nick` | `""` | 使用的昵称 |
+| `adapters.irc.channels` | `[]` | 自动 JOIN 的频道列表（如 `["#chan"]`）；**入站前提**，留空则只能发出站 |
+| `adapters.irc.port` | `6667` | 端口；`use_tls` 为真时默认 `6697` |
+| `adapters.irc.use_tls` | `false` | 是否用 TLS（IRC over TLS） |
+| `adapters.irc.bot_password` | `""` | SASL PLAIN 的密码（可选，与 nick 组成 SASL 凭据） |
+| `adapters.twitch.token` | `""` | Twitch bot token（从开发者控制台取，**不要**自己加 `oauth:` 前缀） |
+| `adapters.twitch.channel` | `""` | 要接入的频道名（小写，不带 `#`） |
+| `adapters.twitch.client_id` | `""` | 开发者控制台的 Client ID（可选，用于取自己的 user id 做回声过滤） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 
@@ -427,7 +511,9 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 ## 8. 已知限制
 
 - 流式显示依赖服务端事件 `session.text.delta`；若服务端不推送该事件，只能在任务结束时（`session.execution.succeeded` / `session.idle`）一次性收到结果。
-- **Discord 的接收端尚未接入**：只实现了主动 `send` / `edit`，入站轮询（`GET /channels/{id}/messages` 增量回放）为 TODO，因此当前只有 Telegram 与 Slack 可以双向对话。
+- **各平台的「编辑消息」能力不一致**（流式进度更新依赖它）：Telegram / Discord / Slack / Mattermost 原生支持；**Matrix** 用 MSC2676 兼容近似（多发一条带 `* ` 前缀与 `m.replace` 关系的事件，不支持该写法的客户端会当成新消息 —— 内容不丢但会多一条）；**IRC / Twitch 完全没有编辑**，`edit()` 恒返回 `False`，此时进度更新会退化成连续发多条消息。
+- **IRC 的正文换行会被折成空格**：IRC 是单行协议，无法承载换行；原样发出会截断整行甚至被注入命令。这是协议约束，不是静默丢内容。
+- **Twitch 的消息长度上限（默认 400 字符）与限流阈值是社区经验值**，非官方文档公开常量，可能随平台调整。
 - 长任务在 IM 侧只有"一条进度消息 + 节流编辑"，**没有**中间逐步流式；工具调用只记录进内部 `tool_trace`，不会逐条推送（避免刷屏）。
 - 权限请求 v1 只发文字提示，不使用 inline buttons（跨平台行为不一致）。
 - 一条进度消息编辑失败时不会降级为重复发送（避免刷屏），定稿消息才具备 `send` 兜底。
@@ -443,7 +529,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | 连接被拒绝（`Connection refused`） | 服务没起或端口不对；`opencode serve` 后确认 `url` |
 | 发消息没有回复、日志见 `409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
 | 日志见 `provider.transport` 重试（`⏳ 重试中 (attempt N): ...`） | 上游模型服务不可达 / 超时，opencode 正在按退避重试；检查网络与 provider 配置 |
-| `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。填好各平台 `bot_token`（见「接入平台引导」）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge |
+| `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。按「接入平台引导」填好**该平台自己的凭据键**（不都是 `bot_token`：Slack 入站另需 `app_token`、Matrix 用 `homeserver`/`access_token`/`user_id`、IRC 用 `host`/`nick`/`channels`、Mattermost 用 `site_url`/`token`、Twitch 用 `token`/`channel`）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge。用 `--status` 逐平台核对缺什么 |
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中 |
 | 会话行为异常 / 想清空上下文 | 发送 `/new`（或 `/reset`）重建 session |
 | 插件没拉起 bridge | 看 `<bridgeDir>\bridge-plugin.log` 与 `<bridgeDir>\.bridge-plugin.lock`；确认插件目录里的 `config.json` 中 `bridgeDir` 指向真实存在的目录 |

@@ -77,7 +77,7 @@ SETUP_MENU_TEXT = """\
 选择要接入的平台：
 1) Telegram —— 支持双向对话
 2) Slack —— 支持双向对话
-3) Discord —— v1 仅支持主动发送
+3) Discord —— 支持双向对话
 
 回复 /setup 1、/setup 2 或 /setup 3 也可直接查看。"""
 
@@ -86,7 +86,7 @@ SETUP_INVALID_TEXT = """\
 无法识别的平台。可接入的平台有：
 1) Telegram —— 支持双向对话
 2) Slack —— 支持双向对话
-3) Discord —— v1 仅支持主动发送
+3) Discord —— 支持双向对话
 
 用法: /setup 1|2|3 或 /setup telegram|slack|discord"""
 
@@ -165,15 +165,17 @@ _SETUP_GUIDES = {
     "discord": """\
 1. 打开 https://discord.com/developers/applications → New Application → 左侧 Bot
 2. Reset Token → 复制 token
-3. 同页面把 Privileged Gateway Intents 下的 MESSAGE CONTENT INTENT 打开（必需）
+3. 同一页把 Privileged Gateway Intents 下的 Message Content Intent 打开（必需）
 4. 左侧 OAuth2 → URL Generator → 勾选 scope: bot → Permissions: Send Messages
 5. 用生成的 URL 把 bot 邀请进你的服务器
 6. 编辑配置文件：
      "adapters": { "discord": { "bot_token": "..." } }
 7. 执行 opencode service restart
+8. 在频道里发一句普通文字，收到回复即成功
 
-能力说明：v1 仅实现主动 send/edit，入站轮询（GET /channels/{id}/messages）为 TODO，
-当前无法在 Discord 里与 bot 双向对话。""",
+两个常见坑：
+· 第 3 步的开关不开，网关会直接拒绝连接（close 4014），日志里会写明原因
+· bot 必须已被邀请进频道，否则发消息报 not_in_channel""",
 }
 
 

@@ -59,9 +59,15 @@ opencode service restart
 插件装好只代表 bridge 能随 opencode 启动，**还要按平台填好 token** 才有消息进出。
 完整的分步引导见仓库根 [`README.md`](../README.md) 的「接入平台引导」一节（三个平台各一份，含配置文件路径），这里只给一句话概述：
 
-- **Telegram**：`@BotFather` 建 bot 拿 token、`@userinfobot` 查 chat id，填进 `adapters.telegram` → 支持双向对话；
-- **Slack**：建 App 后开 Socket Mode 拿 `xapp-` app-level token、再取 `xoxb-` bot token，两枚都填进 `adapters.slack` → 支持双向对话；
-- **Discord**：开发者后台建 Application、开 MESSAGE CONTENT INTENT、用 URL Generator 邀请进服务器 → v1 仅能主动发送。
+- **Telegram**：`@BotFather` 建 bot 拿 token、`@userinfobot` 查 chat id，填进 `adapters.telegram`；
+- **Slack**：建 App 后开 Socket Mode 拿 `xapp-` app-level token、再取 `xoxb-` bot token，两枚都填进 `adapters.slack`（只填 `xoxb-` 只能发不能收）；
+- **Discord**：开发者后台建 Application、开 **Message Content Intent**、用 URL Generator 邀请进服务器，填 `adapters.discord.bot_token`；
+- **Matrix**：填 `adapters.matrix` 的 `homeserver` / `access_token` / `user_id`（`user_id` 用于过滤自己的回环，漏了会自己跟自己对话）；
+- **Mattermost**：填 `adapters.mattermost` 的 `site_url` / `token`；
+- **IRC**：填 `adapters.irc` 的 `host` / `nick` / `channels`（`channels` 留空则只能主动发）；
+- **Twitch**：开发者控制台取 OAuth Token 与频道名，填 `adapters.twitch` 的 `token` / `channel`。
+
+以上七个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
 
 填好 token 并 `opencode service restart` 之后，可在 bot 内发送 **`/setup`** 查看 / 重温这套引导
 （`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台）。

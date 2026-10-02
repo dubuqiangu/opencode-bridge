@@ -178,11 +178,11 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >
 > `allowed_chat_ids` 白名单同样适用：Slack 侧没有"谁能跟 bot 说话"的原生白名单，只能靠频道邀请与本桥接自己的白名单。
 
-#### Discord（⚠️ v1 仅支持主动发送）
+#### Discord（支持双向对话 · Gateway v10 WebSocket，无需公网地址）
 
 1. 打开 <https://discord.com/developers/applications> → **New Application** → 左侧 **Bot**
 2. **Reset Token** → 复制 token
-3. 同一页把 **Privileged Gateway Intents** 下的 **MESSAGE CONTENT INTENT** 打开（**必需**）
+3. 同一页把 **Privileged Gateway Intents** 下的 **Message Content Intent** 打开（**必需**）
 4. 左侧 **OAuth2 → URL Generator** → 勾选 scope: `bot` → Permissions: **Send Messages**
 5. 用生成的 URL 把 bot 邀请进你的服务器
 6. 编辑配置文件（路径见上面的「配置文件位置」）：
@@ -192,8 +192,11 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
    ```
 
 7. 执行 `opencode service restart`
+8. 在频道里发一句普通文字，收到回复即成功
 
-> 能力说明：v1 仅实现主动 `send`/`edit`，入站轮询（`GET /channels/{id}/messages`）为 TODO，当前**无法在 Discord 里与 bot 双向对话**。
+> **两个常见坑**
+> - **第 3 步的开关不开，网关会直接拒绝连接（close 4014）**，日志里会写明原因。
+> - **bot 必须已被邀请进频道**，否则发消息报 `not_in_channel`。
 
 #### Matrix（支持双向对话 · `/sync` 长轮询，无需公网地址）
 
@@ -222,7 +225,64 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > 编辑消息用 MSC2676 兼容写法（多发一条带 `* ` 前缀与 `m.replace` 关系的事件），
 > 不支持该写法的客户端会当成一条新消息 —— 内容不丢，但会多一条。
 
-> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温上面三平台的引导；`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台。**Matrix 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全可用 `--status` 核对。
+#### Mattermost（支持双向对话 · WebSocket，无需公网地址）
+
+1. 拿一枚 token：登录 Web UI → 左下头像 → **Profile** → **Security** → **Personal Access Tokens** → **Create New Token**（个人访问令牌可随时吊销且不影响登录）
+   自己的 user id 不用手填 —— 桥接启动时自动调 `GET /api/v4/users/me` 取
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "mattermost": { "site_url": "https://mm.example.com", "token": "你的令牌" } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 私聊这个账号，或在**它已加入**的频道发一句 `hi`，收到回复即成功
+
+> - **防回环只能靠"是不是我自己发的"**（比对 `users/me` 的 id）。取不到时桥接会**整个停摆入站**并在日志提示，而不是冒险无限回环。
+> - `allowed_chat_ids` 填 **channel id**（26 位字符串），不是 user id。
+> - **消息长度上限不在配置里**：由服务端运行时决定，桥接启动时读 `config/client` 的 `MaxPostSize` 用来分片。
+> - 反向代理部署若握手 404/400，先查 `WebsocketURL` / `WebsocketPort` 与代理是否透传 `Upgrade` 头。
+
+#### IRC（支持双向对话 · TCP）
+
+1. 选一个 IRC 网络，确认端口与是否 TLS（明文常用 `6667`，TLS 常用 `6697`）
+2. 编辑配置文件：
+
+   ```json
+   "adapters": { "irc": {
+     "host": "irc.libera.chat", "nick": "你的昵称",
+     "channels": ["#你的频道"], "use_tls": true
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在频道里 **`@你的昵称` / `昵称:`** 发一句话，或直接私聊该昵称
+
+> - **只响应提及或私聊**。**`channels` 是入站前提**，留空则只能主动发。
+> - **IRC 无编辑消息**，长任务进度会退化成连续发多条消息。
+> - **正文换行折成空格**（单行协议约束，原样发会被注入命令）。整行上限 512 字节。
+> - 昵称冲突（`433`）会自动换名重试；`bot_password` 填密码即启用 SASL PLAIN。
+
+#### Twitch（支持双向对话 · IRC over TLS WebSocket）
+
+1. 打开 <https://dev.twitch.tv/console/apps> → **Register an Application** → 填 Name
+2. 复制页面上的 **OAuth Token**（聊天用）与 **Client ID**
+3. 编辑配置文件：
+
+   ```json
+   "adapters": { "twitch": { "token": "OAuth Token", "channel": "频道名" } }
+   ```
+
+4. 执行 `opencode service restart`
+5. 在频道里 **`@你的昵称`** 发一句话，收到回复即成功
+
+> - **token 粘 `OAuth Token` 原值**，桥接自动加 `oauth:` 前缀（自己加会变成 `oauth:oauth:...`）。
+> - `channel` 填**小写频道名、不带 `#`**。**只响应提及**。命令前缀是 `!`。
+> - **Twitch 无编辑消息**，长任务进度会退化成连续发多条消息。
+> - 400 字符上限与限流阈值是**社区经验值**，非官方公开常量。
+
+> 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
+> **Matrix / Mattermost / IRC / Twitch 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### Step 3: 激活（需要用户点头）
 

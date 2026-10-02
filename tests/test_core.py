@@ -455,8 +455,13 @@ class SetupCommandTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "/setup discord"))
             text = adapter.sent[-1].text
-            self.assertIn("MESSAGE CONTENT INTENT", text)
+            # 后台开关的现行名称是 "Message Content Intent"（旧的
+            # "MESSAGE CONTENT INTENT" 是历史标签）
+            self.assertIn("Message Content Intent", text)
             self.assertIn("discord.com/developers", text)
+            # T2.2 落地后 Discord 已支持双向，"仅能主动发送"不得复活
+            self.assertNotIn("仅实现主动", text)
+            self.assertNotIn("无法在 Discord", text)
             self.assertEqual(client.prompts, [])
 
     def test_setup_is_case_insensitive_and_accepts_numbers(self):

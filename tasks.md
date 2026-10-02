@@ -51,7 +51,7 @@
 | T3.1 | Matrix | S | `/sync` 长轮询 + `next_batch` 游标 | ☑ |
 | T3.2 | Mattermost | S | WebSocket + `authentication_challenge` + ping | ☑ |
 | T3.3 | IRC | S | `socket` 手写客户端 + PING/PONG + 仅响应提及 | ☑ |
-| T3.4 | Twitch | S | WebSocket IRC + IRCv3 tags + 限速节流 | ☐ |
+| T3.4 | Twitch | S | WebSocket IRC + IRCv3 tags + 限速节流 | ☑ |
 | T3.5 | Nextcloud Talk | S | REST 轮询 | ☐ |
 
 ---
@@ -245,3 +245,23 @@
   这条不变量正是当初漏掉 Matrix 的那道防线。
   验证：**520 tests OK (skipped=1)**、compileall 0；只配 Matrix / IRC / Mattermost
   的三种配置实测 preflight 均为 True、状态视图均如实报就绪。
+- **2026-10-02** T3.4 Twitch 完成 + **文档全面纠错**：
+  - Twitch（IRC over TLS WebSocket，64 用例）。行分帧不假设"一帧一行"（`_rbuf` 缓冲按
+    `\n` 切行，**断线时丢弃半行**）；IRCv3 tag 按第一个 `;` 切 tag、第一个 `:` 切参数
+    前缀，反转义逐个单扫（不能用 `str.replace` 连做，否则 `\\\\s` 会错还原成 `\s`）。
+    换行注入防护的测试被**改强**：既断言服务器看到折行后的整行，又断言**不存在**独立的
+    `JOIN` 行、且会话内唯一的 JOIN 是那条合法的。
+  - **文档纠错**：T2.2 落地后 Discord 在 **9 处**仍被描述为"仅支持主动发送"（README
+    能力表还写着「⬜ TODO / 仅发送」），而实际七个平台全部支持双向。逐处改为真实状态，
+    并补齐 Mattermost / IRC / Twitch 的接入小节与配置项（含各自最易踩的坑：
+    Mattermost 取不到 user id 会整个停摆入站、IRC 换行折成空格、Twitch token 不要自己
+    加 `oauth:` 前缀）。能力表新增**编辑消息**一列 —— 这项能力平台间不一致，IRC / Twitch
+    没有它，长任务进度会退化成连续发多条消息，这是不该被"能力一致"掩盖的事实。
+  - 顺带修掉故障排查里"填好各平台 `bot_token`"这句（对六成平台是错的），改成按平台列
+    各自的凭据键并指向 `--status` 核对。
+  - 测试侧同步：Discord 引导的后台开关现行名称是 `Message Content Intent`（旧的
+    `MESSAGE CONTENT INTENT` 是历史标签），并加**反向断言**防止"仅能主动发送"复活。
+  - 排障记录：本机 `grep` 工具对 README.md 的中文匹配失效、PowerShell `-match` 默认
+    大小写不敏感（把新写的正确标签误报成过时的旧标签），最后改用**逐行 `-cmatch`
+    穷举扫描**才拿到可信结论。
+  验证：**584 tests OK (skipped=1)**、compileall 0、过时说法 0 处残留。

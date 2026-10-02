@@ -280,5 +280,41 @@ class TestPreflightAndCredentialDeclarations(unittest.TestCase):
             self.assertIn(key, text, f"提示语里应说明 {key}")
 
 
+class TestTableWidthHelpers(unittest.TestCase):
+    """``--status`` 表格的对齐。
+
+    回归点：``f"{s:<n}"`` 按**字符数**补齐，而中文在终端占 2 列，于是中文表头
+    本来就错位；平台名再一变长（``Nextcloud Talk`` 14 字符 > 原写死的 12），
+    就会把与下一列之间的空格挤掉，输出成 ``Nextcloud Talk未配置``。
+    """
+
+    def test_dwidth_counts_cjk_as_two_columns(self):
+        self.assertEqual(cli._dwidth("平台"), 4)          # 2 个汉字 = 4 列
+        self.assertEqual(cli._dwidth("长度上限"), 8)      # 4 个汉字
+        self.assertEqual(cli._dwidth("Nextcloud Talk"), 14)  # 全 ASCII
+        self.assertEqual(cli._dwidth(""), 0)
+        self.assertEqual(cli._dwidth("IRC"), 3)
+
+    def test_pad_produces_constant_display_width(self):
+        for text in ("IRC", "Telegram", "Mattermost", "Nextcloud Talk", "平台", "未配置"):
+            with self.subTest(text=text):
+                self.assertEqual(cli._dwidth(cli._pad(text, 16)), 16)
+
+    def test_pad_never_truncates_when_text_exceeds_width(self):
+        """标签比列宽长时不能截断内容（截断会隐藏平台名）。"""
+        padded = cli._pad("Nextcloud Talk", 4)
+        self.assertIn("Nextcloud Talk", padded)
+
+    def test_name_column_fits_the_longest_label(self):
+        """列宽必须容得下最长平台名 + 间隔。"""
+        cfg = Config(adapters={})
+        rows = cli._channel_config_rows(cfg)
+        widest = max(cli._dwidth(r[1]) for r in rows)
+        self.assertGreaterEqual(widest, cli._dwidth("Nextcloud Talk"))
+        name_w = max([cli._dwidth("平台")] + [cli._dwidth(r[1]) for r in rows]) + 2
+        for row in rows:
+            self.assertLessEqual(cli._dwidth(row[1]), name_w)
+
+
 if __name__ == "__main__":
     unittest.main()

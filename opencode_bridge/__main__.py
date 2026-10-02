@@ -306,6 +306,25 @@ def _runtime_state(bridge_dir: str) -> tuple[str, str]:
     return ChannelState.DEGRADED.value, f"锁存在但 pid={pid} 已不存在（上次异常退出）"
 
 
+def _dwidth(text: str) -> int:
+    """终端**显示宽度**：CJK / 全角字符占 2 列（用 ``unicodedata`` 判定）。
+
+    ``f"{s:<n}"`` 是按**字符数**补齐的，中文表头（"平台" 2 字却占 4 列）会让整张
+    表在终端里错位；平台名变长（如 "Nextcloud Talk" 14 字符）时更会挤掉与下一列
+    之间的空格。两者都要按显示宽度算才对齐。
+    """
+    import unicodedata
+
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1 for ch in text
+    )
+
+
+def _pad(text: str, width: int) -> str:
+    """按显示宽度左对齐补空格。"""
+    return text + " " * max(0, width - _dwidth(text))
+
+
 def run_status(cfg: Config) -> int:
     """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。"""
     bridge_dir = _bridge_dir()
@@ -326,20 +345,30 @@ def run_status(cfg: Config) -> int:
     print("== 渠道配置与能力 ==")
     print("  说明：「配置」= 必需 token 全部齐备；「入站」= 入站已实现且配置齐备。")
     print("        两者都不代表连接状态（连接状态见下方运行态）")
-    print(f"  {'平台':<12}{'配置':<8}{'入站':<8}{'按钮':<6}{'媒体':<6}{'长度上限':<10}白名单")
-    for key, label, configured, inbound_ready, caps in _channel_config_rows(cfg):
+    rows = _channel_config_rows(cfg)
+    # 列宽按**显示宽度**自适应：平台名长短不一（"IRC" 3 字符、"Nextcloud Talk" 14），
+    # 写死宽度会让长名字挤掉与下一列之间的空格。
+    name_w = max([_dwidth("平台")] + [_dwidth(r[1]) for r in rows]) + 2
+    print(
+        "  " + _pad("平台", name_w) + _pad("配置", 8) + _pad("入站", 8)
+        + _pad("按钮", 6) + _pad("媒体", 6) + _pad("长度上限", 12) + "白名单"
+    )
+    for key, label, configured, inbound_ready, caps in rows:
         if caps.get("error"):
-            print(f"  {label:<12}{'已配置' if configured else '未配置':<8}能力读取失败：{caps['error']}")
+            print(
+                "  " + _pad(label, name_w) + _pad("已配置" if configured else "未配置", 8)
+                + f"能力读取失败：{caps['error']}"
+            )
             continue
         allowed = caps.get("allowed_chat_ids_count")
         wl = "未设(全开)" if not allowed else f"{allowed} 项"
         print(
-            f"  {label:<12}"
-            f"{'已配置' if configured else '未配置':<8}"
-            f"{'就绪' if inbound_ready else '否':<8}"
-            f"{'是' if caps.get('supports_inline_buttons') else '否':<6}"
-            f"{'是' if caps.get('supports_media') else '否':<6}"
-            f"{str(caps.get('max_message_length')):<10}{wl}"
+            "  " + _pad(label, name_w)
+            + _pad("已配置" if configured else "未配置", 8)
+            + _pad("就绪" if inbound_ready else "否", 8)
+            + _pad("是" if caps.get("supports_inline_buttons") else "否", 6)
+            + _pad("是" if caps.get("supports_media") else "否", 6)
+            + _pad(str(caps.get("max_message_length")), 12) + wl
         )
 
     print("")

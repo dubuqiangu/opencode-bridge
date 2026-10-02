@@ -132,7 +132,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**七个平台全部支持双向对话**）：
+各平台当前能力一览（**八个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -141,6 +141,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Discord | ✅ Gateway v10 | ✅ | ✅ 原生 | 需在后台开 **Message Content Intent** |
 | Matrix | ✅ `/sync` 长轮询 | ✅ | ⚠️ 兼容近似 | 无标准编辑 API，见该节说明 |
 | Mattermost | ✅ WebSocket | ✅ | ✅ 原生 | 消息上限运行时从服务端读取 |
+| Nextcloud Talk | ✅ HTTP 长轮询 | ✅ | ✅ 原生（24 小时内） | 上限 32000 字符是源码硬编码常量 |
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 
@@ -322,6 +323,34 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - 消息长度上限（默认 400 字符）与限流阈值是**社区经验值**，非官方文档公开常量。
 > - 填了 `client_id` 就能用 Helix API 取自己的 user id，回声过滤更准；不填则退回按昵称过滤。
 
+### Nextcloud Talk（支持双向对话 · HTTP 长轮询，无需公网地址）
+
+1. 生成 **app password**：登录 Nextcloud → 右上角设置 → **安全** → **设备专属密码** → **创建新密码**。它与账号密码在 Basic Auth 里完全等价，但可单独吊销、不影响登录、不过期。**建议用独立的机器人账号**。
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "nextcloud": {
+     "base_url": "https://cloud.example.com",
+     "username": "my-bot", "password": "app-password-xxxx"
+   } }
+   ```
+
+   `base_url` **要含子路径前缀**（如 `https://host/nextcloud`），原样填即可。
+3. 执行 `opencode service restart`
+4. 私聊机器人，或在它已加入的会话里发一句 `hi`，收到回复即成功
+
+> **三个最容易写错、且都是"静默失败"的地方**（都已在代码里固定并有测试锁住）
+> - **`OCS-APIRequest` 的值必须是字面量小写 `true`** —— 服务端是**严格字符串比较**（`=== 'true'`），写成 `True` / `1` / `yes` 会被当成 CSRF 攻击并返回 **403**。
+> - **只走 `ocs/v2.php`** —— `ocs/v1.php` 入口的 HTTP 状态码**恒为 200**（失败也看不出来），v2 才返回真实状态码。
+> - **`304` 不是错误** —— 长轮询"没有新消息"时服务端返回 304，而 `urllib` 会把它**抛成 `HTTPError`**。这是本适配器最容易写错的一处。
+>
+> 其它要点：
+> - `allowed_chat_ids` 填**会话 token**（`ocs.data[].token`），不是 user id。
+> - 消息长度上限 **32000 字符，是源码里的硬编码常量、不可配置**（网上没有对应的 `occ config` 设置）。超限服务端返回 413。
+> - **支持编辑消息**（`edit()` 会真正生效），但**超过 24 小时不能改**；且需会话权限含 128、且会话非只读 / 非 lobby。
+> - `max_concurrent_polls`（默认 5）别调大：每个长轮询请求会占住一个服务端 worker 30 秒。`poll_timeout` **上限就是 30**（源码 clamp，填更大也会被服务端压回）。
+> - `@提及` 不做渲染：`message` 字段是含 `{mention-call1}` 占位符的模板串，v1 原样透传。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -490,6 +519,12 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.twitch.token` | `""` | Twitch bot token（从开发者控制台取，**不要**自己加 `oauth:` 前缀） |
 | `adapters.twitch.channel` | `""` | 要接入的频道名（小写，不带 `#`） |
 | `adapters.twitch.client_id` | `""` | 开发者控制台的 Client ID（可选，用于取自己的 user id 做回声过滤） |
+| `adapters.nextcloud.base_url` | `""` | Nextcloud 站点地址（**含子路径前缀**，如 `https://host/nextcloud`） |
+| `adapters.nextcloud.username` | `""` | 登录用户名（建议用独立的机器人账号） |
+| `adapters.nextcloud.password` | `""` | **app password**（「设置 → 安全 → 设备专属密码」生成，可单独吊销且不影响登录） |
+| `adapters.nextcloud.user_id` | `""` | 自己的 Nextcloud user id（**大小写敏感**）；留空则启动时自动调 `cloud/user` 取 |
+| `adapters.nextcloud.max_concurrent_polls` | `5` | 同时长轮询的会话数上限；每个长轮询会占住一个服务端 worker 30 秒，不宜过大 |
+| `adapters.nextcloud.poll_timeout` | `30` | 服务端长轮询秒数，**上限就是 30**（源码 clamp，再大也被服务端压回） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

@@ -66,8 +66,9 @@ opencode service restart
 - **Mattermost**：填 `adapters.mattermost` 的 `site_url` / `token`；
 - **IRC**：填 `adapters.irc` 的 `host` / `nick` / `channels`（`channels` 留空则只能主动发）；
 - **Twitch**：开发者控制台取 OAuth Token 与频道名，填 `adapters.twitch` 的 `token` / `channel`。
+- **Nextcloud Talk**：Nextcloud「设置 → 安全 → 设备专属密码」生成 app password，填 `adapters.nextcloud` 的 `base_url` / `username` / `password`。
 
-以上七个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
+以上八个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
 
 填好 token 并 `opencode service restart` 之后，可在 bot 内发送 **`/setup`** 查看 / 重温这套引导
 （`/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台）。

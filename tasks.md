@@ -52,7 +52,7 @@
 | T3.2 | Mattermost | S | WebSocket + `authentication_challenge` + ping | ☑ |
 | T3.3 | IRC | S | `socket` 手写客户端 + PING/PONG + 仅响应提及 | ☑ |
 | T3.4 | Twitch | S | WebSocket IRC + IRCv3 tags + 限速节流 | ☑ |
-| T3.5 | Nextcloud Talk | S | REST 轮询 | ☐ |
+| T3.5 | Nextcloud Talk | S | REST 轮询 | ☑ |
 
 ---
 
@@ -265,3 +265,38 @@
     大小写不敏感（把新写的正确标签误报成过时的旧标签），最后改用**逐行 `-cmatch`
     穷举扫描**才拿到可信结论。
   验证：**584 tests OK (skipped=1)**、compileall 0、过时说法 0 处残留。
+- **2026-10-02** T3.5 Nextcloud Talk 完成 —— **阶段 3 收官，八个平台全部支持双向对话**：
+  - 入站是 HTTP 长轮询（`lookIntoFuture=1` 挂住最多 30 秒），出站走 OCS REST。协议细节
+    全部来自官方文档 + `nextcloud/server` / `nextcloud/spreed` **源码逐行核实**，其中
+    **纠正了官方文档的一处错误**：文档写 `timeout` 最大 60 秒，源码实际 clamp 到 **30**
+    （main 与 stable31~35 六个分支一致）。三个最容易写错且都是**静默失败**的地方：
+    1. **`OCS-APIRequest` 必须是字面量小写 `true`** —— 服务端是**严格字符串比较**
+       （`=== 'true'`），`True`/`1`/`yes` 一律被判 CSRF 攻击并返回 403。
+    2. **只走 `ocs/v2.php`** —— v1 入口的 HTTP 状态码**恒为 200**（失败看不出来）。
+    3. **`304` 不是错误** —— "无新消息"时服务端返回 304，而 `urllib` 把它**抛成
+       `HTTPError`**。这是本适配器最容易写错的一处。
+  - **反直觉的过滤规则**（源码级）：`systemMessage != ""` 能证明是系统消息，但**反向不成立**
+    —— `file_shared` / `object_shared` 会被服务端改写成 `messageType="comment"` **且**
+    `systemMessage=""`。所以还必须额外丢弃 `messageParameters` 里含 `file` / `object` 的。
+    该用例**先断言前提成立再断言被丢弃**，所以将来谁改了过滤顺序它也会失败。
+  - **游标先推进再处理**（与 telegram 推进 offset、matrix 推进 next_batch 同理）：单条
+    处理抛异常不会导致重放。`X-Chat-Last-Given` 只在 200 响应里有；304 时游标一字不动；
+    200 但 header 缺失时**保持旧游标并告警**（宁可重复也不丢，且这是显式的保守选择而非
+    官方要求）。
+  - **会话列表是 `api/v4`**（用 v1/v2/v3 会 404）；`modifiedSince` 增量**检测不到"被移出/会话
+    删除"**，所以按官方要求**每 5 分钟全量刷新一次**并清掉已消失的会话 —— 否则会拿着一个
+    已不存在的 token 一直轮询 404。
+  - **worker 池而非每会话一线程**：默认 5 个 worker 轮转取会话（`pop(0)` 再 `append`），
+    在飞的长轮询数恒 ≤ worker 数。每个长轮询占住一个服务端 worker 30 秒，所以并发必须保守。
+  - **支持编辑消息**（`edit()` 真返回 `True`），但**超 24 小时不能改**、需会话权限含 128、
+    会话非只读/非 lobby —— 限制写进 docstring 并在失败时如实归因。消息上限 **32000 是源码
+    硬编码常量、不可配置**（明确写清"别去找 occ config 设置"）。
+  - 115 个用例，连跑 5 次无抖动。
+  - **修掉一个 `--status` 表格对齐 bug**（lane 诚实指出后我核实确认）：根因不是某一行太长，
+    而是 `f"{s:<n}"` 按**字符数**补齐，而中文在终端占 2 列 —— 中文表头本来就错位，平台名
+    再变长（`Nextcloud Talk` 14 字符 > 写死的 12）就把与下一列的空格挤掉，输出成
+    `Nextcloud Talk未配置`。改为按**显示宽度**（`unicodedata.east_asian_width`）补齐 +
+    列宽按最长平台名自适应，并加 4 个用例锁住。
+  - 复核要点：源码里唯一的 `ocs/v1.php` 出现在**模块 docstring 的告诫文字**里（"不要用
+    `ocs/v1.php`"），`_url()` 只拼 `{base_url}/ocs/v2.php/...` —— 抽查脚本报 False 是误报。
+  验证：**703 tests OK (skipped=1)**、compileall 0、表格对齐实测正确。

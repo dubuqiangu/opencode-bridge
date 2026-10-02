@@ -281,8 +281,31 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > - **Twitch 无编辑消息**，长任务进度会退化成连续发多条消息。
 > - 400 字符上限与限流阈值是**社区经验值**，非官方公开常量。
 
+#### Nextcloud Talk（支持双向对话 · HTTP 长轮询，无需公网地址）
+
+1. 生成 **app password**：登录 Nextcloud → 右上角设置 → **安全** → **设备专属密码** → **创建新密码**（可单独吊销、不影响登录、不过期）。**建议用独立的机器人账号**。
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "nextcloud": {
+     "base_url": "https://cloud.example.com",
+     "username": "my-bot", "password": "app-password-xxxx"
+   } }
+   ```
+
+   `base_url` **要含子路径前缀**（如 `https://host/nextcloud`）。
+3. 执行 `opencode service restart`
+4. 私聊机器人，或在它已加入的会话里发一句 `hi`，收到回复即成功
+
+> **三个最容易写错、且都是"静默失败"的地方**
+> - **`OCS-APIRequest` 必须是字面量小写 `true`** —— 服务端**严格字符串比较**，`True` / `1` / `yes` 一律被判 CSRF 攻击并返回 **403**。
+> - **只走 `ocs/v2.php`** —— `ocs/v1.php` 的 HTTP 状态码**恒为 200**，失败看不出来。
+> - **`304` 不是错误** —— 长轮询"无新消息"时服务端返回 304，而 `urllib` 把它**抛成 `HTTPError`**。
+>
+> 其它：`allowed_chat_ids` 填**会话 token**；消息上限 **32000 字符是源码硬编码常量、不可配置**（超限 413）；**支持编辑消息**但**超 24 小时不能改**；`poll_timeout` **上限就是 30**（源码 clamp）；`@提及` 不做渲染（模板串原样透传）。
+
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
-> **Matrix / Mattermost / IRC / Twitch 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### Step 3: 激活（需要用户点头）
 

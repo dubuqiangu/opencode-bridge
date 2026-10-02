@@ -92,21 +92,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _platform_status(cfg: Config) -> list[dict[str, object]]:
-    """Per-platform ``{key,label,configured}`` for ``--setup --json``.
+def _token_present(entry: dict, key: str) -> bool:
+    return bool(str(entry.get(key) or "").strip())
 
-    ``configured`` mirrors the run-time pre-flight: a non-empty ``bot_token``.
+
+def _status_platform_keys() -> list[str]:
+    """状态视图要列的平台：优先取注册表里全部已注册平台。
+
+    冻结的 ``/setup`` 菜单刻意只列三平台（人工维护的引导文案），但 ``--status``
+    与 ``--setup --json`` 是运行时视图 —— 新加的平台若不在这里出现，用户就根本
+    看不到它。注册表读不到时退回菜单里的三家。
     """
+    try:
+        from .adapters import registered_names
+
+        names = list(registered_names())
+    except Exception:  # noqa: BLE001 - 状态视图不该崩
+        names = []
+    if not names:
+        names = [key for key, _ in setup_platforms()]
+    return names
+
+
+def _platform_status(cfg: Config) -> list[dict[str, object]]:
+    """Per-platform 配置状态 for ``--setup --json``（数据驱动，不硬编码平台表）。
+
+    ``configured`` 要求该平台 ``required_tokens`` **全部**齐备。Slack 缺
+    ``app_token`` 时"只发出站"仍可用，但入站根本没通 —— 这种情况必须能被机器
+    读出来，只看 ``bot_token`` 会把"入站没通"误报成已配置。
+    """
+    from .adapters import adapter_class
+
     entries = cfg.adapters if isinstance(cfg.adapters, dict) else {}
+    labels = dict(setup_platforms())
     out: list[dict[str, object]] = []
-    for key, label in setup_platforms():
-        entry = entries.get(key)
-        token = entry.get("bot_token") if isinstance(entry, dict) else None
+    for key in _status_platform_keys():
+        cls = adapter_class(key)
+        entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
+        required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
+        missing = [k for k in required if not _token_present(entry, k)]
+        supports_inbound = bool(getattr(cls, "supports_inbound", False))
         out.append(
             {
                 "key": key,
-                "label": label,
-                "configured": bool(token is not None and str(token).strip()),
+                "label": str(getattr(cls, "label", "") or labels.get(key) or key),
+                # 全部必需 token 齐备才算配好（入站必需项也算在内）
+                "configured": not missing,
+                "outbound_ready": _token_present(entry, "bot_token"),
+                # 入站要"能力已实现"且"配置齐备"两个条件同时成立
+                "inbound_ready": supports_inbound and not missing,
+                "inbound_implemented": supports_inbound,
+                "missing": missing,
             }
         )
     return out
@@ -185,23 +221,30 @@ class _NullHooks:
         return None
 
 
-def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, dict]]:
-    """``(key, label, configured, capabilities)``；能力来自 T1.1 的显式声明。"""
-    from .adapters import build
+def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]:
+    """``(key, label, configured, inbound_ready, capabilities)``。
+
+    能力来自各适配器的显式声明（T1.1），必需 token 来自 ``required_tokens``，
+    平台清单来自注册表 —— 三者都不在这里硬编码。
+    """
+    from .adapters import adapter_class, build
 
     entries = cfg.adapters if isinstance(cfg.adapters, dict) else {}
-    rows: list[tuple[str, str, bool, dict]] = []
-    for key, label in setup_platforms():
+    rows: list[tuple[str, str, bool, bool, dict]] = []
+    for key in _status_platform_keys():
+        cls = adapter_class(key)
         raw = entries.get(key)
         entry = raw if isinstance(raw, dict) else {}
-        token = entry.get("bot_token")
-        configured = bool(token is not None and str(token).strip())
+        required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
+        missing = [k for k in required if not _token_present(entry, k)]
         caps: dict = {}
         try:
             caps = build(key, entry, _NullHooks()).capabilities()
         except Exception as exc:  # 能力读取失败不该让 --status 崩
             caps = {"error": str(exc)[:80]}
-        rows.append((key, label, configured, caps))
+        label = str(caps.get("label") or getattr(cls, "label", "") or key)
+        supports_inbound = bool(getattr(cls, "supports_inbound", False))
+        rows.append((key, label, not missing, supports_inbound and not missing, caps))
     return rows
 
 
@@ -253,9 +296,10 @@ def run_status(cfg: Config) -> int:
 
     print("")
     print("== 渠道配置与能力 ==")
-    print("  说明：「配置」= 是否已填 bot_token；不代表连接状态（连接状态见下方运行态）")
-    print(f"  {'平台':<12}{'配置':<8}{'入站':<6}{'按钮':<6}{'媒体':<6}{'长度上限':<10}白名单")
-    for key, label, configured, caps in _channel_config_rows(cfg):
+    print("  说明：「配置」= 必需 token 全部齐备；「入站」= 入站已实现且配置齐备。")
+    print("        两者都不代表连接状态（连接状态见下方运行态）")
+    print(f"  {'平台':<12}{'配置':<8}{'入站':<8}{'按钮':<6}{'媒体':<6}{'长度上限':<10}白名单")
+    for key, label, configured, inbound_ready, caps in _channel_config_rows(cfg):
         if caps.get("error"):
             print(f"  {label:<12}{'已配置' if configured else '未配置':<8}能力读取失败：{caps['error']}")
             continue
@@ -264,7 +308,7 @@ def run_status(cfg: Config) -> int:
         print(
             f"  {label:<12}"
             f"{'已配置' if configured else '未配置':<8}"
-            f"{'是' if caps.get('supports_inbound') else '否':<6}"
+            f"{'就绪' if inbound_ready else '否':<8}"
             f"{'是' if caps.get('supports_inline_buttons') else '否':<6}"
             f"{'是' if caps.get('supports_media') else '否':<6}"
             f"{str(caps.get('max_message_length')):<10}{wl}"

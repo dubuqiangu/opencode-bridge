@@ -6,6 +6,8 @@ import abc
 import importlib
 import importlib.util
 import logging
+import os
+import pkgutil
 import threading
 from typing import Dict, Type
 
@@ -13,7 +15,15 @@ from ..hooks import Hooks, MsgHandle, Outbound, SendError, SendResult
 
 logger = logging.getLogger("opencode_bridge.adapters.base")
 
-__all__ = ["Adapter", "AdapterError", "build", "register", "classify_http"]
+__all__ = [
+    "Adapter",
+    "AdapterError",
+    "build",
+    "register",
+    "classify_http",
+    "adapter_class",
+    "registered_names",
+]
 
 
 def classify_http(status: int, detail: str = "") -> SendError:
@@ -87,6 +97,10 @@ class Adapter(abc.ABC):
     supports_media: bool = False
     #: 命令前缀（Telegram/Slack 用 ``/``，部分平台习惯 ``!``）。
     typed_command_prefix: str = "/"
+    #: 配齐才算"该平台可用"的 token 键（``--status`` / ``--setup --json`` 消费）。
+    #: 必须把**入站**必需的键也列进来：Slack 缺 ``app_token`` 会静默降级为"只发出
+    #: 站"，若这里只列 ``bot_token``，状态视图就会把"入站根本没通"报成已配置。
+    required_tokens: tuple[str, ...] = ("bot_token",)
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         self.config: dict = dict(config or {})
@@ -268,6 +282,37 @@ def _ensure_loaded(name: str) -> None:
         importlib.import_module(dotted)
         return
     from . import discord, slack, telegram  # noqa: F401  (side effect)
+
+
+def adapter_class(name: str) -> Type[Adapter] | None:
+    """按名取**已注册的适配器类**（不实例化），没有则 ``None``。
+
+    供 ``--status`` / ``--setup --json`` 查询各平台**声明**的必需 token 与能力。
+    这样新增平台只要写好适配器就会被状态视图自动列出，不必改核心文件。
+    """
+    key = str(name)
+    _ensure_loaded(key)
+    return _REGISTRY.get(key)
+
+
+def registered_names() -> tuple[str, ...]:
+    """扫描本包内的模块并导入，返回全部已注册适配器名（按字母序）。
+
+    冻结的 ``/setup`` 菜单刻意只列三平台（那是人工维护的引导文案），但
+    ``--status`` / ``--setup --json`` 是运行时视图，应该**自动**反映所有可用
+    平台，否则新加的平台用户在状态里根本看不到。
+
+    某个模块导入失败只记 warning 并跳过 —— 状态视图不该被一个坏适配器整个拖垮。
+    """
+    # 注意：base 是**模块**而非包，没有 ``__path__``；要扫的是本包所在目录。
+    for mod in pkgutil.iter_modules([os.path.dirname(os.path.abspath(__file__))]):
+        if mod.name.startswith("_") or mod.name == "base":
+            continue
+        try:
+            importlib.import_module(f"{__package__}.{mod.name}")
+        except Exception as exc:  # noqa: BLE001 - 状态视图要尽量出得来
+            logger.warning("adapters: 跳过无法导入的 %s: %s", mod.name, exc)
+    return tuple(sorted(_REGISTRY))
 
 
 def build(name: str, config: dict, hooks: Hooks) -> Adapter:

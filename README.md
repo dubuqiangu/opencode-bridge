@@ -7,6 +7,20 @@
 
 ## 🚀 一行安装
 
+**推荐：把这行发给你的 AI Agent（跨平台，由 Agent 按文档执行）：**
+
+```
+帮我安装 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/install.md
+```
+
+**以后更新，把这行发给它即可：**
+
+```
+帮我更新 opencode-bridge：https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/docs/update.md
+```
+
+**不想用 Agent？直接跑安装脚本（Windows PowerShell 5.1+）：**
+
 **Windows（PowerShell 5.1+，直接粘贴回车）：**
 
 ```powershell

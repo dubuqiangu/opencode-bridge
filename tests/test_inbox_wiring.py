@@ -372,7 +372,7 @@ class BusyIsNotAFailure(InboxWiringTestCase):
         self.assertEqual(texts_of(client.prompts), ["再等等"])
         session_id = client.created_ids[0]
 
-        core._dispatch(turn_finished(session_id))
+        core.event_stream.dispatch(turn_finished(session_id))
 
         self.assertEqual(
             texts_of(client.prompts), ["再等等", "再等等"],

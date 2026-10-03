@@ -226,7 +226,13 @@ class SessionLifecycleTests(unittest.TestCase):
 
             self.assertEqual(len(client.create_attempts), 1)
             attempt = client.create_attempts[0]
-            self.assertEqual(attempt["directory"], ".")
+            # A4 实测：opencode 对相对路径（含默认的 "."）一律 500 且响应体为空，
+            # 所以 core 必须先解析成绝对路径。见 SessionDirectoryIsAbsoluteTests。
+            self.assertTrue(
+                os.path.isabs(attempt["directory"]),
+                "会话目录必须是绝对路径，否则真实服务端返回 500：%r"
+                % (attempt["directory"],),
+            )
             self.assertTrue(attempt["title"].startswith("tg-bridge:chat:55"))
             self.assertLessEqual(len(attempt["title"]), 60)
             self.assertIsNone(attempt["permissions"])  # permissions_mode=ask
@@ -328,7 +334,18 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(state.get_meta("chat:55", "directory"), "docs")
             self.assertEqual(client.deleted, [old_sid])
             self.assertEqual(len(client.created_ids), 2)
-            self.assertEqual(client.create_attempts[1]["directory"], "docs")
+            # A4 实测：opencode 对相对路径一律 500，所以这里发出去的必须是解析后的绝对路径。
+            # 注意与上一行对照 —— state 里存的仍是用户输入的原样 "docs"，
+            # 解析只发生在发请求的那一刻。这个分离是有意的：
+            # state 保留原样，`/cd` 的回显和后续相对解析才有意义。
+            switched_directory = client.create_attempts[1]["directory"]
+            self.assertTrue(
+                os.path.isabs(switched_directory),
+                "/cd 后的会话目录也必须是绝对路径，否则真实服务端返回 500：%r"
+                % (switched_directory,),
+            )
+            self.assertEqual(os.path.basename(switched_directory), "docs")
+            self.assertEqual(os.path.dirname(switched_directory), os.getcwd())
             self.assertEqual(adapter.sent[-1].text, "已切换到 docs")
             self.assertEqual(len(client.prompts), prompts_before)
 
@@ -1236,3 +1253,66 @@ class CliTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ----------------------------------------------------------------------
+# A4 真实服务端验证发现的回归：会话目录必须是绝对路径
+# ----------------------------------------------------------------------
+class SessionDirectoryIsAbsoluteTests(unittest.TestCase):
+    """opencode `POST /api/session` 对相对路径（含 "."）一律 500 且响应体为空。
+
+    2026-10-03 对着真实 opencode 2.0.22 实测：
+      directory="."            -> 500（5/5 稳定复现，body 为空）
+      directory=""             -> 200
+      directory="<绝对路径>"    -> 200
+
+    回环测试原本抓不到，因为它们都传绝对路径或临时目录；
+只有**默认配置**会中招，而默认配置恰好就是 "."。
+    """
+
+    def test_default_directory_is_resolved_to_absolute(self):
+        # Config 的默认值就是 "."，这是最容易中招的路径
+        with tempfile.TemporaryDirectory() as temp_dir:
+            core, client, _adapter, _state, _, config = make_env(temp_dir)
+            self.assertEqual(
+                config.opencode_directory, ".",
+                "本测试的前提：默认值仍是相对路径。若默认值改了，这里会提醒你复核。",
+            )
+            core.on_inbound(inbound("chat:55", "hello"))
+            self.assertTrue(os.path.isabs(client.create_attempts[0]["directory"]))
+
+    def test_empty_directory_falls_back_to_absolute_not_bare_dot(self):
+        # 配置为空时走 `or "."` 兜底 —— 那个兜底本身也必须被解析
+        with tempfile.TemporaryDirectory() as temp_dir:
+            core, client, _adapter, _state, _, config = make_env(temp_dir)
+            config.opencode_directory = ""
+            core.on_inbound(inbound("chat:56", "hello"))
+            directory = client.create_attempts[0]["directory"]
+            self.assertTrue(os.path.isabs(directory))
+            self.assertNotEqual(directory, ".")
+
+    def test_per_conversation_directory_override_is_also_resolved(self):
+        # 每个会话 meta 里存的 directory 走的是另一条分支，同样不能放过
+        with tempfile.TemporaryDirectory() as temp_dir:
+            core, client, _adapter, state, _, _config = make_env(temp_dir)
+            state.set_meta("chat:57", "directory", ".")
+            core.on_inbound(inbound("chat:57", "hello"))
+            self.assertTrue(os.path.isabs(client.create_attempts[0]["directory"]))
+
+    def test_absolute_directory_is_passed_through_unchanged(self):
+        # 反向保护：已经是绝对路径时不能被二次改写（否则会静默改变用户指定的目录）
+        with tempfile.TemporaryDirectory() as temp_dir:
+            core, client, _adapter, _state, _, config = make_env(temp_dir)
+            chosen = os.path.join(temp_dir, "some-project")
+            config.opencode_directory = chosen
+            core.on_inbound(inbound("chat:58", "hello"))
+            self.assertEqual(client.create_attempts[0]["directory"], chosen)
+
+    def test_every_create_attempt_is_absolute_across_retries(self):
+        # 权限回退会重试 create_session，两次都得是绝对路径
+        with tempfile.TemporaryDirectory() as temp_dir:
+            core, client, _adapter, _state, _, _config = make_env(temp_dir, mode="allow")
+            core.on_inbound(inbound("chat:59", "hello"))
+            self.assertGreaterEqual(len(client.create_attempts), 1)
+            for attempt in client.create_attempts:
+                self.assertTrue(os.path.isabs(attempt["directory"]))

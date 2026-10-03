@@ -811,6 +811,18 @@ class BridgeCore:
             or self.config.opencode_directory
             or "."
         )
+        # ⚠️ 必须解析成绝对路径再发。opencode 的 `POST /api/session` 对
+        # `location.directory` 的**相对路径**（含默认的 "."）一律返回 **500 且响应体为空**，
+        # 错误信息因此完全丢失，桥只能报"HTTP 500"这种没有信息量的错。
+        # 2026-10-03 A4 真实服务端验证时实测：绝对路径 200 / 空串 200 / "." 500（5/5 稳定复现）。
+        #
+        # 这里做 abspath 而不是要求用户配绝对路径，有两个理由：
+        #   1. `opencode_directory` 的默认值就是 "."（见 config.py），语义是"当前目录"——
+        #      把"当前目录"解析成绝对路径是它本来的意思，不该让用户为默认值买单；
+        #   2. 上面那个 `or "."` 兜底意味着即使配置为空也必然踩中，不解析就必然失败。
+        #
+        # 回环测试抓不到这个 bug：测试都传绝对路径或临时目录，只有真实默认配置会中招。
+        directory = os.path.abspath(directory)
         title = f"{SESSION_TITLE_PREFIX}{conversation_id}"[:SESSION_TITLE_MAX]
         agent = self.config.opencode_agent or None
         rules = ruleset_for(self.config.permissions_mode)

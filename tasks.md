@@ -93,7 +93,7 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | # | 问题 | 严重度 | 影响 | 状态 |
 |---|---|---|---|---|
 | **G1** | **桥每 5~7 分钟退出一次** | 高 | 退出期间消息进不来 | ◐ **症状已消失，根因未证实** |
-| **G2** | **at-most-once：崩溃窗口内静默丢消息** | 高 | 消息永久消失，用户在 IM 里看不到任何痕迹 | ☐ **未修** |
+| **G2** | **at-most-once：崩溃窗口内静默丢消息** | 高 | 崩溃窗口内消息永久消失且无痕迹；**prompt 失败本身已有可见告警** | ☐ **未修** |
 | G3 | 无法指定模型 | 中 | 只能吃 opencode 默认值；默认值不可用则整条链路瘫 | ☐ 未修 |
 | G4 | A1 迁移剩 2/8 | 中 | Mattermost / Twitch 仍走各自老实现 | ☐ 未修 |
 | G5 | A2 前缀切换剩 5 家 | 低 | telegram/matrix/slack/discord/mattermost 仍发旧前缀 | ☐ 未修 |
@@ -269,7 +269,67 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 这是有意的选择（避免重复处理），代价：
 
 - 进程死在「游标已推进」与「成功 prompt 到 opencode」之间 → **该消息永久丢失**，
-  用户侧**没有任何痕迹**（不是延迟，是消失）。
+  且**没有任何痕迹**（不是延迟，是消失）。
+- ⚠️ 但要分清两种失败：**prompt 抛异常是有痕迹的**（见下方订正），
+  **只有崩溃落在窗口里才真静默**。
+
+#### G2 前提订正（实测复核，2026-10-03）
+
+动手前重新测绘，发现**上面的语义描述有两处事实错误**。方向性错误比措辞更贵，
+所以必须写在动手之前。
+
+**错误一：「持久化游标」—— 根本没有持久化。**
+
+9 个适配器的游标（telegram `_offset`、matrix `_since`、email `_uid`、
+nextcloud `room.cursor`、ntfy `_since`、discord/mattermost `_last_seq`、
+qqbot `_reply_ctx`、twitch 去重集）**全是内存实例属性**。对 `adapters/*.py`
+grep 磁盘写入（`open(` / `json.dump` / `tempfile` / `sqlite` / `os.replace`）：
+14 处命中**全部**是 HTTP 载荷或 WS 帧的序列化，**零落盘**。
+
+真正让消息被跳过的是**启动自举**，不是持久化 —— telegram `start()` 调
+`_flush_pending()`（`telegram.py:322`）把 `_offset` 设成 `last_update_id + 1`
+（`:364`），历史一律不重放。效果相同（消息永久丢失），机制完全不同。
+
+> **这条纠正是方向性的**：若按"持久化游标"去修，会在适配器里加游标落盘，
+> 而那**恰好是制造丢消息的东西** —— 重启自举本就跳到最新，持久化只会让它
+> 跳过更多。修 G2 **不要动适配器的游标**。
+
+**错误二：「用户侧没有任何痕迹」—— 只对崩溃成立，prompt 失败是看得见的。**
+
+`_dispatch_prompt`（`core.py:751-813`）的三个失败分支各自都发了可见提示：
+
+| 行 | 情形 | 用户收到 |
+|---|---|---|
+| `core.py:758-763` | 建会话失败 | `创建会话失败: {exc}` |
+| `core.py:777-782` | prompt 报错 | `发送失败: {exc}（可尝试 /new 重建会话）` |
+| `core.py:786-791` | 兜底 | `发送失败: {exc}` |
+
+所以下面「方案取舍」里 `保持现状 + 补失败告警` 这一行，**告警部分已经存在**；
+真正缺的只是**崩溃那一瞬**。
+
+**丢失点在哪里：core，不在适配器**
+
+```
+core.py:738   text = queue.pop(0)          ← 出队，此后无引用
+core.py:739   outcome = self._dispatch_prompt(...)
+              ├─ "busy"  -> core.py:743 insert(0, text) 插回
+              │            但 _queues 是内存 dict，同样随进程死
+              └─ "error" -> core.py:764 / :783 / :792 直接 return，text 被丢弃
+```
+
+**不要动的部分**：9 个适配器的「先推进后分发」是**正确的 at-most-once**，
+而且被约 10 条测试硬锁（如 `test_offset_advances_before_dispatch_even_if_dispatch_explodes`
+`tests/test_telegram.py:475`、`test_cursor_advances_before_processing` `tests/test_email.py:517`）。
+把顺序翻成"成功后才推进"等于改成至少一次，**会同时破坏这些测试和 at-most-once 语义**。
+
+**两个必须避开的坑**
+
+- `StateStore` 每次 `set_meta` 都是**全文件重写 + fsync**（`state.py:411-433`，
+  原子性靠 `mkstemp` + `os.replace`，这点是好的）。拿它存重试队列 = 每条消息
+  一次 fsync，**需要先评估成本**。
+- telegram 启动 `_pending.clear()`（`:327`）、email 引导直接
+  `self._uid = uids[-1]` 不取正文（`email.py:669-676`）—— 这两处既有的
+  「启动不重放」约定，**重放逻辑不能与它们冲突**。
 
 **与 G1 的关系**：G1 让崩溃周期性发生，于是这个窗口被**周期性命中**。
 所以 G1 每修一次，G2 的实际命中率降一截——**但 G2 本身仍在**。

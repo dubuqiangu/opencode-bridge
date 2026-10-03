@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -317,6 +316,20 @@ class EventStream:
                 self._note_unhandled_event(event_name)
             return
         data = _as_dict(event.get("data"))
+        with self._lock:
+            # Refresh the session -> conversation reverse map every round, and
+            # **before** the ownership check below -- that check reads this very
+            # map, so refreshing afterwards made it judge on the *previous* round.
+            # Harmless while a turn exists for every live session, but after a
+            # restart the in-memory turn table is empty and the session is known
+            # only from ``state.json``: the first high-volume frame of that turn
+            # (a ``session.text.delta``, say) was dropped as "someone else's".
+            #
+            # Cost is one in-memory dict copy per frame (``all_sessions`` holds
+            # ``state._data`` under its own lock; no disk I/O).
+            self._sid_conv = {
+                sid: conv for conv, sid in self._state.all_sessions().items()
+            }
         if not self._owns_session_event(event_name, data):
             # 已知事件名，但**属于别的会话** —— 这是正常情况，不是错误。
             #
@@ -332,11 +345,6 @@ class EventStream:
                 "忽略非本桥会话的事件 %s (session=%s)", event_name, _session_id(data)
             )
             return
-        with self._lock:
-            # refresh the session -> conversation reverse map every round
-            self._sid_conv = {
-                sid: conv for conv, sid in self._state.all_sessions().items()
-            }
         handler(data)
 
     def _note_unhandled_event(self, event_name: str) -> None:
@@ -354,7 +362,10 @@ class EventStream:
         previous_count = self._unhandled_event_names.get(event_name, 0)
         self._unhandled_event_names[event_name] = previous_count + 1
 
-        now = time.monotonic()
+        # 注入的时钟，与本类其它时间读法一致（流式节流用的就是它）。此前这里直接
+        # 调模块级 ``time.monotonic()``，于是这个节流**没法用注入的时钟测** ——
+        # 测试只能去手改 ``_last_unhandled_log_at`` 才能把窗口"等过去"。
+        now = self.clock()
         if previous_count == 0:
             logger.info(
                 "收到未处理事件 %r（已记账；若你正在等某条回复却没下文，先查这里。"
@@ -476,8 +487,16 @@ class EventStream:
             text = turn.assemble()
             handle = turn.progress_handle
             conversation_id = turn.conversation_id
-            if handle is not None and len(text) > self._max_message_chars:
-                return  # too long to edit; idle finalisation will send it
+            if len(text) > self._max_message_chars:
+                # 超过上限就**不发也不改**这一轮，留给收尾时整段发出去（适配器
+                # 自己会切分）。这就是"已经有句柄时"一直在用的那条策略 ——
+                # 进度消息本来就只发得下上限那么多，再长它也会被后续片段取代。
+                #
+                # ⚠️ 这个判断此前带着 ``handle is not None``，于是**第一片**正文
+                # 无论多长都会被原样发出去：IM 里于是出现一串很快会被取代的碎片
+                # 消息 —— 正是 delta 合并要避免的那种刷屏（实测思考流半分钟 2800+
+                # 条）。判据是"长度"，不该取决于句柄在不在。
+                return
             now = self.clock()
             if (now - turn.last_edit_ts) < self._edit_interval:
                 return  # throttled
@@ -616,11 +635,20 @@ class EventStream:
                 error_message,
             )
             return
-        self._send_text(
+        # 失败**走成功那条发布路径**（:meth:`_finalize_session` 用的同一个
+        # ``_finalize``）：把这一轮已经发出去的那条 ``⏳ 处理中…`` 改写成失败原因。
+        # 之前这里另起一条 ``kind="error"`` 消息，于是用户看到"一个卡住的进度气泡
+        # + 一行不相干的报错"—— 同一件事说了两遍，还留下永远不会被收掉的气泡。
+        #
+        # ⚠️ ``kind="error"`` 必须留着：``adapters/a2a.py`` 靠它把 A2A 任务判成
+        # ``TASK_STATE_FAILED``（``tests/test_a2a.py`` 钉着这条），改成 "final"
+        # 会把一次失败汇报成"完成"。
+        self._finalize(
             conversation_id,
+            turn.progress_handle if turn else None,
             f"任务失败 [{error_type}]: {error_message}",
+            session_id,
             kind="error",
-            session_id=session_id,
         )
         # a failed execution leaves the session idle -> release queued messages
         self._flush_queue(conversation_id)

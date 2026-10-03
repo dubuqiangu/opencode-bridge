@@ -8,6 +8,83 @@
 > 设计依据见 [`docs/platform-design-reference.md`](docs/platform-design-reference.md)（Hermes / dsh-im-gateway 三方对比）。
 > 扩展前稳定点：tag `backup/pre-platform-expansion-20261002`（`06a7d2f`）。
 
+## 实现铁律：先查参考项目，不要靠推测（用户定，2026-10-03）
+
+> **能抄就抄，能借鉴就直接复刻，不要重复造轮子、从头踩坑。**
+> 动手写第一行实现之前，先在下面两个参考项目里搜一遍。
+
+### 参考顺序
+
+| 优先级 | 项目 | 规模 | license | 为什么排这个位置 |
+|---|---|---|---|---|
+| **首选** | [`NousResearch/hermes-agent`](https://github.com/nousresearch/hermes-agent) | 250806 stars | MIT | 平台覆盖面最全（22 个平台），**IM 平台接入范式**的首选参考。⚠️ 但它**不消费 opencode 事件流**（全库 grep `/api/event` 零命中），opencode 契约要找别的来源 |
+| **次选** | [`zhuiyueya/dsh-im-gateway`](https://github.com/zhuiyueya/dsh-im-gateway) | 49 stars | MIT | 纯 IM 网关实现，20+ 平台，桥接/会话/心跳这类“网关侧”问题更集中更好抄。⚠️ 同样**零 opencode 引用** |
+
+两边的 **平台清单、取名、协议细节**都取并集≈ 31 家，见
+[`docs/platform-design-reference.md`](docs/platform-design-reference.md)。
+
+### 本机可读副本（已在，不必联网）
+
+用环境变量写而不是绝对路径——仓库是公开的，绝对路径会把本机用户名泄出去，
+而且换个平台就读不到了。
+
+| 项目 | 路径 |
+|---|---|
+| hermes-agent | `%LOCALAPPDATA%\hermes\hermes-agent` |
+| dsh-im-gateway | `%LOCALAPPDATA%\Temp\opencode\ref-dsh-im-gateway` |
+
+读**实现**而非文档——平台协议细节文档常滞后于实现。要读某个依赖的内部行为而
+不只是 API 用法时，优先直接读这两份源码。
+
+### 为什么要立这条铁律（真实教训，结论已由源码核实）
+
+2026-10-03 的 A4 真实服务端验证。**我第一次的判断是错的，两次都写不准，所以两次都记下来**：
+
+**第一次判断（错）**：以为事件名全错。以为"13 个映射里只认出 1 种"。
+**实际**：核实 opencode 源码后，**13 个里有 11 个是对的**。真正原因不是名字：
+
+1. **观察窗口太短**（只等 25 秒）—— 那轮模型一直在 thinking，
+   167 条 `session.reasoning.delta` 就是证据，turn 根本没结束。
+2. **`session.status` 与 `session.idle` 在 v2.0.22 从不发布**（源码里 `session.idle`
+   标注`// deprecated`）—— 而桥拿 `session.idle` 当"一轮结束"信号之一，
+   于是**永远等不到**。这才是"用户只看到 `⏳ 处理中…`"的真正根因。
+3. **`execution.interrupted` 的 `reason == "shutdown"` 不算结束**（服务重启会
+   保留 claim 并续跑），不特判就会永远等不到 settle。
+
+**第二次判断（也错）**：我据此在全局 AGENTS.md 里写"hermes-agent 本身就跑在
+opencode 上、消费其事件流的方式是权威答案"。**核实后这是错的**：
+`hermes-agent` 全库 grep `/api/event` **零命中**，它的 `/api/events` 是自己的
+dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模型端点**；
+`dsh-im-gateway` 同样零 opencode 引用。
+
+**所以铁律的正确表述**（这才是可复用的部分）：
+
+- **两类参考要分开**：IM 平台/网关工程范式查 hermes-agent → dsh-im-gateway；
+  **opencode 服务端契约不在这两个里**，要查 opencode 源码（`packages/schema/src/
+  event-manifest.ts` 是白名单）、运行时 `GET /openapi.json`、以及真实消费者
+  （`grinev/opencode-telegram-bot` 的 V2→V1 翻译器最贴本项目）。
+- **等待必须由终止事件驱动，不能靠超时猜**—— delta 迟迟不来是正常的（模型在思考）。
+- **未知事件不许静默丢弃**：`_dispatch` 里 `if handler is None: return` 会让
+  "事件名写错"在生产里表现为**完全无迹可循**，至少要打一行日志。
+- **别抄 `dev` 分支**：它已把 `session.*` 改名成 `session.next.*`；运行时是 2.0.22。
+- **文档站对 v2 已过时**（`docs/server.mdx` 列的还是 v1 事件）—— 这正是推测的来源。
+
+两次都错，根子是同一个：**用"看起来像证据的东西"（窗口内没看到= 不存在）代替核实**。
+文档会滞后、观察窗口会骗人，只有源码和真实抓帧不会。
+
+### 怎么用这条铁律
+
+1. **动手前**：先 `Grep` 两个副本里相关关键词（事件名、API 路径、字段名），
+   或 `gh search code '<符号名>' --limit 30`
+2. **找到就照抄**，不要凭理解重写——参考项目已经踩过那些坑了
+3. **抄完记录差异**：抄来的东西与我们不一致的地方，在进度日志里写一句为什么
+4. **抄不到 / 参考项目也没覆盖**才自己实现，此时在日志里说明"查过什么、没查到"
+5. **抄来的契约必须用真实环境验证**：参考项目也可能对着不同版本，
+   所以事件名/字段最终仍要以真实服务端为准（这一步不能省）
+
+---
+
+
 ## 推送约定（用户定，2026-10-03）
 
 > **一个大功能完成后、验证通过就推送** —— 例如整个框架落地、或每新增一个消息平台。

@@ -225,27 +225,27 @@ class _Fetcher:
 class TestPollingTransport(TransportTestCase):
     def test_events_are_passed_through_untouched(self):
         fetch = _Fetcher(["a", {"raw": 1}, 3])
-        t = PollingTransport(fetch, idle_sleep=0.01, name=uniq_name("poll"))
-        events = self.start_transport(t)
+        poll_transport = PollingTransport(fetch, idle_sleep=0.01, name=uniq_name("poll"))
+        events = self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: len(events) >= 3))
         # 原样交付：不解释、不过滤、不包装
         self.assertEqual(events, ["a", {"raw": 1}, 3])
 
     def test_nothing_is_never_dispatched(self):
         fetch = _Fetcher([NOTHING, NOTHING])
-        t = PollingTransport(fetch, idle_sleep=0.01, name=uniq_name("poll"))
-        events = self.start_transport(t)
+        poll_transport = PollingTransport(fetch, idle_sleep=0.01, name=uniq_name("poll"))
+        events = self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: fetch.calls >= 2))
         self.assertEqual(events, [])
-        self.assertGreaterEqual(t.stats()["idle"], 2)
-        self.assertEqual(t.stats()["events"], 0)
+        self.assertGreaterEqual(poll_transport.stats()["idle"], 2)
+        self.assertEqual(poll_transport.stats()["events"], 0)
 
     def test_idle_sleep_is_applied_between_empty_rounds(self):
         fetch = _Fetcher([NOTHING, NOTHING, "x"])
-        t = PollingTransport(
+        poll_transport = PollingTransport(
             fetch, idle_sleep=0.05, min_backoff=0.01, name=uniq_name("poll")
         )
-        events = self.start_transport(t)
+        events = self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: len(events) == 1))
         gaps = [b - a for a, b in zip(fetch.at, fetch.at[1:])]
         self.assertGreaterEqual(len(gaps), 2)
@@ -256,33 +256,33 @@ class TestPollingTransport(TransportTestCase):
     def test_long_poll_does_not_sleep(self):
         """长轮询传 idle_sleep=0：空转要立刻再问（fetch 自己会挂起）。"""
         fetch = _Fetcher([])
-        t = PollingTransport(fetch, idle_sleep=0.0, name=uniq_name("poll"))
-        self.start_transport(t)
+        poll_transport = PollingTransport(fetch, idle_sleep=0.0, name=uniq_name("poll"))
+        self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: fetch.calls >= 40, timeout=2.0))
 
     def test_negative_idle_sleep_is_clamped(self):
-        t = PollingTransport(_Fetcher([]), idle_sleep=-1.0, name=uniq_name("poll"))
-        self.assertEqual(t._idle_delay(), 0.0)
+        poll_transport = PollingTransport(_Fetcher([]), idle_sleep=-1.0, name=uniq_name("poll"))
+        self.assertEqual(poll_transport._idle_delay(), 0.0)
 
     def test_fetch_exception_backs_off_and_retries(self):
         fetch = _Fetcher([OSError("net down"), OSError("net down"), "late"])
-        t = PollingTransport(
+        poll_transport = PollingTransport(
             fetch, idle_sleep=0.0, min_backoff=0.01, max_backoff=0.05,
             name=uniq_name("poll"),
         )
-        events = self.start_transport(t)
+        events = self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: events == ["late"]))
         self.assertGreaterEqual(fetch.calls, 3)
-        self.assertTrue(t.running)          # 失败不该杀死线程
+        self.assertTrue(poll_transport.running)          # 失败不该杀死线程
 
     def test_on_open_called_once_per_session(self):
         fetch = _Fetcher([OSError("x"), OSError("x"), "v"])
         seen: list[int] = []
-        t = PollingTransport(
+        poll_transport = PollingTransport(
             fetch, idle_sleep=0.0, min_backoff=0.01, on_open=lambda: seen.append(1),
             name=uniq_name("poll"),
         )
-        self.start_transport(t)
+        self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: fetch.calls >= 3))
         self.assertEqual(len(seen), 3)
 
@@ -294,23 +294,23 @@ class TestPollingTransport(TransportTestCase):
             attempts["n"] += 1
             raise RuntimeError("handshake failed")
 
-        t = PollingTransport(
+        poll_transport = PollingTransport(
             fetch, idle_sleep=0.0, min_backoff=0.01, on_open=boom,
             name=uniq_name("poll"),
         )
-        self.start_transport(t)
+        self.start_transport(poll_transport)
         self.assertTrue(wait_until(lambda: attempts["n"] >= 2))
         self.assertEqual(fetch.calls, 0)      # 握手没过就不该发请求
-        self.assertTrue(t.running)
+        self.assertTrue(poll_transport.running)
 
     def test_connection_exposes_fetch_callable(self):
         fetch = _Fetcher([])
-        t = PollingTransport(fetch, idle_sleep=0.05, name=uniq_name("poll"))
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.connection is not None))
-        self.assertIs(t.connection, fetch)
-        t.stop()
-        self.assertIsNone(t.connection)       # stop 后应已清空
+        poll_transport = PollingTransport(fetch, idle_sleep=0.05, name=uniq_name("poll"))
+        self.start_transport(poll_transport)
+        self.assertTrue(wait_until(lambda: poll_transport.connection is not None))
+        self.assertIs(poll_transport.connection, fetch)
+        poll_transport.stop()
+        self.assertIsNone(poll_transport.connection)       # stop 后应已清空
 
     def test_non_callable_fetch_rejected(self):
         with self.assertRaises(TypeError):
@@ -368,36 +368,36 @@ class FakeWs:
 class TestWebSocketTransport(TransportTestCase):
     def test_frames_reach_on_event(self):
         ws = FakeWs(["one", "two"])
-        t = WebSocketTransport(lambda: ws, name=uniq_name("ws"))
-        events = self.start_transport(t)
+        ws_transport = WebSocketTransport(lambda: ws, name=uniq_name("ws"))
+        events = self.start_transport(ws_transport)
         self.assertTrue(wait_until(lambda: events == ["one", "two"]))
-        self.assertEqual(t.stats()["connects"], 1)
+        self.assertEqual(ws_transport.stats()["connects"], 1)
 
     def test_recv_none_reconnects(self):
         sockets = [FakeWs([None]), FakeWs(["after"])]
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: sockets.pop(0).open(), min_backoff=0.01, name=uniq_name("ws")
         )
-        events = self.start_transport(t)
+        events = self.start_transport(ws_transport)
         self.assertTrue(wait_until(lambda: events == ["after"]))
-        self.assertGreaterEqual(t.stats()["connects"], 2)
+        self.assertGreaterEqual(ws_transport.stats()["connects"], 2)
 
     def test_recv_exception_reconnects(self):
         sockets = [FakeWs([OSError("tcp reset")]), FakeWs(["ok"])]
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: sockets.pop(0).open(), min_backoff=0.01, name=uniq_name("ws")
         )
-        events = self.start_transport(t)
+        events = self.start_transport(ws_transport)
         self.assertTrue(wait_until(lambda: events == ["ok"]))
 
     def test_on_message_called_with_conn_and_frame(self):
         seen: list[tuple[Any, Any]] = []
         ws = FakeWs(["a", "b"])
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: ws, on_message=lambda conn, frame: seen.append((conn, frame)),
             name=uniq_name("ws"),
         )
-        events = self.start_transport(t)
+        events = self.start_transport(ws_transport)
         self.assertTrue(wait_until(lambda: len(seen) >= 2))
         self.assertEqual(seen[0], (ws, "a"))
         self.assertEqual(seen[1], (ws, "b"))
@@ -408,15 +408,15 @@ class TestWebSocketTransport(TransportTestCase):
             raise ValueError("bad ack")
 
         ws = FakeWs(["a", "b"])
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: ws, on_message=boom, name=uniq_name("ws")
         )
         # ⚠️ start() 必须在 assertLogs **里面**：假 WS 几微秒就能把两帧喂完，
         # 放在外面的话日志会在捕获开始前就打完了（这正是本用例第一次跑失败的原因）。
         with self.assertLogs("opencode_bridge.transport.websocket", level="WARNING"):
-            events = self.start_transport(t)
+            events = self.start_transport(ws_transport)
             self.assertTrue(wait_until(lambda: events == ["a", "b"]))
-        self.assertEqual(t.stats()["connects"], 1)   # 连接没被换掉
+        self.assertEqual(ws_transport.stats()["connects"], 1)   # 连接没被换掉
 
     def test_reconnect_now_skips_backoff(self):
         """on_message 抛 ReconnectNow → 立刻重连（min_backoff=5s 也无所谓）。"""
@@ -430,36 +430,36 @@ class TestWebSocketTransport(TransportTestCase):
         def disconnect(conn, frame):
             raise ReconnectNow(f"server asked: {frame}")
 
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             connect, on_message=disconnect, min_backoff=5.0, max_backoff=60.0,
             name=uniq_name("ws"),
         )
-        self.start_transport(t)
+        self.start_transport(ws_transport)
         started = time.monotonic()
         self.assertTrue(wait_until(lambda: len(made) >= 5, timeout=3.0))
         self.assertLess(time.monotonic() - started, 3.0)
-        self.assertGreaterEqual(t.stats()["sessions"], 4)
+        self.assertGreaterEqual(ws_transport.stats()["sessions"], 4)
 
     def test_close_code_from_peer_is_reported(self):
         ws = FakeWs([None], close_code=4002, close_reason="ratelimited")
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: ws, min_backoff=0.01, name=uniq_name("ws")
         )
         with self.assertLogs("opencode_bridge.transport.base", level="WARNING") as cap:
-            self.start_transport(t)      # 同上：必须放在捕获窗口内
-            self.assertTrue(wait_until(lambda: t.stats()["errors"] >= 1))
+            self.start_transport(ws_transport)      # 同上：必须放在捕获窗口内
+            self.assertTrue(wait_until(lambda: ws_transport.stats()["errors"] >= 1))
         blob = "\n".join(cap.output)
         self.assertIn("close_code=4002", blob)
         self.assertIn("ratelimited", blob)
 
     def test_local_close_code_is_used_on_shutdown(self):
         ws = FakeWs([])
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             lambda: ws, close_code=4001, name=uniq_name("ws")
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.connection is not None))
-        t.stop()
+        self.start_transport(ws_transport)
+        self.assertTrue(wait_until(lambda: ws_transport.connection is not None))
+        ws_transport.stop()
         # stop() 与会话结束的 finally 各关一次 —— 幂等，只要求都用同一状态码
         self.assertTrue(ws.close_calls)
         self.assertEqual(set(ws.close_calls), {4001})
@@ -471,11 +471,11 @@ class TestWebSocketTransport(TransportTestCase):
                 self._gate.set()
 
         ws = NoArgWs([])
-        t = WebSocketTransport(lambda: ws, name=uniq_name("ws"))
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.connection is not None))
-        t.stop()                        # TypeError 回退路径不许崩
-        self.assertFalse(t.running)
+        ws_transport = WebSocketTransport(lambda: ws, name=uniq_name("ws"))
+        self.start_transport(ws_transport)
+        self.assertTrue(wait_until(lambda: ws_transport.connection is not None))
+        ws_transport.stop()                        # TypeError 回退路径不许崩
+        self.assertFalse(ws_transport.running)
 
     def test_connect_failure_is_retried(self):
         attempts = {"n": 0}
@@ -486,10 +486,10 @@ class TestWebSocketTransport(TransportTestCase):
                 raise ConnectionError("handshake refused")
             return FakeWs(["ready"]).open()
 
-        t = WebSocketTransport(
+        ws_transport = WebSocketTransport(
             connect, min_backoff=0.01, max_backoff=0.02, name=uniq_name("ws")
         )
-        events = self.start_transport(t)
+        events = self.start_transport(ws_transport)
         self.assertTrue(wait_until(lambda: events == ["ready"]))
 
 
@@ -616,8 +616,8 @@ class TestTcpLineTransport(TransportTestCase):
         peer = _Peer(theirs[0], [b"PIN", PAUSE, b"G :srv\r\n"])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["PING :srv"]))
 
     def test_multiple_lines_in_one_recv(self):
@@ -625,8 +625,8 @@ class TestTcpLineTransport(TransportTestCase):
         peer = _Peer(theirs[0], [b"001 hi\r\n002 there\r\n003 x\r\n"])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: len(events) >= 3))
         self.assertEqual(events[:3], ["001 hi", "002 there", "003 x"])
 
@@ -643,10 +643,10 @@ class TestTcpLineTransport(TransportTestCase):
         peer = _Peer(theirs[0], [b"PRIVMSG \xff\xfe caf\xc3\r\n"])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["PRIVMSG \ufffd\ufffd caf\ufffd"]))
-        self.assertTrue(t.running)      # 坏字节不该把连接干掉
+        self.assertTrue(tcp_transport.running)      # 坏字节不该把连接干掉
 
     def test_on_connect_is_called_with_socket(self):
         ours, theirs = pair_sockets()
@@ -654,8 +654,8 @@ class TestTcpLineTransport(TransportTestCase):
         peer.start()
         self.addCleanup(peer.close)
         seen: list[Any] = []
-        t = self._transport(ours, on_connect=seen.append)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours, on_connect=seen.append)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["ok"]))
         self.assertEqual(seen, [ours[0]])       # 回调拿到的就是 socket
 
@@ -673,8 +673,8 @@ class TestTcpLineTransport(TransportTestCase):
             if calls["n"] == 1:
                 raise RuntimeError("registration rejected")
 
-        t = self._transport(ours, on_connect=flaky)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours, on_connect=flaky)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["hi"]))
         self.assertEqual(calls["n"], 2)
 
@@ -683,10 +683,10 @@ class TestTcpLineTransport(TransportTestCase):
         peer = _Peer(theirs[0], [])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.connection is not None))
-        self.assertTrue(t.send_line("NICK opencodebot"))
+        tcp_transport = self._transport(ours)
+        self.start_transport(tcp_transport)
+        self.assertTrue(wait_until(lambda: tcp_transport.connection is not None))
+        self.assertTrue(tcp_transport.send_line("NICK opencodebot"))
         self.assertEqual(peer.read(), b"NICK opencodebot\r\n")
 
     def test_send_line_neutralizes_embedded_crlf(self):
@@ -694,15 +694,15 @@ class TestTcpLineTransport(TransportTestCase):
         peer = _Peer(theirs[0], [])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.connection is not None))
-        self.assertTrue(t.send_line("PRIVMSG #a :hi\r\nQUIT sneaky"))
+        tcp_transport = self._transport(ours)
+        self.start_transport(tcp_transport)
+        self.assertTrue(wait_until(lambda: tcp_transport.connection is not None))
+        self.assertTrue(tcp_transport.send_line("PRIVMSG #a :hi\r\nQUIT sneaky"))
         self.assertEqual(peer.read(), b"PRIVMSG #a :hi QUIT sneaky\r\n")
 
     def test_send_line_without_connection_returns_false(self):
-        t = TcpLineTransport("127.0.0.1", 9, name=uniq_name("tcp"))
-        self.assertFalse(t.send_line("NICK x"))   # 没起线程就没连接
+        tcp_transport = TcpLineTransport("127.0.0.1", 9, name=uniq_name("tcp"))
+        self.assertFalse(tcp_transport.send_line("NICK x"))   # 没起线程就没连接
 
     def test_peer_close_triggers_reconnect(self):
         ours, theirs = pair_sockets(2)
@@ -715,37 +715,37 @@ class TestTcpLineTransport(TransportTestCase):
         second = _Peer(theirs[1], [b"again\r\n"])
         second.start()
         self.addCleanup(second.close)
-        t = self._transport(ours)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["bye", "again"]))
-        self.assertEqual(t.stats()["connects"], 2)
-        self.assertGreaterEqual(t.stats()["sessions"], 1)
+        self.assertEqual(tcp_transport.stats()["connects"], 2)
+        self.assertGreaterEqual(tcp_transport.stats()["sessions"], 1)
 
     def test_idle_timeout_is_not_a_disconnect(self):
         ours, theirs = pair_sockets()
         peer = _Peer(theirs[0], [b"only\r\n"])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        events = self.start_transport(t)
+        tcp_transport = self._transport(ours)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["only"]))
         # 让对端彻底安静 > io_timeout：只应增加 NOTHING 计数，不该重连
-        idle_before = t.stats()["idle"]
-        self.assertTrue(wait_until(lambda: t.stats()["idle"] > idle_before + 2))
-        self.assertEqual(t.stats()["connects"], 1)
-        self.assertEqual(t.stats()["errors"], 0)
+        idle_before = tcp_transport.stats()["idle"]
+        self.assertTrue(wait_until(lambda: tcp_transport.stats()["idle"] > idle_before + 2))
+        self.assertEqual(tcp_transport.stats()["connects"], 1)
+        self.assertEqual(tcp_transport.stats()["errors"], 0)
 
     def test_overlong_line_drops_buffer_without_dying(self):
         ours, theirs = pair_sockets()
         peer = _Peer(theirs[0], [b"x" * 200])
         peer.start()
         self.addCleanup(peer.close)
-        t = self._transport(ours)
-        t.max_line_bytes = 32              # 类级旋钮，测试里收紧
-        events = self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.stats()["idle"] >= 3))
+        tcp_transport = self._transport(ours)
+        tcp_transport.max_line_bytes = 32              # 类级旋钮，测试里收紧
+        events = self.start_transport(tcp_transport)
+        self.assertTrue(wait_until(lambda: tcp_transport.stats()["idle"] >= 3))
         self.assertEqual(events, [])       # 没换行 → 不产出事件
-        self.assertTrue(t.running)
+        self.assertTrue(tcp_transport.running)
 
     def test_real_loopback_socket_path(self):
         """走真实 ``_open``（create_connection）+ on_connect + send_line。"""
@@ -753,7 +753,7 @@ class TestTcpLineTransport(TransportTestCase):
         server.start()
         self.addCleanup(server.close)
         sent: list[Any] = []
-        t = TcpLineTransport(
+        tcp_transport = TcpLineTransport(
             "127.0.0.1",
             server.port,
             tls=False,
@@ -763,13 +763,13 @@ class TestTcpLineTransport(TransportTestCase):
             min_backoff=0.05,
             name=uniq_name("tcp"),
         )
-        events = self.start_transport(t)
+        events = self.start_transport(tcp_transport)
         self.assertTrue(wait_until(lambda: events == ["001 welcome"]))
         self.assertEqual(len(sent), 1)
-        self.assertTrue(t.send_line("NICK bot"))
+        self.assertTrue(tcp_transport.send_line("NICK bot"))
         self.assertTrue(wait_until(lambda: b"NICK bot\r\n" in bytes(server.received)))
-        t.stop()
-        self.assertEqual(t.connection, None)
+        tcp_transport.stop()
+        self.assertEqual(tcp_transport.connection, None)
 
 
 # ----------------------------------------------------------------------
@@ -780,38 +780,38 @@ class TestBaseInvariants(TransportTestCase):
         """先关连接，再 join：**用时刻/顺序证明**，不只看 stop() 返不返回。"""
         order: list[str] = []
         conn = _GateConn(order)
-        t = _BlockingTransport(conn, block=30.0, name=uniq_name("block"))
-        events = self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.running))
+        fake_transport = _BlockingTransport(conn, block=30.0, name=uniq_name("block"))
+        events = self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.running))
         time.sleep(0.05)                    # 确保消费线程已阻塞在 conn.wait 上
 
         began = time.monotonic()
-        t.stop(timeout=5.0)
+        fake_transport.stop(timeout=5.0)
         elapsed = time.monotonic() - began
 
         self.assertEqual(events, [])
         self.assertIsNotNone(conn.closed_at, "stop() 没关连接")
-        self.assertIsNotNone(t.thread_ended_at, "消费线程没跑起来")
+        self.assertIsNotNone(fake_transport.thread_ended_at, "消费线程没跑起来")
         # 关闭连接 → 才唤醒读 → 消费线程才结束。反过来（先 join）就会白等 30s。
         self.assertEqual(order, ["close", "thread_end"], "顺序错了：join 在关连接之前")
-        self.assertLessEqual(conn.closed_at, t.thread_ended_at)
+        self.assertLessEqual(conn.closed_at, fake_transport.thread_ended_at)
         self.assertLess(elapsed, 3.0, f"stop() 耗了 {elapsed:.2f}s（应被 close 唤醒）")
-        self.assertFalse(t.running)
-        self.addCleanup(t.stop)
+        self.assertFalse(fake_transport.running)
+        self.addCleanup(fake_transport.stop)
 
     def test_invariant2_backoff_doubles_and_caps(self):
-        t = _ScriptedBase(min_backoff=1.0, max_backoff=4.0, name=uniq_name("bo"))
-        waits = [t._next_backoff(survived=False) for _ in range(6)]
+        fake_transport = _ScriptedBase(min_backoff=1.0, max_backoff=4.0, name=uniq_name("bo"))
+        waits = [fake_transport._next_backoff(survived=False) for _ in range(6)]
         self.assertEqual(waits, [1.0, 2.0, 4.0, 4.0, 4.0, 4.0])
 
     def test_invariant2_backoff_resets_after_stable_connection(self):
-        t = _ScriptedBase(min_backoff=1.0, max_backoff=8.0, name=uniq_name("bo"))
-        self.assertEqual(t._next_backoff(survived=False), 1.0)
-        self.assertEqual(t._next_backoff(survived=False), 2.0)
+        fake_transport = _ScriptedBase(min_backoff=1.0, max_backoff=8.0, name=uniq_name("bo"))
+        self.assertEqual(fake_transport._next_backoff(survived=False), 1.0)
+        self.assertEqual(fake_transport._next_backoff(survived=False), 2.0)
         # 这次连接稳定存活过 → 本次就只等下限，且状态归零
-        self.assertEqual(t._next_backoff(survived=True), 1.0)
-        self.assertEqual(t._next_backoff(survived=False), 1.0)
-        self.assertEqual(t._next_backoff(survived=False), 2.0)
+        self.assertEqual(fake_transport._next_backoff(survived=True), 1.0)
+        self.assertEqual(fake_transport._next_backoff(survived=False), 1.0)
+        self.assertEqual(fake_transport._next_backoff(survived=False), 2.0)
 
     def test_reset_after_defaults_to_zero(self):
         """默认必须是 0 —— "只要连上过就重置"才是迁移前 8 个适配器的既有语义。
@@ -819,14 +819,14 @@ class TestBaseInvariants(TransportTestCase):
         默认若为正数，迁移就构成行为变更：网络闪断时退避会一路涨到上限，
         而现状每次都从下限重来。这条断言是那个承诺的锁。
         """
-        t = _ScriptedBase()
-        self.assertEqual(t.reset_after, 0.0)
+        fake_transport = _ScriptedBase()
+        self.assertEqual(fake_transport.reset_after, 0.0)
 
     def test_reset_after_positive_defers_reset_until_connection_survives(self):
         """``reset_after > 0`` 时，短命连接**不**重置退避（闸门在调用点，不在
         ``_next_backoff`` 内）—— 保守模式确实生效，而不是死参数。"""
         conn = _GateConn()
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[OSError("boom"), OSError("boom"), conn, OSError("gone")],
             # 每次只活 0.005s，远小于 reset_after=10s
             next_script=[_Hang(0.005)],
@@ -836,13 +836,13 @@ class TestBaseInvariants(TransportTestCase):
             idle_delay=0.005,
             name=uniq_name("noreset"),
         )
-        self.start_transport(t)
+        self.start_transport(fake_transport)
         # 断言**内部退避状态**而不是 wall-clock 间隔：机器忙时线程调度会让间隔
         # 测量剧烈抖动（实测本用例单独跑通过、全量跑失败），那是测试写法的问题，
         # 不是实现的问题。
-        self.assertTrue(wait_until(lambda: t._backoff >= 0.4, timeout=5.0))
+        self.assertTrue(wait_until(lambda: fake_transport._backoff >= 0.4, timeout=5.0))
         # 闸门没开 → 短命连接不会把退避打回下限
-        self.assertGreaterEqual(t._backoff, 0.4, "短命连接不应触发退避重置")
+        self.assertGreaterEqual(fake_transport._backoff, 0.4, "短命连接不应触发退避重置")
 
     def test_reset_after_zero_resets_even_a_brief_connection(self):
         """``reset_after=0``（默认）时，**哪怕只活了几毫秒**的连接也必须重置退避。
@@ -869,7 +869,7 @@ class TestBaseInvariants(TransportTestCase):
         不用 wall-clock 间隔断言 —— 那正是本项目踩过的 flaky 坑）。
         """
         conn = _GateConn()
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[OSError("boom"), OSError("boom"), conn, OSError("gone")],
             # 每次只活 0.005s，远小于任何正数 reset_after —— 正是"短暂连接"的极端
             next_script=[_Hang(0.005)],
@@ -879,10 +879,10 @@ class TestBaseInvariants(TransportTestCase):
             idle_delay=0.005,
             name=uniq_name("zeroreset"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: len(t.opened_at) >= 4, timeout=5.0))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: len(fake_transport.opened_at) >= 4, timeout=5.0))
         self.assertLessEqual(
-            t._backoff, 0.25,
+            fake_transport._backoff, 0.25,
             "reset_after=0 时，短暂成功连接也必须把退避打回下限",
         )
 
@@ -911,7 +911,7 @@ class TestBaseInvariants(TransportTestCase):
         若重置逻辑坏掉，序列会变成 ``0.1, 0.2, 0.4, 0.8, 0.8`` 而立刻失败。
         """
         conn = _GateConn()
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[OSError("boom"), OSError("boom"), conn, OSError("gone")],
             next_script=[_Hang(0.05)],
             min_backoff=0.1,
@@ -920,13 +920,13 @@ class TestBaseInvariants(TransportTestCase):
             idle_delay=0.01,
             name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: len(t.opened_at) >= 5, timeout=5.0))
-        seen = [round(v, 6) for v in t.backoff_at_open[:5]]
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: len(fake_transport.opened_at) >= 5, timeout=5.0))
+        seen = [round(v, 6) for v in fake_transport.backoff_at_open[:5]]
         for got, want in zip(seen, [0.1, 0.2, 0.4, 0.1, 0.2]):
             self.assertAlmostEqual(got, want, places=6)
         # 附带：确实真的等了（墙钟只做**下界**断言 —— 等待只会更长，绝不会更短）
-        gaps = [b - a for a, b in zip(t.opened_at, t.opened_at[1:5])]
+        gaps = [b - a for a, b in zip(fake_transport.opened_at, fake_transport.opened_at[1:5])]
         for index, gap in enumerate(gaps):
             self.assertGreaterEqual(
                 gap, 0.09,
@@ -935,25 +935,25 @@ class TestBaseInvariants(TransportTestCase):
 
     def test_invariant3_open_exception_never_escapes(self):
         boom = ConnectionError("always down")
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[boom, boom, boom, boom], min_backoff=0.01,
             max_backoff=0.02, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 3))
-        self.assertTrue(t.running, "线程被异常带走了")
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 3))
+        self.assertTrue(fake_transport.running, "线程被异常带走了")
 
     def test_invariant3_next_exception_reconnects_and_survives(self):
         conn1, conn2 = _GateConn(), _GateConn()
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[conn1, conn2],
             next_script=[OSError("stream broke"), NOTHING],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 2))
-        self.assertTrue(t.running)
-        self.assertIn(conn1, t.on_close_calls)     # 旧连接被清理了
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 2))
+        self.assertTrue(fake_transport.running)
+        self.assertIn(conn1, fake_transport.on_close_calls)     # 旧连接被清理了
 
     def test_invariant3_on_open_exception_reconnects(self):
         class _Flaky(_ScriptedBase):
@@ -962,13 +962,13 @@ class TestBaseInvariants(TransportTestCase):
                 if len(self.on_open_calls) == 1:
                     raise RuntimeError("identify rejected")
 
-        t = _Flaky(
+        fake_transport = _Flaky(
             open_script=[_GateConn(), _GateConn(), _GateConn()],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 2))
-        self.assertTrue(t.running)
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 2))
+        self.assertTrue(fake_transport.running)
 
     def test_invariant3_on_close_exception_never_escapes(self):
         class _Angry(_ScriptedBase):
@@ -976,25 +976,25 @@ class TestBaseInvariants(TransportTestCase):
                 super()._on_close(conn)
                 raise RuntimeError("cleanup blew up")
 
-        t = _Angry(
+        fake_transport = _Angry(
             open_script=[_GateConn(), _GateConn()],
             next_script=[OSError("drop")],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 2))
-        self.assertTrue(t.running)
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 2))
+        self.assertTrue(fake_transport.running)
 
     def test_invariant3_close_conn_exception_never_escapes(self):
         bad = _BadConn()
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[bad, _GateConn()], next_script=[OSError("drop")],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 2))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 2))
         self.assertGreaterEqual(bad.close_calls, 1)
-        self.assertTrue(t.running)
+        self.assertTrue(fake_transport.running)
 
     def test_invariant4_on_event_exception_does_not_kill_loop(self):
         seen: list[int] = []
@@ -1003,75 +1003,75 @@ class TestBaseInvariants(TransportTestCase):
             seen.append(item)
             raise RuntimeError("user code is broken")
 
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=list(range(6)),
             min_backoff=0.01, name=uniq_name("bo"),
         )
         with self.assertLogs("opencode_bridge.transport.base", level="WARNING"):
-            self.start_transport(t, on_event=bad_callback)   # 同上：在捕获窗口内起线程
+            self.start_transport(fake_transport, on_event=bad_callback)   # 同上：在捕获窗口内起线程
             self.assertTrue(wait_until(lambda: len(seen) >= 6))
-        self.assertTrue(t.running)
+        self.assertTrue(fake_transport.running)
 
     def test_invariant5_start_is_idempotent(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=list(range(50)),
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        events = self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.running))
-        t.start(events.append)
-        t.start(events.append)
+        events = self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.running))
+        fake_transport.start(events.append)
+        fake_transport.start(events.append)
         time.sleep(0.05)
-        same_name = [th for th in threading.enumerate() if th.name == t.thread_name]
+        same_name = [th for th in threading.enumerate() if th.name == fake_transport.thread_name]
         self.assertEqual(len(same_name), 1, "start() 起了第二个线程")
 
     def test_invariant5_stop_is_idempotent(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], min_backoff=0.01, name=uniq_name("bo")
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.running))
-        t.stop()
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.running))
+        fake_transport.stop()
         began = time.monotonic()
-        t.stop()
-        t.stop()
+        fake_transport.stop()
+        fake_transport.stop()
         self.assertLess(time.monotonic() - began, 1.0)
-        self.assertFalse(t.running)
+        self.assertFalse(fake_transport.running)
 
     def test_invariant5_stop_before_start_is_noop(self):
-        t = _ScriptedBase(name=uniq_name("bo"))
-        t.stop()
-        self.assertFalse(t.running)
+        fake_transport = _ScriptedBase(name=uniq_name("bo"))
+        fake_transport.stop()
+        self.assertFalse(fake_transport.running)
 
     def test_invariant5_restart_after_stop(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn(), _GateConn()],
             next_script=[1, NOTHING, 2, NOTHING],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        events = self.start_transport(t)
+        events = self.start_transport(fake_transport)
         self.assertTrue(wait_until(lambda: events[:1] == [1]))
-        t.stop()
-        self.assertFalse(t.running)
-        t.start(events.append)
+        fake_transport.stop()
+        self.assertFalse(fake_transport.running)
+        fake_transport.start(events.append)
         self.assertTrue(wait_until(lambda: events[:2] == [1, 2]))
-        self.assertTrue(t.running)
+        self.assertTrue(fake_transport.running)
 
     def test_invariant6_stop_interrupts_backoff_wait(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[OSError("down")] * 3,
             min_backoff=30.0, max_backoff=60.0, name=uniq_name("bo"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.opens >= 1))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.opens >= 1))
         began = time.monotonic()
-        t.stop(timeout=5.0)
+        fake_transport.stop(timeout=5.0)
         self.assertLess(time.monotonic() - began, 2.0, "退避等待没被 stop 打断")
-        self.assertFalse(t.running)
+        self.assertFalse(fake_transport.running)
 
     def test_stop_from_inside_callback_does_not_deadlock(self):
         """适配器常在事件处理里关自己 —— 不能 join 自己（否则死等）。"""
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=[1, 2, 3],
             min_backoff=0.01, name=uniq_name("bo"),
         )
@@ -1079,32 +1079,32 @@ class TestBaseInvariants(TransportTestCase):
 
         def callback(item):
             fired.append(item)
-            t.stop()                      # 在消费线程里调 stop()
+            fake_transport.stop()                      # 在消费线程里调 stop()
 
-        self.start_transport(t, on_event=callback)
+        self.start_transport(fake_transport, on_event=callback)
         self.assertTrue(wait_until(lambda: fired == [1]))
-        self.assertTrue(wait_until(lambda: not t.running, timeout=3.0))
-        t.stop()
+        self.assertTrue(wait_until(lambda: not fake_transport.running, timeout=3.0))
+        fake_transport.stop()
 
     def test_running_flag_and_stats(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=["a", "b"],
             min_backoff=0.01, name=uniq_name("bo"),
         )
-        self.assertFalse(t.running)      # 还没 start
-        events = self.start_transport(t)
+        self.assertFalse(fake_transport.running)      # 还没 start
+        events = self.start_transport(fake_transport)
         self.assertTrue(wait_until(lambda: events == ["a", "b"]))
-        stats = t.stats()
+        stats = fake_transport.stats()
         self.assertEqual(stats["connects"], 1)
         self.assertEqual(stats["events"], 2)
         self.assertEqual(stats["errors"], 0)
         self.assertGreater(stats["idle"], 0)
-        t.stop()
+        fake_transport.stop()
 
     def test_start_requires_callable(self):
-        t = _ScriptedBase(name=uniq_name("bo"))
+        fake_transport = _ScriptedBase(name=uniq_name("bo"))
         with self.assertRaises(TypeError):
-            t.start(None)                # type: ignore[arg-type]
+            fake_transport.start(None)                # type: ignore[arg-type]
 
 
 # ----------------------------------------------------------------------
@@ -1136,12 +1136,12 @@ class TestPeriodicHook(TransportTestCase):
     # -- 循环驱动 -------------------------------------------------------
     def test_loop_tick_runs_before_every_fetch(self):
         order: list[str] = []
-        t = _OrderTicked(
+        fake_transport = _OrderTicked(
             order, lambda: order.append("tick"),
             open_script=[_GateConn()], next_script=["a", "b"],
             min_backoff=0.01, idle_delay=0.01, name=uniq_name("tick"),
         )
-        events = self.start_transport(t)
+        events = self.start_transport(fake_transport)
         self.assertTrue(wait_until(lambda: events[:2] == ["a", "b"]))
         # 严格交替：tick 必须在对应那次 _next **之前**（不是攒到后面一起发）
         self.assertGreaterEqual(order.count("tick"), 2, order)
@@ -1153,19 +1153,19 @@ class TestPeriodicHook(TransportTestCase):
 
     def test_io_timeout_round_still_ticks(self):
         """IO 超时（:data:`NOTHING`）也是一轮 —— 这正是 IRC 迁移前的语义。"""
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=[NOTHING],
             min_backoff=0.01, idle_delay=0.005,
             on_tick=lambda: None, name=uniq_name("tick"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.stats()["idle"] >= 3))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.stats()["idle"] >= 3))
         self.assertGreaterEqual(
-            t.stats()["ticks"], t.stats()["idle"],
-            f"每一轮空转都要 tick 一次: {t.stats()}",
+            fake_transport.stats()["ticks"], fake_transport.stats()["idle"],
+            f"每一轮空转都要 tick 一次: {fake_transport.stats()}",
         )
-        self.assertEqual(t.stats()["connects"], 1, "IO 超时不是掉线，不该重连")
-        self.assertEqual(t.stats()["errors"], 0)
+        self.assertEqual(fake_transport.stats()["connects"], 1, "IO 超时不是掉线，不该重连")
+        self.assertEqual(fake_transport.stats()["errors"], 0)
 
     # -- 定时驱动 -------------------------------------------------------
     def test_timer_tick_fires_while_the_read_is_blocked(self):
@@ -1177,30 +1177,30 @@ class TestPeriodicHook(TransportTestCase):
         """
         ticks: list[int] = []
         conn = _GateConn()
-        t = _BlockingTransport(
+        fake_transport = _BlockingTransport(
             conn, block=30.0, on_tick=lambda: ticks.append(1),
             tick_interval=0.01, name=uniq_name("tick"),
         )
-        self.start_transport(t)
+        self.start_transport(fake_transport)
         self.assertTrue(
             wait_until(lambda: len(ticks) >= 5, timeout=3.0),
             f"阻塞中的读也要触发周期钩子，实际 {len(ticks)} 次",
         )
-        self.assertEqual(t.stats()["connects"], 1)
+        self.assertEqual(fake_transport.stats()["connects"], 1)
 
     def test_timer_tick_only_fires_while_a_session_is_active(self):
         """退避（没有活动会话）期间**不许**触发 —— 否则适配器会对着已关的连接保活。"""
         ticks: list[int] = []
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[ConnectionError("down")] * 999,
             on_tick=lambda: ticks.append(1), tick_interval=0.01,
             min_backoff=0.01, max_backoff=0.02, name=uniq_name("tick"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.stats()["sessions"] >= 2))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.stats()["sessions"] >= 2))
         time.sleep(0.08)                       # 足够它"想" tick 十几次
         self.assertEqual(ticks, [], "没有活动会话时不该触发周期钩子")
-        self.assertEqual(t.stats()["ticks"], 0)
+        self.assertEqual(fake_transport.stats()["ticks"], 0)
 
     def test_timer_tick_interval_can_be_tightened_at_runtime(self):
         """适配器在协商到周期之后才收紧粒度（Discord 在 HELLO 之后才拿到 41s）。
@@ -1211,19 +1211,19 @@ class TestPeriodicHook(TransportTestCase):
         """
         ticks: list[int] = []
         conn = _GateConn()
-        t = _BlockingTransport(
+        fake_transport = _BlockingTransport(
             conn, block=30.0, on_tick=lambda: ticks.append(1),
             tick_interval=0.2, name=uniq_name("tick"),
         )
-        self.start_transport(t)
+        self.start_transport(fake_transport)
         self.assertTrue(wait_until(lambda: len(ticks) >= 1))
         time.sleep(0.25)
         coarse = len(ticks)
         self.assertLessEqual(coarse, 3, f"tick_interval=0.2 不该这么密: {coarse}")
         # 用 tune_tick_interval：光改属性的话定时线程还睡在当前那一拍（0.2s）里，
         # 第一次心跳会被拖满 —— 那正是"周期看起来慢一倍"的错觉来源。
-        t.tune_tick_interval(0.01)
-        self.assertEqual(t.tick_interval, 0.01)
+        fake_transport.tune_tick_interval(0.01)
+        self.assertEqual(fake_transport.tick_interval, 0.01)
         self.assertTrue(
             wait_until(lambda: len(ticks) >= coarse + 5, timeout=3.0),
             "tune_tick_interval 必须立刻生效（唤醒定时线程）",
@@ -1238,18 +1238,18 @@ class TestPeriodicHook(TransportTestCase):
             calls["n"] += 1
             raise RuntimeError("heartbeat blew up")
 
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=list(range(6)),
             min_backoff=0.01, idle_delay=0.005,
             on_tick=boom, name=uniq_name("tick"),
         )
         with self.assertLogs("opencode_bridge.transport.base", level="WARNING"):
-            events = self.start_transport(t)
+            events = self.start_transport(fake_transport)
             self.assertTrue(wait_until(lambda: len(events) >= 6))
         self.assertGreaterEqual(calls["n"], 6, "钩子每一轮都要试一次")
-        self.assertEqual(t.stats()["connects"], 1, "钩子出错不是连接出错，不该重连")
-        self.assertGreaterEqual(t.stats()["errors"], 6, f"异常要记进 errors: {t.stats()}")
-        self.assertTrue(t.running)
+        self.assertEqual(fake_transport.stats()["connects"], 1, "钩子出错不是连接出错，不该重连")
+        self.assertGreaterEqual(fake_transport.stats()["errors"], 6, f"异常要记进 errors: {fake_transport.stats()}")
+        self.assertTrue(fake_transport.running)
 
     def test_timer_tick_exception_does_not_end_the_session(self):
         """定时驱动同样隔离 —— 而且**不许**杀掉定时线程自己。"""
@@ -1260,34 +1260,34 @@ class TestPeriodicHook(TransportTestCase):
             raise RuntimeError("ack check exploded")
 
         conn = _GateConn()
-        t = _BlockingTransport(
+        fake_transport = _BlockingTransport(
             conn, block=30.0, on_tick=boom, tick_interval=0.01,
             name=uniq_name("tick"),
         )
         with self.assertLogs("opencode_bridge.transport.base", level="WARNING"):
-            self.start_transport(t)
+            self.start_transport(fake_transport)
             self.assertTrue(wait_until(lambda: calls["n"] >= 3, timeout=3.0))
-        self.assertEqual(t.stats()["connects"], 1)
-        self.assertGreaterEqual(t.stats()["errors"], 3, f"{t.stats()}")
-        self.assertTrue(t.running, "钩子异常不许杀死消费线程")
+        self.assertEqual(fake_transport.stats()["connects"], 1)
+        self.assertGreaterEqual(fake_transport.stats()["errors"], 3, f"{fake_transport.stats()}")
+        self.assertTrue(fake_transport.running, "钩子异常不许杀死消费线程")
 
     # -- 铁律：未配置时零开销 -------------------------------------------
     def test_no_hook_means_no_thread_and_no_ticks(self):
-        t = _ScriptedBase(
+        fake_transport = _ScriptedBase(
             open_script=[_GateConn()], next_script=["a"], min_backoff=0.01,
             name=uniq_name("tick"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.stats()["events"] >= 1))
-        self.assertIsNone(t.on_tick)
-        self.assertFalse(t._loop_ticks, "未配钩子时循环里不该有 tick 分支")
-        self.assertFalse(t._timer_ticks)
-        self.assertIsNone(t._tick_thread, "不该起定时线程")
-        self.assertEqual(t.stats()["ticks"], 0)
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.stats()["events"] >= 1))
+        self.assertIsNone(fake_transport.on_tick)
+        self.assertFalse(fake_transport._loop_ticks, "未配钩子时循环里不该有 tick 分支")
+        self.assertFalse(fake_transport._timer_ticks)
+        self.assertIsNone(fake_transport._tick_thread, "不该起定时线程")
+        self.assertEqual(fake_transport.stats()["ticks"], 0)
         names = [th.name for th in threading.enumerate()]
-        self.assertNotIn(t.tick_thread_name, names)
-        t.stop()                # stop() 不该去 join 一个不存在的线程
-        self.assertFalse(t.running)
+        self.assertNotIn(fake_transport.tick_thread_name, names)
+        fake_transport.stop()                # stop() 不该去 join 一个不存在的线程
+        self.assertFalse(fake_transport.running)
 
     def test_non_callable_hook_rejected(self):
         with self.assertRaises(TypeError):
@@ -1305,23 +1305,23 @@ class TestPeriodicHook(TransportTestCase):
         """
         ticks: list[int] = []
         conn = _GateConn()
-        t = _BlockingTransport(
+        fake_transport = _BlockingTransport(
             conn, block=30.0, on_tick=lambda: ticks.append(1),
             tick_interval=30.0, name=uniq_name("tick"),
         )
-        self.start_transport(t)
-        self.assertTrue(wait_until(lambda: t.running))
+        self.start_transport(fake_transport)
+        self.assertTrue(wait_until(lambda: fake_transport.running))
         self.assertTrue(
-            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            any(th.name == fake_transport.tick_thread_name for th in threading.enumerate()),
             "定时线程应该已经起来",
         )
-        t.stop(timeout=5.0)
+        fake_transport.stop(timeout=5.0)
         self.assertFalse(
-            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            any(th.name == fake_transport.tick_thread_name for th in threading.enumerate()),
             "粒度 30s 时 stop() 也必须立刻收掉定时线程（不许睡满那一拍）",
         )
-        self.assertIsNone(t._tick_thread)
-        self.assertFalse(t.running)
+        self.assertIsNone(fake_transport._tick_thread)
+        self.assertFalse(fake_transport.running)
         settled = len(ticks)
         time.sleep(0.05)
         self.assertEqual(len(ticks), settled, "stop() 之后不该再有任何 tick")
@@ -1335,14 +1335,14 @@ class TestPeriodicHook(TransportTestCase):
         """
         order: list[str] = []
         conn = _GateConn(order)
-        t = _BlockingTransport(
+        fake_transport = _BlockingTransport(
             conn, block=30.0,
             on_tick=lambda: order.append("tick"),
             tick_interval=0.01, name=uniq_name("tick"),
         )
-        self.start_transport(t)
+        self.start_transport(fake_transport)
         self.assertTrue(wait_until(lambda: order.count("tick") >= 2))
-        t.stop()
+        fake_transport.stop()
         self.assertEqual(order.count("close"), 1)
         last_tick = max(i for i, x in enumerate(order) if x == "tick")
         self.assertLess(
@@ -1355,7 +1355,7 @@ class TestPeriodicHook(TransportTestCase):
         )
         self.assertEqual(order[-1], "thread_end")
         self.assertFalse(
-            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            any(th.name == fake_transport.tick_thread_name for th in threading.enumerate()),
             "stop() 之后定时线程必须已退出",
         )
 

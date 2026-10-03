@@ -392,8 +392,8 @@ class TestRequestHeaders(unittest.TestCase):
         self.assertEqual(adapter.max_concurrent_polls, 3)
         bad, _ = make_adapter({"max_concurrent_polls": 0})
         self.assertEqual(bad.max_concurrent_polls, 5)
-        junk, _ = make_adapter({"max_concurrent_polls": "abc"})
-        self.assertEqual(junk.max_concurrent_polls, 5)
+        non_numeric, _ = make_adapter({"max_concurrent_polls": "abc"})
+        self.assertEqual(non_numeric.max_concurrent_polls, 5)
 
 
 # ----------------------------------------------------------------------
@@ -965,8 +965,8 @@ class TestRoomTable(unittest.TestCase):
         self.assertEqual(fast.full_refresh_seconds, 60.0)
         bad, _ = make_adapter({"full_refresh_seconds": 5})  # 低于下限 30
         self.assertEqual(bad.full_refresh_seconds, 300.0)
-        junk, _ = make_adapter({"full_refresh_seconds": "soon"})
-        self.assertEqual(junk.full_refresh_seconds, 300.0)
+        non_numeric, _ = make_adapter({"full_refresh_seconds": "soon"})
+        self.assertEqual(non_numeric.full_refresh_seconds, 300.0)
 
 
 # ----------------------------------------------------------------------

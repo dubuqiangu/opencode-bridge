@@ -204,9 +204,9 @@ class OpenCodeClient:
     # ------------------------------------------------------------------
     def info(self) -> dict:
         """GET /api/info — returns the unwrapped payload (version, pid, ...)."""
-        data = self._request("GET", "/api/info")
-        inner = data.get("data")
-        return inner if isinstance(inner, dict) else data
+        response = self._request("GET", "/api/info")
+        inner = response.get("data")
+        return inner if isinstance(inner, dict) else response
 
     def _request(
         self,
@@ -224,16 +224,16 @@ class OpenCodeClient:
                 url = url + sep + urllib.parse.urlencode(clean)
 
         headers = dict(self._endpoint.auth_header())
-        data: bytes | None
+        body_bytes: bytes | None
         if isinstance(body, (bytes, bytearray)):
-            data = bytes(body)
+            body_bytes = bytes(body)
         elif body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
         else:
-            data = None
+            body_bytes = None
 
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 raw = resp.read()
@@ -261,23 +261,23 @@ class OpenCodeClient:
         return {"data": parsed}
 
     @staticmethod
-    def _unwrap_dict(data: dict) -> dict:
-        inner = data.get("data")
-        return inner if isinstance(inner, dict) else data
+    def _unwrap_dict(response: dict) -> dict:
+        inner = response.get("data")
+        return inner if isinstance(inner, dict) else response
 
     @staticmethod
-    def _unwrap_list(data: dict) -> list:
-        inner = data.get("data")
+    def _unwrap_list(response: dict) -> list:
+        inner = response.get("data")
         return inner if isinstance(inner, list) else []
 
     @staticmethod
-    def _data_id(data: dict, what: str) -> str:
-        inner = data.get("data")
+    def _data_id(response: dict, what: str) -> str:
+        inner = response.get("data")
         if isinstance(inner, dict):
             value = inner.get("id")
             if isinstance(value, str) and value:
                 return value
-        raise OpenCodeError(f"{what}: response has no data.id", body=json.dumps(data))
+        raise OpenCodeError(f"{what}: response has no data.id", body=json.dumps(response))
 
     # ------------------------------------------------------------------
     # sessions
@@ -297,22 +297,22 @@ class OpenCodeClient:
             "location": {"directory": directory},
             "permissions": permissions if permissions is not None else [],
         }
-        data = self._request("POST", "/api/session", body=payload)
-        return self._data_id(data, "create_session")
+        response = self._request("POST", "/api/session", body=payload)
+        return self._data_id(response, "create_session")
 
     def get_session(self, session_id: str) -> dict:
-        data = self._request("GET", f"/api/session/{urllib.parse.quote(session_id)}")
-        return self._unwrap_dict(data)
+        response = self._request("GET", f"/api/session/{urllib.parse.quote(session_id)}")
+        return self._unwrap_dict(response)
 
     def list_sessions(
         self, *, limit: int = 50, directory: str | None = None
     ) -> list[dict]:
-        data = self._request(
+        response = self._request(
             "GET",
             "/api/session",
             params={"limit": limit, "directory": directory},
         )
-        return self._unwrap_list(data)
+        return self._unwrap_list(response)
 
     def delete_session(self, session_id: str) -> None:
         self._request("DELETE", f"/api/session/{urllib.parse.quote(session_id)}")
@@ -326,12 +326,12 @@ class OpenCodeClient:
 
         409 (session busy) raises :class:`OpenCodeError` with ``status=409``.
         """
-        data = self._request(
+        response = self._request(
             "POST",
             f"/api/session/{urllib.parse.quote(session_id)}/prompt",
             body={"text": text, "resume": resume},
         )
-        return self._data_id(data, "prompt")
+        return self._data_id(response, "prompt")
 
     def interrupt(self, session_id: str) -> None:
         """POST /api/session/{id}/interrupt (no body)."""
@@ -365,12 +365,12 @@ class OpenCodeClient:
         return None
 
     def messages(self, session_id: str, *, limit: int = 100) -> list[dict]:
-        data = self._request(
+        response = self._request(
             "GET",
             f"/api/session/{urllib.parse.quote(session_id)}/message",
             params={"limit": limit},
         )
-        return self._unwrap_list(data)
+        return self._unwrap_list(response)
 
     # ------------------------------------------------------------------
     # events

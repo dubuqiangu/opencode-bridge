@@ -123,7 +123,7 @@
 | **B1** | email | IMAP 轮询（`UID` 游标） | S | 已完成。`imaplib`/`smtplib` 全标准库，协议通用永不废弃；**必须用专用邮箱 + app 专用密码**；**无用户身份**（任何能发信给你的人都能驱动 agent）→ 必须用 `allowed_chat_ids` 限定发件人；不支持编辑 |
 | **B1** | a2a | 本地 HTTP server（**我们是被调方**） | S | 已完成。方向与其他平台相反；`httpsrv.py` 是**可复用共用模块**（A3 的地基，第一个使用方是 a2a）；默认 bind 127.0.0.1；**无凭据可填** → 需要 `config_optional`（见阶段 A 备注） |
 | **B2** | qqbot | WebSocket 网关 | M | 已完成。⚠️ **原描述两处需更正**：① "Discord 风格变体"只对了一半 —— opcode 表像，但**鉴权完全不同**（QQ 握手**不带凭据**，靠 op 2 Identify 传 `QQBot {token}`）；② **"防回环天然"不成立** —— `GROUP_MESSAGE_CREATE` 文档写的是"群里的**每一条**消息"、**不承诺排除 bot**。改用平台签发字段（`author.bot` / `author.id`）。心跳 `heartbeat_interval` 单位是**毫秒**（与 Discord 同坑） |
-| **B2** | homeassistant | WebSocket 事件总线（本机） | M | WS 极简；HA 极活跃。**但它是设备事件管道不是 IM**，取决于定位是否要收 |
+| **B2** | homeassistant | WebSocket 事件总线（本机/局域网） | M | 已完成。⚠️ **"是不是 IM"这个问题现在有答案了**：结论是**默认不成立** —— HA 推的是设备状态变更，只有能追溯到**真人用户操作**的事件才适合起对话。故默认**一个事件都不收**（须给 `entities`/`domains`/`accept_all`）+ `require_user_context` 默认真。**保活分两层且方向相反**（传输层 aiohttp 发 ping、`ws.py` 自动回；应用层 JSON ping 必须客户端主动发）。`call_service` 出站，不支持编辑 |
 | **B3** | feishu / lark | WebSocket 长连接 | M | 官方明确"免内网穿透、**事件明文免解密**"；代价是 SDK 的 WS 握手 + `app_ticket` 刷新要自己实现；⚠️ **无 fromMe 字段**，防回环需自己记 message_id |
 | **B3** | wecom | WebSocket（`openws.work.weixin.qq.com`） | M | 必须选"智能机器人"（自建应用只有 callback 模式，要 AES 加解密 + 公网）；流式回复 `streamId` 机制较复杂 |
 | **B3** | dingtalk | WebSocket Stream 模式 | L | 二进制帧 + 签名校验，自己实现成本高；出站 `sessionWebhook` 是会话内下发的 URL，须做 **hostname 白名单**防 SSRF |
@@ -840,3 +840,46 @@
     还钉住了那个前提本身："这几个前缀在登记表里映射到自身" —— 若哪天有人把它改成
     指向别的平台，"零风险"就不成立了，用例会立刻失败。
   验证：**223 OK**（twitch + nextcloud + identity + routing）、compileall 0。
+
+- **2026-10-03** **B2 homeassistant 完成**（第十三个平台）+ **复核发现并修掉一个
+  「状态说就绪、实际不工作」的可用性缺陷**：
+  - `adapters/homeassistant.py`（约 1000 行）+ 42 个用例（真 WebSocket 服务器，
+    服务端独立实现 `base64(sha1(key+GUID))` 与 `ws.py` 各算一遍）。
+  - **协议事实逐条对照官方文档与 HA 源码**（`websocket_api/const.py`、`auth.py`、
+    `commands.py`、`messages.py`、`auth/permissions/events.py`、`connection.py`），
+    几个反直觉点：握手**不带任何鉴权**（服务端先发 `auth_required`）；`auth` 消息
+    **不能带 `id`**（`vol.Exclusive`）；命令 `id` 必须**严格递增**否则 `ERR_ID_REUSE`；
+    `event_type: "*"` 通配订阅**需要管理员**；`ActiveConnection.context()`
+    固定返回服务端自己的 user id ⇒ **不能**用平台签发字段给事件打回环标记。
+  - **保活分两层且方向相反**（本项目此前只有 Mattermost「服务端 ping」与 Twitch
+    「客户端主动发」两种，这次是**同一个平台两层都要**）：
+    传输层 = aiohttp `heartbeat=55` 发 RFC 6455 ping ⇒ `ws.py` 自动回 pong、零代码；
+    应用层 JSON `ping` HA **只回不主动发** ⇒ 必须客户端主动发。两者都实现了，
+    并有用例断言"服务端只收到客户端发来的 ping"。
+  - **「设备事件管道算不算对话」我要求它先回答**：结论是**默认不成立** ——
+    HA 推的是设备状态变更，只有能追溯到**真人用户操作**的事件才适合起对话
+    （定时器/脚本触发的事件 `context.user_id` 为空）。显式化成三条默认保守的规则：
+    ① 默认**一个事件都不收**（须给 `entities`/`domains`/`accept_all`）；
+    ② `require_user_context` 默认 `True`；③ 防回环用"我们刚调过哪些实体"的动作记录
+    做 10 秒窗口抑制（因为平台签发字段不可用，见上）。
+  - `edit()` 恒 `False`，依据是**核实过的**：`persistent_notification` 组件只注册
+    `create`/`dismiss`/`dismiss_all`，`dismiss` 是删掉而非改内容；命令表里也没有
+    "改一条已有内容"的命令。
+  - lane 主动做了**10 个反向变异**并全部被抓到（谎报能力、跳过闸门、令牌进日志、
+    去掉回声抑制、`edit` 返回 True…），**主动验证自己的测试有效**，而不是只报"全绿"。
+  - ⚠️ **复核发现的缺陷（本轮最值得记的一类）**：只配齐 `required_tokens`
+    （`url`+`token`）后，`--status` 显示「已配置 / **入站就绪**」，而适配器默认
+    **丢弃全部事件** —— **状态视图说就绪，实际收不到任何东西，且不报错**。
+    这与本项目修过多次的"配得完全正确却被判成不可用"同族。
+    启动日志里确实有 WARNING，但只查 `--status` 的人看不到。
+    **修法**：`capabilities()` 覆写并暴露 `inbound_accepts_anything`（机器可读判据，
+    `--status --json` / `--setup --json` 直接可读）+ 过滤条件计数 +
+    `require_user_context`；`docs/install.md` 与 `plugin/README.md` 都写明
+    "入站就绪 ≠ 会收到消息"。
+    新增 4 条用例，其中一条断言**快照判据与运行时 `_accepts_everything()` 一致**
+    （防两套逻辑分叉），并**验证过它能抓住谎报**（把判据写死为 True → 用例失败）。
+  - **我自己漏掉的文档同步**：这条 lane 被禁止改 README/install.md，所以
+    qqbot 与 homeassistant 的接入文档我**当时没补**（`docs/install.md` 与
+    `plugin/README.md` 连 a2a/qqbot/homeassistant 三家都缺）—— 这次一并补齐，
+    并在 install.md 里点明"入站就绪 ≠ 会收到消息"。
+  验证：**homeassistant 42 OK**、compileall 0、**十三个平台**。

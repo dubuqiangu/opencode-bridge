@@ -5,7 +5,7 @@
 
 把 **12 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
 
-支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot —— **十二个全部支持双向对话**。
+支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant —— **十三个全部支持双向对话**。
 
 > **a2a 是唯一方向相反的平台**：前十个都是我们主动连出去（长轮询 / WebSocket / IMAP），
 > **a2a 是我们被调方** —— 起一个本机 HTTP 服务让外部 agent 调我们。因此它**默认无鉴权**，
@@ -150,7 +150,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**十二个平台全部支持双向对话**）：
+各平台当前能力一览（**十三个平台全部支持双向对话**）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -166,6 +166,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 | a2a | ✅ 本机 HTTP（**我们被调方**） | ✅ 回给等待方 | ❌ 无 | 默认 bind `127.0.0.1` + **默认无鉴权**；上限 1 MiB（规范未规定，自行声明） |
 | QQ Bot | ✅ WebSocket 网关 | ✅ REST | ❌ 无 | 上限 2000（**官方未给数字**，保守自定）；群/私聊/频道三种作用域 |
+| Home Assistant | ✅ WebSocket 事件总线 | ✅ `call_service` | ❌ 无 | ⚠️ **默认一个事件都不收**，必须配 `entities`/`domains`/`accept_all`；上限 4096（官方未公布） |
 
 > 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
 >
@@ -491,6 +492,46 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 >   而不是正文，所以 `edit()` 诚实返回 `False`，长任务进度会退化成连续多条消息。
 > - **未实现与真实 QQ 客户端的互操作验证**（协议事实已逐条对照官方文档）。
 
+### Home Assistant（支持双向对话 · WebSocket 事件总线，无需公网地址）
+
+1. 在 HA 的**个人档案页**生成**长期访问令牌**
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "homeassistant": {
+     "url": "http://homeassistant.local:8123", "token": "eyJ...",
+     "domains": ["light"]
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在 HA 里开关一下灯，agent 应该收到事件
+
+> ⚠️ **不配过滤条件就一个事件都收不到（这是刻意设计）**
+>
+> Home Assistant 推的是**设备状态变更**（"灯亮了"），而不是"某人给你发了条消息"。
+> 把这类事件当对话喂给 agent，只在事件能追溯到**某个真人用户的操作**时才成立——
+> 定时器、脚本、集成自己触发的事件（`context.user_id` 为空）根本不是"有人在跟你说话"，
+> 拿它起对话只会污染上下文。所以默认**全丢**：
+>
+> - 必须给 `entities` / `domains`，或显式 `accept_all: true`，否则**收不到任何事件**
+> - `require_user_context` 默认 `true`：只接收能归因到真人的事件
+>
+> ⚠️ **这一点很容易被"状态显示已就绪"误导**：只配 `url` + `token` 时 `--status` 会显示
+> 「已配置 / 入站就绪」，但实际收不到东西。所以 `capabilities()` 里给了机器可读的判据
+> —— `inbound_accepts_anything: false` 就是"配好了但收不到"的明确信号
+> （`--status --json` / `--setup --json` 能直接读到）。启动日志里也会打一次WARNING。
+>
+> 其它要点：
+> - **两层保活方向相反**：传输层是 **aiohttp 每 55s 发 RFC 6455 ping**（`ws.py` 自动回
+>   pong，零代码）；应用层 JSON `ping` 必须**客户端主动发**（HA 只回不主动发）。两者都实现了。
+> - `event_types: ["*"]` 通配订阅**需要管理员**权限。
+> - 出站走 `call_service`（HA 没有"发消息"原语），默认发 `persistent_notification.create`，
+>   它**不改状态**所以天然不成环。若你改配成改状态的服务（如 `light.turn_on`），
+>   会有自触发回声，靠 `ignore_entities` + 10 秒动作窗口压制。
+> - **不支持编辑消息**（HA 只有 create/dismiss，没有"改一条"），进度更新会退化成连续多条。
+> - 未与真实 HA 实例做过互操作验证（协议事实已逐条对照官方文档与源码）。
+
 ## npm 方式（占位 / 待发布）
 
 opencode 也支持通过 npm 包名启用插件——在 `opencode.json` 中配置：
@@ -691,6 +732,15 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.qqbot.app_secret` | `""` | AppSecret（**必填**）；用它换 `access_token`，日志里会打码 |
 | `adapters.qqbot.api_base` | `https://api.bot.qq.com` | API 基址。**沙箱域名未在官方文档中核实**，默认走正式环境 |
 | `adapters.qqbot.gateway_url` | `""` | 留空则启动时 `GET /gateway` 自动取 |
+| `adapters.homeassistant.url` | `http://homeassistant.local:8123` | HA 地址。⚠️ `homeassistant.local` 是 **mDNS 惯例**、不是官方规定；留空会用它兜底并告警 |
+| `adapters.homeassistant.token` | `""` | **长期访问令牌**（HA 档案页生成）（**必填**） |
+| `adapters.homeassistant.entities` | `[]` | 只接收这些实体的事件，如 `["light.kitchen"]` |
+| `adapters.homeassistant.domains` | `[]` | 只接收这些域的事件，如 `["light","switch"]` |
+| `adapters.homeassistant.accept_all` | `false` | `true` = **接收全部事件**（很吵慎用） |
+| `adapters.homeassistant.event_types` | `["state_changed"]` | 订阅哪些事件类型。⚠️ `["*"]` 通配**需要管理员**权限 |
+| `adapters.homeassistant.require_user_context` | `true` | 只接收能归因到**真人用户**的事件（`context.user_id` 非空）。定时器/脚本触发的事件会被丢 |
+| `adapters.homeassistant.ignore_entities` | `[]` | 收到事件后忽略这些实体（用于躲开自己触发的回声） |
+| `adapters.homeassistant.poll_interval` | `5.0` | 无事件时的重连间隔（秒） |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

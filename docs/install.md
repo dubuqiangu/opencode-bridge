@@ -350,8 +350,59 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > 带 `[opencode]` 且记 `Message-ID` 做**防回环**（你回复它不会被误丢）；单行上限 998
 > （RFC 5322）；**不支持编辑邮件**；用 `UID` 游标而非 `UNSEEN`（你在手机点开仍能被看见）。
 
+#### QQ Bot（支持双向对话 · WebSocket 网关，无需公网地址）
+
+1. 在 [QQ 开放平台](https://bot.q.qq.com/) 建机器人，拿 **AppID** 与 **AppSecret**
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "qqbot": { "app_id": "102xxxxx", "app_secret": "xxxx" } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在开放平台后台把机器人加进群 / 频道，或直接私聊它
+
+> 其它：支持**群聊 / 私聊（C2C）/ 频道**三种作用域，`allowed_chat_ids` 填对应前缀
+> （`qqbot:group:...` / `qqbot:c2c:...` / `qqbot:channel:...`）。**主动消息在群里会失败**
+> （`40034105`），桥接会带上传入站的 `msg_id` 与 `msg_seq`；被动回复有时效与次数上限
+> （群 5 分钟 5 次、私聊 1 小时 4 次）。**不支持编辑消息**（官方只有撤回）。
+> 未与真实 QQ 客户端做过互操作验证。
+
+#### Home Assistant（支持双向对话 · WebSocket 事件总线，无需公网地址）
+
+1. 在 HA 的**个人档案页**生成**长期访问令牌**
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "homeassistant": {
+     "url": "http://homeassistant.local:8123", "token": "eyJ...",
+     "domains": ["light"]
+   } }
+   ```
+
+3. 执行 `opencode service restart`
+4. 在 HA 里开关一下灯，agent 应该收到事件
+
+> ⚠️ **不配过滤条件就一个事件都收不到（刻意设计）**：HA 推的是**设备状态变更**而不是
+> "某人给你发消息"，只有能追溯到**真人用户操作**的事件才适合起对话（定时器 / 脚本触发
+> 的事件 `context.user_id` 为空）。所以必须给 `entities` / `domains`，或显式
+> `accept_all: true`；`require_user_context` 默认 `true`。
+>
+> ⚠️ 只配 `url` + `token` 时 `--status` 会显示「已配置 / 入站就绪」，**但实际收不到
+> 任何事件** —— 所以 `capabilities()` 给了机器可读判据：`inbound_accepts_anything: false`
+> 就是"配好了但收不到"的明确信号（`--status --json` 可直接读到），启动日志也会打一次
+> WARNING。
+>
+> 其它：`homeassistant.local` 是 **mDNS 惯例**、不是官方规定；`event_types: ["*"]`
+> 通配订阅**需要管理员**；两层保活方向相反（传输层由 aiohttp 发 ping、`ws.py` 自动回，
+> 应用层 JSON ping 必须客户端主动发）；出站走 `call_service`；**不支持编辑消息**。
+
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
-> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+>
+> ⚠️ 但 `--status` 的「入站就绪」只代表**凭据齐备且入站已实现**，不代表"真的会收到消息"：
+> **Home Assistant** 默认**一个事件都不收**（必须另配 `entities`/`domains`/`accept_all`），
+> 判据是 `--status --json` 里的 `inbound_accepts_anything`。
 
 ### Step 3: 激活（需要用户点头）
 

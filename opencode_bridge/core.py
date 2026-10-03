@@ -702,9 +702,15 @@ class BridgeCore:
 
     def _finalize(
         self, conversation_id: str, handle: MsgHandle | None, text: str,
-        session_id: str,
+        session_id: str, *, kind: str = "final",
     ) -> None:
-        """Publish the final message (LANE_C_SPEC §1.5 step 4/5)."""
+        """Publish the final message (LANE_C_SPEC §1.5 step 4/5).
+
+        ``kind`` 是**收尾语义**，不是文案：成功走 ``"final"``，失败走 ``"error"``，
+        两条路共用这一段（先把已发的那条进度消息改写成收尾内容，改不动就再发一条）。
+        ``adapters/a2a.py`` 靠 ``kind == "error"`` 把任务判成 ``TASK_STATE_FAILED``，
+        所以失败那条不能落到默认值上。
+        """
         adapter = self._adapter_for(conversation_id)
         if adapter is None:
             logger.warning("no adapter for %s; cannot finalise", conversation_id)
@@ -714,7 +720,7 @@ class BridgeCore:
             out = Outbound(
                 conversation_id=conversation_id,
                 text=final,
-                kind="final",
+                kind=kind,
                 session_id=session_id,
             )
             try:
@@ -730,8 +736,8 @@ class BridgeCore:
                 logger.exception("adapter.edit failed; sending instead")
         # no handle / too long / edit failed -> plain send (adapter chunks)
         self._send_text(
-            conversation_id, final, kind="final",
-            adapter=adapter, session_id=session_id,
+            conversation_id, final, kind=kind, adapter=adapter,
+            session_id=session_id,
         )
 
     # ------------------------------------------------------------------

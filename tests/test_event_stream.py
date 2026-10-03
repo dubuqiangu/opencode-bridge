@@ -172,12 +172,15 @@ class EventStreamTestCase(unittest.TestCase):
         )
         return True
 
-    def _record_finalize(self, conversation_id, handle, text,
-                         session_id) -> None:
-        self.finalize_calls.append(
-            (conversation_id, handle.message_id if handle else None, text,
-             session_id)
-        )
+    def _record_finalize(self, conversation_id, handle, text, session_id,
+                         *, kind="final") -> None:
+        self.finalize_calls.append((
+            conversation_id,
+            handle.message_id if handle else None,
+            text,
+            session_id,
+            kind,
+        ))
 
     def _flush_queue(self, conversation_id: str) -> None:
         self.flush_queue_calls.append(conversation_id)
@@ -296,6 +299,39 @@ class DispatchTests(EventStreamTestCase):
         self.assertEqual(len(self.send_text.outgoing), before)
         self.assertEqual(self.edit_progress_calls, [])
 
+    # --- Fix 2: 归属判断要用**当前**那份映射 ----------------------------
+    def test_the_first_high_volume_frame_of_a_restored_session_is_not_dropped(self):
+        """重启后内存里的 turn 表是空的，会话只登记在 ``state.json`` 里。
+
+        归属判断读的就是那张反向表，而它此前是在判断**之后**才刷新的 —— 于是这轮
+        的第一帧（``session.text.delta`` 属于高频事件）会被当成"别人的会话"丢掉，
+        用户永远看不到这一轮。
+        """
+        self.assertEqual(self.turns, {}, "前提：还没有任何 turn")
+        self.assertEqual(self.stream._sid_conv, {}, "前提：反向表还是空的")
+
+        self.feed(text_delta(SESSION_ID, "first frame after restart"))
+
+        self.assertIn(SESSION_ID, self.turns)
+        self.assertEqual(self.send_text.outgoing[-1].text,
+                         "first frame after restart")
+
+    def test_the_ownership_filter_still_drops_a_session_we_never_registered(self):
+        """修的是"顺序"，不是"放松"：没登记过的会话照样丢。"""
+        self.start_turn()
+        before = len(self.send_text.outgoing)
+
+        self.feed(text_delta("ses_never_registered", "noise"))
+
+        self.assertEqual(len(self.send_text.outgoing), before)
+        self.assertNotIn("ses_never_registered", self.turns)
+
+    def test_the_reverse_map_is_refreshed_even_for_dropped_frames(self):
+        """刷新在判断之前，所以被丢掉的那一帧也已经刷新过了。"""
+        self.feed(text_delta("ses_ghost", "noise"))
+
+        self.assertEqual(self.stream._sid_conv, {SESSION_ID: CONVERSATION})
+
     def test_low_frequency_events_from_another_session_still_reach_the_handler(self):
         """低频事件放行：``permission.asked`` 的"未知会话"警告是有意义的信息。"""
         with self.assertLogs("opencode_bridge.event_stream",
@@ -382,6 +418,30 @@ class UnhandledEventAccountingTests(EventStreamTestCase):
 
         self.assertEqual(len(logs.output), 1)
         self.assertTrue(any("累计" in line for line in logs.output))
+
+    # --- Fix 3: 这个节流用的是注入的时钟 ------------------------------
+    def test_the_log_throttle_is_driven_by_the_injected_clock(self):
+        """节流窗口必须能被注入的时钟推过去 —— 不然只能手改私有属性。"""
+        with self.assertLogs("opencode_bridge.event_stream",
+                             level="INFO") as first:
+            self.feed(ev("session.brand.new.event"))
+        self.assertEqual(len(first.output), 1)
+
+        # 窗口内：只记账，不打日志
+        with self.assertNoLogs("opencode_bridge.event_stream", level="INFO"):
+            self.ticks[0] += 1.0
+            self.feed(ev("session.brand.new.event"))
+
+        # 把注入的时钟推过窗口 -> 允许再打一行汇总
+        self.ticks[0] += self.stream._UNHANDLED_LOG_INTERVAL_SECONDS
+        with self.assertLogs("opencode_bridge.event_stream",
+                             level="INFO") as second:
+            self.feed(ev("session.brand.new.event"))
+
+        self.assertEqual(len(second.output), 1)
+        self.assertTrue(any("累计" in line for line in second.output))
+        self.assertEqual(self.stream._unhandled_event_names,
+                         {"session.brand.new.event": 3})
 
 
 # ----------------------------------------------------------------------
@@ -509,6 +569,47 @@ class TextDeltaTests(EventStreamTestCase):
 
         self.assertEqual(self.edit_progress_calls, [])
         self.assertEqual(self.turns[SESSION_ID].assemble(), "A0123456789")
+
+    # --- Fix 4: 上限判据与"句柄在不在"无关 --------------------------
+    def test_a_first_fragment_over_the_cap_publishes_no_progress_message(self):
+        """第一片就已经超上限时，不发那条进度消息。
+
+        上限策略是"**拒绝**这一轮、留给收尾整段发"（既不截断也不在这里切分）。
+        此前这个判断只在已有句柄时生效，于是第一片无论多长都会被原样发出去 ——
+        IM 里出现一串很快会被取代的碎片消息。
+        """
+        self.rebuild(max_message_chars=5)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "0123456789"))
+
+        self.assertEqual(self.send_text.outgoing, [])
+        self.assertEqual(self.edit_progress_calls, [])
+        self.assertEqual(self.turns[SESSION_ID].assemble(), "0123456789")
+        # 被拒的那一帧不消耗节流窗口
+        self.assertEqual(self.turns[SESSION_ID].last_edit_ts, 0.0)
+
+    def test_the_whole_answer_is_still_published_after_a_refused_first_fragment(self):
+        """拒绝只是"进度消息不发"，答案本身不能丢：收尾时整段发出去。"""
+        self.rebuild(max_message_chars=5)
+        self.start_turn()
+        self.feed(text_delta(SESSION_ID, "0123456789"))
+        self.feed(text_delta(SESSION_ID, " tail", 1))
+
+        self.feed(ev("session.execution.succeeded", sessionID=SESSION_ID))
+
+        self.assertEqual(self.send_text.outgoing, [])
+        self.assertEqual(self.finalize_calls[-1][1], None, "没有句柄可改")
+        self.assertEqual(self.finalize_calls[-1][2], "0123456789 tail")
+
+    def test_a_first_fragment_exactly_at_the_cap_is_published(self):
+        """边界：等于上限要照发（判据是 ``>``）。"""
+        self.rebuild(max_message_chars=5)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "12345"))
+
+        self.assertEqual(self.send_text.outgoing[-1].text, "12345")
 
     def test_delta_shapes_that_carry_nothing_are_dropped(self):
         self.start_turn()
@@ -666,6 +767,7 @@ class FinalizeTests(EventStreamTestCase):
 
         self.assertEqual(self.finalize_calls[-1][2], "final answer")
         self.assertEqual(self.finalize_calls[-1][0], CONVERSATION)
+        self.assertEqual(self.finalize_calls[-1][4], "final")
         self.assertEqual(self.flush_queue_calls, [CONVERSATION])
         self.assertNotIn(SESSION_ID, self.turns)
 
@@ -695,10 +797,60 @@ class FinalizeTests(EventStreamTestCase):
         self.feed(ev("session.execution.failed", sessionID=SESSION_ID,
                      error={"type": "ProviderError", "message": "boom"}))
 
-        self.assertEqual(self.send_text.last.kind, "error")
-        self.assertEqual(self.send_text.last.text, "任务失败 [ProviderError]: boom")
+        self.assertEqual(self.finalize_calls[-1][2],
+                         "任务失败 [ProviderError]: boom")
+        self.assertEqual(self.finalize_calls[-1][4], "error")
         self.assertEqual(self.flush_queue_calls, [CONVERSATION])
         self.assertNotIn(SESSION_ID, self.turns)
+
+    # --- Fix 1: 失败走收尾那条路，不再另起一条消息 ---------------------
+    def test_a_failure_edits_the_progress_message_instead_of_sending_a_second_one(self):
+        """用户只该看到**一条**消息：那条 ``⏳ 处理中…`` 被改写成失败原因。
+
+        之前这里另发一条 ``kind="error"``，于是 IM 里留下一个永远不会被收掉的
+        进度气泡 + 一行不相干的报错 —— 同一件事说了两遍。
+        """
+        self.start_turn()
+        self.feed(text_delta(SESSION_ID, "half an answer"))
+
+        self.feed(ev("session.execution.failed", sessionID=SESSION_ID,
+                     error={"type": "ProviderError", "message": "boom"}))
+
+        # publish 走 _finalize，带着这一轮那条进度消息的句柄
+        self.assertEqual(len(self.finalize_calls), 1)
+        conversation, handle, text, session_id, kind = self.finalize_calls[-1]
+        self.assertEqual(conversation, CONVERSATION)
+        self.assertEqual(handle, "m1", "必须是那条已经发出去的进度消息")
+        self.assertEqual(text, "任务失败 [ProviderError]: boom")
+        self.assertEqual(session_id, SESSION_ID)
+        self.assertEqual(kind, "error")
+        # 关键：没有第二条消息被发出去
+        self.assertEqual(len(self.send_text.outgoing), 1)
+        self.assertEqual(self.send_text.outgoing[0].kind, "progress")
+
+    def test_a_failure_without_a_progress_message_still_publishes_one_message(self):
+        """还没有进度消息时（第一片正文都没来）照发，只是没有句柄可改。"""
+        self.start_turn()
+
+        self.feed(ev("session.execution.failed", sessionID=SESSION_ID,
+                     error={"type": "ProviderError", "message": "boom"}))
+
+        self.assertEqual(self.finalize_calls[-1][1], None)
+        self.assertEqual(self.finalize_calls[-1][2],
+                         "任务失败 [ProviderError]: boom")
+
+    def test_the_failure_keeps_the_error_kind_so_a2a_marks_the_task_failed(self):
+        """``adapters/a2a.py`` 用 ``kind == "error"`` 判 ``TASK_STATE_FAILED``。
+
+        失败若落到 ``_finalize`` 的默认 "final"，一次失败会被汇报成"完成"。
+        """
+        self.start_turn()
+        self.feed(text_delta(SESSION_ID, "half"))
+
+        self.feed(ev("session.execution.failed", sessionID=SESSION_ID,
+                     error={"type": "RateLimited", "message": "gave up"}))
+
+        self.assertEqual(self.finalize_calls[-1][4], "error")
 
     def test_a_failure_for_an_unknown_session_only_warns(self):
         self.feed(ev("session.execution.failed", sessionID="ses_ghost",

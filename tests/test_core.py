@@ -1049,9 +1049,14 @@ class StreamingTests(unittest.TestCase):
           于是每来一个新名字就打一行含 30+ 项的全量汇总，日志被自己的"降噪
           机制"冲垮（实测半小时上千行）。
         - 现在一律**按时间节流**：首次见到打一行，之后每 60 秒最多一行汇总。
+
+        时钟是注入的（``event_stream.clock``），所以"等过窗口"靠**拨时钟**，
+        不再手改 ``_last_unhandled_log_at`` 那个私有属性。
         """
         with tempfile.TemporaryDirectory() as td:
             core, _client, _adapter, _, _, _ = make_env(td)
+            ticks = [1000.0]
+            core.event_stream.clock = lambda: ticks[0]
 
             # 首次见到未知事件名 -> 打一行
             with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
@@ -1060,7 +1065,7 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(len(logs.output), 1)
 
             # 节流窗口内：反复来**同一个**名字也不许打日志（但要记账）
-            with self.assertNoLogs("opencode_bridge.core", level="INFO"):
+            with self.assertNoLogs("opencode_bridge.event_stream", level="INFO"):
                 for _ in range(5):
                     core.event_stream.dispatch(ev("session.brand.new.event", sessionID="ses_x"))
             self.assertEqual(core.event_stream._unhandled_event_names["session.brand.new.event"], 6)
@@ -1073,8 +1078,8 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(len(logs.output), 1)
             self.assertEqual(core.event_stream._unhandled_event_names["session.other.unknown.event"], 1)
 
-            # 把时钟往前推过节流窗口 -> 才允许再打一行汇总
-            core.event_stream._last_unhandled_log_at -= (
+            # 把注入的时钟推过节流窗口 -> 才允许再打一行汇总
+            ticks[0] += (
                 core.event_stream._UNHANDLED_LOG_INTERVAL_SECONDS + 1
             )
             with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
@@ -1121,11 +1126,28 @@ class StreamingTests(unittest.TestCase):
 # 10-12: failures / permissions / unknown sessions
 # ----------------------------------------------------------------------
 class EventFailureTests(unittest.TestCase):
-    def test_execution_failed_sends_error_message(self):
+    def test_execution_failed_edits_the_progress_message_into_one_bubble(self):
+        """失败走收尾那条路：那条 ``⏳ 处理中…`` 被改写成失败原因。
+
+        之前是**另发一条** ``kind="error"`` 消息，于是用户看到两个气泡：一个卡住的
+        进度、一个不相干的报错 —— 同一件事说了两遍，且进度那条永远不会被收掉。
+        """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
+            core.event_stream.dispatch(
+                ev(
+                    "session.text.delta",
+                    sessionID=sid,
+                    assistantMessageID="msg_1",
+                    ordinal=0,
+                    delta="写到一半",
+                )
+            )
+            self.assertEqual(adapter.sent[-1].kind, "progress")
+            sent_before = len(adapter.sent)
+
             core.event_stream.dispatch(
                 ev(
                     "session.execution.failed",
@@ -1133,9 +1155,12 @@ class EventFailureTests(unittest.TestCase):
                     error={"type": "APIError", "message": "boom"},
                 )
             )
-            self.assertEqual(adapter.sent[-1].kind, "error")
-            self.assertIn("APIError", adapter.sent[-1].text)
-            self.assertIn("boom", adapter.sent[-1].text)
+
+            # 只多了一条 edit，没有新消息
+            self.assertEqual(len(adapter.sent), sent_before)
+            self.assertEqual(adapter.edited[-1][1].kind, "error")
+            self.assertIn("APIError", adapter.edited[-1][1].text)
+            self.assertIn("boom", adapter.edited[-1][1].text)
 
     def test_permission_asked_then_callback_reply(self):
         with tempfile.TemporaryDirectory() as td:

@@ -31,10 +31,12 @@ Telegram（以及多数IM 平台）的收消息接口**同一时刻只允许一�
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import io
 import json
 import os
+import sys
 import time
 from typing import Any
 
@@ -52,25 +54,94 @@ DEFAULT_LOCK_NAME = ".bridge-instance.lock"
 #: 第二天开机时不会卡住。
 MAX_LOCK_AGE_SECONDS = 24 * 60 * 60
 
+# --------------------------------------------------------------------------
+# Windows 进程探活
+#
+# ⚠️ **不要用 `os.kill(pid, 0)` 做 Windows 上的探活。**
+# 信号 0 是 POSIX 语义，Windows 上没有这个约定。实测行为**不一致**：
+# 对当前进程派生的子/孙进程，它不抛异常（像纯探测）；
+# 但对**由 PowerShell Start-Process 拉起、经 venv launcher 两层启动的桥进程**，
+# 它抛 `OSError: [WinError 87] 参数错误`（`OpenProcess` 失败路径）——
+# 于是"活着"被误判成"死了"。
+#
+# 后果不是小问题：锁的持有者永远被当成已死 -> 单实例守卫永远放行 ->
+# 两个桥并存 -> 消息随机丢失、且同一条消息被发两遍。
+# 这个 bug 已经真实发生过一次（用户收到两条一模一样的回复）。
+# 本项目原有的 `__main__._pid_alive` 用的正是 `os.kill(pid, 0)`，
+# 所以 `--status` 报告的运行态在 Windows 上也一直是错的。
+#
+# 顺带排除一个更吓人的可能：**它不会终止目标进程**。实测对子进程与孙进程
+# 调用 `os.kill(pid, 0)` 后进程都仍存活（不是 `TerminateProcess`）。
+# 所以"桥每5~7 分钟退出、退出码 0"那个悬案**不能**用自杀解释，原因仍未知。
+#
+# 正确做法：`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
+# `GetExitCodeProcess`，活着的进程返回 `STILL_ACTIVE` (259)。
+# --------------------------------------------------------------------------
+
+_IS_WINDOWS = os.name == "nt"
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87
+
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    """用 Windows API 判活。`OpenProcess` 失败时靠 GetLastError 区分原因。"""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
+    ]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        # ACCESS_DENIED = 进程存在但当前用户无权查询 -> 算活着
+        # INVALID_PARAMETER = 该 pid 根本不存在
+        return error == _ERROR_ACCESS_DENIED
+
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _posix_pid_is_alive(pid: int) -> bool:
+    """POSIX 上信号 0 是合法的探活方式。"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        # EPERM = 进程存在但不许发信号，仍算活着
+        return exc.errno == errno.EPERM
+    except Exception:
+        return False
+
 
 def pid_is_alive(pid: int) -> bool:
-    """进程是否存活。
+    """进程是否存活（跨平台）。
 
-    Windows 上 `os.kill(pid, 0)` 可用（对存活进程抛 PermissionError 或返回 0），
-    POSIX 上信号 0 同样可用于探测。两者都不真发信号。
+    ⚠️ 平台差异必须显式处理：POSIX 用 `os.kill(pid, 0)`，而 Windows 必须走
+    `OpenProcess` + `GetExitCodeProcess`——用错会让"活着"被误判成"死了"。
+    详见上方注释。
     """
     if pid <= 0:
         return False
     if pid == os.getpid():
         return True
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError as exc:
-        # EPERM 说明进程存在但当前用户无权发信号 —— 仍然算活着
-        return exc.errno == errno.EPERM
+        if _IS_WINDOWS:
+            return _windows_pid_is_alive(pid)
+        return _posix_pid_is_alive(pid)
     except Exception:
-        return False
+        # 探活本身出错时**倾向保守**：宁可当成"活着"而让用户看到"已有实例在跑"，
+        # 也不要当成"死了"而放任第二个实例进来抢同一个 bot。
+        return True
 
 
 class InstanceLock:

@@ -50,6 +50,67 @@ class PidIsAliveTests(unittest.TestCase):
             child.terminate()
             child.wait(timeout=10)
 
+    def test_detects_process_we_do_not_own(self):
+        """必须能判活**不是自己子进程**的进程 —— 生产里失败的正是这一种。
+
+        这条测试是补上一个真实漏网的 bug：原来的实现用 `os.kill(pid, 0)`，
+        它对"当前进程派生的子/孙进程"恰好能探活，所以单测一直是绿的；
+        但对**由 PowerShell Start-Process 拉起、经 venv launcher 两层启动的桥进程**，
+        实测抛 `WinError 87 参数错误` -> "活着"被误判成"死了" ->
+        单实例守卫永远放行 -> 用户收到两条一模一样的回复。
+
+        原来的测试用 `subprocess.Popen`，那恰好是**能工作**的那种进程关系，
+        于是测试全绿而生产失败。这里刻意换成"非自己子进程"来复现。
+
+        实现注意：被启动的代码**写进临时 .py 文件**再执行。
+        早先一版把代码塞进 `Start-Process -ArgumentList '-c','...'`，被 PowerShell
+        的引号规则拆坏，进程**根本没起来**（tasklist 查不到），
+        于是两种实现都报"死了"——测试看着通过，其实什么也没验证到。
+        """
+        if os.name != "nt":
+            self.skipTest("这条针对 Windows 的 OpenProcess 路径")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sleeper = os.path.join(temp_dir, "sleeper.py")
+            with io.open(sleeper, "w", encoding="utf-8") as handle:
+                handle.write("import time\ntime.sleep(60)\n")
+
+            launcher = subprocess.Popen(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "$p = Start-Process -FilePath '%s' -ArgumentList '%s' "
+                    "-PassThru -WindowStyle Hidden; $p.Id"
+                    % (sys.executable, sleeper),
+                ],
+                stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                detached_pid = int(launcher.stdout.readline().strip())
+                time.sleep(1.2)
+
+                # 先确认它真的活着，否则本测试什么也没验证到
+                listing = subprocess.run(
+                    ["tasklist", "/FI", "PID eq %d" % detached_pid],
+                    capture_output=True, text=True,
+                ).stdout
+                self.assertIn(
+                    str(detached_pid), listing,
+                    "前置条件失败：分离进程没起来（pid=%d），本测试将毫无意义"
+                    % detached_pid,
+                )
+
+                self.assertTrue(
+                    pid_is_alive(detached_pid),
+                    "对非自己子进程的进程（pid=%d）也必须判活 —— 生产里失败的正是这一种"
+                    % detached_pid,
+                )
+            finally:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(detached_pid)],
+                    capture_output=True,
+                )
+                launcher.wait(timeout=15)
+
     # 刻意**不测**"已退出的子进程应被判为不存活"：Windows 的 pid 回收很积极，
     # 子进程 wait() 之后那个 pid 可能立刻被别的进程占用，于是断言随机失败——
     # 那是环境的性质，不是本模块的契约。实测本机 pid 回收确实会触发。

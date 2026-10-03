@@ -614,13 +614,13 @@ class PromptRoutingTests(unittest.TestCase):
             self.assertEqual(client.prompts, [(sid, "queued text")])
             self.assertEqual(adapter.sent, [])  # nothing sent while busy
 
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             self.assertEqual(
                 client.prompts,
                 [(sid, "queued text"), (sid, "queued text")],
             )
             # queue drained: a second idle must not prompt again
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             self.assertEqual(len(client.prompts), 2)
 
     def test_prompt_error_sends_error_message(self):
@@ -642,8 +642,8 @@ class StreamingTests(unittest.TestCase):
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
 
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -652,7 +652,7 @@ class StreamingTests(unittest.TestCase):
                     delta="c",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -661,7 +661,7 @@ class StreamingTests(unittest.TestCase):
                     delta="a",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -670,7 +670,7 @@ class StreamingTests(unittest.TestCase):
                     delta="b",
                 )
             )
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
@@ -682,15 +682,15 @@ class StreamingTests(unittest.TestCase):
                 td, bridge={"edit_interval_seconds": 1.5}
             )
             ticks = [1000.0]
-            core.clock = lambda: ticks[0]
+            core.event_stream.clock = lambda: ticks[0]
 
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
             self.assertEqual(adapter.sent[0].kind, "progress")
-            core._dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
 
             def delta(text: str) -> None:
-                core._dispatch(
+                core.event_stream.dispatch(
                     ev(
                         "session.text.delta",
                         sessionID=sid,
@@ -717,8 +717,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -728,7 +728,7 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             sends_before = len(adapter.sent)
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["结果如下"])
@@ -739,8 +739,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], [NO_OUTPUT_TEXT])
 
@@ -751,8 +751,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -761,7 +761,7 @@ class StreamingTests(unittest.TestCase):
                     delta="done",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.execution.succeeded", sessionID=sid)
             )
             finals = [out for _, out in adapter.edited if out.kind == "final"]
@@ -769,7 +769,7 @@ class StreamingTests(unittest.TestCase):
             self.assertNotIn(sid, core._turns)
 
             # a late duplicate trigger must not publish a second final
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
 
@@ -778,8 +778,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -788,7 +788,7 @@ class StreamingTests(unittest.TestCase):
                     delta="部分结果",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.execution.interrupted", sessionID=sid,
                    reason="user")
             )
@@ -806,8 +806,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -816,17 +816,17 @@ class StreamingTests(unittest.TestCase):
                     delta="ok",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.status", sessionID=sid, status={"type": "idle"})
             )
             # 关键断言：没有final，只有进行中的那条
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(finals, [])
             # 且它被记账了，不再是"静默丢弃"
-            self.assertIn("session.status", core._unhandled_event_names)
+            self.assertIn("session.status", core.event_stream._unhandled_event_names)
 
             # 真正的收尾事件仍然要能收尾（证明上面不是"整条链路都不工作"）
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["ok"])
 
@@ -837,8 +837,8 @@ class StreamingTests(unittest.TestCase):
             )
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -848,7 +848,7 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             self.assertEqual(adapter.edited, [])  # long delta never edited
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             self.assertEqual(adapter.edited, [])  # still no edit call
             self.assertEqual(adapter.sent[-1].kind, "final")
@@ -859,8 +859,8 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -870,7 +870,7 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             adapter.edit_results.append(ValueError("edit text too long"))
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             self.assertEqual(adapter.sent[-1].kind, "final")
             self.assertEqual(adapter.sent[-1].text, "最终结果")
@@ -889,10 +889,10 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
             # 先产生一段正文，让 turn 里记下这个 assistantMessageID，
             # 否则反查不到会话（这正是新事件没有 sessionID 带来的约束）
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -901,7 +901,7 @@ class StreamingTests(unittest.TestCase):
                     delta="思考中",
                 )
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.retry.scheduled",
                     assistantMessageID="msg_retry_1",
@@ -920,7 +920,7 @@ class StreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             core, _client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.retry.scheduled",
                     assistantMessageID="msg_never_seen",
@@ -947,14 +947,14 @@ class StreamingTests(unittest.TestCase):
 
             # 高频事件 + 别人的会话 -> 被归属过滤，handler 不跑、不产生任何编辑
             # （会打一行 DEBUG 说明被忽略了——降噪但可查，正是设计意图）
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID="ses_someone_else",
                    assistantMessageID="msg_x", ordinal=0, delta="别人的内容")
             )
             self.assertEqual(adapter.edited, [], "别人的会话不该被渲染")
 
             # 高频事件 + 自己的会话 -> 正常处理
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID=owned_session,
                    assistantMessageID="msg_y", ordinal=0, delta="我的内容")
             )
@@ -962,8 +962,8 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(adapter.edited[-1][1].text, "我的内容")
 
             # 低频事件 + 未知会话 -> **必须放行**，让原有的警告继续暴露问题
-            with self.assertLogs("opencode_bridge.core", level="WARNING") as logs:
-                core._dispatch(ev("permission.asked", sessionID="ses_ghost",
+            with self.assertLogs("opencode_bridge.event_stream", level="WARNING") as logs:
+                core.event_stream.dispatch(ev("permission.asked", sessionID="ses_ghost",
                                   id="per_1", action="bash"))
             self.assertTrue(
                 any("unknown session" in line for line in logs.output),
@@ -976,11 +976,11 @@ class StreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             core, client, _adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID="ses_someone_else",
                    assistantMessageID="msg_x", ordinal=0, delta="别人的")
             )
-            self.assertEqual(core._unhandled_event_names, {})
+            self.assertEqual(core.event_stream._unhandled_event_names, {})
 
     def test_shutdown_interruption_does_not_finalise_turn(self):
         """`execution.interrupted{reason:"shutdown"}` **不是**结束——这一轮会被续跑。
@@ -996,12 +996,12 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID=sid,
                    assistantMessageID="msg_1", ordinal=0, delta="写了一半")
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.execution.interrupted",
                    sessionID=sid, reason="shutdown")
             )
@@ -1014,11 +1014,11 @@ class StreamingTests(unittest.TestCase):
             self.assertIn(sid, core._turns, "shutdown 之后 turn 不该被弹掉")
 
             # 3) 续跑：同一turn 继续累积，最终由真正的终止事件收尾
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID=sid,
                    assistantMessageID="msg_1", ordinal=0, delta="，然后写完了")
             )
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["写了一半，然后写完了"])
 
@@ -1028,12 +1028,12 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev("session.text.delta", sessionID=sid,
                    assistantMessageID="msg_1", ordinal=0, delta="说到一半被打断")
             )
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev("session.execution.interrupted",
                    sessionID=sid, reason="user")
             )
@@ -1054,31 +1054,31 @@ class StreamingTests(unittest.TestCase):
             core, _client, _adapter, _, _, _ = make_env(td)
 
             # 首次见到未知事件名 -> 打一行
-            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
-                core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
-            self.assertIn("session.brand.new.event", core._unhandled_event_names)
+            with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
+                core.event_stream.dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertIn("session.brand.new.event", core.event_stream._unhandled_event_names)
             self.assertEqual(len(logs.output), 1)
 
             # 节流窗口内：反复来**同一个**名字也不许打日志（但要记账）
             with self.assertNoLogs("opencode_bridge.core", level="INFO"):
                 for _ in range(5):
-                    core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
-            self.assertEqual(core._unhandled_event_names["session.brand.new.event"], 6)
+                    core.event_stream.dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertEqual(core.event_stream._unhandled_event_names["session.brand.new.event"], 6)
 
             # 注意：**新出现的名字**不受节流限制，每个都打一行——
             # 这正是"看得见的静默"的意义（opencode 升版新增了什么，一眼就知道）。
             # 上界是"不同名字的个数"，不是事件条数，所以是安全的。
-            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
-                core._dispatch(ev("session.other.unknown.event", sessionID="ses_x"))
+            with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
+                core.event_stream.dispatch(ev("session.other.unknown.event", sessionID="ses_x"))
             self.assertEqual(len(logs.output), 1)
-            self.assertEqual(core._unhandled_event_names["session.other.unknown.event"], 1)
+            self.assertEqual(core.event_stream._unhandled_event_names["session.other.unknown.event"], 1)
 
             # 把时钟往前推过节流窗口 -> 才允许再打一行汇总
-            core._last_unhandled_log_at -= (
-                core._UNHANDLED_LOG_INTERVAL_SECONDS + 1
+            core.event_stream._last_unhandled_log_at -= (
+                core.event_stream._UNHANDLED_LOG_INTERVAL_SECONDS + 1
             )
-            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
-                core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
+                core.event_stream.dispatch(ev("session.brand.new.event", sessionID="ses_x"))
             self.assertEqual(len(logs.output), 1, "过窗口后应打一行汇总")
             self.assertTrue(any("累计" in line for line in logs.output))
 
@@ -1092,14 +1092,14 @@ class StreamingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             core, _client, _adapter, _, _, _ = make_env(td)
             with self.assertNoLogs("opencode_bridge.core", level="INFO"):
-                for name in sorted(core._KNOWN_BUT_IGNORED_EVENTS)[:12]:
-                    core._dispatch(
+                for name in sorted(core.event_stream._KNOWN_BUT_IGNORED_EVENTS)[:12]:
+                    core.event_stream.dispatch(
                         ev(name, sessionID="ses_x", assistantMessageID="msg_a",
                            ordinal=0, delta="思考中")
                     )
             self.assertEqual(
-                core._unhandled_event_names, {},
-                "故意忽略的事件不该进未处理记账：%r" % core._unhandled_event_names,
+                core.event_stream._unhandled_event_names, {},
+                "故意忽略的事件不该进未处理记账：%r" % core.event_stream._unhandled_event_names,
             )
 
     def test_thinking_stream_never_reaches_the_im_bridge(self):
@@ -1108,13 +1108,13 @@ class StreamingTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             session_id = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=session_id))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=session_id))
+            core.event_stream.dispatch(
                 ev("session.reasoning.delta", sessionID=session_id,
                    assistantMessageID="msg_r", ordinal=0, delta="让我想想")
             )
             self.assertEqual(adapter.edited, [], "思考过程不该被渲染给用户")
-            self.assertEqual(core._unhandled_event_names, {})
+            self.assertEqual(core.event_stream._unhandled_event_names, {})
 
 
 # ----------------------------------------------------------------------
@@ -1126,7 +1126,7 @@ class EventFailureTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.execution.failed",
                     sessionID=sid,
@@ -1143,7 +1143,7 @@ class EventFailureTests(unittest.TestCase):
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
 
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "permission.asked",
                     sessionID=sid,
@@ -1201,7 +1201,7 @@ class EventFailureTests(unittest.TestCase):
             core.on_inbound(inbound("chat:55", "go"))
             sends_before = len(adapter.sent)
 
-            core._dispatch(
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID="ses_ghost",
@@ -1210,8 +1210,8 @@ class EventFailureTests(unittest.TestCase):
                     delta="x",
                 )
             )
-            core._dispatch(ev("session.execution.started", sessionID="ses_ghost"))
-            core._dispatch(ev("session.execution.succeeded", sessionID="ses_ghost"))
+            core.event_stream.dispatch(ev("session.execution.started", sessionID="ses_ghost"))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID="ses_ghost"))
 
             self.assertEqual(len(adapter.sent), sends_before)
             self.assertNotIn("ses_ghost", core._turns)
@@ -1221,8 +1221,8 @@ class EventFailureTests(unittest.TestCase):
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
-            core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(
+            core.event_stream.dispatch(ev("session.execution.started", sessionID=sid))
+            core.event_stream.dispatch(
                 ev(
                     "session.text.delta",
                     sessionID=sid,
@@ -1231,7 +1231,7 @@ class EventFailureTests(unittest.TestCase):
                     delta="bad\x00text",
                 )
             )
-            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
             self.assertNotIn("\x00", finals[0].text)
@@ -1263,7 +1263,7 @@ class CoreLifecycleTests(unittest.TestCase):
             core.start()
             thread = core._thread
 
-            original = core._dispatch
+            original = core.event_stream.dispatch
             calls = {"n": 0}
 
             def flaky(event: dict) -> None:
@@ -1272,8 +1272,11 @@ class CoreLifecycleTests(unittest.TestCase):
                     raise RuntimeError("boom")
                 original(event)
 
-            core._dispatch = flaky  # type: ignore[method-assign]
-            with self.assertLogs("opencode_bridge.core", level="ERROR") as logs:
+            core.event_stream.dispatch = flaky  # type: ignore[method-assign]
+            # 事件流搬进了 opencode_bridge.event_stream（AGENTS.md §5.1），所以这行
+            # 日志的 logger 也跟着换了名字；断言的仍然是同一条消息。
+            with self.assertLogs("opencode_bridge.event_stream",
+                                 level="ERROR") as logs:
                 client.push(ev("session.execution.started", sessionID="ses_x"))
                 client.push(ev("session.execution.started", sessionID="ses_x"))
                 deadline = time.time() + 5.0

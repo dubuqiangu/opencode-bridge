@@ -13,3 +13,13 @@
 #
 # text=auto 让 git 按内容判定文本/二进制,将来加入图片等资源时不会被误转换。
 * text=auto eol=lf
+
+# ⚠️ install.ps1 与 plugin/install.ps1 的 UTF-8 BOM 是**故意保留**的,不要删。
+#
+# 这两个文件里有大量中文字面量(分别约 3000 / 950 个非 ASCII 字节)。Windows
+# PowerShell 5.1 在**没有** BOM 时会退回系统 ANSI 代码页解读 .ps1,于是所有中文
+# 提示语和注释变成乱码。PowerShell 7 因默认 UTF-8 不需要 BOM,但它同样接受带 BOM
+# 的文件——保留 BOM 对 5.1 和 7 都是安全的那一侧。
+#
+# 对比:同名约束在 TypeScript 仓库里结论相反(src/engine.ts 的 BOM 已删除),
+# 因为 TS 按规范恒为 UTF-8,与 BOM 无关。处置方式取决于文件类型,不是无脑统一。

@@ -1388,7 +1388,7 @@ class RulesetTests(unittest.TestCase):
         )
 
     def test_ruleset_for_unknown_mode_falls_back_to_ask(self):
-        with self.assertLogs("opencode_bridge.core", level="WARNING"):
+        with self.assertLogs("opencode_bridge.session_registry", level="WARNING"):
             self.assertIsNone(ruleset_for("whatever"))
 
 

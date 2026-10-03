@@ -219,7 +219,7 @@ class AmbiguousChannelKeysSurvive(LegacyStateFileTestCase):
 
     @staticmethod
     def _route(core: BridgeCore, conversation_id: str) -> str | None:
-        adapter = core._adapter_for(conversation_id)
+        adapter = core.routing.adapter_for(conversation_id)
         return adapter.name if adapter is not None else None
 
 

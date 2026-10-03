@@ -1452,7 +1452,7 @@ class TestCoreCursorHookWiring(unittest.TestCase):
         store = StateStore(state_path)
         store.set_meta(self.SCOPE, "stream_cursor", "not-a-number")
         core = BridgeCore(Config(), UnusedOpenCodeClient(), store)
-        with self.assertLogs("opencode_bridge.core", level="WARNING"):
+        with self.assertLogs("opencode_bridge.stream_cursor", level="WARNING"):
             self.assertIsNone(core.load_stream_cursor(self.SCOPE))
 
     def test_core_does_not_raise_when_the_store_cannot_be_written(self):
@@ -1465,7 +1465,7 @@ class TestCoreCursorHookWiring(unittest.TestCase):
         self.addCleanup(temp_dir.cleanup)
         core = BridgeCore(Config(), UnusedOpenCodeClient(),
                           UnwritableStore(os.path.join(temp_dir.name, "s.json")))
-        with self.assertLogs("opencode_bridge.core", level="WARNING"):
+        with self.assertLogs("opencode_bridge.stream_cursor", level="WARNING"):
             core.save_stream_cursor(self.SCOPE, 7)
 
 

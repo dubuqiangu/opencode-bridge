@@ -142,7 +142,9 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 
 | 类 | 文件 | 方法数 | 自有代码行 |
 |---|---|---|---|
-| `BridgeCore` | `core.py` | **43** | **1113** |
+| `BridgeCore` | `core.py` | **26** | **681** |（原 49/1120 -> 54/1315 -> **26/681**）|
+| `EventStream` | `event_stream.py` | 18 | 491 |（`67cb720` 新增；见下方「已知偏离」）|
+| `CommandHandler` | `commands.py` | 13 | 289 |（`f8461d0` 新增；含冻结文案约 129 行）|
 | `HomeAssistantAdapter` | `adapters/homeassistant.py` | 49 | 829 |
 | `DiscordAdapter` | `adapters/discord.py` | 43 | 678 |
 | `QQBotAdapter` | `adapters/qqbot.py` | 42 | 828 |
@@ -541,6 +543,91 @@ mattermost **三家共用**，从字符串判断不出来源，`normalize()` 因
 事件流路径。
 
 ##### 顺带挖出的权限 bug（`AGENTS.md` §8 推翻记录）
+
+##### 类体量偿债第二步：事件流簇抽出（`67cb720`）
+
+`BridgeCore` 再降一档：**43 → 26 方法 / 1113 → 681 行**（起点 49/1120）。
+
+切口是我先用 AST 量每个簇触及的 `self.*` 数定的，并要求实现者**复测后再动刀**
+（我给的表是上一步之前的）。复测结论：独占状态 6 项搬走、共享 4 项注入、
+对簇外 5 个调用。**生命周期簇触及 39 个 `self.*`，是所有簇的汇点，必须留。**
+
+**私有状态一起搬**（§5.1 的「抽出去」形态）：`Turn`、`_sid_conv`、`_tool_names`、
+`_handlers`、`_unhandled_event_names`、`_last_unhandled_log_at` 全部随簇搬走 ——
+这些状态本来就只属于这个簇，留在 core 才是耦合。
+
+**唯一偏离指令**：`turns` 留在 core。它有**两个簇外写入者**（`_dispatch_prompt` 建、
+`_drop_session` 弹），搬走就切断不了。改以**同一个 dict 对象、同一个 lock 注入**，
+身份与互斥不变，并用 `self.stream._turns is self.turns` 断言这个身份。
+**后果要说清：改 turn 的创建逻辑仍要动 core。**
+
+行为零变化是**实测**的：26 场景 / 171 步 / **719714 字节前后 sha256 完全相同**，
+且覆盖刻意做宽（乱序 delta、7 种畸形 delta、节流、14 种工具事件形态、
+retry 的两种匹配、shutdown 与其他 interrupt 的区分、跨会话过滤、409 后刷队列……）。
+
+改的测试**只有访问路径与 logger 名**，证明方式是把 8 处替换反向应用回去、
+两个文件**逐字节回到 HEAD** —— 没有任何期望值被改过。
+
+##### 偿债第二步顺带挖出的 4 个行为缺陷（`804eb37` 修复）
+
+纯结构改动里**刻意不改**行为 —— 混进去就无法评审「哪一行是搬动、哪一行是行为变更」。
+本次逐个修复，每项独立测试 + 独立非空洞证明：
+
+1. **失败时泄漏进度气泡**。根因：失败有**自己的一套发布路径**（`_send_text`），
+   成功走 `_finalize`（编辑那条已发出的气泡）。一个生命周期两条发布路径 ⇒
+   气泡永远收不回。`turn` 被弹出后从未使用，正因为那条路径上没东西需要它。
+   改法：失败改走 `_finalize`，复用同一条路。
+   ⚠️ **它抓到一个会由自己引入的新 bug**：`_finalize` 默认 `kind="final"`，
+   而 `adapters/a2a.py:1316` 是 `STATE_FAILED if out.kind == "error" else
+   STATE_COMPLETED`（`test_a2a.py:664` 钉住）—— 照默认走会把 a2a 失败任务报成
+   `COMPLETED`。故 `_finalize` 新增 `*, kind`，编辑与回退发送两处都用它。
+2. **重启后首个高流量事件被丢弃**。根因是**顺序错不是过滤错**：`_owns_session_event`
+   读 `_sid_conv`，而刷新发生在检查**之后**，于是判断用的是**上一轮**的映射。
+   今天无害（`_dispatch_prompt` 会先插入 turn），但重启后内存表为空、只知
+   `state.json` 时就会丢。改法：把刷新移到检查之前。**过滤本身未削弱** ——
+   `_sid_conv` 只由我们自己的 `state.all_sessions()` 构建，「在表里」就等于
+   「登记在本桥 state.json 里」。
+3. **日志节流用了模块级 `time.monotonic()` 而非注入的 `clock`**，于是该节流
+   **在构造上就不可测**，测试只能手工戳私有属性。改用 `self.clock()`，生产等价。
+   **顺带发现一条恒真断言**：某条 `assertNoLogs("opencode_bridge.core")` 断言的是
+   一个自 `67cb720` 起就不再使用的 logger —— 节流彻底坏掉它也会通过。改成真的之后，
+   该测试里真正有价值的部分（首次恰好记一行、窗口内重复被计数但不打印、
+   **新名字永不被节流**）逐字保留。
+4. **首片超长仍先发进度**。先查清既有上限到底怎么做：对已建立的 handle 是
+   **拒绝**（不编辑、之后整段发布），**本层不截断也不切分**，切分在适配器的
+   `split_text`。所以长度检查本身就是策略，`handle is not None` 是被硬接上去的
+   无关条件。**没有发明第三种策略。**
+
+**修复的诚实记录**：实现者首轮基线**被污染**（只替换了 `core.py`，新 `kind=` 撞上
+HEAD 的 `_finalize`，基线记下 `TypeError` 而非旧行为），它改成同时替换全部改动文件
+并复核哈希，并证明新基线与「改任何代码之前捕获的快照」完全一致。
+
+##### 仍未修的第 5 个缺陷（已记录，待单独判）
+
+**错误正文本身超长时仍需要第二条气泡**：失败正文超过 `max_message_chars` 后，
+`_finalize` 自己的长度守卫会跳过编辑、回退 `_send_text`，于是又回到「卡住的
+进度气泡 + 一条报错」。`execution-failed-long-error` 场景在 `804eb37` 前后
+**逐字节相同**。修它要截断或切分错误正文 = **改变用户可见的消息切分**，
+与第 4 项同类决策。触发条件很窄：默认需错误正文超过 4000 字符。
+
+##### 类体量仍未达标的地方（有意接受，非漏做）
+
+`EventStream` **18 方法 / 491 行，仍超阈值**（15 / 250）。但 §5.1 同时说
+「出现多个互不相关的职责块」才该拆 —— 这个类只有一个职责。唯一剩下的杠杆是
+散在 5 个 handler 里约 68 行的 `_turns` 记账；拆它属于 §5.1 的**第二种形态
+（拆基类）**，明确是不优先的那个，所以**留到第三步之后判** —— 因为第三步会把
+`_dispatch_prompt` 与 `_drop_session` 这两个簇外写入者搬走，届时事件流**可能
+可以完全拥有 turn 表**，那才是拆的前提成立。
+
+`CommandHandler` 289 行超 ~250 线 39 行（同因：约 129 行是冻结文案，是数据）。
+
+**这轮债务不止 `BridgeCore`**：债务表里还有 10 个适配器超阈值
+（`HomeAssistantAdapter` 49、`DiscordAdapter` 43、`QQBotAdapter` 42、
+`TwitchAdapter` 42、`MattermostAdapter` 41、`NextcloudAdapter` 38、
+`IRCAdapter` 35、`A2aAdapter` 34、`EmailAdapter` 32、`TelegramAdapter` 24）。
+**没有排期**，记在这里以免被当成已完成。§5.1 的**约束**（新功能不得加厚这些类）
+对新代码立即生效；**存量**的全面偿还需要单独立项。
+
 
 **当初为什么那么定**：`/deny` 与 `/approve` 共用一个 `_reply_permission(..., default_decision)`，
 `default_decision` 只是**默认值**——第二个 token 若是 `once`/`always` 就覆盖它，

@@ -6,6 +6,8 @@ plugin/config.json
 bridge-output.log
 bridge-plugin.log
 .bridge-plugin.lock
+# 本项目自己的单实例锁（桥启动时生成，含本机 pid）
+.bridge-instance.lock
 
 # Python
 __pycache__/

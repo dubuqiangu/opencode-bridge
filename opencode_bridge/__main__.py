@@ -29,12 +29,25 @@ from typing import Sequence
 from .adapters import build
 from .config import Config, DEFAULT_CONFIG_NAME
 from .core import BridgeCore, setup_platforms, setup_reply
+from .instance_lock import InstanceLock, pid_is_alive
 from .opencode_client import OpenCodeClient, discover_endpoint
 from .state import StateStore
 
 __all__ = ["main"]
 
 logger = logging.getLogger("opencode_bridge")
+
+#: 已有实例在跑时的提示。**必须说清三件事**：谁占着（pid）、为什么不能并存
+#: （同一 bot 的收消息接口只能有一个消费者）、以及怎么解决（停掉那个）。
+#: 只说"已有实例在运行"会让人以为是崩溃或配置错误。
+ALREADY_RUNNING_MESSAGE = (
+    "已有另一个 bridge 实例在运行（pid={pid}），本次不启动。\n"
+    "同一个 bot 的收消息接口同时只允许一个消费者：两个实例并存会导致\n"
+    "  · 消息随机丢失（谁抢到算谁的）\n"
+    "  · 同一条消息被处理两次，用户收到两份一样的回复\n"
+    "如果你要调试，请先停掉那个实例（或停用 opencode 的 bridge 插件），\n"
+    "不要让两个同时轮询。"
+)
 
 #: 未配置任何可用适配器时的提示。**不能**只说 ``bot_token``：Matrix / IRC /
 #: Mattermost 根本没有这个键，只提它会让那三类用户以为自己配错了。
@@ -234,16 +247,8 @@ def _bridge_dir() -> str:
 
 
 def _pid_alive(pid: int) -> bool:
-    """进程是否存活（Windows 上 os.kill(pid, 0) 可用）。"""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-    except Exception:
-        return False
+    """进程是否存活。委托给 :func:`instance_lock.pid_is_alive`，避免两处实现。"""
+    return pid_is_alive(pid)
 
 
 class _NullHooks:
@@ -419,6 +424,23 @@ def run_bridge(cfg: Config) -> int:
             file=sys.stderr,
         )
         return 0
+
+    # 单实例闸门：同一台机器上不允许两个桥同时轮询同一个 bot。
+    # 必须在建连接之前拦下——否则消息已经被抢走一半了。
+    instance_lock = InstanceLock(_bridge_dir())
+    acquired, holder_pid = instance_lock.acquire()
+    if not acquired:
+        print(ALREADY_RUNNING_MESSAGE.format(pid=holder_pid), file=sys.stderr)
+        return 0
+
+    try:
+        return _run_bridge_locked(cfg)
+    finally:
+        instance_lock.release()
+
+
+def _run_bridge_locked(cfg: Config) -> int:
+    """真正启动桥。调用方必须已持有单实例锁。"""
 
     endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
     client = OpenCodeClient(endpoint)

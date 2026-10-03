@@ -646,7 +646,7 @@ class RoutingStillResolvesBothForms(ConversationStateTestCase):
             core.attach(ChannelPlatformStub(platform))
 
         def routed_to(conversation_id: str) -> str | None:
-            adapter = core._adapter_for(conversation_id)
+            adapter = core.routing.adapter_for(conversation_id)
             return adapter.name if adapter is not None else None
 
         for platform, local_id, _session_id, _legacy_key in PLATFORM_FIXTURES:

@@ -793,11 +793,19 @@ export default {
             } else {
               deleteLockIfPid(lockPath, c.pid)
               if (code === 0 && aliveMs < FAST_FAIL_MS) {
-                // 未配置 adapter 时 Python 侧会 exit 0 正常退出：这不是崩溃，不写 failedAt、不进 backoff。
+                // 「快速 exit 0」有**两个**原因，原来只说了其中一个，会把人引到错误的排查方向：
+                //   1. 未配置 adapter（三个 bot_token 均为空）
+                //   2. **已有另一个 bridge 实例在跑** —— Python 侧的单实例锁会干净退出
+                //      （见 opencode_bridge/instance_lock.py）。常见于有人手动
+                //      `python -m opencode_bridge` 调试，或上一实例还没退干净。
+                // 之前只报 1：用户会照着去填 token，而真正的原因是 2，怎么填都没用。
                 log(
-                  `bridge 启动后即退出 (code=0, 存活 ${aliveMs}ms)：不是崩溃，不会进入 backoff —— ` +
-                    `通常是因为尚未配置 adapter（三个 bot_token 均为空），属正常情况。` +
-                    `填好 token 后下次 location 加载会自动启动；见 README「接入平台引导」与「未配置时的行为」，或在 bot 内发送 /setup`,
+                  `bridge 启动后即退出 (code=0, 存活 ${aliveMs}ms)：不是崩溃，不会进入 backoff。` +
+                    `两种可能：① 尚未配置 adapter（bot_token 为空）—— 填好 token 后下次 location 加载会自动启动，` +
+                    `见 README「接入平台引导」或在 bot 内发送 /setup；` +
+                    `② 已有另一个 bridge 实例在运行（单实例锁拦下了本次启动）—— 先确认没有手动启动的 ` +
+                    "`python -m opencode_bridge` 残留，必要时停掉它再让插件拉起。" +
+                    ` 两种情况都会在 bridge-output.log 末尾留下原因（NO_ADAPTER_MESSAGE / 已有另一个 bridge 实例在运行）。`,
                 )
               }
               log(`bridge pid=${c.pid} 退出 (code=${code} signal=${signal}, 存活 ${aliveMs}ms)，锁已删除`)

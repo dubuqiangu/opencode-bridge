@@ -582,7 +582,7 @@ class PromptRoutingTests(unittest.TestCase):
             kinds = [out.kind for out in adapter.sent]
             self.assertEqual(kinds, ["progress"])
 
-    def test_prompt_409_queues_message_and_idle_flushes_it(self):
+    def test_prompt_409_queues_message_and_succeeded_flushes_it(self):
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             client.prompt_errors.append(OpenCodeError("busy", status=409))
@@ -592,13 +592,13 @@ class PromptRoutingTests(unittest.TestCase):
             self.assertEqual(client.prompts, [(sid, "queued text")])
             self.assertEqual(adapter.sent, [])  # nothing sent while busy
 
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             self.assertEqual(
                 client.prompts,
                 [(sid, "queued text"), (sid, "queued text")],
             )
             # queue drained: a second idle must not prompt again
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             self.assertEqual(len(client.prompts), 2)
 
     def test_prompt_error_sends_error_message(self):
@@ -648,7 +648,7 @@ class StreamingTests(unittest.TestCase):
                     delta="b",
                 )
             )
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
@@ -690,7 +690,7 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(len(adapter.edited), 2)
             self.assertEqual(adapter.edited[1][1].text, "ABCD")
 
-    def test_idle_edits_progress_into_final(self):
+    def test_execution_succeeded_edits_progress_into_final(self):
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
@@ -706,25 +706,25 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             sends_before = len(adapter.sent)
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["结果如下"])
             self.assertEqual(len(adapter.sent), sends_before)  # no extra send
 
-    def test_idle_without_output_sends_placeholder(self):
+    def test_execution_succeeded_without_output_sends_placeholder(self):
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
             core._dispatch(ev("session.execution.started", sessionID=sid))
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], [NO_OUTPUT_TEXT])
 
     def test_execution_succeeded_finalises_and_is_idempotent(self):
         # Live opencode 2.0.21 emits session.execution.succeeded but never
-        # session.idle — finalisation must work for both.
+        # session.execution.succeeded / .interrupted — finalisation must work for both.
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
@@ -747,7 +747,7 @@ class StreamingTests(unittest.TestCase):
             self.assertNotIn(sid, core._turns)
 
             # a late duplicate trigger must not publish a second final
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
 
@@ -773,7 +773,13 @@ class StreamingTests(unittest.TestCase):
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["部分结果"])
 
-    def test_status_idle_finalises_turn(self):
+    def test_unpublished_status_event_does_not_finalise_turn(self):
+        """`session.status` 在 v2.0.22 **从不发布**，所以它不能、也不该触发收尾。
+
+        这条测试以前断言的是相反的事（"status idle 会 finalize"），
+        于是 1409 条测试全绿而真实环境永远收不到尾——**测试在保护虚构的契约**。
+        现在改成断言真实契约：这个事件被忽略，且被记账成"未处理事件"。
+        """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
@@ -791,6 +797,14 @@ class StreamingTests(unittest.TestCase):
             core._dispatch(
                 ev("session.status", sessionID=sid, status={"type": "idle"})
             )
+            # 关键断言：没有final，只有进行中的那条
+            finals = [out for _, out in adapter.edited if out.kind == "final"]
+            self.assertEqual(finals, [])
+            # 且它被记账了，不再是"静默丢弃"
+            self.assertIn("session.status", core._unhandled_event_names)
+
+            # 真正的收尾事件仍然要能收尾（证明上面不是"整条链路都不工作"）
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["ok"])
 
@@ -812,7 +826,7 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             self.assertEqual(adapter.edited, [])  # long delta never edited
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             self.assertEqual(adapter.edited, [])  # still no edit call
             self.assertEqual(adapter.sent[-1].kind, "final")
@@ -834,29 +848,168 @@ class StreamingTests(unittest.TestCase):
                 )
             )
             adapter.edit_results.append(ValueError("edit text too long"))
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
 
             self.assertEqual(adapter.sent[-1].kind, "final")
             self.assertEqual(adapter.sent[-1].text, "最终结果")
 
-    def test_retry_status_edits_progress_message(self):
+    def test_retry_scheduled_edits_progress_message(self):
+        """重试提示改挂到 `session.retry.scheduled`——v2.0.22 里真实存在的那个事件。
+
+        两处与旧实现不同，都是核实源码后的结论：
+
+        1. 旧实现挂在 `session.status{type:"retry"}` 上，而 `session.status`
+           在 v2.0.22 全代码库零处发布，所以那段代码**从来没跑过**。
+        2. 新事件的 `data` 里**没有 `sessionID`**，只有 `assistantMessageID /
+           attempt / at / error`，所以要靠 assistantMessageID 反查会话。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            sid = client.created_ids[0]
+            core._dispatch(ev("session.execution.started", sessionID=sid))
+            # 先产生一段正文，让 turn 里记下这个 assistantMessageID，
+            # 否则反查不到会话（这正是新事件没有 sessionID 带来的约束）
+            core._dispatch(
+                ev(
+                    "session.text.delta",
+                    sessionID=sid,
+                    assistantMessageID="msg_retry_1",
+                    ordinal=0,
+                    delta="思考中",
+                )
+            )
+            core._dispatch(
+                ev(
+                    "session.retry.scheduled",
+                    assistantMessageID="msg_retry_1",
+                    attempt=2,
+                    at=1234567890,
+                    error={"message": "provider transport"},
+                )
+            )
+            self.assertEqual(
+                adapter.edited[-1][1].text,
+                "⏳ 重试中 (attempt 2): provider transport",
+            )
+
+    def test_retry_scheduled_without_session_hint_is_ignored(self):
+        """反查不到会话时不能崩、也不能乱发——什么都不发，只返回。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, _client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            core._dispatch(
+                ev(
+                    "session.retry.scheduled",
+                    assistantMessageID="msg_never_seen",
+                    attempt=1,
+                )
+            )
+            # 没有匹配的 turn -> 不该发出任何编辑
+            self.assertEqual(adapter.edited, [])
+
+    def test_shutdown_interruption_does_not_finalise_turn(self):
+        """`execution.interrupted{reason:"shutdown"}` **不是**结束——这一轮会被续跑。
+
+        这是本次修掉的真实 bug。若误当结束处理，后果是双重的：
+        半截内容被当最终答复发出去，且 turn 已弹掉；续跑后 `session.text.delta`
+        会另建 turn，于是**同一条回复被发两遍**。
+
+        源码依据：v2.0.22 `packages/core/src/session/projector.ts` 的 `projectIdle`
+        对 `reason === "shutdown"` 直接 return，不产生 idle 投影。
+        """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
             sid = client.created_ids[0]
             core._dispatch(ev("session.execution.started", sessionID=sid))
             core._dispatch(
-                ev(
-                    "session.status",
-                    sessionID=sid,
-                    status={
-                        "type": "retry",
-                        "attempt": 2,
-                        "message": "provider transport",
-                    },
-                )
+                ev("session.text.delta", sessionID=sid,
+                   assistantMessageID="msg_1", ordinal=0, delta="写了一半")
             )
-            self.assertEqual(adapter.edited[-1][1].text, "⏳ 重试中 (attempt 2): provider transport")
+            core._dispatch(
+                ev("session.execution.interrupted",
+                   sessionID=sid, reason="shutdown")
+            )
+
+            # 1) 不能收尾
+            finals = [out for _, out in adapter.edited if out.kind == "final"]
+            self.assertEqual(finals, [], "shutdown 不该触发收尾")
+
+            # 2) turn 必须还在，否则续跑时会另建 turn 导致重复发送
+            self.assertIn(sid, core._turns, "shutdown 之后 turn 不该被弹掉")
+
+            # 3) 续跑：同一turn 继续累积，最终由真正的终止事件收尾
+            core._dispatch(
+                ev("session.text.delta", sessionID=sid,
+                   assistantMessageID="msg_1", ordinal=0, delta="，然后写完了")
+            )
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
+            finals = [out for _, out in adapter.edited if out.kind == "final"]
+            self.assertEqual([f.text for f in finals], ["写了一半，然后写完了"])
+
+    def test_non_shutdown_interruption_does_finalise_turn(self):
+        """对照组：`reason` 是别的值（user/inactivity）时**就是**结束，必须收尾。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            sid = client.created_ids[0]
+            core._dispatch(ev("session.execution.started", sessionID=sid))
+            core._dispatch(
+                ev("session.text.delta", sessionID=sid,
+                   assistantMessageID="msg_1", ordinal=0, delta="说到一半被打断")
+            )
+            core._dispatch(
+                ev("session.execution.interrupted",
+                   sessionID=sid, reason="user")
+            )
+            finals = [out for _, out in adapter.edited if out.kind == "final"]
+            self.assertEqual([f.text for f in finals], ["说到一半被打断"])
+
+    def test_unhandled_event_is_recorded_and_logged_once_per_name(self):
+        """未知事件必须**可观测**：记账 + 打日志，绝不静默丢弃。
+
+        曾经 `_dispatch` 对未知事件裸`return`，于是"事件名写错"在生产里
+        表现为完全无迹可循——A4 真实验证时被这个坑了两天。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, _client, _adapter, _, _, _ = make_env(td)
+            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
+                core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertIn("session.brand.new.event", core._unhandled_event_names)
+            self.assertTrue(
+                any("未处理事件" in line for line in logs.output),
+                "首次见到未知事件应打一行日志，实际: %r" % (logs.output,),
+            )
+
+            # 同一个名字再刷 3 次：**一行都不许打**。delta 类事件每秒可达数百条，
+            # 逐条记日志会把真正的错误淹掉——那正是要避免的。
+            with self.assertNoLogs("opencode_bridge.core", level="INFO"):
+                for _ in range(3):
+                    core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertEqual(
+                core._unhandled_event_names["session.brand.new.event"], 4,
+                "记账要累加（4 次），但日志不该刷屏",
+            )
+
+            # 换一个**没见过的**名字：仍走"首次见到"分支，打新事件那行
+            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
+                core._dispatch(ev("session.another.new.event", sessionID="ses_x"))
+            self.assertIn("session.another.new.event", core._unhandled_event_names)
+            self.assertEqual(len(logs.output), 1)
+            self.assertTrue(
+                any("another.new.event" in line for line in logs.output),
+                "新事件名应各打一行，实际: %r" % (logs.output,),
+            )
+
+            # 回头再发一个**见过但不是最后一个**的名字 -> 汇总一行
+            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
+                core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertEqual(len(logs.output), 1)
+            self.assertTrue(
+                any("累计" in line for line in logs.output),
+                "切回旧事件名时应打一行累计汇总，实际: %r" % (logs.output,),
+            )
 
 
 # ----------------------------------------------------------------------
@@ -953,7 +1106,7 @@ class EventFailureTests(unittest.TestCase):
                 )
             )
             core._dispatch(ev("session.execution.started", sessionID="ses_ghost"))
-            core._dispatch(ev("session.idle", sessionID="ses_ghost"))
+            core._dispatch(ev("session.execution.succeeded", sessionID="ses_ghost"))
 
             self.assertEqual(len(adapter.sent), sends_before)
             self.assertNotIn("ses_ghost", core._turns)
@@ -973,7 +1126,7 @@ class EventFailureTests(unittest.TestCase):
                     delta="bad\x00text",
                 )
             )
-            core._dispatch(ev("session.idle", sessionID=sid))
+            core._dispatch(ev("session.execution.succeeded", sessionID=sid))
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual(len(finals), 1)
             self.assertNotIn("\x00", finals[0].text)
@@ -1016,10 +1169,8 @@ class CoreLifecycleTests(unittest.TestCase):
 
             core._dispatch = flaky  # type: ignore[method-assign]
             with self.assertLogs("opencode_bridge.core", level="ERROR") as logs:
-                client.push(ev("session.status", sessionID="ses_x",
-                               status={"type": "busy"}))
-                client.push(ev("session.status", sessionID="ses_x",
-                               status={"type": "busy"}))
+                client.push(ev("session.execution.started", sessionID="ses_x"))
+                client.push(ev("session.execution.started", sessionID="ses_x"))
                 deadline = time.time() + 5.0
                 while calls["n"] < 2 and time.time() < deadline:
                     time.sleep(0.01)

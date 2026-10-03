@@ -317,21 +317,35 @@ class BridgeCore:
         #: injectable monotonic clock (tests freeze it to check throttling)
         self.clock: Callable[[], float] = time.monotonic
 
+        # 事件名以 **anomalyco/opencode v2.0.22 源码** 为准，不是文档
+        # （`docs/server.mdx` 对 v2 已过时，仍列 v1 事件——那是推测的来源）。
+        # 白名单见 `packages/schema/src/event-manifest.ts`。
+        #
+        # ⚠️ 下面**故意没有** `session.idle` 与 `session.status`：
+        # 源码里 `session.idle` 标注 `// deprecated`，而 `session.status`
+        # 在 v2.0.22 **全代码库零处发布**。它们曾被当作"一轮结束"的信号，
+        # 于是真实环境永远等不到收尾（症状：用户只看到 `⏳ 处理中…`）。
+        # 结束信号只有一个：`session.execution.succeeded / .failed / .interrupted`。
         self._handlers: dict[str, Callable[[dict], None]] = {
             "session.execution.started": self._on_execution_started,
             "session.execution.succeeded": self._on_turn_finished,
-            "session.execution.interrupted": self._on_turn_finished,
+            "session.execution.interrupted": self._on_execution_interrupted,
+            "session.execution.failed": self._on_execution_failed,
             "session.step.started": self._on_step_started,
             "session.text.delta": self._on_text_delta,
             "session.tool.input.started": self._on_tool_input_started,
             "session.tool.called": self._on_tool_event,
             "session.tool.success": self._on_tool_event,
             "session.tool.failed": self._on_tool_event,
-            "session.status": self._on_status,
-            "session.idle": self._on_turn_finished,
-            "session.execution.failed": self._on_execution_failed,
+            "session.retry.scheduled": self._on_retry_scheduled,
             "permission.asked": self._on_permission_asked,
         }
+        #: 事件名出现但没有 handler 时记进这里，便于 `_dispatch` 打汇总日志，
+        #: 免得刷屏（一个未知事件可能每秒来几百条）。有界，不无限增长。
+        self._unhandled_event_names: dict[str, int] = {}
+        #: 上一次打了"新事件"或"汇总"日志的事件名，用来识别"连续刷屏"，
+        #: 从而避免同一个未知事件被逐条记日志。
+        self._last_unhandled_name: str = ""
 
     @staticmethod
     def _positive_float(value: Any, default: float) -> float:
@@ -1109,9 +1123,49 @@ class BridgeCore:
             logger.exception("event stream terminated")
         logger.debug("event loop exited")
 
+    def _note_unhandled_event(self, event_name: str) -> None:
+        """记账一个"事件名认识但没有 handler"的事件，并按需打日志。
+
+        为什么要记账而不是逐条打：未知的 delta 类事件每秒可达数百条，
+        逐条 INFO 会把真正需要关注的信息淹掉。策略是
+        **首次见到打一行**、之后静默计数、**下次再见到未知事件时打一行汇总**。
+        这样"静默失败"变成"看得见的静默"。
+        """
+        previous_count = self._unhandled_event_names.get(event_name, 0)
+        self._unhandled_event_names[event_name] = previous_count + 1
+        if previous_count == 0:
+            logger.info(
+                "收到未处理事件 %r（已记账；这类事件会被忽略，若你正在等某条回复"
+                "却没下文，先查这里）",
+                event_name,
+            )
+            self._last_unhandled_name = event_name
+            return
+        if event_name == self._last_unhandled_name:
+            # 同一个名字连续刷屏：静默计数。delta 类事件每秒可达数百条，
+            # 逐条打日志会把真正的错误淹掉——那正是这个方法要避免的。
+            return
+        # 出现了另一个名字 = 上一批被忽略的事件已经告一段落，汇总一次
+        self._last_unhandled_name = event_name
+        logger.info(
+            "未处理事件累计：%s",
+            ", ".join(
+                "%s x%d" % (name, count)
+                for name, count in sorted(self._unhandled_event_names.items())
+            ),
+        )
+
     def _dispatch(self, event: dict) -> None:
         handler = self._handlers.get(str(event.get("type") or ""))
         if handler is None:
+            # 未知事件**不许静默丢弃**。曾经这里是裸 `return`，于是"事件名写错"
+            # 这类错误在生产里表现为**完全无迹可循**：用户只看到 `⏳ 处理中…`，
+            # 而日志里什么都没有。A4 真实验证时被这个坑了两天。
+            #
+            # 记账而不是逐条打日志：单个未知事件可能每秒来几百条（delta 类），
+            # 逐条打会把真正的错误淹掉。首次见到打一行 INFO，之后按名字计数，
+            # 到下一个见到的未知事件时打一行汇总。
+            self._note_unhandled_event(str(event.get("type") or ""))
             return  # unknown / irrelevant event
         data = _as_dict(event.get("data"))
         with self._lock:
@@ -1255,29 +1309,79 @@ class BridgeCore:
                 return
             turn.tool_trace.append(f"▶ {name}")
 
-    def _on_status(self, data: dict) -> None:
+    def _session_for_assistant(self, assistant_id: str) -> str | None:
+        """按 ``assistantMessageID`` 反查它属于哪个会话。
+
+        为什么需要反查：v2.0.22 里 `session.retry.scheduled` 的 `data` 只有
+        `assistantMessageID / attempt / at / error`，**没有 `sessionID`**，
+        而其余 `session.*` 事件都有。不能靠会话 id 路由，就只能按
+        assistantMessageID 在活跃 turn 里找。
+
+        turn 数量是"当前并发对话数"，很小，线性扫足够；找不到就返回 None，
+        交给调用方记账而不是静默丢弃。
+        """
+        if not assistant_id:
+            return None
+        with self._lock:
+            for session_id, turn in self._turns.items():
+                if assistant_id in turn.parts:
+                    return session_id
+        return None
+
+    def _on_retry_scheduled(self, data: dict) -> None:
+        """`session.retry.scheduled` —— 模型重试时给用户一个提示，别干等着。
+
+        取代原先挂在 `session.status{type:"retry"}` 上的实现：那个事件在
+        v2.0.22 **从不发布**，所以那段代码从来没跑过；而它想提供的
+        「正在重试」反馈本身是有价值的，于是改挂到真实存在的事件上。
+        """
         session_id = _session_id(data)
-        status = _as_dict(data.get("status"))
-        status_type = status.get("type")
-        if status_type == "idle":
-            # legacy / alternate idle signal — same finalisation as
-            # session.execution.succeeded (idempotent: the turn is popped)
-            self._finalize_session(session_id)
+        if not session_id:
+            session_id = self._session_for_assistant(
+                str(data.get("assistantMessageID") or "")
+            )
+        if not session_id:
+            logger.debug(
+                "retry.scheduled 找不到对应会话 (assistantMessageID=%r)",
+                data.get("assistantMessageID"),
+            )
             return
-        if status_type != "retry":
-            return  # "busy" -> no operation
         conversation_id = self._conversation_for(session_id)
         if not conversation_id:
             return
-        attempt = status.get("attempt", "?")
-        message = _clean(status.get("message") or "")
-        text = f"⏳ 重试中 (attempt {attempt}): {message}"
+        attempt = data.get("attempt", "?")
+        error = _as_dict(data.get("error"))
+        reason = _clean(error.get("message") or error.get("type") or "")
+        text = f"⏳ 重试中 (attempt {attempt})" + (f": {reason}" if reason else "")
         with self._lock:
             turn = self._turns.get(session_id)
             handle = turn.progress_handle if turn else None
         if handle is None:
             return
         self._edit_progress(conversation_id, handle, text, session_id)
+
+    def _on_execution_interrupted(self, data: dict) -> None:
+        """`session.execution.interrupted` —— 但 ``reason == "shutdown"`` **不算**结束。
+
+        opencode 服务重启时会保留 claim 并**续跑**这一轮。源码依据
+        （v2.0.22 `packages/core/src/session/projector.ts` 的 `projectIdle`）：
+        `reason === "shutdown"` 时直接 return，不产生 idle 投影。
+
+        若把它当结束处理，后果是双重的：
+          1. 还没写完的 turn 被提前 finalize，把半截内容当最终答复发出去；
+          2. turn 已从 `_turns` 弹掉，续跑后 `session.text.delta` 会**另建一个
+             turn**，于是同一条回复被发两遍。
+        多个第三方消费者（openchamber / waku）都专门为这条踩过坑。
+        """
+        reason = str(data.get("reason") or "")
+        if reason == "shutdown":
+            logger.info(
+                "execution interrupted by shutdown (session=%s)：这一轮会被续跑，"
+                "不当作结束",
+                _session_id(data),
+            )
+            return
+        self._finalize_session(_session_id(data))
 
     def _on_execution_failed(self, data: dict) -> None:
         session_id = _session_id(data)
@@ -1334,11 +1438,18 @@ class BridgeCore:
     def _finalize_session(self, session_id: str) -> None:
         """Publish the turn's final message, then flush the queue.
 
-        Triggered by ``session.execution.succeeded`` /
-        ``session.execution.interrupted`` / ``session.idle`` /
-        ``session.status{type:"idle"}``.  Safe to run more than once: the
-        turn is popped under the lock, so a duplicate trigger only re-flushes
-        an (usually empty) queue.
+        触发源只有两个（v2.0.22 源码核实）：
+          - ``session.execution.succeeded``
+          - ``session.execution.interrupted``，**且** ``reason != "shutdown"``
+            （shutdown 会被续跑，见 :meth:`_on_execution_interrupted`）
+
+        ⚠️ 曾经还把 ``session.idle`` 与 ``session.status{type:"idle"}`` 当触发源，
+        但前者在源码里已标 ``// deprecated``、后者全代码库零处发布 ——
+        于是真实环境**永远等不到收尾**，症状是用户只看到 `⏳ 处理中…`。
+        写这段注释时全仓 1409 条测试都是绿的，而它们正是拿那两个不存在的事件
+        当触发源：**测试在保护一个虚构的契约**。
+
+        幂等：turn 在锁内 pop，所以重复触发只会多刷一次（通常为空的）队列。
         """
         if not session_id:
             return

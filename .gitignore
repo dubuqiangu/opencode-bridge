@@ -20,6 +20,10 @@ __pycache__/
 .venv/
 venv/
 
+# 测试用的仓库内临时目录（Windows 上 tempfile 默认落到用户 Temp，
+# 会触发沙箱的外部目录权限；测试统一把 TEMP/TMP 指到这里）
+.tmp/
+
 # Node / bun
 node_modules/
 package-lock.json

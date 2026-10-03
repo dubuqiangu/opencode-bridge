@@ -59,6 +59,17 @@ class FakeClient:
             "tokens": {"input": 10, "output": 20},
             "location": {"directory": "D:\\work"},
         }
+        #: ``GET /api/model`` 的返回。``/model`` 命令的搜索与校验都靠它。
+        self.model_catalog: list[dict] = [
+            {"providerID": "prov", "id": "model-x", "name": "Model X"},
+            {"providerID": "opencode", "id": "space-bunny-free",
+             "name": "Space Bunny Free"},
+            {"providerID": "opencode", "id": "space-bunny", "name": "Space Bunny"},
+            {"providerID": "anthropic", "id": "claude-sonnet-4-5",
+             "name": "Claude Sonnet 4.5"},
+        ]
+        self.list_models_calls: list[int] = []
+        self.model_switches: list[tuple[str, str, str]] = []
         self.closed = False
         self._seq = 0
         self._events: list[dict] = []
@@ -103,6 +114,17 @@ class FakeClient:
         if self.delete_errors:
             raise self.delete_errors.pop(0)
         self.deleted.append(session_id)
+
+    # --- models -------------------------------------------------------
+    def list_models(self) -> list[dict]:
+        self.list_models_calls.append(1)
+        return [dict(entry) for entry in self.model_catalog]
+
+    def set_session_model(
+        self, session_id: str, provider_id: str, model_id: str
+    ) -> None:
+        # 先记后抛：测试要断言的是"这个端点有没有被调用过"。
+        self.model_switches.append((session_id, provider_id, model_id))
 
     # --- conversation -------------------------------------------------
     def prompt(self, session_id: str, text: str, *, resume: bool = True) -> str:

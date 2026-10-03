@@ -233,6 +233,9 @@ class RequestTests(unittest.TestCase):
             self.assertIsNone(client.delete_session("ses_1"))
             self.assertIsNone(client.interrupt("ses_1"))
             self.assertIsNone(
+                client.set_session_model("ses_1", "opencode", "space-bunny-free")
+            )
+            self.assertIsNone(
                 client.reply_permission("ses_1", "req_1", "reject")
             )
 
@@ -284,6 +287,41 @@ class RequestTests(unittest.TestCase):
         ):
             self.assertEqual(client.list_sessions(limit=5), [{"id": "ses_1"}])
             self.assertEqual(client.messages("ses_1"), [{"id": "ses_1"}])
+
+    def test_set_session_model_posts_a_model_ref_object(self) -> None:
+        # 真机 2.0.22 实测：请求体是 Model.Ref **对象**（不是字符串），
+        # 只给 providerID + id 即可，variant 由服务端补成 default，成功回 204。
+        client = make_client()
+        seen: list = []
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=lambda req, **k: seen.append(req) or FakeHTTPResponse(b"", 204),
+        ):
+            client.set_session_model("ses_1", "opencode", "space-bunny-free")
+        req = seen[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertTrue(req.full_url.endswith("/api/session/ses_1/model"))
+        self.assertEqual(
+            json.loads(req.data.decode("utf-8")),
+            {"model": {"providerID": "opencode", "id": "space-bunny-free"}},
+        )
+
+    def test_list_models_unwraps_the_whole_catalog(self) -> None:
+        client = make_client()
+        catalog = [
+            {"providerID": "opencode", "id": "space-bunny-free",
+             "name": "Space Bunny Free"},
+            {"providerID": "anthropic", "id": "claude-sonnet-4-5",
+             "name": "Claude Sonnet 4.5"},
+        ]
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=lambda req, **k: FakeHTTPResponse(
+                json.dumps({"data": catalog}).encode("utf-8")
+            ),
+        ):
+            models = client.list_models()
+        self.assertEqual(models, catalog)
 
     def test_reply_permission_invalid_decision_raises_valueerror(self) -> None:
         client = make_client()

@@ -639,6 +639,9 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 | `/new` `/reset` | 删除当前 session 并新建，回 `已新建会话 <sid 前 12 位>` |
 | `/stop` | `interrupt` 当前正在执行的任务；失败回错误 |
 | `/status` | 显示 `session_id / agent / model / cost / tokens / directory` |
+| `/model` | 显示当前会话用的模型，并提示怎么切换 |
+| `/model <provider>/<id>` | 切换模型（例如 `/model opencode/space-bunny-free`）。**不在 opencode 的模型目录里就拒绝切换**，并回最接近的几个候选；**不会**新建会话来校验 |
+| `/model <关键词>` | 在模型目录里搜索（匹配 provider / id / 名称），列出 `provider/id  名称`，**不会**切换 |
 | `/cd <目录>` | 切换该会话的工作目录（写入 `state.json`）并重建 session，回 `已切换到 <目录>` |
 | `/approve <请求ID>` | 回复权限请求：允许一次 |
 | `/approve <请求ID> always` | 回复权限请求：总是允许 |

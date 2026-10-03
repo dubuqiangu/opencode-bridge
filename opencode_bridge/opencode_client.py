@@ -319,6 +319,35 @@ class OpenCodeClient:
         return None
 
     # ------------------------------------------------------------------
+    # models
+    # ------------------------------------------------------------------
+    def set_session_model(
+        self, session_id: str, provider_id: str, model_id: str
+    ) -> None:
+        """POST /api/session/{id}/model -> **204 No Content**（没有可解析的响应体）。
+
+        请求体是 ``Model.Ref`` **对象**而不是字符串：只给 ``providerID`` + ``id``
+        即可，``variant`` 由服务端自己补成 ``default``（真实 2.0.22 实测 204）。
+        ``_request`` 对空响应体返回 ``{}``，所以这里和 ``delete_session`` /
+        ``interrupt`` 一样只发不等。
+        """
+        self._request(
+            "POST",
+            f"/api/session/{urllib.parse.quote(session_id)}/model",
+            body={"model": {"providerID": provider_id, "id": model_id}},
+        )
+        return None
+
+    def list_models(self) -> list[dict]:
+        """GET /api/model -> the whole provider model catalog (unwrapped).
+
+        不是分页接口：2.0.22 实测一次返回全部模型（本机 819 条）。调用方
+        （:mod:`opencode_bridge.session_model`）负责缓存，别每次都用。
+        """
+        response = self._request("GET", "/api/model")
+        return self._unwrap_list(response)
+
+    # ------------------------------------------------------------------
     # conversation
     # ------------------------------------------------------------------
     def prompt(self, session_id: str, text: str, *, resume: bool = True) -> str:

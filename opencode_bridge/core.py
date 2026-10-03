@@ -42,6 +42,7 @@ from .identity import LEGACY_PREFIXES
 from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import recover_pending
 from .opencode_client import OpenCodeClient, OpenCodeError
+from .session_model import SessionModelCommand
 from .state import StateStore
 
 __all__ = [
@@ -82,6 +83,7 @@ HELP_TEXT = """\
 /new  /reset                新建会话（丢弃当前上下文）
 /stop                       中断当前正在执行的任务
 /status                     查看当前会话状态
+/model [provider/id]         查看或切换当前会话使用的模型
 /cd <目录>                  切换工作目录并新建会话
 /approve <请求ID> [always]  允许权限请求（always = 总是允许）
 /deny <请求ID>              拒绝权限请求
@@ -391,6 +393,11 @@ class BridgeCore:
         self.client = client
         self.state = state
         self._inbox = inbox
+        # ``/model`` 的全部逻辑（参数解析、模型目录缓存、回复文案）都在这个对象
+        # 里，core 侧只留一个转发（AGENTS.md §5.1：这个类已经 50+ 个方法）。
+        self.model_command = SessionModelCommand(
+            client, ensure_session=self._ensure_session
+        )
 
         self._lock = threading.RLock()
         self._adapters: list[Adapter] = []
@@ -1165,6 +1172,7 @@ class BridgeCore:
             "reset": self._cmd_new,
             "stop": self._cmd_stop,
             "status": self._cmd_status,
+            "model": self._cmd_model,
             "cd": self._cmd_cd,
             "approve": self._cmd_approve,
             "allow": self._cmd_approve,
@@ -1319,6 +1327,14 @@ class BridgeCore:
         self._drop_session(conversation_id)
         self._ensure_session(conversation_id)
         self._send_text(conversation_id, f"已切换到 {directory}", adapter=adapter)
+
+    def _cmd_model(self, conversation_id: str, adapter: Adapter, args: str) -> None:
+        """``/model`` —— 逻辑在 :mod:`opencode_bridge.session_model`，这里只转发。"""
+        reply = self.model_command.reply_for(conversation_id, args)
+        self._send_text(
+            conversation_id, reply.text, kind=reply.kind, adapter=adapter,
+            session_id=reply.session_id,
+        )
 
     def _cmd_approve(
         self, conversation_id: str, adapter: Adapter, args: str

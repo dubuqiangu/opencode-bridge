@@ -908,6 +908,58 @@ class StreamingTests(unittest.TestCase):
             # 没有匹配的 turn -> 不该发出任何编辑
             self.assertEqual(adapter.edited, [])
 
+    def test_unrelated_session_events_are_filtered_by_event_volume(self):
+        """`/api/event` 是全服务器广播，必须按会话归属过滤，但**只过滤高频事件**。
+
+        实测曾刷出 `permission request for unknown session ses_effe80...`，
+        那是开发者自己正在跑的 opencode 会话，与本桥毫无关系——却每次都打一条
+        WARNING。同机多会话时这会把日志淹掉。
+
+        但**不能一律过滤**：`permission.asked` 若因竞态丢失，agent 会永远等不到
+        审批，而日志里什么都看不到。所以低频生命周期事件必须放行。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            owned_session = client.created_ids[0]
+
+            # 高频事件 + 别人的会话 -> 被归属过滤，handler 不跑、不产生任何编辑
+            # （会打一行 DEBUG 说明被忽略了——降噪但可查，正是设计意图）
+            core._dispatch(
+                ev("session.text.delta", sessionID="ses_someone_else",
+                   assistantMessageID="msg_x", ordinal=0, delta="别人的内容")
+            )
+            self.assertEqual(adapter.edited, [], "别人的会话不该被渲染")
+
+            # 高频事件 + 自己的会话 -> 正常处理
+            core._dispatch(
+                ev("session.text.delta", sessionID=owned_session,
+                   assistantMessageID="msg_y", ordinal=0, delta="我的内容")
+            )
+            self.assertTrue(adapter.edited, "自己的会话应被处理")
+            self.assertEqual(adapter.edited[-1][1].text, "我的内容")
+
+            # 低频事件 + 未知会话 -> **必须放行**，让原有的警告继续暴露问题
+            with self.assertLogs("opencode_bridge.core", level="WARNING") as logs:
+                core._dispatch(ev("permission.asked", sessionID="ses_ghost",
+                                  id="per_1", action="bash"))
+            self.assertTrue(
+                any("unknown session" in line for line in logs.output),
+                "低频事件不应被归属过滤吞掉，否则审批竞态会静默失败，实际: %r"
+                % (logs.output,),
+            )
+
+    def test_unrelated_session_events_are_not_recorded_as_unhandled(self):
+        """别人的会话事件**不算**"未处理事件名"——否则记账会被噪音撑爆。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            core._dispatch(
+                ev("session.text.delta", sessionID="ses_someone_else",
+                   assistantMessageID="msg_x", ordinal=0, delta="别人的")
+            )
+            self.assertEqual(core._unhandled_event_names, {})
+
     def test_shutdown_interruption_does_not_finalise_turn(self):
         """`execution.interrupted{reason:"shutdown"}` **不是**结束——这一轮会被续跑。
 

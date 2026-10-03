@@ -1158,16 +1158,27 @@ class BridgeCore:
     def _dispatch(self, event: dict) -> None:
         handler = self._handlers.get(str(event.get("type") or ""))
         if handler is None:
-            # 未知事件**不许静默丢弃**。曾经这里是裸 `return`，于是"事件名写错"
-            # 这类错误在生产里表现为**完全无迹可循**：用户只看到 `⏳ 处理中…`，
-            # 而日志里什么都没有。A4 真实验证时被这个坑了两天。
-            #
-            # 记账而不是逐条打日志：单个未知事件可能每秒来几百条（delta 类），
-            # 逐条打会把真正的错误淹掉。首次见到打一行 INFO，之后按名字计数，
-            # 到下一个见到的未知事件时打一行汇总。
+            # 未知**事件名**不许静默丢弃（可能是契约不匹配的信号，要能查）
             self._note_unhandled_event(str(event.get("type") or ""))
-            return  # unknown / irrelevant event
+            return
         data = _as_dict(event.get("data"))
+        if not self._owns_session_event(str(event.get("type") or ""), data):
+            # 已知事件名，但**属于别的会话** —— 这是正常情况，不是错误。
+            #
+            # `/api/event` 是**全服务器广播**：同机跑的其它 agent 会话（本项目里
+            # 就包括开发者自己正在跑的 opencode 会话）的事件同样会推过来。
+            # 实测曾刷出 `permission request for unknown session ses_effe80...`，
+            # 那是我们自己的会话，与Telegram 毫无关系。
+            #
+            # 所以这里与上面的"未知事件名"必须区别对待：
+            #   未知**名字** = 可能是我们漏实现了什么 -> 记账 + 打日志
+            #   已知名字但**别人的会话** = 正常 -> debug 级，不惊动人
+            logger.debug(
+                "忽略非本桥会话的事件 %s (session=%s)",
+                event.get("type"),
+                _session_id(data),
+            )
+            return
         with self._lock:
             # refresh the session -> conversation reverse map every round
             self._sid_conv = {
@@ -1308,6 +1319,45 @@ class BridgeCore:
             if turn is None:
                 return
             turn.tool_trace.append(f"▶ {name}")
+
+    #: 高频、按会话归属过滤的事件类型。`/api/event` 是**全服务器广播**，同机其它
+    #: agent 会话（包括开发者自己正在跑的 opencode 会话）的 delta 会以每秒数百条
+    #: 的量级推过来；不过滤会把日志和 CPU 全烧在无关数据上。
+    #:
+    #: **刻意只包含高频事件**：`permission.asked` 与 `session.execution.*` 不在其中。
+    #: 它们低频，且对它们而言"未知会话"是**有意义的信息** —— 放行让原有的
+    #: warning 继续暴露真问题（比如竞态导致会话没登记上）。若一律过滤，
+    #: 一次竞态就会让 agent 永远等不到审批，而日志里什么都看不到。
+    _HIGH_VOLUME_SESSION_EVENTS = frozenset({
+        "session.text.delta",
+        "session.reasoning.delta",
+        "session.step.started",
+        "session.step.streamed",
+        "session.step.ended",
+        "session.tool.input.started",
+        "session.tool.input.delta",
+        "session.tool.input.ended",
+        "session.tool.called",
+        "session.tool.progress",
+        "session.tool.success",
+        "session.tool.failed",
+    })
+
+    def _owns_session_event(self, event_name: str, data: dict) -> bool:
+        """这个事件是否属于本桥关心的会话。
+
+        判据是"**state.json 里登记过**，或**当前有活跃 turn**"。
+        拿不到 sessionID 时返回 True，交给 handler 自行处理
+        （`session.retry.scheduled` 没有 sessionID，它靠 assistantMessageID
+        反查，反查不到会安静返回并记debug 日志）。
+        """
+        if event_name not in self._HIGH_VOLUME_SESSION_EVENTS:
+            return True  # 低频生命周期事件：放行，让"未知会话"的警告有意义
+        session_id = _session_id(data)
+        if not session_id:
+            return True
+        with self._lock:
+            return session_id in self._sid_conv or session_id in self._turns
 
     def _session_for_assistant(self, assistant_id: str) -> str | None:
         """按 ``assistantMessageID`` 反查它属于哪个会话。

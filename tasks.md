@@ -142,7 +142,8 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 
 | 类 | 文件 | 方法数 | 自有代码行 |
 |---|---|---|---|
-| `BridgeCore` | `core.py` | **26** | **681** |（原 49/1120 -> 54/1315 -> **26/681**）|
+| `BridgeCore` | `core.py` | **22** | **449** |（原 49/1120 -> 峰值 54/1315 -> 26/681 -> **22/449**）|
+| `InboundGateway` | `inbound_gateway.py` | 8 | 304 |（`c59095b` 新增；见「已知偏离」）|
 | `EventStream` | `event_stream.py` | 18 | 491 |（`67cb720` 新增；见下方「已知偏离」）|
 | `CommandHandler` | `commands.py` | 13 | 289 |（`f8461d0` 新增；含冻结文案约 129 行）|
 | `HomeAssistantAdapter` | `adapters/homeassistant.py` | 49 | 829 |
@@ -609,6 +610,59 @@ HEAD 的 `_finalize`，基线记下 `TypeError` 而非旧行为），它改成�
 进度气泡 + 一条报错」。`execution-failed-long-error` 场景在 `804eb37` 前后
 **逐字节相同**。修它要截断或切分错误正文 = **改变用户可见的消息切分**，
 与第 4 项同类决策。触发条件很窄：默认需错误正文超过 4000 字符。
+
+##### 类体量偿债第三步：入站/队列/收件箱簇抽出（`c59095b`）
+
+`BridgeCore` **26 → 22 方法 / 686 → 449 行**。三步累计：**54/1315 → 22/449**，
+拆成四个内聚的类（`CommandHandler` / `EventStream` / `InboundGateway` + 瘦身后的 core）。
+
+**这一簇跑的是 G2 的写前收件箱 —— 消息持久性路径**，失误等于静默丢消息或重复投递，
+正是 A4 真机验证暴露的原始症状。所以我额外强调「**被污染的基线比没有基线更糟**」
+（上一轮它正是在这里栽过：只替换一个文件，基线记下 `TypeError` 而非旧行为）。
+
+**这次基线是三重印证的**：
+
+    baseline（改动前，2 次跑）      103937 字节  54FBD809…36D6E
+    baseline（从 HEAD 重新替换）   103937 字节  54FBD809…36D6E
+    candidate（工作树）            103937 字节  54FBD809…36D6E   ← 逐字节相同
+
+每步记录全部 `Outbound`、编辑、按钮回执、client 调用、**直接从 SQLite 读出的原始
+收件箱行**、会话映射与队列簿记。32 场景 / 74 步，50 次收件箱行读取横跨**全部四种
+状态**（pending 6 / attempting 8 / delivered 31 / failed 5），其中 **20 个场景专打
+持久性**：写前落盘后崩溃（行留 pending、不派发）、prompt 中崩溃（attempting、
+**不重放**）、重启重放（崩溃后 / 失败后）、409 后刷队列、两次 409 仍排队、
+三类失败各自的 `last_error` 原文、按 message-id 与按内容哈希去重、**命令永不写前
+落盘**、恢复时对 `attempting` 只告警、预算耗尽放弃、通知失败、派发失败。
+
+**本簇未发现新行为缺陷** —— 实现者是被要求专门盯这条路径的，如实报「没有」比
+挖出 bug 更能说明快照逐字节相同是真的一致，而非巧合。
+
+**非空洞验证里两处变异起初是绿的**，它如实报告这是**自己测试的真实缺口**而非代码
+问题，补了 3 条测试（忙消息排队位置需要两条消息的队列才能区分头尾；恢复路径需要给
+收件箱替身加写日志）后重验为红。**这比一开始全绿有价值。**
+
+构造顺序上有一处真实的双向依赖：`EventStream` 需要 `flush_queue`，而
+`InboundGateway` 需要流的 `stream_confirmed`。所以 core 保留 `_flush_queue` 作为
+**一行转发的接缝**（与既有的 `send_text`/`finalize`/`edit_progress` 接缝同模式），
+并在流之后构造 gateway。
+
+##### §8 决策记录：**否决**「为了让 `EventStream` 达标而拆 turn 表」
+
+我问了它一个决定下一步的问题：第三步搬走 `_dispatch_prompt` 之后，事件流能否
+完全拥有 turn 表？它答**不能**，并指出一个我没想到的东西：
+
+`_turns` 有**三个**写入者 —— `InboundGateway._dispatch_prompt`（建、挂 handle）、
+`EventStream`（建/改/弹）、`BridgeCore._drop_session`（弹）。而 `_drop_session`
+在会话映射簇，所以第三步后流**仍有簇外写入者**。
+
+更要紧的是：**即使**第四步搬走 `_drop_session`、让流自己建这个 dict，
+gateway 仍然需要流上的 owner 方法（`begin_turn`/`attach_progress`）——
+**耦合不会消失，只是挪个位置**。而且 `_lock` 无论如何都得注入（core 另有 7 个
+方法在用）——「**拥有 turn 表不等于拥有 turn 状态**」。
+
+**据此否决**：拆 turn 表属于「为了达标而拆」，而 §5.1 明确说「若拆完还要同时改两个
+类，说明拆错了」。加上拆完仍超行数阈值，**收益不抵耦合搬家的代价**。
+该判断已写进第四步的指令，第四步**不做**这件事。
 
 ##### 类体量仍未达标的地方（有意接受，非漏做）
 

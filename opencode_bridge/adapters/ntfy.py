@@ -266,6 +266,19 @@ class NtfyAdapter(Adapter):
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+    @property
+    def running(self) -> bool:
+        """轮询线程是否还在跑。
+
+        ⚠️ **必须显式覆写**：基类的 ``running`` 读 ``self._thread``，而线程归
+        ``Transport`` 所有、本类从不设它 —— 于是 ``capabilities()["running"]``
+        会**永远是 False**，``--status`` / ``--setup --json`` 就会把一个正在收信的
+        平台报成"没在跑"。这属于本项目反复修的那一类"状态被误报"。
+        与已迁移的 irc / matrix / telegram / slack / qqbot 同款。
+        """
+        transport = self._transport
+        return transport is not None and transport.running
+
     def start(self) -> None:
         if not self.topic:
             logger.warning("ntfy: topic missing; adapter not started")

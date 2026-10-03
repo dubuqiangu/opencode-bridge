@@ -89,9 +89,27 @@
 
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
-| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 4/11：IRC ✓ Matrix ✓ Telegram ✓ Slack ✓**（下一个：Discord） |
-| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ☑ 模块已建成（24 用例）；**迁移进度 1/9：IRC ✓**（`irc` 前缀在 `LEGACY_PREFIXES` 里映射到自身，故 `conversation_id` 字节级不变，已用断言钉死） |
-| A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ |
+| A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 4/8：IRC ✓ Matrix ✓ Telegram ✓ Slack ✓**。剩余：**Discord**（需"周期钩子"跑心跳）→ Mattermost → Twitch（IRC-over-WS，最别扭，或考虑不迁）。⚠️ **Nextcloud 不迁**：它是 5 worker 轮转池（在飞长轮询恒 ≤ worker 数），映射不到单`fetch` 回调模型，硬迁会破坏结构 |
+| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ◐ 包已建成（24 用例）。**分两类**：<br>· **映射到自身、切换零风险**（`conversation_id` 字节级不变）：irc ✓ / **twitch ☐ / nextcloud ☐** —— 后两家只差一个 `format_id()` 调用，可随时做<br>· **切换会改键格式**（须先有 A2b）：telegram(`chat:`) / matrix(`room:`) / slack / discord / mattermost(`channel:`，歧义还需知道是哪一家) ☐ |
+| A2b | **`state.json` 键迁移**：加载时按 `identity.normalize(..., platform_hint=)` 重写旧键并原子落盘 | M | 用旧 `state.json` 起一次，`chat:`/`room:`/`channel:` 键全部变新格式；**中途中断不丢数据**；旧文件保留备份 | ☐ **A2 的前置**，见下方备注 |
+| A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ `httpsrv.py` 已建成（a2a 首个使用方），A3 只需 `add_route()` |
+| A4 | **真实服务端到端验证**：至少让一个平台对着**真实服务器**跑通入站+ 出站 | M | 有一条真实会话的端到端记录（收发各一条），并把踩到的协议差异写回文档 | ☐ **⚠️ 当前 12 个平台无一验证过**，详见下方备注 |
+
+**A2b 为什么必须先做**：切前缀会改 `conversation_id` 的**字符串格式**，而 `StateStore`
+拿它当**不透明键**存会话映射 —— 于是已落盘 `state.json` 里的旧键全部变成孤儿，
+用户会**一次性丢失会话映射**，而且**不报错**（只表现为"agent 突然记错上下文"，
+比直接失败难查得多）。所以这不是格式美化，是**数据迁移**。
+歧义前缀 `channel:` 还多一层：它被 slack / discord / mattermost **三家共用**，
+无法从字符串判断来源，必须由调用方（知道自己是哪家的适配器或 core 的路由层）传
+`platform_hint`，**绝不猜**。
+
+**A4 为什么必须做（当前最大的已知风险）**：12 个平台的协议事实全部来自
+**官方文档 + 参考项目源码 + 本机回环/假服务器测试**，手法本身可靠，但
+**没有任何一个平台对着真实服务器跑通过** —— 手上没有任何 token。
+已知的三类残余风险：① 协议字段猜错（症状多为静默收不到消息）；
+② 权限/限流语义猜错（如 intents 没勾、scope 不对，症状是"连上了但没事件"）；
+③ 各家服务端实现与文档不一致。**只要有一个平台跑通真实收发，就能把①②类风险
+从"未知"降为"已验证"**，所以这一项的性价比高于再加一个平台。
 
 ---
 
@@ -770,4 +788,41 @@
       它锁定的正是现已修好的 bug。已把延时置 0（**让 qqbot 整套真服务器测试顺带
       覆盖"同段"这条路径，即现实里服务端的行为**）并把守卫用例**反转**为正向断言。
   验证：**qqbot 113 OK**、**全量 1296 tests OK (skipped=1)**、compileall 0、12 个平台。
+- **2026-10-03** **跨适配器机械审计**（应用户要求"审视已完成的功能是否存在 bug"）：
+  写脚本对 12 个适配器逐项检查这一整轮反复暴露的风险类，而不是靠回忆逐个翻文件。
+  - **发现 1 个真 bug**：`ntfy` 与 `email` **继承了基类的 `running`**，而基类读
+    `self._thread` —— 这两家把线程交给了 `Transport`、**从不设** `_thread`，
+    于是 `capabilities()["running"]` **永远是 False**，`--status` /
+    `--setup --json` 会把一个**正在收信**的平台报成"没在跑"。
+    属于本项目反复修的那一类"**状态被误报**"（此前修过"配了但报未配置"、
+    "发不出去"、"入站没通"）。
+    实证：修复前 `ntfy` 在 `start()` 之后仍报 `running=False`；修复后
+    `start()` → True、`stop()` → False，与 irc 一致。
+    - **新增跨适配器回归测试**（`TestTransportBasedRunningIsReported`，2 条）：
+      凡源码里出现 `_transport` 的适配器**必须**在自己的 `__dict__` 里覆写
+      `running`，并列出 `ntfy/email/irc/telegram` 作为"本用例确实覆盖到了"的断言；
+      另有一条**反面对照**保证"未迁移、仍用 `_thread` 的平台继承基类是对的"。
+      **并且验证了这条测试确实有效** —— 临时删掉 ntfy 的覆写，用例立刻失败。
+  - **审计的 2 处误报也如实记录**（机械检查的局限）：
+    ① `a2a: 未接transport` —— **设计使然**，它是服务器不是轮询器，走 `httpsrv.py`；
+    ② `ntfy: start() 未 clear _stop_event` —— **不是 bug**：ntfy 的 `stop()` 既不调
+       `super().stop()` 也从不碰 `_stop_event`，而 `start()` 每次都新建 transport，
+       所以那个陈旧 event 毫无影响。这条与我在 Slack 上修的"stop 后重启静默不工作"
+       表面相似、机制不同 —— **不能看到同一个 grep 命中就照抄结论**。
+  - 审计顺带确认无问题的项：凭据不变量 12 家全过（含 `config_optional` 只有 a2a
+    为真）、能力声明无谎报、`edit()` 返回注解均为 `bool`、12 家失败路径都有记账。
+  - **同时补齐了 4 个计划缺口**（应用户要求"未实现的功能是否有安排好的执行计划"）：
+    ① 阶段 A 表格里**根本没有 "`state.json` 键迁移"这一行** —— 而它是 5 个平台
+       （telegram/matrix/slack/discord/mattermost）切前缀的**硬前置**，之前只作为
+       Matrix 进度日志里的一句背景提到，**没有被排期**。已补为 **A2b** 并写清
+       "这不是格式美化，是数据迁移"+ 歧义前缀那多出来的一层；
+    ② **A2 的进度数字过时**（写着 1/9），现已按"映射到自身（零风险）"与
+       "切换会改键格式（须先有 A2b）"**分类**列出；
+    ③ **A1 也没记下 Nextcloud 不可迁移的理由**（5 worker 轮转池），导致"下一个"
+       看起来像还有 5 家；现明确剩余为 Discord → Mattermost → Twitch（3 家）；
+    ④ 新增 **A4 真实服务端端到端验证** —— 这是**当前最大的已知风险**：
+       12 个平台的协议事实全来自官方文档 + 参考源码 + 本机假服务器，
+       **但没有任何一个对着真实服务器跑通过**（手上无 token）。已写明三类残余风险
+       与"跑通一个平台的性价比高于再加一个平台"的判断。
+  验证：**全量 1298 tests OK (skipped=1)**、compileall 0。
 

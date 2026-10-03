@@ -890,6 +890,66 @@ class TestBuildRegistry(unittest.TestCase):
             base_mod._REGISTRY.pop("faketestplat", None)
 
 
+class TestTransportBasedRunningIsReported(unittest.TestCase):
+    """凡是线程归``Transport`` 所有的适配器，都**必须**覆写 ``running``。
+
+    ⚠️ 这条来自一个真实缺陷：基类 ``Adapter.running`` 读 ``self._thread``
+    （``thread is not None and thread.is_alive()``），而传输层化的适配器把线程
+    交给了 ``Transport``、**从不设** ``_thread`` —— 于是继承基类的那个实现会
+    **永远返回 False**，``capabilities()["running"]`` 也就永远False，
+    ``--status`` / ``--setup --json`` 会把一个**正在收信**的平台报成"没在跑"。
+
+    ``ntfy`` 与 ``email`` 都栽在这上面（它们生在新传输层上，却继承了基类实现）。
+    这条测试一次性覆盖全部适配器，所以下一个"生在新传输层上"的平台不会再栽。
+
+    判据用**类自己的``__dict__``** 而不是"能否跑起来"—— 后者需要真实网络或
+    逐个平台造条件，既慢又脆。
+    """
+
+    def test_transport_based_adapters_must_override_running(self):
+        import inspect
+        import sys
+
+        from opencode_bridge.adapters import adapter_class, registered_names
+
+        checked = []
+        for name in sorted(registered_names()):
+            cls = adapter_class(name)
+            module = sys.modules[cls.__module__]
+            source = inspect.getsource(module)
+            if "_transport" not in source:
+                continue  # 未传输层化，仍用 _thread，继承基类是对的
+            checked.append(name)
+            with self.subTest(platform=name):
+                self.assertIn(
+                    "running",
+                    cls.__dict__,
+                    f"{name} 的线程归 Transport 所有，却继承了基类 running"
+                    f"（基类读 self._thread，本类从不设它）→ capabilities() 里"
+                    f" running 永远是 False，状态视图会把正在收信的平台报成没在跑",
+                )
+        # 这条断言本身要有效：至少得覆盖到几个已知传输层化的平台
+        for expected in ("ntfy", "email", "irc", "telegram"):
+            self.assertIn(expected, checked, f"{expected} 应被本用例覆盖")
+
+    def test_base_running_still_works_for_thread_owning_adapters(self):
+        """反面对照：仍用 ``_thread`` 的适配器继承基类实现是对的，别被误改。"""
+        from opencode_bridge.adapters import adapter_class, registered_names
+
+        inheriting = []
+        for name in sorted(registered_names()):
+            cls = adapter_class(name)
+            if "running" in cls.__dict__:
+                continue
+            inheriting.append(name)
+            with self.subTest(platform=name):
+                self.assertFalse(
+                    hasattr(cls, "_transport"),
+                    f"{name} 既有 _transport 又没覆写 running —— 那才是 bug",
+                )
+        self.assertTrue(inheriting, "应至少有几个未迁移的平台继承基类 running")
+
+
 class TestCapabilities(unittest.TestCase):
     """T1.1 — 能力显式声明：调用方据此判断，不再靠 try/except 猜。"""
 

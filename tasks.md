@@ -399,6 +399,55 @@ core.py:739   outcome = self._dispatch_prompt(...)
 `tests/test_telegram.py:475`、`test_cursor_advances_before_processing` `tests/test_email.py:517`）。
 把顺序翻成"成功后才推进"等于改成至少一次，**会同时破坏这些测试和 at-most-once 语义**。
 
+#### 崩溃丢失的**真实机制**（2026-10-03 核实，修正上一轮结论）
+
+上一轮写的"丢失点在 `core.py:738`、修复收在 core.py、不要动适配器"
+**只对 dispatch 失败成立，对崩溃不成立**。两种路径必须分开看：
+
+**路径 A —— dispatch 失败（prompt 抛异常）**
+
+丢失点就是 `core.py:738` 出队 + 三个 `return "error"` 分支。但这条路径
+**用户看得见**（已发 `发送失败: …`），所以**不是静默丢失**。
+
+**路径 B —— 崩溃落在窗口里（真静默，机制在适配器，不在 core）**
+
+关键：**Telegram 的 ack 是隐式且滞后的**。`getUpdates(offset=N)` 才确认 id<N 的
+消息；内存里推进 `_offset`（`telegram.py:454-460`）要等**下一轮**轮询才生效。
+所以崩溃之后平台**本来还会重投**——
+
+**是重启时我们自己把重投丢掉的**：
+
+```
+adapters/telegram.py:322   start() -> self._flush_pending()
+adapters/telegram.py:352     getUpdates {"limit": 1, "offset": -1}
+adapters/telegram.py:364     self._offset = last_update_id + 1
+adapters/telegram.py:327     self._pending.clear()
+```
+
+即**每次启动都主动告诉 Telegram 忘掉所有未确认更新**。崩溃窗口那条尾巴
+在这里被销毁，**且一行日志都没有**。
+
+**这个区别决定设计方向，不能含糊：**
+
+| 只修一侧 | 后果 |
+|---|---|
+| 只修 core（路径 A） | 崩溃路径 B **原样存在**，静默丢失照旧 |
+| 只改适配器顺序（hermes「成功才记录」） | **对我们无效** —— 连重投都拿不到，启动时已丢 |
+
+**还有一层张力**：若改成"启动不丢弃"，代价是**新装机器上会重放最多 24 小时历史**
+（Telegram 对未确认更新的保留上限）。hermes 的 receipt 集合也躲不开这点——
+首次运行没有 receipt，等于全量重放。所以"首次运行"与"崩溃重启"**必须能被区分**，
+而这需要额外持久化状态。
+
+**另一个约束**：`telegram.py:33/398/426/440` 有明文「**顺序铁律：先推进 offset，
+再分发**」，理由是防止单条毒消息卡死整批、导致轮询楔住。任何改成至少一次的设计
+**必须保住这个性质**。
+
+**当前状态**：机制已查清，**具体形态待架构裁决**（已派 oracle 权衡两条路线：
+路径 A 的 core 重试队列 vs 路径 B 的启动丢弃/重投恢复）。实现前不要照任一侧动手。
+
+---
+
 **两个必须避开的坑**
 
 - `StateStore` 每次 `set_meta` 都是**全文件重写 + fsync**（`state.py:411-433`，

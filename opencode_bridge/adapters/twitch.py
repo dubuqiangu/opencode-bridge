@@ -47,6 +47,7 @@ import uuid
 from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
 from .base import Adapter, classify_http, register
 # 纯解析/文本工具复用 IRC 适配器的唯一实现（不重复实现，也不修改它）
@@ -719,7 +720,15 @@ class TwitchAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(target: Any) -> str:
-        return f"twitch:{target}"
+        """``twitch`` 在 ``identity.LEGACY_PREFIXES`` 里**映射到自身**，所以这里改用
+        ``format_id`` 的产物与原来的 ``f"twitch:{target}"`` **逐字节相同** ——
+        已落盘的 ``state.json`` 不受影响（这三家irc / twitch / nextcloud 都享有
+        这个性质；``chat:`` / ``room:`` / ``channel:`` 不享有）。
+
+        :meth:`_target` **刻意保留手写剥前缀**：它必须容忍无前缀的裸 target，
+        而 ``identity.local_of()`` 对那种输入会抛错 —— 换成它就是行为变更。
+        """
+        return format_id("twitch", target)
 
     @staticmethod
     def _target(conversation_id: Any) -> Optional[str]:

@@ -90,7 +90,7 @@
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
 | A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（56 用例）；**迁移进度 4/8：IRC ✓ Matrix ✓ Telegram ✓ Slack ✓**。剩余：**Discord**（需"周期钩子"跑心跳）→ Mattermost → Twitch（IRC-over-WS，最别扭，或考虑不迁）。⚠️ **Nextcloud 不迁**：它是 5 worker 轮转池（在飞长轮询恒 ≤ worker 数），映射不到单`fetch` 回调模型，硬迁会破坏结构 |
-| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ◐ 包已建成（24 用例）。**分两类**：<br>· **映射到自身、切换零风险**（`conversation_id` 字节级不变）：irc ✓ / **twitch ☐ / nextcloud ☐** —— 后两家只差一个 `format_id()` 调用，可随时做<br>· **切换会改键格式**（须先有 A2b）：telegram(`chat:`) / matrix(`room:`) / slack / discord / mattermost(`channel:`，歧义还需知道是哪一家) ☐ |
+| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ◐ 包已建成（27 用例）。**分两类**：<br>· **映射到自身、切换零风险**（`conversation_id` 字节级不变）：**irc ✓ twitch ✓ nextcloud ✓ 已全部完成**<br>· **切换会改键格式**（须先有 A2b）：telegram(`chat:`) / matrix(`room:`) / slack / discord / mattermost(`channel:`，歧义还需知道是哪一家) ☐ |
 | A2b | **`state.json` 键迁移**：加载时按 `identity.normalize(..., platform_hint=)` 重写旧键并原子落盘 | M | 用旧 `state.json` 起一次，`chat:`/`room:`/`channel:` 键全部变新格式；**中途中断不丢数据**；旧文件保留备份 | ☐ **A2 的前置**，见下方备注 |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ `httpsrv.py` 已建成（a2a 首个使用方），A3 只需 `add_route()` |
 | A4 | **真实服务端到端验证**：至少让一个平台对着**真实服务器**跑通入站+ 出站 | M | 有一条真实会话的端到端记录（收发各一条），并把踩到的协议差异写回文档 | ☐ **⚠️ 当前 12 个平台无一验证过**，详见下方备注 |
@@ -826,3 +826,17 @@
        与"跑通一个平台的性价比高于再加一个平台"的判断。
   验证：**全量 1298 tests OK (skipped=1)**、compileall 0。
 
+- **2026-10-03** **A2 的零风险部分收官**：twitch 与 nextcloud 的 `_conversation_id`
+  从手写 `f"prefix:{x}"` 改走 `identity.format_id`（与 IRC 同款）。
+  - **零风险的根据**：这两家在 `LEGACY_PREFIXES` 里**映射到自身**，所以产物与原来
+    **逐字节相同** —— 已落盘 `state.json` 不受影响，用户无感。
+    实测覆盖空值类、**含冒号的 id**（local 段允许冒号）、CJK、超长串，全部相同。
+  - **`_target()` / `_token()` 刻意保留手写剥前缀**：它们必须容忍**无前缀的裸
+    target**，而 `identity.local_of()` 对那种输入会抛错 —— 换成它就是行为变更。
+    这与 IRC 迁移时的判断一致。
+  - 新增**跨适配器**回归断言（`TestSelfMappingPrefixesStayByteIdentical`，3 条），
+    放在 `test_identity.py` 而非各平台测试文件 —— **一处覆盖全部三家**，且含一条
+    **反向断言**确认它们真的改走了 `format_id`（而不是碰巧输出相同）。
+    还钉住了那个前提本身："这几个前缀在登记表里映射到自身" —— 若哪天有人把它改成
+    指向别的平台，"零风险"就不成立了，用例会立刻失败。
+  验证：**223 OK**（twitch + nextcloud + identity + routing）、compileall 0。

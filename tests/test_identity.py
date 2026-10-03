@@ -192,5 +192,72 @@ class TestNormalize(unittest.TestCase):
         self.assertNotEqual(after_slack, after_discord)  # 迁移后：不再撞车
 
 
+class TestSelfMappingPrefixesStayByteIdentical(unittest.TestCase):
+    """映射到自身的前缀：改用 ``format_id`` 后产物必须**逐字节相同**。
+
+    ``identity.LEGACY_PREFIXES`` 里有三个平台的旧前缀映射到自身 ——
+    ``irc`` / ``twitch`` / ``nextcloud``。所以这几家把 ``_conversation_id`` 从
+    手写``f"prefix:{x}"`` 换成 ``format_id("prefix", x)`` 是**零风险**的：
+    已落盘 ``state.json`` 的键一个字节都不会变，用户不受影响。
+
+    而 ``chat:`` / ``room:`` / ``channel:`` **不享有**这个性质（它们指向别的平台），
+    切换必须先有 ``state.json`` 键迁移（tasks.md 的 A2b）。
+
+    这条测试的作用是**钉住那个前提**：若哪天有人把这些前缀改成"指向别的平台"，
+    或者改坏某个 ``_conversation_id``，这里会立刻失败 —— 因为"零风险"完全依赖
+    "映射到自身"这个登记。
+    """
+
+    #: 这些平台的 ``_conversation_id`` 已改走 format_id
+    SELF_MAPPING = {
+        "irc": "irc",
+        "twitch": "twitch",
+        "nextcloud": "nextcloud",
+    }
+
+    #: 覆盖空值类、含冒号（local 段允许冒号）、CJK、超长
+    SAMPLES = ["someone", "#chan", "a", "name_with:colon", "名字", "x" * 200, "1"]
+
+    def test_registered_prefixes_map_to_themselves(self):
+        from opencode_bridge.identity import LEGACY_PREFIXES
+
+        for prefix, platform in self.SELF_MAPPING.items():
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    LEGACY_PREFIXES.get(prefix), platform,
+                    f"{prefix} 必须映射到自身，否则下面的字节相同性不成立",
+                )
+
+    def test_conversation_id_output_is_byte_identical(self):
+        from opencode_bridge.identity import format_id
+        from opencode_bridge.adapters import adapter_class, registered_names
+
+        for prefix, platform in self.SELF_MAPPING.items():
+            cls = adapter_class(platform)
+            self.assertIn(platform, registered_names())
+            for sample in self.SAMPLES:
+                with self.subTest(platform=platform, sample=sample[:12]):
+                    # format_id 与旧的手写 f-string 必须完全一致
+                    self.assertEqual(format_id(prefix, sample), f"{prefix}:{sample}")
+                    # 而适配器实际产出的也必须一致
+                    self.assertEqual(
+                        cls._conversation_id(sample), f"{prefix}:{sample}"
+                    )
+
+    def test_those_platforms_actually_use_format_id(self):
+        """反向：确认它们**真的**改走了 format_id，而不是碰巧输出相同。"""
+        import inspect
+
+        from opencode_bridge.adapters import adapter_class
+
+        for platform in self.SELF_MAPPING:
+            with self.subTest(platform=platform):
+                module = inspect.getmodule(adapter_class(platform))
+                self.assertIn(
+                    "format_id(", inspect.getsource(module),
+                    f"{platform} 的 _conversation_id 应走 identity.format_id",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

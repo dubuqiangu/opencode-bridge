@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
 from .base import Adapter, classify_http, register
 
@@ -919,7 +920,15 @@ class NextcloudAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(token: Any) -> str:
-        return f"nextcloud:{token}"
+        """``nextcloud`` 在 ``identity.LEGACY_PREFIXES`` 里**映射到自身**，所以这里改用
+        ``format_id`` 的产物与原来的 ``f"nextcloud:{token}"`` **逐字节相同** ——
+        已落盘的 ``state.json`` 不受影响（irc / twitch / nextcloud 三家都享有这个
+        性质；``chat:`` / ``room:`` / ``channel:`` 不享有）。
+
+        :meth:`_token` **刻意保留手写剥前缀**：它必须容忍无前缀的裸 token，
+        而 ``identity.local_of()`` 对那种输入会抛错 —— 换成它就是行为变更。
+        """
+        return format_id("nextcloud", token)
 
     @staticmethod
     def _token(conversation_id: Any) -> Optional[str]:

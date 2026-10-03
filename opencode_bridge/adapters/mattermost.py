@@ -61,12 +61,34 @@ G4：WS 连接 / 收包循环 / 退避 / 线程 / ``stop()`` 语义已迁到
    "4000" 都不是稳定契约。因此类属性 :attr:`MattermostAdapter.max_message_length`
    只声明一个**保守的静态下限**（官方常量 ``PostMessageMaxRunesV1`` = 4000），
    启动后再用 ``GET /api/v4/config/client?format=old`` 的 ``MaxPostSize`` **细化**。
+
+``conversation_id`` 前缀：已从 ``channel:`` 切到 ``mattermost:``（歧义前缀，靠划分回读）
+------------------------------------------------------------------------
+``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里的值是 ``None`` ——
+**歧义前缀**，被 slack / discord / mattermost **三家共用**，光看字符串**判不出**来源。
+所以切前缀不像 telegram / matrix 那样只要配一次键迁移就完事：**旧键永远迁不了**
+（:mod:`opencode_bridge.state` 对歧义前缀只捕获、不归一），必须靠"读取时回退"把历史
+会话接上。
+
+于是本适配器做三件事：产出统一的 ``mattermost:<channel_id>``
+（:meth:`MattermostAdapter._conversation_id`）；声明
+:attr:`MattermostAdapter.legacy_conversation_prefix` = ``channel:`` 并让
+:meth:`MattermostAdapter._channel_id` 继续认旧前缀（只为让读侧知道那个旧前缀长什么样）；
+声明 :attr:`MattermostAdapter.local_id_pattern` = :data:`MATTERMOST_LOCAL_ID_PATTERN`
+—— **本平台自己的** local id 文法（26 位小写字母/数字）。
+
+回退读发生在哪一步：:mod:`opencode_bridge.conversation_keys` 只在**发起查询的平台
+就是 mattermost**、且那个 local id 符合**本文件**声明的文法时，才去试一次
+``channel:<local>``。三家文法两两不相交，于是"这个 ``channel:`` 键归谁"是**能确定的
+判断**而不是猜；推导见 :data:`MATTERMOST_LOCAL_ID_PATTERN`，判定入口见
+:meth:`~opencode_bridge.adapters.base.Adapter.owns_local_id`。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import ssl
 import threading
 import time
@@ -76,6 +98,7 @@ import urllib.request
 from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
 from ..transport import WebSocketTransport
 from .base import Adapter, classify_http, register
@@ -127,6 +150,18 @@ PRE_HELLO_GRACE = 10.0
 #: ``typing`` / ``reaction_*`` / ``channel_*`` 等一切噪声事件。
 POSTED_EVENT = "posted"
 
+#: Mattermost local id 的文法：**恰好 26 位**的小写字母 / 数字。
+#:
+#: Mattermost 的所有实体 id 都由服务端 ``model.NewId()`` 生成 —— 一个固定 **26 位**
+#: 的 base32 串（字母表 ``ybndrfg8ejkmcpqxot1uwisza345h769``，所以是小写 + 数字）。
+#: 同一份生成本也用在校验 WebSocket ``hello`` 的连接 id 上（本文件按 26 字符读它）。
+#:
+#: ⚠️ **长度是承重的那一头**，必须恰好 26：26 位**纯数字**也要算 mattermost 的 ——
+#: base32 字母表里本来就有数字，而 discord 的上限是 20 位（见
+#: :data:`~opencode_bridge.adapters.discord.DISCORD_LOCAL_ID_PATTERN`），所以这一格
+#: 不会和 discord 抢；slack 那格要求大写字母开头，也抢不到。
+MATTERMOST_LOCAL_ID_PATTERN = re.compile(r"^[a-z0-9]{26}$")
+
 
 def _classify_mm_error(status: int, data: Any) -> SendError:
     """把 HTTP 状态码 + Mattermost 的 ``{"message", "detailed_error"}`` 收敛成 7 类。
@@ -177,6 +212,10 @@ class MattermostAdapter(Adapter):
     真实上限随部署而异（服务端运行时从 DB 列宽算出），启动后由
     :meth:`_apply_max_post_size` 用 ``GET /config/client`` 的 ``MaxPostSize`` 细化，
     出站分片按**运行时的有效值**切（见 :attr:`message_limit`）。
+
+    ``_conversation_id`` 产出统一格式 ``mattermost:<channel_id>``（已从 ``channel:``
+    切过来），``_channel_id`` 仍认旧前缀；读取时的归属划分见
+    :mod:`opencode_bridge.conversation_keys`。
     """
 
     name = "mattermost"
@@ -198,6 +237,18 @@ class MattermostAdapter(Adapter):
     #: 分片阈值（**运行时的有效上限**）：初值 = 静态下限，``start()`` 后被 MaxPostSize 细化。
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
+    #: 迁移前 Mattermost 用的 ``conversation_id`` 前缀（**歧义**：三家共用）。
+    #: 值刻意写**字面量**，不用任何常量拼 —— 拼了就跟"防走偏断言"一样会恒真。
+    legacy_conversation_prefix = "channel:"
+    #: 本平台的 local id 文法（26 位小写字母/数字，见
+    #: :data:`MATTERMOST_LOCAL_ID_PATTERN` 的推导）。判定入口是基类的
+    #: :meth:`~opencode_bridge.adapters.base.Adapter.owns_local_id`。
+    local_id_pattern = MATTERMOST_LOCAL_ID_PATTERN
+    #: ``conversation_id`` 的合法前缀：当前格式 + 旧别名。
+    #: :meth:`_channel_id` 按这个列表剥前缀，所以**旧前缀必须继续认** ——
+    #: 写前收件箱把 ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的
+    #: 未投递消息带着 ``channel:``，认不出来就等于把那些回复永久丢弃。
+    _CONVERSATION_PREFIXES = ("mattermost:", legacy_conversation_prefix)
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
@@ -855,13 +906,30 @@ class MattermostAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(channel_id: Any) -> str:
-        return f"channel:{channel_id}"
+        """``channel_id`` → ``mattermost:...``（统一 ``platform:local_id`` 格式）。
+
+        ① 歧义前缀 **永不迁移**：:mod:`opencode_bridge.state` 对 ``channel:`` 只捕获、
+        不归一（归属从未被持久化，推不出来），所以历史会话靠
+        :mod:`opencode_bridge.conversation_keys` 的"各家 local id 文法不相交"
+        在**读取时**接回来 —— 判据是 :attr:`MattermostAdapter.local_id_pattern`。
+        ② 反向解析（:meth:`_channel_id`）必须继续认 ``channel:``：写前收件箱把
+        ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的未投递消息带着
+        旧前缀，认不出来就等于把那些回复永久丢弃。
+        """
+        return format_id("mattermost", channel_id)
 
     @staticmethod
     def _channel_id(conversation_id: Any) -> Optional[str]:
+        """``conversation_id`` → Mattermost channel id；空的一律返回 ``None``。
+
+        裸 channel id 也认，切换前后的两种前缀都认 ——
+        理由见 :attr:`MattermostAdapter._CONVERSATION_PREFIXES`。
+        """
         raw = str(conversation_id or "")
-        if raw.startswith("channel:"):
-            raw = raw[len("channel:"):]
+        for prefix in MattermostAdapter._CONVERSATION_PREFIXES:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
         return raw or None
 
     def _post_body_bytes(self, channel_id: str, text: str) -> int:

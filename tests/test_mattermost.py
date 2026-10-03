@@ -419,7 +419,7 @@ class TestPostedEvent(MattermostTestCase):
         )
         self.assertEqual(len(hooks.inbounds), 1)
         inbound = hooks.inbounds[0]
-        self.assertEqual(inbound.conversation_id, f"channel:{CHANNEL}")
+        self.assertEqual(inbound.conversation_id, f"mattermost:{CHANNEL}")
         self.assertEqual(inbound.text, "你好 **world**", "正文取 data['message']")
         self.assertEqual(inbound.user_id, OTHER_USER_ID, "作者取 data['user_id']")
         self.assertEqual(inbound.message_id, "post_abc", "消息 id 取 data['id']")

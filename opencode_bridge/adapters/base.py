@@ -8,8 +8,9 @@ import importlib.util
 import logging
 import os
 import pkgutil
+import re
 import threading
-from typing import Dict, Type
+from typing import Dict, Optional, Type
 
 from ..hooks import Hooks, MsgHandle, Outbound, SendError, SendResult
 
@@ -119,6 +120,43 @@ class Adapter(abc.ABC):
     #: 置True 表示"我没有凭据可填，且默认值是安全的"。它**不豁免任何配置声明义务**：
     #: ``required_tokens`` 仍须非空（守那条不变量的测试照样通过）。
     config_optional: bool = False
+
+    #: 迁移**前**本平台用的 ``conversation_id`` 前缀，**仅当它有歧义**（多家共用）
+    #: 时才需要声明；``None`` 表示"没有歧义旧前缀"（那种由
+    #: :meth:`~opencode_bridge.state.StateStore` 的键迁移自动处理）。
+    #:
+    #: ⚠️ 这不是装饰性字段：它是 :mod:`opencode_bridge.conversation_keys` 在**读取时**
+    #: 回退旧键的前提 —— 没有它就没人知道本平台历史上用的是哪个前缀。
+    #: 声明方**不要**拿它去仲裁（"这个 ``channel:`` 键归谁"由 :meth:`owns_local_id`
+    #: 回答），更不要据此改盘上的键。
+    legacy_conversation_prefix: Optional[str] = None
+
+    #: 本平台 **local id** 的合法形状。描述的是该平台 API 发出来的 id，所以由
+    #: **拥有那个平台的适配器**自己声明，而不是集中登记在一张表里
+    #: （Slack 的 id 规则变了只该碰 Slack 那一个文件）。
+    #:
+    #: 用途只有一个：歧义旧前缀（``channel:``）在**读取时**的归属划分，见
+    #: :meth:`owns_local_id`。``None`` = 本平台不参与划分（telegram / matrix 等
+    #: 本来就没有歧义旧前缀）。
+    local_id_pattern: Optional[re.Pattern[str]] = None
+
+    def owns_local_id(self, local_id: str) -> bool:
+        """``local_id`` 是不是落在**本平台**的 id 命名空间里。
+
+        这是歧义旧前缀（``channel:``）归属判定的**唯一**判据。三家文法必须
+        **两两不相交**（见 :mod:`opencode_bridge.conversation_keys`），正因为不相交，
+        "这个 local id 属不属于我"才是**可以确定**的判断，而不是猜 ——
+        「宁可不续，也不把 A 平台的会话接到 B 平台上」才真正兑现得出来。
+
+        ⚠️ 只在**本平台自己**的文法上判断，绝不遍历别的平台：一旦拿别人的文法
+        来仲裁（"谁认得多就算谁的"），就退化成了猜，而猜错的后果与猜错平台完全一样。
+
+        声明了 :attr:`local_id_pattern` 的子类自动继承这个判定，无需各自实现。
+        """
+        pattern = self.local_id_pattern
+        if pattern is None:
+            return False
+        return pattern.fullmatch(str(local_id or "")) is not None
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         self.config: dict = dict(config or {})

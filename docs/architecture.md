@@ -92,6 +92,7 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 | `identity.py` | 241 | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
 | `split.py` | 294 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
 | `state.py` | 488 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
+| `conversation_keys.py` | 207 | 会话级状态读写门面 + **歧义旧前缀的归属划分**（`channel:` 键按各家 local id 文法认领） | 在多家之间仲裁（= 猜）、改盘上的歧义键 |
 | `status.py` | 436 | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
 | `transport/base.py` | 395 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
 | `transport/polling.py` | 94 | HTTP 短轮询/长轮询 | — |
@@ -140,19 +141,45 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
    `__main__` **显式打开**它。已完成的迁移：irc/twitch/nextcloud **字节级不变**
    （它们的前缀本就映射到自身）；**telegram（`chat:` → `telegram:`）与
    matrix（`room:` → `matrix:`）已切换**，旧的 `chat:` / `room:` 键在加载时
-   被改写成新格式。歧义的 `channel:`（slack/discord/mattermost 共用）**尚待第 2 步**。
+   被改写成新格式；**slack / discord / mattermost（`channel:` → `slack:` /
+   `discord:` / `mattermost:`）也已切换**，但走的是下面第 10 条那条路。
 
    `StateStore` 的默认值仍是**关闭**，而 `__main__` 打开它 —— 这个组合是有意的：
    默认关，任何**不**经过 `__main__` 的调用方（脚本、测试）都不会意外改写用户的
    文件；而桥本身必须开，否则就是上面那条"半迁移态"。
 
-   歧义前缀 `channel:`（slack/discord/mattermost 共用）**原样保留**：
-   `state.py` 拿到的只是不透明字符串，它没有依据判断是哪一家，
-   而**猜错会把用户映射到别人的会话**。`get_session` 额外做一次"精确键 → 无歧义别名"
-   的回退查找，让迁移期不会出现"文件迁了但查找全落空"；同理 telegram / matrix 的
-   **反向解析**（`_chat_id` / `_room_id`）也继续认旧前缀 —— 写前收件箱把
-   `conversation_id` 持久化在盘上，切换前写入、切换后才重放的未投递消息带着旧前缀。
-   这两段兼容代码都要等 slack / discord / mattermost 也切完之后才谈得上删。
+   **歧义旧前缀走另一条路：不相交划分，不迁移。** `channel:` 永远不会被改写成新键
+   （`state.py` 只捕获、不归一）。取而代之，三家各自声明两件东西 ——
+   `legacy_conversation_prefix = "channel:"`（让读侧知道历史上那个前缀长什么样）与
+   `local_id_pattern`（**本平台自己的** local id 文法，描述的是那个平台的 API）：
+
+   | 平台 | 文法 | 承重的那一条 |
+   |---|---|---|
+   | slack | `^[A-Z][A-Z0-9]{5,}$` | 首字符是大写字母 |
+   | discord | `^[0-9]{17,20}$` | 纯数字，且不超过 20 位 |
+   | mattermost | `^[a-z0-9]{26}$` | 恰好 26 位 |
+
+   三行**两两不相交**，于是「这个 local id 属不属于我」是**能确定的判断**，不是猜：
+   `channel:C01ABC` 只可能是 slack 的，`channel:123456789012345678` 只可能是 discord
+   的。`ConversationState` 只在**发起查询的那个平台**自己的文法上判定
+   （`get_session(..., platform=...)`），并按名字取那**一个**适配器 ——
+   绝不遍历已挂载适配器去仲裁（拿别人的文法挑"谁认领"就退化成了猜）。
+
+   这么做的收益是两家都成立的：**三家同时挂载时三份历史会话全部存活、互不串台**；
+   而曾经同时跑过 slack + discord、后来删掉 discord 的用户，剩下的 slack **也不会**认领
+   discord 的键 ——「曾经是否共存过」这件事盘上根本没记过（`meta` 里除游标只有
+   `/cd` 写的 `directory`），任何按"当前挂了谁"仲裁的方案都判不了它。
+   代价只剩一种：形状不属于该平台的键读不到（用户从新会话开始）—— 宁可不续，
+   也不把 A 平台的对话接到 B 平台的会话上（后者静默、难复现，比不续更坏）。
+
+   `state.py` 那边仍然不许动：给它喂 `platform_hint` 就是伪造一条自己都不知道真假的线索。
+   ⚠️ 形状只许用于**读侧的归属划分**，**永不**用于改盘上的键，也**永不**用于出站路由
+   （`_route_by_prefix` 那条启发式判的是"回复发给谁"，是另一件事，仍按原样保留）。
+
+   同理 telegram / matrix / slack / discord / mattermost 的**反向解析**
+   （`_chat_id` / `_room_id` / `_channel_id`）都继续认旧前缀：写前收件箱把
+   `conversation_id` 持久化在盘上，切换前写入、切换后才重放的未投递消息带着旧前缀，
+   认不出来就等于把那些回复永久丢弃。
 
 ### 传输层
 

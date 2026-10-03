@@ -37,6 +37,7 @@ from typing import Any, Callable, Optional
 
 from .adapters import Adapter
 from .config import DEFAULT_CONFIG_NAME, Config
+from .conversation_keys import ConversationState
 from .hooks import Button, Inbound, MsgHandle, Outbound  # BridgeCore implements Hooks
 from .identity import LEGACY_PREFIXES
 from .inbox import InboundInbox, QueuedPrompt
@@ -402,6 +403,14 @@ class BridgeCore:
         self._lock = threading.RLock()
         self._adapters: list[Adapter] = []
         self._adapter_by_name: dict[str, Adapter] = {}
+        #: 会话级状态读写（会话 ↔ opencode session 的映射）。
+        #: ⚠️ **不是** ``self.state``：``channel:`` 这类**歧义**旧前缀的键该归谁，
+        #: 只能由"发起查询的平台"回答 —— 而那条信息在本类手里（:attr:`Inbound.platform`
+        #: 种下的 :attr:`_conv_adapter`）。:mod:`opencode_bridge.conversation_keys`
+        #: 负责那条不相交划分，本类负责**显式**把平台传进去。
+        #: 会话相关的读写**一律走它**；``self.state`` 只留给非会话键
+        #: （邮件的流位置游标、``all_sessions`` 清单）。
+        self.conversation_state = ConversationState(state, lambda: self.adapters)
         #: conversation_id -> adapter name (learned on first inbound)
         self._conv_adapter: dict[str, str] = {}
         #: session_id -> conversation_id (rebuilt from state per event)
@@ -568,6 +577,10 @@ class BridgeCore:
             # 歧义前缀只能启发式：Slack id 以 C/D 开头、Discord 是纯数字、
             # Mattermost 是 26 位 base32。**这仍然可能猜错** —— 真正的确定性来自
             # :meth:`_remember_platform`，这里只是没有别的办法时的兜底。
+            #
+            # ⚠️ 别被"我们知道各家文法不相交"带偏：那个划分只许用在
+            # :mod:`opencode_bridge.conversation_keys` 的**读侧归属判定**上，
+            # **绝不许**拿它来路由出站消息（那是按前缀猜目标，不是认领键）。
             if rest.isdigit():
                 return named("discord") or named("slack") or adapters[0]
             return named("slack") or named("discord") or adapters[0]
@@ -600,6 +613,24 @@ class BridgeCore:
             return
         with self._lock:
             self._conv_adapter[conversation_id] = name
+
+    def _asking_platform(self, conversation_id: str) -> str:
+        """这条会话的**提问平台** —— 歧义旧键归属划定的唯一输入。
+
+        来源是 :meth:`_remember_platform`：入站时由产生这条消息的适配器**自己**报上
+        来的 :attr:`~opencode_bridge.hooks.Inbound.platform`。这是准确信息，
+        :meth:`_adapter_for` 里那条"前缀猜出来的"兜底只会写进**旧格式** id 的条目，
+        而旧格式 id 在读侧根本不会走到归属判定（它按精确键读）。
+
+        从未收到过入站消息的会话（agent 主动外发）返回空串 —— 那时没有"提问方"，
+        也就没有平台有权认领旧键，于是 :meth:`ConversationState` 不做任何回退。
+
+        调用点大多会**显式**把平台传进来（收件箱行 / 命令的适配器），本方法是那些
+        拿不到上下文的路径（:class:`~opencode_bridge.session_model.SessionModelCommand`
+        通过注入的 ``ensure_session`` callable 回调进来）的兜底。
+        """
+        with self._lock:
+            return self._conv_adapter.get(str(conversation_id or ""), "")
 
     def _adapter_for(self, conversation_id: str) -> Adapter | None:
         """Pick the adapter that owns ``conversation_id``.
@@ -930,7 +961,10 @@ class BridgeCore:
         adapter = self._adapter_for(conversation_id)
         inbox = self._inbox if recording_delivery else None
         try:
-            session_id = self._ensure_session(conversation_id)
+            # ⚠️ ``queued.platform`` 就是当初产生这条消息的适配器报上来的，准确；
+            #: 它是归属划分需要的那个"提问平台"（启动重放路径上 ``_conv_adapter``
+            #: 可能还是空的，这一行就不依赖它）。
+            session_id = self._ensure_session(conversation_id, platform=queued.platform)
         except Exception as exc:
             logger.exception("create_session failed for %s", conversation_id)
             self._send_text(
@@ -1088,12 +1122,25 @@ class BridgeCore:
     # ------------------------------------------------------------------
     # session lifecycle
     # ------------------------------------------------------------------
-    def _ensure_session(self, conversation_id: str) -> str:
-        session_id = self.state.get_session(conversation_id)
+    def _ensure_session(self, conversation_id: str, *, platform: str = "") -> str:
+        """取这条会话的 opencode session，没有就建一个。
+
+        :param platform: **发起这次读取的平台**，显式传给
+            :class:`~opencode_bridge.conversation_keys.ConversationState` 去判定
+            ``channel:`` 旧键的归属。留空时退回 :meth:`_asking_platform`
+            （入站时种下的准确映射）；那条路只服务"拿不到上下文"的调用方，
+            :class:`~opencode_bridge.session_model.SessionModelCommand` 就是。
+        """
+        asking = platform or self._asking_platform(conversation_id)
+        session_id = self.conversation_state.get_session(
+            conversation_id, platform=asking
+        )
         if session_id:
             return session_id
         directory = (
-            self.state.get_meta(conversation_id, "directory", None)
+            self.conversation_state.get_meta(
+                conversation_id, "directory", None, platform=asking
+            )
             or self.config.opencode_directory
             or "."
         )
@@ -1132,22 +1179,29 @@ class BridgeCore:
                 agent=agent,
                 permissions=None,
             )
-        self.state.set_session(conversation_id, session_id)
+        self.conversation_state.set_session(conversation_id, session_id)
         logger.info(
             "created session %s for %s (dir=%s)", session_id, conversation_id,
             directory,
         )
         return session_id
 
-    def _drop_session(self, conversation_id: str) -> str | None:
-        """Delete the current session server-side and locally (never raises)."""
-        session_id = self.state.get_session(conversation_id)
+    def _drop_session(self, conversation_id: str, *, platform: str = "") -> str | None:
+        """Delete the current session server-side and locally (never raises).
+
+        ``platform`` 语义同 :meth:`_ensure_session`：它决定 :meth:`drop_session`
+        要不要连带删掉那个 ``channel:`` 旧键 —— 只删**本平台文法覆盖得到**的那个。
+        """
+        asking = platform or self._asking_platform(conversation_id)
+        session_id = self.conversation_state.get_session(
+            conversation_id, platform=asking
+        )
         if session_id:
             try:
                 self.client.delete_session(session_id)
             except Exception as exc:
                 logger.warning("delete_session(%s) failed: %s", session_id, exc)
-            self.state.drop_session(conversation_id)
+            self.conversation_state.drop_session(conversation_id, platform=asking)
             with self._lock:
                 self._turns.pop(session_id, None)
         return session_id
@@ -1255,8 +1309,8 @@ class BridgeCore:
             logger.exception("attaching /setup inline buttons failed")
 
     def _cmd_new(self, conversation_id: str, adapter: Adapter, args: str) -> None:
-        self._drop_session(conversation_id)
-        session_id = self._ensure_session(conversation_id)
+        self._drop_session(conversation_id, platform=adapter.name)
+        session_id = self._ensure_session(conversation_id, platform=adapter.name)
         self._send_text(
             conversation_id,
             f"已新建会话 {session_id[:12]}",
@@ -1265,7 +1319,9 @@ class BridgeCore:
         )
 
     def _cmd_stop(self, conversation_id: str, adapter: Adapter, args: str) -> None:
-        session_id = self.state.get_session(conversation_id)
+        session_id = self.conversation_state.get_session(
+            conversation_id, platform=adapter.name
+        )
         if not session_id:
             self._send_text(conversation_id, "当前没有会话。", adapter=adapter)
             return
@@ -1278,7 +1334,9 @@ class BridgeCore:
         )
 
     def _cmd_status(self, conversation_id: str, adapter: Adapter, args: str) -> None:
-        session_id = self.state.get_session(conversation_id)
+        session_id = self.conversation_state.get_session(
+            conversation_id, platform=adapter.name
+        )
         if not session_id:
             self._send_text(conversation_id, "当前没有会话。", adapter=adapter)
             return
@@ -1323,9 +1381,9 @@ class BridgeCore:
             )
             return
         directory = args
-        self.state.set_meta(conversation_id, "directory", directory)
-        self._drop_session(conversation_id)
-        self._ensure_session(conversation_id)
+        self.conversation_state.set_meta(conversation_id, "directory", directory)
+        self._drop_session(conversation_id, platform=adapter.name)
+        self._ensure_session(conversation_id, platform=adapter.name)
         self._send_text(conversation_id, f"已切换到 {directory}", adapter=adapter)
 
     def _cmd_model(self, conversation_id: str, adapter: Adapter, args: str) -> None:
@@ -1368,7 +1426,9 @@ class BridgeCore:
                 )
                 return
             decision = choice
-        session_id = self.state.get_session(conversation_id)
+        session_id = self.conversation_state.get_session(
+            conversation_id, platform=adapter.name
+        )
         if not session_id:
             self._send_text(
                 conversation_id, "当前没有会话，无法回复权限请求。",

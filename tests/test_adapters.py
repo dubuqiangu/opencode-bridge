@@ -481,7 +481,7 @@ class TestSlackInbound(unittest.TestCase):
         adapter._handle_envelope(ws, self._envelope(event=self._msg()))
         self.assertEqual(len(hooks.inbounds), 1)
         ib = hooks.inbounds[0]
-        self.assertEqual(ib.conversation_id, "channel:C1")
+        self.assertEqual(ib.conversation_id, "slack:C1")
         self.assertEqual(ib.text, "hi")
         self.assertEqual(ib.user_id, "U1")
         self.assertEqual(ib.message_id, "111.222")
@@ -611,7 +611,7 @@ class TestSlackInbound(unittest.TestCase):
             adapter.stop()
 
             self.assertEqual(len(hooks.inbounds), 1, "只应处理重连后那条")
-            self.assertEqual(hooks.inbounds[0].conversation_id, "channel:C_NEW")
+            self.assertEqual(hooks.inbounds[0].conversation_id, "slack:C_NEW")
             self.assertGreaterEqual(len(urls), 2, "disconnect 后应重新取 URL 重连")
         finally:
             slack_mod.RECONNECT_DELAY = old_delay
@@ -715,7 +715,7 @@ class TestSlackInboundRealWebSocket(unittest.TestCase):
             while not hooks.inbounds and time.time() < deadline:
                 time.sleep(0.01)
             self.assertEqual(len(hooks.inbounds), 1, "真 WS 收到消息后应产生 Inbound")
-            self.assertEqual(hooks.inbounds[0].conversation_id, "channel:C_REAL")
+            self.assertEqual(hooks.inbounds[0].conversation_id, "slack:C_REAL")
             self.assertEqual(hooks.inbounds[0].text, "真 socket 联调")
             self.assertEqual(hooks.inbounds[0].user_id, "U_REAL")
             self.assertEqual(hooks.inbounds[0].platform, "slack")

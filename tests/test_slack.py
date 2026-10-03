@@ -43,17 +43,16 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
 import opencode_bridge.adapters.slack as slack_mod
 from opencode_bridge.adapters.slack import (
-    CONVERSATION_PREFIX,
     RECONNECT_DELAY,
     SOCKET_TIMEOUT,
     SlackAdapter,
 )
+from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.identity import (
     AMBIGUOUS_LEGACY_PREFIXES,
     LEGACY_PREFIXES,
     AmbiguousConversationId,
-    InvalidConversationId,
     is_valid,
     normalize,
     parse_id,
@@ -61,7 +60,15 @@ from opencode_bridge.identity import (
 from opencode_bridge.state import StateStore
 from opencode_bridge.transport import ReconnectNow, WebSocketTransport
 
-CID = "channel:C1"
+CID = "slack:C1"
+#: 切换**前**的前缀。断言"旧前缀不再出现"一律拿它和**字面量**比，绝不拿
+#: ``identity.LEGACY_PREFIXES`` 比 —— 后者被改了就变成恒真（``tasks.md`` 记的教训）。
+LEGACY_CID = "channel:C1"
+#: ⚠️ 走 ``ConversationState`` 归属划分的那几条用例必须用**真实形状**的 channel id：
+#: ``C1`` 是占位串，不符合 Slack 的文法（``^[A-Z][A-Z0-9]{5,}$``），拿它当夹具等于
+#: 把"这个形状归不归 slack"这件事测没了。真实 Slack id 是 9~11 位。
+REALISTIC_CID = "slack:C01ABCDEFGH"
+REALISTIC_LEGACY_CID = "channel:C01ABCDEFGH"
 
 
 def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
@@ -259,93 +266,143 @@ class TestSlackMigrationInvariants(SlackTestCase):
     """A1 迁移的「行为不变」清单：逐条钉死。"""
 
     # ------------------------------------------------------------------
-    # 前缀：本轮**刻意不切**
+    # 前缀：已从 ``channel:`` 切到 ``slack:``（歧义前缀，读取时靠文法划分接回）
     # ------------------------------------------------------------------
-    def test_conversation_id_still_uses_legacy_channel_prefix(self):
-        """显式防呆：有人在本轮偷偷把 ``channel:`` 换成 ``slack:`` 时这里会红。
+    def test_conversation_id_uses_the_unified_platform_prefix(self):
+        """显式防呆：有人把 ``_conversation_id`` 悄悄改回 ``channel:`` 时这里会红。
 
-        ``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里值是 ``None`` ——
-        **歧义前缀**，slack / discord / mattermost 三家共用，所以光看字符串
-        **完全判不出**来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。
-        这正是"必须显式钉住"的理由。
+        ⚠️ "不许出现 ``channel:``"这条比的是**字面量**，不是 ``LEGACY_PREFIXES``
+        常量 —— 改了常量断言就恒真（``tasks.md`` 记的教训）。反过来，"归一后等于
+        新 id"那条**必须**引用常量：那是登记表本身的契约。
         """
         self.assertIn("channel", LEGACY_PREFIXES)
         self.assertIsNone(LEGACY_PREFIXES["channel"], "channel: 是歧义前缀")
         self.assertIn("channel", AMBIGUOUS_LEGACY_PREFIXES)
-        self.assertEqual(CONVERSATION_PREFIX, "channel:")
+        self.assertEqual(SlackAdapter.legacy_conversation_prefix, "channel:",
+                         "旧前缀声明让读侧知道历史上那个前缀长什么样")
+        self.assertEqual(SlackAdapter.local_id_pattern.pattern,
+                         r"^[A-Z][A-Z0-9]{5,}$", "本家的 local id 文法（首字符大写字母）")
         self.assertEqual(SlackAdapter._conversation_id("C1"), CID)
         for channel in ("C1", "C0123ABCD", "D0C0FFEE", 12345):
             with self.subTest(channel=channel):
                 self.assertEqual(
-                    SlackAdapter._conversation_id(channel), f"channel:{channel}"
+                    SlackAdapter._conversation_id(channel), f"slack:{channel}"
+                )
+                self.assertFalse(
+                    SlackAdapter._conversation_id(channel).startswith("channel:"),
+                    "旧前缀不许复活：新写的键与盘上保留的旧键对不上，"
+                    "用户会以为会话丢了",
                 )
         self.assertEqual(SlackAdapter._channel_id(CID), "C1")
-        # 仍是旧格式：``parse_id`` 拒绝它，只有 ``normalize`` 才知道怎么归一
-        self.assertFalse(is_valid(CID))
-        with self.assertRaises(InvalidConversationId):
-            parse_id(CID)
-        self.assertEqual(normalize(CID, platform_hint="slack"), "slack:C1")
-        self.assertEqual(SlackAdapter._channel_id("slack:C1"), "slack:C1",
-                         "_channel_id 只剥 channel: 前缀")
+        # 已是合法新格式：``parse_id`` 收它
+        self.assertTrue(is_valid(CID))
+        self.assertEqual(parse_id(CID).platform, "slack")
+        self.assertEqual(normalize(CID), CID, "新格式必须幂等")
+        # 旧 id 仍能被归一（迁移期在途的旧 conversation_id），但**要显式给线索**
+        self.assertEqual(normalize(LEGACY_CID, platform_hint="slack"), CID)
+
+    def test_channel_id_still_accepts_the_legacy_prefix_and_a_bare_channel_id(self):
+        """反向解析**必须**继续认旧前缀，否则盘上未投递的消息会被永久丢弃。
+
+        写前收件箱把 ``conversation_id`` 持久化在 SQLite 里：切换前写入、切换后才
+        重放的那几行带着 ``channel:`` 前缀，认不出来就再也发不出去了。
+        """
+        for raw, expected in (
+            (CID, "C1"),                  # 当前格式
+            (LEGACY_CID, "C1"),           # 切换前落盘的旧 conversation_id
+            ("C1", "C1"),                 # 裸 channel id
+            ("channel:", None),
+            ("slack:", None),
+            ("", None),
+            (None, None),
+        ):
+            with self.subTest(conversation_id=raw):
+                self.assertEqual(SlackAdapter._channel_id(raw), expected)
 
     def test_the_ambiguity_is_real_so_the_prefix_cannot_be_guessed(self):
-        """把"为什么现在不能切"写成**可执行**的断言：同一个旧键能归一成三家。
+        """把"歧义前缀不能猜"写成**可执行**的断言：同一个旧键能归一成三家。
 
-        这条是 :meth:`SlackAdapter._conversation_id` 里那条断言存在的理由：
         没有平台线索时 :func:`identity.normalize` **拒绝**猜（抛
         :class:`~opencode_bridge.identity.AmbiguousConversationId`），而不是
         悄悄猜成 slack —— 猜错的后果是把用户映射到别人的会话上。
+        这也是 :mod:`opencode_bridge.conversation_keys` 必须靠"各家文法不相交"
+        而不是靠"当前挂了谁"来判定归属的理由。
         """
         with self.assertRaises(AmbiguousConversationId):
-            normalize(CID)
-        self.assertEqual(normalize(CID, platform_hint="slack"), "slack:C1")
-        self.assertEqual(normalize(CID, platform_hint="discord"), "discord:C1")
-        self.assertEqual(normalize(CID, platform_hint="mattermost"), "mattermost:C1")
+            normalize(LEGACY_CID)
+        self.assertEqual(normalize(LEGACY_CID, platform_hint="slack"), CID)
+        self.assertEqual(normalize(LEGACY_CID, platform_hint="discord"), "discord:C1")
+        self.assertEqual(normalize(LEGACY_CID, platform_hint="mattermost"),
+                         "mattermost:C1")
         self.assertNotEqual(
-            normalize(CID, platform_hint="slack"),
-            normalize(CID, platform_hint="discord"),
+            normalize(LEGACY_CID, platform_hint="slack"),
+            normalize(LEGACY_CID, platform_hint="discord"),
             "同一个旧键在两家之间串台 —— 这就是旧前缀的代价",
         )
+        # ⚠️ 反向也不许猜：旧键**永不迁移**，所以盘上它必须原样留着
+        with self.assertRaises(AmbiguousConversationId):
+            normalize(LEGACY_CID, platform_hint=None)
 
-    def test_prefix_guard_assertion_actually_fires_when_the_prefix_is_switched(self):
-        """证明 :meth:`SlackAdapter._conversation_id` 里那条防呆断言**不是恒真**。
+    def test_legacy_channel_key_is_read_back_through_the_ownership_partition(self):
+        """端到端：只有 slack 在挂时，切换前的 ``channel:C01ABCDEFGH`` 会话**完整存活**。
 
-        如果那条断言写得像 ``assert cid.startswith(CONVERSATION_PREFIX)``（用同一个
-        常量比），改常量就会把它一起改掉、断言形同虚设；本用例把常量改成
-        ``slack:`` 并要求它立刻炸 —— 断言本身被测到了。
-        """
-        old = slack_mod.CONVERSATION_PREFIX
-        self.addCleanup(setattr, slack_mod, "CONVERSATION_PREFIX", old)
-        slack_mod.CONVERSATION_PREFIX = "slack:"
-        with self.assertRaises(AssertionError):
-            SlackAdapter._conversation_id("C1")
-        setattr(slack_mod, "CONVERSATION_PREFIX", old)   # 立刻恢复（addCleanup 只是保险）
-        self.assertEqual(SlackAdapter._conversation_id("C1"), CID, "恢复后仍是旧格式")
-
-    def test_switching_prefix_now_would_orphan_stored_sessions(self):
-        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
-
-        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
-        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
-        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        歧义前缀**永不迁移**（``state.py`` 对它只捕获不归一），所以历史会话只能靠
+        :mod:`opencode_bridge.conversation_keys` 的"各家 local id 文法不相交"在
+        **读取时**接回来；判据只有一条：那个 local id 是不是符合 Slack 自己的文法。
+        这里真写一份**旧格式** ``state.json``（模拟升级前的用户磁盘），再装配一个
+        只挂了 slack 的 core，断言新 id 取得到同一个会话。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            cid = SlackAdapter._conversation_id("C1")
-            store = StateStore(path)
-            store.set_session(cid, "sess-1")
-            reopened = StateStore(path)          # 模拟进程重启
-            self.assertEqual(reopened.get_session(cid), "sess-1",
-                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
-            future = normalize(cid, platform_hint="slack")
-            self.assertNotEqual(future, cid)
-            self.assertIsNone(
-                reopened.get_session(future),
-                "切前缀后同一个 channel 是另一个不透明键 → 会话映射直接丢失",
-            )
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": {REALISTIC_LEGACY_CID: "ses-slack"},
+                           "meta": {}}, fh)
 
-    def test_inbound_ids_keep_the_legacy_prefix_end_to_end(self):
-        """入站链路上的 id 也必须是 ``channel:``（不只是 ``_conversation_id``）。"""
+            # core 装配的门面就是这一个；查询时必须显式告诉它"提问的是 slack"
+            adapter, _hooks = make_slack()
+            store = StateStore(path, migrate_keys=True)
+            sessions = ConversationState(store, lambda: [adapter])
+
+            self.assertEqual(
+                sessions.get_session(REALISTIC_CID, platform="slack"),
+                "ses-slack",
+                "属于 slack 形状的旧键必须接得回来，否则用户升级即丢历史会话",
+            )
+            self.assertEqual(
+                store.last_migration.ambiguous_kept, 1,
+                "歧义键只被记成 ambiguous_kept，不许迁移",
+            )
+            # 旧键**留在盘上不动**：改键名是迁移，歧义前缀永不迁移
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["sessions"],
+                                 {REALISTIC_LEGACY_CID: "ses-slack"})
+
+    def test_dropping_the_session_also_drops_the_legacy_key(self):
+        """``/new`` 必须把旧键**一起**删，否则下一次读取又认领回已删掉的会话。
+
+        这就是 :meth:`ConversationState.drop_session` 要遍历候选键的原因：
+        留着 ``channel:C01ABCDEFGH`` 的话，新键删掉后读取会命中它，而那个会话 id
+        已经在服务端被删了 —— 用户看到的是"agent 对着一个不存在的会话说话"。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": {REALISTIC_LEGACY_CID: "ses-slack"},
+                           "meta": {}}, fh)
+
+            adapter, _hooks = make_slack()
+            sessions = ConversationState(StateStore(path, migrate_keys=True),
+                                         lambda: [adapter])
+
+            sessions.drop_session(REALISTIC_CID, platform="slack")
+
+            self.assertIsNone(sessions.get_session(REALISTIC_CID, platform="slack"))
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["sessions"], {},
+                                 "旧键必须一起删：留着就会认领回已删会话")
+
+    def test_inbound_ids_carry_the_unified_prefix_end_to_end(self):
+        """入站链路上的 id 也必须是 ``slack:``（不只是 ``_conversation_id``）。"""
         adapter, hooks = make_slack()
         adapter._handle_envelope(ScriptedWS(), envelope(event=msg()))
         self.assertEqual([i.conversation_id for i in hooks.inbounds], [CID])
@@ -358,7 +415,13 @@ class TestSlackMigrationInvariants(SlackTestCase):
         self.assertIsInstance(handle, MsgHandle)
         self.assertEqual(handle.conversation_id, CID)
         self.assertEqual(calls[-1][2]["channel"], "C1",
-                         "出站必须把 channel: 前缀剥掉再发（回环风险）")
+                         "出站必须把 slack: 前缀剥掉再发（回环风险）")
+        # ⚠️ 切换前落盘的旧 conversation_id 仍要能发出去（写前收件箱里躺着的就是它）
+        adapter._request = lambda m, p, pl, *, timeout=None: (
+            calls.append((m, p, pl)) or (200, {"ok": True, "ts": "2"})
+        )
+        self.assertIsNotNone(adapter.send(Outbound(LEGACY_CID, "旧键回声")))
+        self.assertEqual(calls[-1][2]["channel"], "C1")
 
     # ------------------------------------------------------------------
     # 退避接线：3s 恒定（不是指数）+ reset_after=0
@@ -460,7 +523,7 @@ class TestSlackMigrationInvariants(SlackTestCase):
                         "disconnect 之后必须立刻重连（不该等 30s 退避）")
         self.assertGreaterEqual(len(urls), 2, "重连必须**重新取** WSS URL")
         self.assertGreaterEqual(len(created), 2, "确实建了第二条连接")
-        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["channel:C_NEW"])
+        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["slack:C_NEW"])
 
     def test_disconnect_drops_messages_still_queued_on_the_old_connection(self):
         """disconnect 之后旧连接上到达的消息**必须被丢弃**（否则等于静默丢消息）。
@@ -484,7 +547,7 @@ class TestSlackMigrationInvariants(SlackTestCase):
                          "旧连接在 disconnect 之后不许再被读（否则会处理已失效连接的消息）")
         self.assertEqual(old.recv_calls, 1, "旧连接只读过那一条 disconnect")
         self.assertTrue(old.closed, "旧连接必须被关闭")
-        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["channel:C_NEW"],
+        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["slack:C_NEW"],
                          "只应处理新连接上那条")
 
     def test_disconnect_also_survives_the_real_socket_path(self):
@@ -604,7 +667,7 @@ class TestSlackMigrationInvariants(SlackTestCase):
         adapter.start()
         self.addCleanup(adapter.stop)
         self.assertTrue(wait_until(lambda: hooks.inbounds, timeout=5))
-        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["channel:C_allow"])
+        self.assertEqual([i.conversation_id for i in hooks.inbounds], ["slack:C_allow"])
         self.assertEqual(calls,
                          ["admits:C_other", "admits:C_allow", "inbound"],
                          "闸门必须先于投递被调用（core 之前）")

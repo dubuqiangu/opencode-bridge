@@ -23,7 +23,6 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 import opencode_bridge.adapters.discord as discord_mod  # noqa: E402
 from opencode_bridge.adapters import build  # noqa: E402
 from opencode_bridge.adapters.discord import (  # noqa: E402
-    CONVERSATION_PREFIX,
     DEFAULT_INTENTS,
     GATEWAY_API_VERSION,
     INTENT_DIRECT_MESSAGES,
@@ -33,12 +32,12 @@ from opencode_bridge.adapters.discord import (  # noqa: E402
     RECONNECT_MIN,
     DiscordAdapter,
 )
+from opencode_bridge.conversation_keys import ConversationState  # noqa: E402
 from opencode_bridge.hooks import Inbound, Outbound  # noqa: E402
 from opencode_bridge.identity import (  # noqa: E402
     AMBIGUOUS_LEGACY_PREFIXES,
     LEGACY_PREFIXES,
     AmbiguousConversationId,
-    InvalidConversationId,
     is_valid,
     normalize,
     parse_id,
@@ -49,7 +48,15 @@ from opencode_bridge.transport import WebSocketTransport  # noqa: E402
 GATEWAY_URL = "wss://gw.example.test/gw"
 RESUME_URL = "wss://resume.example.test/gw"
 BOT_USER_ID = "U_BOT_ME"
-CID = "channel:C1"
+CID = "discord:C1"
+#: 切换**前**的前缀。断言"旧前缀不再出现"一律拿它和**字面量**比，绝不拿
+#: ``identity.LEGACY_PREFIXES`` 比 —— 后者被改了就变成恒真（``tasks.md`` 记的教训）。
+LEGACY_CID = "channel:C1"
+#: ⚠️ 走 ``ConversationState`` 归属划分的那条用例必须用**真实形状**的 snowflake：
+#: ``C1`` 是占位串，不符合 Discord 的文法（``^[0-9]{17,20}$``），拿它当夹具等于
+#: 把"纯数字 id 归不归 discord"这件事测没了。
+SNOWFLAKE_CID = "discord:123456789012345678"
+SNOWFLAKE_LEGACY_CID = "channel:123456789012345678"
 
 
 # ----------------------------------------------------------------------
@@ -621,7 +628,7 @@ class TestMessageFilter(unittest.TestCase):
         self.assertEqual(len(self.hooks.inbounds), 1)
         inbound = self.hooks.inbounds[0]
         self.assertIsInstance(inbound, Inbound)
-        self.assertEqual(inbound.conversation_id, "channel:C1")
+        self.assertEqual(inbound.conversation_id, "discord:C1")
         self.assertEqual(inbound.text, "在吗")
         self.assertEqual(inbound.kind, "text")
         self.assertEqual(inbound.user_id, "U_HUMAN")
@@ -712,7 +719,7 @@ class TestMessageFilter(unittest.TestCase):
             adapter._handle_message_create(json.loads(message_packet(channel="C_OK"))["d"])
         )
         self.assertEqual(
-            calls[-2:], [("admits", "C_OK"), ("inbound", "channel:C_OK")], "先闸门后 Inbound"
+            calls[-2:], [("admits", "C_OK"), ("inbound", "discord:C_OK")], "先闸门后 Inbound"
         )
 
 
@@ -795,83 +802,105 @@ class TestReconnectDecisions(GatewayTestCase):
 # 7) A1 迁移的「行为不变」清单（逐条钉死）
 # ----------------------------------------------------------------------
 class TestMigrationInvariants(GatewayTestCase):
-    def test_conversation_id_still_uses_the_legacy_channel_prefix(self):
-        """显式防呆：有人在本轮偷偷把 ``channel:`` 换成 ``discord:`` 时这里会红。
+    def test_conversation_id_uses_the_unified_platform_prefix(self):
+        """显式防呆：有人把 ``_conversation_id`` 悄悄改回 ``channel:`` 时这里会红。
 
-        ``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里值是 ``None`` ——
-        **歧义前缀**，slack / discord / mattermost 三家共用，所以光看字符串
-        **完全判不出**来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。
-        这正是"必须显式钉住"的理由。
+        ⚠️ "不许出现 ``channel:``"这条比的是**字面量**，不是 ``LEGACY_PREFIXES``
+        常量 —— 改了常量断言就恒真（``tasks.md`` 记的教训）。反过来，"归一后等于
+        新 id"那条**必须**引用常量：那是登记表本身的契约。
         """
         self.assertIn("channel", LEGACY_PREFIXES)
         self.assertIsNone(LEGACY_PREFIXES["channel"], "channel: 是歧义前缀")
         self.assertIn("channel", AMBIGUOUS_LEGACY_PREFIXES)
-        self.assertEqual(CONVERSATION_PREFIX, "channel:")
+        self.assertEqual(DiscordAdapter.legacy_conversation_prefix, "channel:",
+                         "旧前缀声明让读侧知道历史上那个前缀长什么样")
+        self.assertEqual(DiscordAdapter.local_id_pattern.pattern,
+                         r"^[0-9]{17,20}$", "本家的 local id 文法（纯数字 snowflake）")
         self.assertEqual(DiscordAdapter._conversation_id("C1"), CID)
-        for channel in ("C1", "C0123ABCD", "D0C0FFEE", 12345):
+        for channel in ("123456789012345678", "C1", "D0C0FFEE", 12345):
             with self.subTest(channel=channel):
                 self.assertEqual(
-                    DiscordAdapter._conversation_id(channel), f"channel:{channel}"
+                    DiscordAdapter._conversation_id(channel), f"discord:{channel}"
+                )
+                self.assertFalse(
+                    DiscordAdapter._conversation_id(channel).startswith("channel:"),
+                    "旧前缀不许复活：新写的键与盘上保留的旧键对不上，"
+                    "用户会以为会话丢了",
                 )
         self.assertEqual(DiscordAdapter._channel_id(CID), "C1")
-        # 仍是旧格式：``parse_id`` 拒绝它，只有 ``normalize`` 才知道怎么归一
-        self.assertFalse(is_valid(CID))
-        with self.assertRaises(InvalidConversationId):
-            parse_id(CID)
-        self.assertEqual(normalize(CID, platform_hint="discord"), "discord:C1")
+        # 已是合法新格式：``parse_id`` 收它
+        self.assertTrue(is_valid(CID))
+        self.assertEqual(parse_id(CID).platform, "discord")
+        self.assertEqual(normalize(CID), CID, "新格式必须幂等")
+        # 旧 id 仍能被归一（迁移期在途的旧 conversation_id），但**要显式给线索**
+        self.assertEqual(normalize(LEGACY_CID, platform_hint="discord"), CID)
+
+    def test_channel_id_still_accepts_the_legacy_prefix_and_a_bare_channel_id(self):
+        """反向解析**必须**继续认旧前缀，否则盘上未投递的消息会被永久丢弃。
+
+        写前收件箱把 ``conversation_id`` 持久化在 SQLite 里：切换前写入、切换后才
+        重放的那几行带着 ``channel:`` 前缀，认不出来就再也发不出去了。
+        """
+        for raw, expected in (
+            (CID, "C1"),                  # 当前格式
+            (LEGACY_CID, "C1"),           # 切换前落盘的旧 conversation_id
+            ("C1", "C1"),                 # 裸 channel id
+            ("channel:", None),
+            ("discord:", None),
+            ("", None),
+            (None, None),
+        ):
+            with self.subTest(conversation_id=raw):
+                self.assertEqual(DiscordAdapter._channel_id(raw), expected)
 
     def test_the_ambiguity_is_real_so_the_prefix_cannot_be_guessed(self):
-        """把"为什么现在不能切"写成**可执行**的断言：同一个旧键能归一成三家。"""
+        """把"歧义前缀不能猜"写成**可执行**的断言：同一个旧键能归一成三家。"""
         with self.assertRaises(AmbiguousConversationId):
-            normalize(CID)
+            normalize(LEGACY_CID)
         for platform in ("slack", "discord", "mattermost"):
             with self.subTest(platform=platform):
-                self.assertEqual(normalize(CID, platform_hint=platform), f"{platform}:C1")
+                self.assertEqual(normalize(LEGACY_CID, platform_hint=platform),
+                                 f"{platform}:C1")
         self.assertNotEqual(
-            normalize(CID, platform_hint="slack"),
-            normalize(CID, platform_hint="discord"),
+            normalize(LEGACY_CID, platform_hint="slack"),
+            normalize(LEGACY_CID, platform_hint="discord"),
             "同一个旧键在两家之间串台 —— 这就是旧前缀的代价",
         )
+        # ⚠️ 反向也不许猜：旧键**永不迁移**，所以盘上它必须原样留着
+        with self.assertRaises(AmbiguousConversationId):
+            normalize(LEGACY_CID, platform_hint=None)
 
-    def test_prefix_guard_assertion_actually_fires_when_the_prefix_is_switched(self):
-        """证明 :meth:`DiscordAdapter._conversation_id` 里那条防呆断言**不是恒真**。
+    def test_legacy_channel_key_is_read_back_through_the_ownership_partition(self):
+        """端到端：只有 discord 在挂时，切换前的 ``channel:1234…`` 会话**完整存活**。
 
-        如果那条断言写得像 ``assert cid.startswith(CONVERSATION_PREFIX)``（用同一个
-        常量比），改常量就会把它一起改掉、断言形同虚设；本用例把常量改成
-        ``discord:`` 并要求它立刻炸 —— 断言本身被测到了。
-        """
-        old = discord_mod.CONVERSATION_PREFIX
-        self.addCleanup(setattr, discord_mod, "CONVERSATION_PREFIX", old)
-        discord_mod.CONVERSATION_PREFIX = "discord:"
-        with self.assertRaises(AssertionError):
-            DiscordAdapter._conversation_id("C1")
-        setattr(discord_mod, "CONVERSATION_PREFIX", old)   # 立刻恢复（addCleanup 只是保险）
-        self.assertEqual(DiscordAdapter._conversation_id("C1"), CID, "恢复后仍是旧格式")
-
-    def test_switching_prefix_now_would_orphan_stored_sessions(self):
-        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
-
-        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
-        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
-        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        歧义前缀**永不迁移**（``state.py`` 对它只捕获不归一），所以历史会话只能靠
+        :mod:`opencode_bridge.conversation_keys` 的"各家 local id 文法不相交"在
+        **读取时**接回来；判据只有一条：那个 local id 是不是纯数字的 snowflake。
+        这里真写一份**旧格式** ``state.json``（模拟升级前的用户磁盘），再装配一个
+        只挂了 discord 的门面，断言新 id 取得到同一个会话。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            cid = DiscordAdapter._conversation_id("C1")
-            store = StateStore(path)
-            store.set_session(cid, "sess-1")
-            reopened = StateStore(path)          # 模拟进程重启
-            self.assertEqual(reopened.get_session(cid), "sess-1",
-                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
-            future = normalize(cid, platform_hint="discord")
-            self.assertNotEqual(future, cid)
-            self.assertIsNone(
-                reopened.get_session(future),
-                "切前缀后同一个 channel 是另一个不透明键 → 会话映射直接丢失",
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": {SNOWFLAKE_LEGACY_CID: "ses-discord"},
+                           "meta": {}}, fh)
+
+            sessions = ConversationState(
+                StateStore(path, migrate_keys=True), lambda: [self.adapter()]
             )
 
-    def test_inbound_ids_keep_the_legacy_prefix_end_to_end(self):
-        """入站链路上的 id 也必须是 ``channel:``（不只是 ``_conversation_id``）。"""
+            self.assertEqual(
+                sessions.get_session(SNOWFLAKE_CID, platform="discord"),
+                "ses-discord",
+                "属于 discord 形状的旧键必须接得回来，否则用户升级即丢历史会话",
+            )
+            # 旧键**留在盘上不动**：改键名是迁移，歧义前缀永不迁移
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["sessions"],
+                                 {SNOWFLAKE_LEGACY_CID: "ses-discord"})
+
+    def test_inbound_ids_carry_the_unified_prefix_end_to_end(self):
+        """入站链路上的 id 也必须是 ``discord:``（不只是 ``_conversation_id``）。"""
         hooks = RecordingHooks()
         adapter = self.adapter(hooks)
         ws = GatewayWS()
@@ -880,8 +909,6 @@ class TestMigrationInvariants(GatewayTestCase):
         adapter._handle_payload(ws, message_packet(content="回声"))
         self.assertEqual([i.conversation_id for i in hooks.inbounds], [CID])
         self.assertEqual(adapter._channel_id(CID), "C1")
-        self.assertEqual(adapter._channel_id("discord:C1"), "discord:C1",
-                         "_channel_id 只剥 channel: 前缀")
         # 出站也必须把前缀剥掉再发
         calls: list[tuple] = []
         adapter._request = lambda m, p, pl, *, timeout=None: (
@@ -890,6 +917,9 @@ class TestMigrationInvariants(GatewayTestCase):
         handle = adapter.send(Outbound(conversation_id=CID, text="hi"))
         self.assertIsNotNone(handle)
         self.assertEqual(handle.conversation_id, CID)
+        self.assertEqual(calls[-1][1], "channels/C1/messages")
+        # ⚠️ 切换前落盘的旧 conversation_id 仍要能发出去（写前收件箱里躺着的就是它）
+        self.assertIsNotNone(adapter.send(Outbound(conversation_id=LEGACY_CID, text="hi")))
         self.assertEqual(calls[-1][1], "channels/C1/messages")
 
     # -- 传输层接线值 ---------------------------------------------------

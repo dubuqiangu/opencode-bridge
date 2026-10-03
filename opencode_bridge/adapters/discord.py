@@ -9,29 +9,31 @@ HELLO 协商、心跳（周期 + ACK 监测）、opcode 分发、close code 决�
 授权闸门、出站 REST。生产连的是 :mod:`opencode_bridge.ws`（T2.0，纯标准库自研的
 最小 RFC 6455 客户端），因此本文件不引入任何第三方依赖。
 
-⚠️ ``conversation_id`` 前缀**本轮刻意仍是 ``channel:``**，不要"顺手改好"
+``conversation_id`` 前缀：已从 ``channel:`` 切到 ``discord:``（歧义前缀，靠划分回读）
 ------------------------------------------------------------------------
 ``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里的值是 ``None`` ——
 **歧义前缀**，被 slack / discord / mattermost **三家共用**，光看字符串**判不出**
-来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。
+来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。所以切前缀不像
+telegram / matrix 那样只要配一次键迁移就完事：**旧键永远迁不了**
+（:mod:`opencode_bridge.state` 对歧义前缀只捕获、不归一），
+必须靠"读取时回退"把历史会话接上。
 
-把 :meth:`DiscordAdapter._conversation_id` 改成 ``identity.format_id("discord", ...)``
-会改变 ``conversation_id`` 的字符串格式，而 :class:`~opencode_bridge.state.StateStore`
-拿它当**不透明键**存 ``conversation_id ↔ session_id`` 映射 —— 于是**已落盘
-``state.json`` 里的所有 ``channel:`` 键会一次性变成孤儿**，用户会在迁移后一次性
-"忘记"所有历史会话映射。这种故障**不报错**，只表现为"agent 突然记错上下文"，
-比直接失败难查得多。
+于是本适配器做三件事：
 
-前缀切换必须是一个**单独的变更**，前置条件有两个：
+1. :meth:`DiscordAdapter._conversation_id` 产出统一的 ``discord:<channel_id>``；
+2. 声明 :attr:`DiscordAdapter.legacy_conversation_prefix` = ``channel:``（只为让读侧
+   知道历史上那个前缀长什么样），并让 :meth:`DiscordAdapter._channel_id`
+   **继续认**它；
+3. 声明 :attr:`DiscordAdapter.local_id_pattern` = :data:`DISCORD_LOCAL_ID_PATTERN`
+   —— **本平台自己的** local id 文法（snowflake）。
 
-1. 必须与 ``state.py`` 的键迁移（旧键 → 新键的显式重写 + 版本门控）**一起**发；
-2. 歧义前缀还**额外**需要"是三家中的哪一家"这条线索 ——
-   :func:`identity.normalize` 对 ``channel:`` 不给 ``platform_hint`` 就抛
-   :class:`~opencode_bridge.identity.AmbiguousConversationId`，无法静默猜。
-
-在那之前 ``_conversation_id`` 必须逐字节保持 ``channel:`` 前缀 ——
-:meth:`DiscordAdapter._conversation_id` 里有一条**显式断言**把它钉死，
-``tests/test_discord_gateway.py`` 里另有一条独立用例（防有人把断言删掉）。
+回退读发生在哪一步：:mod:`opencode_bridge.conversation_keys` 只在**发起查询的平台
+就是 discord**、且那个 local id 符合**本文件**声明的文法时，才去试一次
+``channel:<local>``。Slack / discord / mattermost 三家的文法两两不相交，于是
+"这个 ``channel:`` 键归谁"是**能确定的判断**而不是猜 —— 纯数字的 id 不可能是
+slack 的（大写字母开头）也不可能是 mattermost 的（恰好 26 位）。文法推导见
+:data:`DISCORD_LOCAL_ID_PATTERN`，判定入口见
+:meth:`~opencode_bridge.adapters.base.Adapter.owns_local_id`。
 
 心跳（本项目最贵的坑之一）
 --------------------------
@@ -80,6 +82,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -87,6 +90,7 @@ import urllib.request
 from typing import Any, Callable, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
 from ..transport import NOTHING, ReconnectNow, WebSocketTransport
 from .base import Adapter, classify_http, register
@@ -166,9 +170,17 @@ FATAL_CLOSE_CODES = {
     4014: "intent 未在开发者后台开启：去 Portal 勾选对应 intent 后重连",
 }
 
-#: 旧的 ``conversation_id`` 前缀（A1 之后**仍是**它，见模块 docstring）。
-#: 单独提成常量，是为了 :meth:`DiscordAdapter._conversation_id` 里能断言"产物就是这个"。
-CONVERSATION_PREFIX = "channel:"
+#: Discord local id 的文法：**纯十进制数字**，17~20 位。
+#:
+#: Discord 的 channel / user / guild id 都是 snowflake —— ``(unix_ms << 22) | 杂项``，
+#: 所以必然是十进制数字串，而位数由毫秒时间戳决定：Discord 2015 年上线，那之后的
+#: 时间戳左移 22 位约等于 5.9e18 起（17 位），到 uint64 的天花板是 20 位。
+#:
+#: ⚠️ **上限 20 是承重的那一头**：Mattermost 的 id 恰好 26 位（它用小写字母，
+#: 但 base32 字母表里含数字），所以"26 位纯数字"这种形状必须落到 mattermost 而不是
+#: discord —— 上限放到 26 就会和它撞。下限 17 则是刻意放松：没有任何别的平台的文法
+#: 会匹配 17~20 位纯数字（slack 要大写字母开头），而收紧下限只会让真实会话接不回来。
+DISCORD_LOCAL_ID_PATTERN = re.compile(r"^[0-9]{17,20}$")
 
 # _handle_payload / 收包循环的返回值（动作）
 _ACT_CONTINUE = "continue"      # 继续收下一包
@@ -221,9 +233,8 @@ class DiscordAdapter(Adapter):
     线程与连接归 :class:`_DiscordTransport`；:attr:`running` / :meth:`stop` 是它的
     代理。
 
-    ⚠️ ``_conversation_id`` 刻意仍产出 ``channel:`` 前缀 —— 见模块 docstring
-    「``conversation_id`` 前缀本轮刻意仍是 ``channel:``」一节（切换的前置条件是
-    ``state.py`` 的键迁移，且歧义前缀额外需要知道是三家中的哪一家）。
+    ``_conversation_id`` 产出统一格式 ``discord:<channel_id>``（已从 ``channel:`` 切过来），
+    ``_channel_id`` 仍认旧前缀 —— 见模块 docstring「``conversation_id`` 前缀」一节。
     """
 
     name = "discord"
@@ -236,6 +247,19 @@ class DiscordAdapter(Adapter):
 
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
+
+    #: 迁移前 Discord 用的 ``conversation_id`` 前缀（**歧义**：三家共用）。
+    #: 值刻意写**字面量**，不用任何常量拼 —— 拼了就跟"防走偏断言"一样会恒真。
+    legacy_conversation_prefix = "channel:"
+    #: 本平台的 local id 文法（snowflake 纯数字，见
+    #: :data:`DISCORD_LOCAL_ID_PATTERN` 的推导）。判定入口是基类的
+    #: :meth:`~opencode_bridge.adapters.base.Adapter.owns_local_id`。
+    local_id_pattern = DISCORD_LOCAL_ID_PATTERN
+    #: ``conversation_id`` 的合法前缀：当前格式 + 旧别名。
+    #: :meth:`_channel_id` 按这个列表剥前缀，所以**旧前缀必须继续认** ——
+    #: 写前收件箱把 ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的
+    #: 未投递消息带着 ``channel:``，认不出来就等于把那些回复永久丢弃。
+    _CONVERSATION_PREFIXES = ("discord:", legacy_conversation_prefix)
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
@@ -912,40 +936,31 @@ class DiscordAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _channel_id(conversation_id: str) -> Optional[str]:
-        raw = conversation_id
-        if raw.startswith(CONVERSATION_PREFIX):
-            raw = raw[len(CONVERSATION_PREFIX):]
+        """``conversation_id`` → Discord channel id；空的一律返回 ``None``。
+
+        裸 channel id（``"1234"``）也认，切换前后的两种前缀都认 ——
+        理由见 :attr:`DiscordAdapter._CONVERSATION_PREFIXES`。
+        """
+        raw = str(conversation_id or "")
+        for prefix in DiscordAdapter._CONVERSATION_PREFIXES:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
         return raw or None
 
     @staticmethod
     def _conversation_id(channel_id: Any) -> str:
-        """``channel_id`` → ``channel:...``。
+        """``channel_id`` → ``discord:...``（统一 ``platform:local_id`` 格式）。
 
-        ⚠️ **不要**改成 ``identity.format_id("discord", channel_id)``。
-
-        ① ``channel:`` 是**歧义前缀**：:data:`identity.LEGACY_PREFIXES["channel"]`
-        的值是 ``None``（slack / discord / mattermost 三家共用），归一时**必须**
-        额外给 ``platform_hint``，否则 :func:`identity.normalize` 抛
-        :class:`~opencode_bridge.identity.AmbiguousConversationId`。
-        ② 切换会改变 ``conversation_id`` 的字符串格式，而
-        :class:`~opencode_bridge.state.StateStore` 拿它当**不透明键**存
-        ``conversation_id ↔ session_id`` —— 已落盘 ``state.json`` 里的键会全部
-        变孤儿，用户一次性丢失会话映射，且**不报错**。
-
-        前置条件：必须与 ``state.py`` 的键迁移（旧键 → 新键的显式重写 + 版本门控）
-        **一起**发。见模块 docstring「``conversation_id`` 前缀本轮刻意仍是
-        ``channel:``」。下面的断言就是**防呆**：后续迁移里若有人顺手把它切成
-        ``discord:``，这里会立刻炸（而不是等到用户报"agent 记错上下文"）。
+        ① 歧义前缀 **永不迁移**：:mod:`opencode_bridge.state` 对 ``channel:`` 只捕获、
+        不归一（归属从未被持久化，推不出来），所以历史会话靠
+        :mod:`opencode_bridge.conversation_keys` 的"各家 local id 文法不相交"
+        在**读取时**接回来 —— 判据是 :attr:`DiscordAdapter.local_id_pattern`。
+        ② 反向解析（:meth:`_channel_id`）必须继续认 ``channel:``：写前收件箱把
+        ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的未投递消息带着
+        旧前缀，认不出来就等于把那些回复永久丢弃。
         """
-        cid = f"{CONVERSATION_PREFIX}{channel_id}"
-        # ⚠️ 这里比的是**字面量** ``channel:``，不是 ``CONVERSATION_PREFIX`` ——
-        # 用常量比会变成恒真（改了常量就一起改了），等于没钉。
-        # （``tests/test_discord_gateway.py`` 里有一条用例专门证明这条断言不是恒真。）
-        assert cid.startswith("channel:"), (
-            f"conversation_id 前缀被改动了: {cid!r}（本轮必须保持 channel:；"
-            "见模块 docstring「conversation_id 前缀本轮刻意仍是 channel:」）"
-        )
-        return cid
+        return format_id("discord", channel_id)
 
     def _send_chunk(
         self, channel: str, content: str, conversation_id: str

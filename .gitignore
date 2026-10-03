@@ -8,6 +8,10 @@ bridge-plugin.log
 .bridge-plugin.lock
 # 本项目自己的单实例锁（桥启动时生成，含本机 pid）
 .bridge-instance.lock
+# 进程诊断产物（G1 取证）：生命周期账本 + 崩溃栈，含 pid/线程栈/本机路径
+bridge-lifecycle.jsonl
+bridge-lifecycle.jsonl.1
+bridge-stacks.log
 
 # Python
 __pycache__/

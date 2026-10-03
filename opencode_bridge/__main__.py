@@ -29,6 +29,7 @@ from typing import Sequence
 from .adapters import build
 from .config import Config, DEFAULT_CONFIG_NAME
 from .core import BridgeCore, setup_platforms, setup_reply
+from .diagnostics import ProcessDiagnostics, describe_environment
 from .instance_lock import InstanceLock, pid_is_alive
 from .opencode_client import OpenCodeClient, discover_endpoint
 from .state import StateStore
@@ -472,12 +473,29 @@ def _run_bridge_locked(cfg: Config) -> int:
     core.start()
     logger.info("bridge running against %s — press Ctrl+C to stop", endpoint.url)
     stop_event = threading.Event()
+
+    # 台账 G1 的取证：桥会不明原因退出，而 Python 层日志在进程被外部杀死时
+    # **什么都不会留下**。这里补上崩溃栈 + 生命周期账本，**只取证不自愈**
+    # （死因未知时加自愈机制等于用一层自愈掩盖真正的问题）。
+    # 详见 opencode_bridge/diagnostics.py 的模块说明。
+    diagnostics = ProcessDiagnostics(_bridge_dir())
+    diagnostics.install()
+    exit_reason = "stopped"
     try:
         while not stop_event.wait(1.0):  # periodic -> Ctrl+C always lands
             pass
     except KeyboardInterrupt:
+        exit_reason = "keyboard-interrupt"
         logger.info("收到中断信号 (Ctrl+C)，正在停止 ...")
+    except BaseException as exc:  # 含 SystemExit；被信号打断时可能走到这
+        exit_reason = "unhandled:%s" % type(exc).__name__
+        raise
     finally:
+        # 顺序很关键：**先留证据再停 core**。core.stop() 会关掉线程，
+        # 那时线程栈已经没有诊断价值了。
+        diagnostics.record(exit_reason, detail=describe_environment())
+        diagnostics.dump_stacks(exit_reason)
+        diagnostics.close()
         core.stop()
     logger.info("已退出")
     return 0

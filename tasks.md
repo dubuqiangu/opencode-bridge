@@ -8,6 +8,26 @@
 > 设计依据见 [`docs/platform-design-reference.md`](docs/platform-design-reference.md)（Hermes / dsh-im-gateway 三方对比）。
 > 扩展前稳定点：tag `backup/pre-platform-expansion-20261002`（`06a7d2f`）。
 
+## 推送约定（用户定，2026-10-03）
+
+> **一个大功能完成后、验证通过就推送** —— 例如整个框架落地、或每新增一个消息平台。
+> 不攒着"攒一大批再推"。
+
+**推送前必须过的检查**（推送是**不可逆**动作，所以顺序是"先查再推"）：
+
+1. `python -m unittest discover -s tests` 全绿 + `python -m compileall -q opencode_bridge` exit 0
+2. **凭据/隐私扫描**：已跟踪文件里不得出现真实 token / `app_secret` / 长随机串凭据，
+   也不得出现**本机真实用户名或绝对路径**。测试里的占位符必须是通用值
+   （`tests/test_core.py` 曾硬编码 `C:\Users\33204`，已在 `f767b85` 修掉）。
+   查真实凭据形状：Telegram `\d{8,10}:[A-Za-z0-9_-]{35}`、Slack `xoxb-`/`xapp-`、
+   GitHub `gh[pousr]_`、OpenAI `sk-`。
+3. **索引里没有运行期产物**：`.gitignore` 只挡将来添加，**已跟踪的文件不会被它移除**，
+   所以要显式确认 `config.json` / `state.json` / `*.log` / 锁文件 / `__pycache__` /
+   `*.session` 都不在 `git ls-files` 里。
+4. 文档一致性：平台数、能力表行数、链接无断链。
+
+**首次推送已发生**：`91c4478 → f767b85`（36 个 commit，13 个平台）。
+
 ## 目标
 
 **融合两个参考项目的平台覆盖面**（Hermes 22 个 + dsh-im-gateway 22 个，取并集 ≈ 31 个），

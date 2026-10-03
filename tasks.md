@@ -96,7 +96,7 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | **G2** | **at-most-once：崩溃窗口内静默丢消息** | 高 | 崩溃窗口**主体已修**（写前收件箱+ 启动重放）；**残留**：「游标已落盘 → on_inbound」段未覆盖 | ◐ **主体已修，残留窗口未闭合** |
 | G3 | 无法指定模型 | 中 | **已实现** `/model`（看当前 / 切换 / 搜819 个目录），实测换模型真的生效 | ✅ **已完成**（`3518c61`） |
 | G4 | A1 迁移剩 2/8 | 中 | **已完成**：Mattermost / Twitch 已上共享 transport 层，8/8 迁移完毕 | ✅ **已完成** |
-| G5 | A2 前缀切换剩 5 家 | 低 | telegram/matrix/slack/discord/mattermost 仍发旧前缀 | ☐ 未修 |
+| G5 | A2 前缀切换剩 5 家 | 低 | **telegram / matrix 已切**（`0c4c163`）；`channel:` 三家受歧义前缀阻塞，需单独设计决定 | ◐ **2/5，第二步待设计** |
 | **G6** | **测试夹具硬编码本机 opencode 口令** | 中 | 口令已随origin/main 公开（仅指向 127.0.0.1:4097，实际可利用性低） | ⏸ **用户决定暂不修** |
 
 ### G6 · 测试夹具硬编码本机opencode 口令（**用户决定暂不修，2026-10-03**）
@@ -404,6 +404,71 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 **持久性**：模型存在**服务端会话**里，而桥把 `session_id` 持久化在
 `state.json`（`core._ensure_session`）—— 所以模型**跨桥重启天然保持**，
 不需要桥额外存。
+
+#### G5 第一步已完成（`0c4c163`）
+
+台账原方案是「前缀翻转 + `migrate_keys=True` + 改写断言 + 删别名回退，同一commit」。
+**实际拆成两步**，因为其中3 家在当前机制下无法安全翻。拆的依据是查出来的，不是偏好。
+
+**阻塞点**：`state.py:151` 调`identity.normalize(key)`，**没有传 `platform_hint`**；
+而 `LEGACY_PREFIXES["channel"] = None` —— `channel:` 被 slack / discord /
+mattermost **三家共用**，从字符串判断不出来源，`normalize()` 因此抛
+`AmbiguousConversationId`。
+
+| 分组 | 前缀 | 迁移器能否处理 |
+|---|---|---|
+| telegram | `chat:` | ✅ `"chat" -> "telegram"` |
+| matrix | `room:` | ✅ `"room" -> "matrix"` |
+| slack / discord / mattermost | `channel:` | ❌ 歧义，抛异常 |
+
+若硬翻那三家，`state.json` 里的 `channel:*` 键不会被迁移 → 会话映射成孤儿 →
+**agent 突然忘事**，正是 `tasks.md:1887` 警告的后果。
+
+`migrate_keys=True` **不是可选项**：翻了前缀不迁移存量键，用户已有的
+`chat:*` / `room:*` 就成孤儿—— 这就是台账要求两件事同一 commit 的原因。
+`__main__` 打开开关，而 **`StateStore` 的默认值仍保持关闭**：
+库不替调用方做决定，单测也因此能覆盖关闭态。
+
+##### 抓到一处我完全没考虑的跨功能交互（G2 × G5）
+
+反向解析**必须继续接受** `chat:` / `room:` —— 因为 **G2 的写前收件箱把
+`conversation_id` 存进了 SQLite**（`inbox.py:185` 的 TEXT 列），
+**切换前写入的行会在切换后被重放**。若反向解析只认新格式，那些行会投递失败。
+
+所以两个适配器都加了 `_CONVERSATION_PREFIXES = ("telegram:", "chat:")` /
+`("matrix:", "room:")`，反向解析两个都剥、外加裸 id。实测：
+
+    telegram:55 -> 55      chat:55 -> 55      55 -> 55
+    matrix:!abc:example.org -> '!abc:example.org'
+    room:!abc:example.org   -> '!abc:example.org'
+
+##### 承重安全属性：`channel:` 键原样存活（我自己建真实文件实测）
+
+    scanned=2 migrated=1 ambiguous_kept=1
+    get_session("telegram:55") = 'ses_legacy'   <- chat:55 已迁移
+    get_session("channel:C1")  = 'ses_chan'     <- 原样保留且仍可解析
+    get_meta("channel:C1")     = '/x'
+    落盘后的键: ['channel:C1', 'telegram:55']     <- channel 逐字节未变
+
+##### 第二步还欠什么（**未排期，需设计决定**）
+
+1. **给迁移器接上平台线索**。线索**不在 `state.json` 里**（文件只存键值对，
+   不记录某个键属于哪个平台），唯一可用的是「哪些适配器已配置并连上」——
+   即在 core 侧按已挂载适配器逐个尝试 `normalize(key, platform_hint=...)`。
+   ⚠️ `state.py:46-49` 明写**绝不**用 local id 形状（Slack `C`/`D` 开头、
+   Discord 纯数字、Mattermost 26 位 base32）去猜，那等于伪造线索。
+2. 翻 slack / discord / mattermost 的 `_conversation_id`。
+3. **删** `_lookup` / `_legacy_alias` 的别名回退（`state.py:277-284`）——
+   在 `channel:` 键还存在时它是**活代码**，第一步刻意没删。
+4. 改写 `test_slack.py:264,325` 与 `test_discord_gateway.py:851`
+   那几条编码「切前缀会让会话映射丢失」的用例。
+
+##### 一处我补的过时陈述
+
+实现者**正确地没有越权**改 `state.py`（在它的禁改清单里），但标出来交回：
+原 docstring 声称「前缀切换还没发（telegram/matrix/… 仍产出旧前缀）」现已**不成立**，
+且指名了一个**已被改名**的测试。已改写，并逐个核实新引用的测试名真实存在
+（`test_telegram.py:221` / `test_matrix.py:626`）。
 
 #### G4 已完成：Mattermost / Twitch 上共享 transport
 

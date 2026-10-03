@@ -196,7 +196,7 @@ def send(self, out: Outbound) -> MsgHandle | None:
 ## 验收命令
 
 ```powershell
-cd D:\workSpace\python\aicode\opencode\opencode-bridge
+cd <本仓库路径>                                    # 换成你自己的 checkout 目录
 python -m unittest tests.test_<name>          # 专项
 python -m unittest discover -s tests          # 全量（不得出现新失败）
 python -m compileall -q opencode_bridge      # 必须 exit 0

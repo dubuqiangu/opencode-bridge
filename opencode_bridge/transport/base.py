@@ -32,6 +32,29 @@ Twitch / Nextcloud Talk），而每个适配器当初都**自己手写了一遍*
 * :class:`ReconnectNow` —— 在 ``_next`` / ``_on_open`` / ``on_message`` 里抛它，
   表示"这次连接**主动**作废，但不要退避，立刻重连"（Slack Socket Mode 服务端
   下发 ``disconnect`` 就是这种语义）。
+
+周期钩子
+--------
+"没有入站数据时也要定期做点事"这件事（Discord 心跳、Twitch 保活与注册超时
+判定）以前每家都在适配器里**自己写一个线程或子类**（见
+:mod:`opencode_bridge.adapters.irc` 的 ``_IrcTransport._tick``），于是同一份机制
+会有三份。现在它是传输层的一等能力：``on_tick`` + ``tick_interval``，两种触发
+源，语义分别是：
+
+* ``tick_interval <= 0``（**循环驱动**）：基类在**每次取下一条数据之前**调一次。
+  IO 超时也算一轮 —— :mod:`.tcp_lines` 把读超时表达成 :data:`NOTHING`，所以
+  ``io_timeout`` 到了就会重新问一轮、也就重新 tick。**这与 IRC 迁移前的子类
+  逐项等价**，IRC 因此保持原样不动（见 ``tests/test_transport.py`` 的
+  ``TestPeriodicHook``）。
+* ``tick_interval > 0``（**定时驱动**）：起一个 daemon 定时线程，每
+  ``tick_interval`` 秒调一次，**只在有活动会话时调**。给"``_next`` 可能长时间
+  阻塞、循环自己转不起来"的长连接用 —— Discord 的 WS 读要阻塞整整 60s，而心跳
+  周期是 41~45s：靠循环驱动的话心跳会被拖到 60s 一次（> 服务端容忍的 1.25 倍），
+  连接会被直接判死。``tick_interval`` **可在运行期调整**（用
+  :meth:`Transport.tune_tick_interval` 会立刻唤醒定时线程），所以适配器能在协商到
+  周期之后把粒度收紧。
+
+两种模式下钩子抛异常都**不许**杀死循环：记进 ``stats()["errors"]`` 后继续。
 """
 
 from __future__ import annotations
@@ -105,11 +128,18 @@ class Transport(abc.ABC):
     4. 用户回调 ``on_event`` 抛异常**不得杀死消费循环**（记 log 后继续）。
     5. :meth:`start` 与 :meth:`stop` 都幂等（不会起第二个线程 / 不会二次崩）。
     6. 退避等待可被 :meth:`stop` **立即打断**（用 ``Event.wait``，不是 ``sleep``）。
+    7. :meth:`stop` 的顺序是**停周期钩子 → 关连接 → join 消费线程**（顺序与第 1 条
+       同源：适配器的心跳/保活必须先停，否则关连接时它还会往一条正在关的连接上写）。
 
     :param name: 日志前缀（给适配器传平台名即可，便于按平台过滤日志）。
     :param min_backoff: 首次失败后的等待秒数，也是重置后的下限。
     :param max_backoff: 等待上限（封顶后不再增长）。
     :param reset_after: 连接存活超过这么久就认为"稳定"，退避重置回下限。
+    :param on_tick: 可选的**周期钩子**（无参可调用）。见模块 docstring「周期钩子」。
+        ``None`` = 完全关闭（不额外起线程、循环里只有一次 ``is None`` 判断）。
+    :param tick_interval: 周期钩子的间隔秒数。``<= 0`` = 循环驱动（每次取下一条
+        数据之前调一次，IO 超时也算）；``> 0`` = 定时驱动（另起一个 daemon 定时
+        线程，运行期可用 :meth:`tune_tick_interval` 调整）。
     """
 
     def __init__(
@@ -119,7 +149,11 @@ class Transport(abc.ABC):
         min_backoff: float = 1.0,
         max_backoff: float = 60.0,
         reset_after: float = 0.0,
+        on_tick: Callable[[], None] | None = None,
+        tick_interval: float = 0.0,
     ) -> None:
+        if on_tick is not None and not callable(on_tick):
+            raise TypeError("on_tick 必须可调用")
         self.name = str(name or "")
         # 夹逼一下，免得 min > max 这种手滑配置让退避第一次就"封顶"在错误值上。
         self.min_backoff = max(0.0, float(min_backoff))
@@ -127,6 +161,20 @@ class Transport(abc.ABC):
         # 默认 0 =「只要连上过就重置退避」——这是迁移前 8 个适配器的既有语义，
         # 默认取它才能保证迁移行为不变。传正数才启用"需稳定存活 N 秒"的保守模式。
         self.reset_after = max(0.0, float(reset_after))
+
+        # --- 周期钩子（见模块 docstring「周期钩子」）---------------------
+        self.on_tick = on_tick
+        #: 公开属性：定时驱动模式下适配器可在运行期收紧粒度（每轮重读）。
+        self.tick_interval = max(0.0, float(tick_interval))
+        # 两种触发源在这里定型：谁也不许在运行期换模式（换模式必须重建传输层，
+        # 否则 stop() 的"先停钩子"顺序会与实际模式对不上）。
+        self._loop_ticks = on_tick is not None and self.tick_interval <= 0.0
+        self._timer_ticks = on_tick is not None and self.tick_interval > 0.0
+        self._tick_stop = threading.Event()
+        #: 只用来"提前唤醒"定时线程（调粒度 / 收工），本身不携带状态。
+        self._tick_wake = threading.Event()
+        self._tick_thread: threading.Thread | None = None
+        self._last_tick = 0.0
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -143,6 +191,7 @@ class Transport(abc.ABC):
             "events": 0,       # 交给 on_event 的条数
             "errors": 0,       # 被吞掉的异常次数
             "idle": 0,         # 收到 NOTHING 的次数
+            "ticks": 0,        # 周期钩子实际被调用的次数
         }
 
     # --- 属性 ----------------------------------------------------------
@@ -154,6 +203,11 @@ class Transport(abc.ABC):
     @property
     def thread_name(self) -> str:
         return f"transport:{self.label}"
+
+    @property
+    def tick_thread_name(self) -> str:
+        """周期钩子定时线程名（仅 ``tick_interval > 0`` 时存在）。"""
+        return f"transport-tick:{self.label}"
 
     @property
     def running(self) -> bool:
@@ -193,6 +247,13 @@ class Transport(abc.ABC):
             self._on_event = on_event
             self._stop_event.clear()
             self._backoff = self.min_backoff
+            if self._timer_ticks:
+                self._tick_stop.clear()
+                tick_thread = threading.Thread(
+                    target=self._tick_loop, name=self.tick_thread_name, daemon=True
+                )
+                self._tick_thread = tick_thread
+                tick_thread.start()
             thread = threading.Thread(
                 target=self._run, name=self.thread_name, daemon=True
             )
@@ -200,19 +261,25 @@ class Transport(abc.ABC):
             thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """**先关连接再 join**（顺序不能反）。**幂等**。
+        """**停周期钩子 → 关连接 → join 消费线程**（顺序不能反）。**幂等**。
 
         顺序为什么重要：消费线程多半阻塞在 ``_next()`` 里（``recv()`` 可能要
         30s 才超时），而 ``join`` 只等 ``timeout``（默认 5s）。不先把连接关掉、
         把那个阻塞唤醒，每次 stop 都会白等满 5 秒。
 
-        从消费线程内部调用是安全的（不会 join 自己）。
+        周期钩子排在最前面，是因为适配器的心跳/保活会往 ``connection`` 上写 ——
+        连接正在被关时还写，会抛异常、也会把"我们主动关的"记成"发失败"。
+        这正是 Discord ``stop()`` 的「停心跳 → 关 WS → join」三段式，现在由基类
+        统一保证。
+
+        从消费线程内部调用是安全的（不会 join 自己；定时线程照常被停掉）。
         """
         self._stop_event.set()
+        self._stop_ticking()               # ① 先停周期钩子（不等它发完一拍）
         with self._conn_lock:
             conn, self._conn = self._conn, None
         if conn is not None:
-            self._close_conn(conn)      # 让阻塞中的 _next 立刻返回
+            self._close_conn(conn)        # ② 让阻塞中的 _next 立刻返回
         with self._lifecycle_lock:
             thread = self._thread
         if (
@@ -220,7 +287,7 @@ class Transport(abc.ABC):
             and thread.is_alive()
             and thread is not threading.current_thread()
         ):
-            thread.join(timeout)
+            thread.join(timeout)          # ③ 最后才 join
 
     # --- 子类实现这三个（每次重连调一遍）-------------------------------
     @abc.abstractmethod
@@ -327,6 +394,8 @@ class Transport(abc.ABC):
     def _pump(self, conn: Any) -> None:
         """反复 ``_next`` 并派发，直到连接出问题或被 stop。"""
         while not self._stop_event.is_set():
+            if self._loop_ticks:           # 未配置钩子时只是一次布尔判断
+                self._fire_tick()
             item = self._next(conn)
             if item is NOTHING:
                 self._stats["idle"] += 1
@@ -350,6 +419,96 @@ class Transport(abc.ABC):
                 self.label,
                 exc,
             )
+
+    # --- 周期钩子（子类不用碰）------------------------------------------
+    def _fire_tick(self) -> None:
+        """跑一次周期钩子，并把异常**关进笼子**。
+
+        钩子抛异常 = 这一次周期没做成，**不许**因此终止会话或杀死消费线程：
+        记进 ``stats()["errors"]`` 后继续下一轮。（与 IRC 迁移前的 ``_tick`` 不同 ——
+        那个钩子靠抛异常表达"本次会话作废"，语义不同，所以 IRC 保留了它自己的接缝。）
+
+        定时驱动模式额外做一次间隔闸门：定时线程本身已经按 ``tick_interval`` 睡过，
+        这一次判断只是让"运行期调小间隔"立即生效（等下一拍就行，不必等下一轮）。
+        """
+        hook = self.on_tick
+        if hook is None:                  # 零开销路径：没配钩子时直接返回
+            return
+        if self._timer_ticks:
+            now = time.monotonic()
+            if now - self._last_tick < self.tick_interval:
+                return
+            self._last_tick = now
+        self._stats["ticks"] += 1
+        try:
+            hook()
+        except Exception as exc:  # noqa: BLE001 - 钩子的 bug 不该断连
+            self._stats["errors"] += 1
+            logger.warning(
+                "transport[%s]: on_tick 钩子抛出异常（已忽略，继续消费）: %s",
+                self.label,
+                exc,
+            )
+
+    def _tick_loop(self) -> None:
+        """定时驱动的周期钩子线程（仅 ``tick_interval > 0`` 时存在）。
+
+        两点与循环驱动的差别：
+
+        1. **只在有活动会话时调**：退避期间 ``connection`` 是 ``None``，这时调钩子
+           会让适配器对着一条已经关掉的连接做保活/心跳（写出错、还刷无意义的告警）。
+        2. **每轮重读 ``tick_interval``**：适配器可以在协商到周期之后（心跳 41s）
+           把粒度收紧到周期的一小部分（否则心跳会晚最多一整个 ``tick_interval``）。
+           用 :meth:`tune_tick_interval` 还能**立刻**唤醒，不必睡满当前那一拍。
+
+        等待用 ``Event.wait``，所以 :meth:`stop` 能立即打断（不必等满一拍）。
+        """
+        try:
+            while not self._tick_stop.is_set():
+                self._tick_wake.clear()
+                if self._tick_wake.wait(max(0.001, self.tick_interval)):
+                    continue         # 被 tune_tick_interval / stop 唤醒 → 重读粒度或退出
+                if self.connection is None:
+                    continue
+                self._fire_tick()
+        finally:
+            with self._lifecycle_lock:
+                if self._tick_thread is threading.current_thread():
+                    self._tick_thread = None
+
+    def tune_tick_interval(self, interval: float) -> None:
+        """运行期调整周期钩子的粒度，并**立刻**唤醒定时线程。
+
+        为什么必须唤醒：定时线程正阻塞在 ``Event.wait(当前粒度)`` 里，光改属性要等
+        它睡满那一拍才生效。适配器拿到协商值之前的初始粒度往往很粗（Discord 是
+        5s），第一次心跳因此会被拖掉整整 5s —— 那正是"周期看起来慢一倍"的错觉来源。
+
+        循环驱动模式（``tick_interval <= 0``）下本方法只改属性、不唤醒（那个模式
+        根本没有等待）。
+        """
+        self.tick_interval = max(0.0, float(interval))
+        if self._timer_ticks:
+            self._tick_wake.set()
+
+    def _stop_ticking(self, timeout: float = 1.0) -> None:
+        """停掉周期钩子线程并 join（幂等；未配置钩子时是 no-op）。
+
+        ⚠️ 必须**两个**事件都置位：定时线程阻塞在 ``self._tick_wake.wait(粒度)`` 上，
+        只置 ``_tick_stop`` 唤不醒它 —— 于是 ``join`` 会白等满 ``timeout``，而那个
+        线程还会在关连接之后继续往一条正在关的连接上写（生产里粒度是 5s，所以这是
+        "stop() 之后还会冒出一拍心跳"）。置上 ``_tick_wake`` 才能立刻唤醒。
+        """
+        self._tick_stop.set()
+        self._tick_wake.set()
+        with self._lifecycle_lock:
+            thread = self._tick_thread
+            self._tick_thread = None
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout)
 
     # --- 退避 ----------------------------------------------------------
     def _next_backoff(self, *, survived: bool) -> float:

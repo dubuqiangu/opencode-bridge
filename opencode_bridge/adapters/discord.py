@@ -1,9 +1,78 @@
 """Lane B — Discord adapter (CONTRACT.md §2.3). Standard library only.
 
 Outbound (``POST /channels/{id}/messages`` / ``PATCH .../{message_id}``) 与
-**入站 Gateway v10 WebSocket**（tasks.md T2.2）都可用。入站传输层复用
-:mod:`opencode_bridge.ws`（T2.0，纯标准库自研的最小 RFC 6455 客户端），
-因此本文件不引入任何第三方依赖。
+**入站 Gateway v10 WebSocket**（tasks.md T2.2）都可用。
+
+A1：WS 连接 / 收包循环 / 退避 / 线程 / ``stop()`` 语义已迁到
+:class:`~opencode_bridge.transport.WebSocketTransport`。本文件只留 Discord 语义：
+HELLO 协商、心跳（周期 + ACK 监测）、opcode 分发、close code 决策、事件过滤、
+授权闸门、出站 REST。生产连的是 :mod:`opencode_bridge.ws`（T2.0，纯标准库自研的
+最小 RFC 6455 客户端），因此本文件不引入任何第三方依赖。
+
+⚠️ ``conversation_id`` 前缀**本轮刻意仍是 ``channel:``**，不要"顺手改好"
+------------------------------------------------------------------------
+``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里的值是 ``None`` ——
+**歧义前缀**，被 slack / discord / mattermost **三家共用**，光看字符串**判不出**
+来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。
+
+把 :meth:`DiscordAdapter._conversation_id` 改成 ``identity.format_id("discord", ...)``
+会改变 ``conversation_id`` 的字符串格式，而 :class:`~opencode_bridge.state.StateStore`
+拿它当**不透明键**存 ``conversation_id ↔ session_id`` 映射 —— 于是**已落盘
+``state.json`` 里的所有 ``channel:`` 键会一次性变成孤儿**，用户会在迁移后一次性
+"忘记"所有历史会话映射。这种故障**不报错**，只表现为"agent 突然记错上下文"，
+比直接失败难查得多。
+
+前缀切换必须是一个**单独的变更**，前置条件有两个：
+
+1. 必须与 ``state.py`` 的键迁移（旧键 → 新键的显式重写 + 版本门控）**一起**发；
+2. 歧义前缀还**额外**需要"是三家中的哪一家"这条线索 ——
+   :func:`identity.normalize` 对 ``channel:`` 不给 ``platform_hint`` 就抛
+   :class:`~opencode_bridge.identity.AmbiguousConversationId`，无法静默猜。
+
+在那之前 ``_conversation_id`` 必须逐字节保持 ``channel:`` 前缀 ——
+:meth:`DiscordAdapter._conversation_id` 里有一条**显式断言**把它钉死，
+``tests/test_discord_gateway.py`` 里另有一条独立用例（防有人把断言删掉）。
+
+心跳（本项目最贵的坑之一）
+--------------------------
+1. **``heartbeat_interval`` 的单位是毫秒**（按秒用会让心跳快 1000 倍，瞬间触发
+   4008 限流被踢）。换算在 :meth:`DiscordAdapter._on_hello` 里，**一个字都别改**。
+2. **心跳的 ``d`` 键不能省**：一个事件都没收到时也必须发 ``{"op":1,"d":null}``。
+   :meth:`DiscordAdapter._send_op` 无条件写 ``"d"``。
+3. **周期由传输层的周期钩子驱动**（``on_tick`` + ``tick_interval``），**不是**自带
+   心跳线程 —— 见下一节。
+
+为什么心跳要用"定时驱动"的周期钩子而不是循环驱动
+--------------------------------------------------
+Gateway 的 WS 读会阻塞 :data:`GATEWAY_RECV_TIMEOUT`（60s）才返回，而心跳周期是
+41~45s。靠"每次取下一条数据之前 tick"的话，心跳会被拖到 60s 一次 —— 超过 Discord
+容忍的 ``interval × 1.25``，连接会被直接判死。
+
+也**不能**靠调小 WS 读超时来解决：:mod:`opencode_bridge.ws` 的 ``_recv_exact`` 在
+读超时时会抛异常并**丢掉已读到的半帧**，把 socket 超时调小等于让字节流损坏。所以
+本适配器用 ``tick_interval > 0``（另起一个 daemon 定时线程）的模式，粒度取
+心跳周期的 1/8（:data:`HEARTBEAT_TICK_DIVISOR`），见 :meth:`_make_transport`。
+
+Gateway 上七个不能省的点
+------------------------
+1. **网关主机名必须问 REST**：``GET /gateway/bot`` 返回的 ``url``（官方会换域名），
+   不许硬编码 ``gateway.discord.gg``。见 :meth:`_resolve_gateway_url`。
+2. **Resume 必须用 READY 给的 ``resume_gateway_url``**，用错会显著提高断线率。
+3. **停止重连的 close code** 是 ``{4004, 4010, 4011, 4012, 4013, 4014}`` ——
+   配错/缺权限，重连一万次也不会好，必须带**具体原因**停下而不是无脑
+   ``while True``。⚠️ **invalid token 是 4004，不是常被误传的 4010**（4010 是
+   shard 参数非法）。见 :data:`FATAL_CLOSE_CODES`。
+4. **防回环只看 ``author.id`` 是否等于自己**（READY 里缓存的 user id），
+   **绝不能用 ``author.bot``** —— 那会把别的 bot 发的消息全丢掉。而且
+   ``author.bot`` 是**可选**字段，可能整个键不存在。
+5. **七个事件过滤器一条都不能少**：自己发的 / ``type != 0`` 系统消息 /
+   IS_CROSSPOST / webhook / 空正文 / 缺 channel_id / 授权闸门。见
+   :meth:`_handle_message_create`。
+6. **主动断开用 4000 而不是 1000**：1000/1001 会让 session 失效、bot 在开发者后台
+   显示离线，也会让 Resume 失去意义。见 :data:`GATEWAY_CLOSE_REQUESTED`。
+7. **intents 用位值表达式**（``512|4096|32768`` = 37376），不是裸数字。
+   ⚠️ MESSAGE_CONTENT（``1 << 15``）**必须在开发者后台勾选**，否则服务端 close
+   4014（"Disallowed intents"）—— 见 :data:`INTENT_MESSAGE_CONTENT`。
 """
 
 from __future__ import annotations
@@ -15,10 +84,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
+from ..transport import NOTHING, ReconnectNow, WebSocketTransport
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.discord")
@@ -38,22 +108,35 @@ GATEWAY_API_VERSION = 10           # 连接串固定 ?v=10（REST 侧已由 API_
 GATEWAY_ENCODING = "json"          # 不加 compress=（那需要 zlib-stream 协商）
 GATEWAY_MAX_PAYLOAD = 4096         # 单个网关 payload 上限，超了服务端 close 4002
 #: recv 超时（秒）。心跳周期实测 41~45s 且每次心跳都有 op 11 往返，正常不会触发；
-#: 它只是"Linux 上 close() 不保证唤醒阻塞 recv"的兜底（见 _inbound_loop 注释）。
+#: 它只是"Linux 上 close() 不保证唤醒阻塞 recv"的兜底（见 _open_socket 注释）。
+#: ⚠️ **不要为了让心跳更准而调小它** —— ws.py 在读超时会丢掉半帧（见模块 docstring）。
 GATEWAY_RECV_TIMEOUT = 60.0
 RECONNECT_MIN = 1.0                # 重连退避下限（秒）
 RECONNECT_MAX = 60.0               # 重连退避上限（秒）
 HEARTBEAT_DEFAULT = 45.0           # Hello 没给 heartbeat_interval 时的兜底（秒）
+#: 心跳到期判定的时间粒度 = 心跳周期 / 这个除数（再封顶在 5s）。心跳的实际发送
+#: 时刻最多比协商值晚这么多 —— 41s 周期下是 ~5.2%，远小于服务端容忍的 25%。
+#: 取周期的分数（而不是常数）是为了让亚秒级的协商值也能测（周期 60ms 时粒度 7.5ms）。
+HEARTBEAT_TICK_DIVISOR = 8
+HEARTBEAT_TICK_MAX = 5.0
+HEARTBEAT_TICK_MIN = 0.001
 
 #: intents 是**整数 bitmask**（按位或），不是数组。本项目只要消息类 intent：
 INTENT_GUILD_MESSAGES = 1 << 9     # 512   服务器内频道消息
 INTENT_DIRECT_MESSAGES = 1 << 12   # 4096  私聊
 INTENT_MESSAGE_CONTENT = 1 << 15   # 32768 消息正文（不开就收不到 content）
+#: ⚠️ MESSAGE_CONTENT 必须在**开发者后台 / Portal** 勾选，否则网关会 close 4014
+#: （"Disallowed intents"）。403/401 之类都跟这个无关 —— 只改配置、不改代码。
 DEFAULT_INTENTS = (
     INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT
 )  # = 37376
 
 #: 我们主动断开时使用的 close code。**不能用 1000/1001**：那样会让 session 失效、
 #: bot 在开发者后台显示离线；用 4000 才能保住 session 供 Resume。
+#: 迁移前这条只用在"我们自己主动断"（op 7 / ACK 超时）上，会话收尾的 ``ws.close()``
+#: 用的是默认 1000 —— 那等于每次重连都作废 session、Resume 形同虚设。现在由
+#: :class:`~opencode_bridge.transport.WebSocketTransport` 的 ``close_code`` 统一
+#: 覆盖**两种**断开路径。
 GATEWAY_CLOSE_REQUESTED = 4000
 
 #: IS_CROSSPOST：转发消息会在源频道与每个目标频道各触发一次 MESSAGE_CREATE
@@ -71,6 +154,9 @@ OP_HEARTBEAT_ACK = 11      # 心跳确认
 
 #: 这些 close code 是**配置/权限层面的错**，重连一万次也不会好，必须停下并给出
 #: 可执行的诊断（官方 Gateway 文档的 close code 表）。
+#:
+#: ⚠️ **invalid token 是 4004**（"Authentication failed"），不是常被误传的 4010。
+#: 4010 是 "Invalid Shard"，本适配器固定 ``[0]`` 单分片，正常不该出现。
 FATAL_CLOSE_CODES = {
     4004: "认证失败：bot_token 无效或已重置",
     4010: "shard 参数非法（本适配器固定 [0] 单分片，正常不该出现）",
@@ -80,6 +166,10 @@ FATAL_CLOSE_CODES = {
     4014: "intent 未在开发者后台开启：去 Portal 勾选对应 intent 后重连",
 }
 
+#: 旧的 ``conversation_id`` 前缀（A1 之后**仍是**它，见模块 docstring）。
+#: 单独提成常量，是为了 :meth:`DiscordAdapter._conversation_id` 里能断言"产物就是这个"。
+CONVERSATION_PREFIX = "channel:"
+
 # _handle_payload / 收包循环的返回值（动作）
 _ACT_CONTINUE = "continue"      # 继续收下一包
 _ACT_RECONNECT = "reconnect"    # 重连（尽量 Resume）
@@ -87,9 +177,54 @@ _ACT_REIDENTIFY = "reidentify"  # 重连 + 丢弃 session 走 Identify
 _ACT_FATAL = "fatal"            # 停止重连
 
 
+# ---------------------------------------------------------------------------
+# 传输层接缝
+# ---------------------------------------------------------------------------
+class _DiscordTransport(WebSocketTransport):
+    """Discord 用的 :class:`~opencode_bridge.transport.WebSocketTransport`。
+
+    只覆写一样东西，**都留在适配器这一侧**（传输层不该知道 Discord 存在）：
+
+    **对端关闭时把 ``close_code`` 交回适配器判断。** 基类
+    :meth:`~opencode_bridge.transport.WebSocketTransport._next` 在 ``recv()``
+    返回 ``None`` 时把它统一变成 ``ConnectionError``（消息里带 close code 字符串），
+    而**哪个 close code 该停止重连**是平台语义（``4004`` 是 token 失效、
+    ``4014`` 是 intent 没在后台勾选）—— 基类不该知道。所以这里接回来，让适配器
+    决定；判定为"配错"时直接 :meth:`Transport.stop` 停掉整个循环（而不是
+    重连一万次）。
+
+    ⚠️ 周期钩子**不是**在这里实现的 —— 那是传输层的一等能力（``on_tick`` +
+    ``tick_interval``），见 :class:`DiscordAdapter._make_transport`。本子类与
+    ``_IrcTransport`` 一样只承担"平台语义接缝"，不重写任何连接管理机制。
+    """
+
+    def __init__(self, connect: Callable[[], Any], *, on_disconnect: Callable[[Any], bool],
+                 **kw: Any) -> None:
+        self._on_disconnect = on_disconnect
+        super().__init__(connect, **kw)
+
+    def _next(self, conn: Any) -> Any:
+        try:
+            return super()._next(conn)
+        except ConnectionError:
+            # 对端关闭（或读失败）。判定是不是"配错"必须看 close code。
+            if self._on_disconnect(conn):
+                self.stop()            # ① 停钩子 → ② 关连接 → （不自 join）
+                return NOTHING          # 消费循环下一轮就会看到停止位并退出
+            raise
+
+
 @register("discord")
 class DiscordAdapter(Adapter):
-    """Discord adapter: REST 出站 + Gateway v10 入站。"""
+    """Discord adapter: REST 出站 + Gateway v10 入站。
+
+    线程与连接归 :class:`_DiscordTransport`；:attr:`running` / :meth:`stop` 是它的
+    代理。
+
+    ⚠️ ``_conversation_id`` 刻意仍产出 ``channel:`` 前缀 —— 见模块 docstring
+    「``conversation_id`` 前缀本轮刻意仍是 ``channel:``」一节（切换的前置条件是
+    ``state.py`` 的键迁移，且歧义前缀额外需要知道是三家中的哪一家）。
+    """
 
     name = "discord"
     label = "Discord"
@@ -121,10 +256,15 @@ class DiscordAdapter(Adapter):
         self._my_user_id: Optional[str] = None     # READY.d.user.id（过滤自己）
         self._ack_received: bool = False            # 最近一次心跳是否被 ACK
         self._heartbeat_interval: float = 0.0       # 秒（Hello 给的是毫秒）
-        self._ws = None                              # 当前连接，stop() 时关掉
         self._ws_factory = None                      # 测试注入点
-        self._hb_thread: Optional[threading.Thread] = None
-        self._hb_stop = threading.Event()
+        self._transport: Optional[_DiscordTransport] = None
+        # --- 心跳状态机（迁移前在心跳线程的局部变量里，这里显式化以便断言）----
+        #: 当前会话的 WS（HELLO 时记下，供周期钩子发心跳）。
+        self._hb_conn: Any = None
+        #: 最近一次**周期**心跳的发出时刻（None = 本会话还没发过）。
+        self._hb_last_sent: Optional[float] = None
+        #: 下一次周期心跳到期的时间戳（见 :meth:`_tick`）。
+        self._hb_due: float = 0.0
 
     def _config_intents(self) -> int:
         """读 ``intents`` 配置；非法值退回默认 37376 而不是静默发 0。"""
@@ -199,6 +339,145 @@ class DiscordAdapter(Adapter):
                 return
 
     # ------------------------------------------------------------------
+    # 传输层接缝
+    # ------------------------------------------------------------------
+    @property
+    def transport(self) -> Optional[_DiscordTransport]:
+        """当前传输层（``start()`` 之后才有；测试与 :meth:`_connection` 看它）。"""
+        return self._transport
+
+    @property
+    def running(self) -> bool:
+        """消费线程是否活着（代理到传输层）。
+
+        ⚠️ 基类的 :attr:`Adapter._thread` 现在**恒为 None**（入站线程由传输层持有，
+        名字是 ``transport:discord``）。``core.py`` 的 ``_adapter_for`` 已经能靠前缀/
+        映射找到本适配器，不依赖线程匹配。
+        """
+        transport = self._transport
+        return transport is not None and transport.running
+
+    def _connection(self) -> Any:
+        """当前 WS 连接（未连接时 ``None``；由传输层持有）。"""
+        transport = self._transport
+        return transport.connection if transport is not None else None
+
+    def _make_transport(self) -> _DiscordTransport:
+        """构造本次运行用的传输层（测试注入点：退避 / 关闭码 / 粒度接线值）。
+
+        退避**逐字对齐迁移前** ``_inbound_loop`` 末尾那三行：
+
+        * ``min_backoff=RECONNECT_MIN`` / ``max_backoff=RECONNECT_MAX`` ——
+          1s 起、×2、封顶 60s，与迁移前 ``delay = min(delay*2, RECONNECT_MAX)`` 一致。
+        * ``reset_after=RECONNECT_MIN`` —— 迁移前的判定是
+          ``time.monotonic() - started >= RECONNECT_MIN``（``started`` 取在**建连之前**）。
+          传 0（基类默认）会变成"只要连上过就重置"，与那一行**不是**逐字等价，所以
+          这里显式传 1.0。
+
+        其它两处接线值：
+
+        * ``close_code=GATEWAY_CLOSE_REQUESTED``（4000）—— 迁移前只有"主动断开"
+          （op 7 / ACK 超时）用 4000，会话收尾走的是默认 1000，那等于每次重连都作废
+          session、Resume 形同虚设。现在**两种**断开都用 4000（见模块 docstring 第 6 条）。
+        * ``tick_interval`` 初始值只是一档粗粒度；HELLO 协商到真实周期之后
+          :meth:`_on_hello` 会把它收紧成"周期 / 8"（见 :data:`HEARTBEAT_TICK_DIVISOR`）。
+
+        ⚠️ 刻意读**模块全局**而不是类属性：迁移前就是运行时读全局
+        ``RECONNECT_MIN`` / ``RECONNECT_MAX``，既有测试
+        （``tests/test_discord_gateway.py`` 的 ``LoopTestCase``）靠 monkeypatch
+        那个全局来缩短等待。
+        """
+        return _DiscordTransport(
+            self._open_socket,
+            on_message=self._on_frame,
+            on_disconnect=self._on_disconnect,
+            on_tick=self._tick,
+            tick_interval=HEARTBEAT_TICK_MAX,
+            name="discord",
+            min_backoff=RECONNECT_MIN,
+            max_backoff=RECONNECT_MAX,
+            reset_after=RECONNECT_MIN,
+            close_code=GATEWAY_CLOSE_REQUESTED,
+        )
+
+    def _open_socket(self) -> Any:
+        """建一次会话：定 URL → 建 WS → 记日志。
+
+        对应迁移前 ``_inbound_loop`` 开头的两行，逐字保留顺序与日志文本。
+        """
+        ws = self._make_ws(self._resolve_gateway_url())
+        logger.info(
+            "discord: gateway 已连接（%s 路径）",
+            "Resume" if self._should_resume() else "Identify",
+        )
+        return ws
+
+    def _make_ws(self, url: str):
+        """建 WS 连接；``_ws_factory`` 为测试注入点，生产走标准库实现（T2.0）。
+
+        ``GATEWAY_RECV_TIMEOUT`` 是"Linux 上 ``close()`` 不保证唤醒阻塞 ``recv()``"
+        的兜底 —— 心跳每 ~41s 就有一次 ACK 往返，正常连接不会因为它被误判。
+        """
+        factory = self._ws_factory
+        if factory is None:
+            from ..ws import connect as factory  # 延迟导入：没开入站也不加载它
+        return factory(url, timeout=GATEWAY_RECV_TIMEOUT)
+
+    def _on_frame(self, conn: Any, frame: Any) -> None:
+        """传输层的 ``on_message`` 钩子：一条**原始帧** → 分发 → 可能要求换连接。
+
+        迁移前是内层 ``while`` 循环里"``recv()`` → ``_handle_payload`` → 动作 !=
+        continue 就 ``break``"。现在 break 由抛
+        :class:`~opencode_bridge.transport.ReconnectNow` 表达。
+
+        ⚠️ 一处**刻意**的行为差异：op 7 / op 9 会抛 ``ReconnectNow``（**立刻**重连、
+        不走退避），而迁移前它们走的是"break 出内层循环后 ``wait(RECONNECT_MIN)``"
+        —— 即 1s 后才重连。理由与 :mod:`opencode_bridge.adapters.slack` 完全一致：
+        这两类包都是**服务端主动要求换连接**（"不是故障"），不该被当失败指数退避；
+        官方对 op 7 的说法也是"别在那儿干等"。顺带还避免了一次假的"会话出错"告警。
+        若将来要求逐字保留那 1s，改成让基类走正常退避即可（去掉 ``ReconnectNow``、
+        直接 :meth:`_close_ws` 让下一次 ``recv()`` 返回 ``None``）。
+        """
+        action = self._handle_payload(conn, frame)
+        if action == _ACT_CONTINUE:
+            return
+        if action == _ACT_FATAL:
+            self._stop_gateway("配置/权限类 close code")
+            return
+        if action == _ACT_REIDENTIFY:
+            # 迁移前在会话收尾的 ``finally`` 里清；现在就地清 —— 这两步之间没有任何
+            # 代码读 session，语义等价（见模块 docstring）。
+            self._clear_session()
+        raise ReconnectNow(f"discord: gateway 要求重连（{action}）")
+
+    def _on_disconnect(self, conn: Any) -> bool:
+        """对端关闭：按 close code 判定"要不要停"。返回 ``True`` = 停掉整个循环。
+
+        只对"拿到 close code 且属于 :data:`FATAL_CLOSE_CODES`"返回 ``True``；
+        ``None``（对端没给 close code）按可 Resume 处理，与迁移前一致。
+        """
+        return self._action_for_close(getattr(conn, "close_code", None)) == _ACT_FATAL
+
+    def _stop_gateway(self, why: str) -> None:
+        """配置/权限错 → 打带原因的 error 并**停止重连**（不再 ``while True``）。"""
+        logger.error("discord: %s，停止重连", why)
+        self._stop_event.set()          # 顺带让 _throttle 之类立刻放开
+        transport = self._transport
+        if transport is not None:
+            transport.stop()            # 停钩子 → 关连接 → join（不自 join）
+
+    def _on_event(self, item: Any) -> None:
+        """传输层的 ``on_event`` 回调：**刻意是 no-op**。
+
+        :class:`~opencode_bridge.transport.WebSocketTransport` 在每条原始帧到达时
+        先调 ``on_message(conn, frame)``、**再**把同一帧交给 ``on_event``。Discord 的
+        解析全在 :meth:`_on_frame` 里做完了，这里必须什么都不做 ——
+        否则同一条消息会被投递两次（core 会当成两条消息，bot 也会回两次）。
+        保留这个空实现（而不是给 ``start()`` 传 ``lambda _: None``）是为了让
+        "同一帧会被两个钩子看到"这件事在代码里是**显式可见**的。
+        """
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -206,11 +485,27 @@ class DiscordAdapter(Adapter):
         if not self.bot_token:
             logger.warning("discord: bot_token missing; adapter not started")
             return
-        thread = threading.Thread(
-            target=self._inbound_loop, name="discord-gateway", daemon=True
-        )
-        self._thread = thread
-        thread.start()
+        # 迁移前漏了这一行：stop() 置位后同一个实例再 start()，入站循环会立刻
+        # 退出（静默不工作）。matrix / telegram / irc / slack 迁到传输层时都补上了。
+        # 传输层的 start() 只清它自己的停止位，不碰适配器这个（_throttle 依赖它）。
+        self._stop_event.clear()
+        transport = self._make_transport()
+        self._transport = transport
+        transport.start(self._on_event)
+
+    def stop(self) -> None:
+        """置停止位 → **停心跳 → 关 WS 唤醒阻塞的 recv() → join 线程**（**幂等**）。
+
+        顺序不能反：传输层的 ``join`` 只等 5s，而 ``recv()`` 在
+        :data:`GATEWAY_RECV_TIMEOUT`（60s）内可能一直阻塞；不先把连接关掉就会每次
+        stop 都等满超时。三段式（停钩子 → 关连接 → join）现在由
+        :meth:`~opencode_bridge.transport.Transport.stop` 统一保证，迁移前是在本方法
+        里手写的（``_stop_heartbeat()`` → ``_close_ws(ws)`` → ``super().stop()``）。
+        """
+        super().stop()                      # 置停止位（_throttle 依赖它）
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.stop()
 
     # ------------------------------------------------------------------
     # Inbound (Gateway v10)
@@ -269,66 +564,6 @@ class DiscordAdapter(Adapter):
             base = url
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}v={GATEWAY_API_VERSION}&encoding={GATEWAY_ENCODING}"
-
-    def _make_ws(self, url: str):
-        """建 WS 连接；``_ws_factory`` 为测试注入点，生产走标准库实现（T2.0）。"""
-        factory = self._ws_factory
-        if factory is None:
-            from ..ws import connect as factory  # 延迟导入：没开入站也不加载它
-        return factory(url, timeout=GATEWAY_RECV_TIMEOUT)
-
-    def _inbound_loop(self) -> None:
-        """连接 → 收包 → 决策（继续 / 重连 / 重新 Identify / 停止）→ 退避。
-
-        ``recv()`` 阻塞时：Windows 上 ``close()`` 会立刻唤醒它；Linux 上不保证，
-        所以 :data:`GATEWAY_RECV_TIMEOUT` 是兜底（心跳每 ~45s 就有一次 ACK 往返，
-        正常连接不会因为它被误判）。
-        """
-        delay = RECONNECT_MIN
-        while not self._stop_event.is_set():
-            ws = None
-            action = _ACT_RECONNECT
-            started = time.monotonic()
-            try:
-                ws = self._make_ws(self._resolve_gateway_url())
-                self._ws = ws
-                logger.info(
-                    "discord: gateway 已连接（%s 路径）",
-                    "Resume" if self._should_resume() else "Identify",
-                )
-                while not self._stop_event.is_set():
-                    raw = ws.recv()
-                    if raw is None:  # 对端关闭 → 看 close code 决定要不要再连
-                        action = self._action_for_close(getattr(ws, "close_code", None))
-                        break
-                    action = self._handle_payload(ws, raw)
-                    if action != _ACT_CONTINUE:
-                        break
-            except Exception as exc:  # noqa: BLE001 - 线程里绝不外抛
-                if not self._stop_event.is_set():
-                    logger.warning("discord: gateway 异常：%s", exc)
-                action = _ACT_RECONNECT
-            finally:
-                self._stop_heartbeat()
-                current, self._ws = self._ws, None
-                if current is not None:
-                    try:
-                        current.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if action == _ACT_REIDENTIFY:
-                    self._clear_session()
-            if action == _ACT_FATAL:
-                logger.error("discord: close code 表示配置/权限错误，停止重连")
-                return
-            if self._stop_event.is_set():
-                break
-            # 退避：连上并活过一段时间就把间隔重置回下限
-            if time.monotonic() - started >= RECONNECT_MIN:
-                delay = RECONNECT_MIN
-            if self._stop_event.wait(delay):
-                break
-            delay = min(delay * 2, RECONNECT_MAX)
 
     # -- 收包 -------------------------------------------------------------
     def _handle_payload(self, ws, raw: str) -> str:
@@ -402,11 +637,15 @@ class DiscordAdapter(Adapter):
 
     # -- 会话建立 ---------------------------------------------------------
     def _on_hello(self, ws, data: object) -> None:
-        """HELLO → 定心跳周期 → 立刻发一次心跳 → Identify / Resume → 起心跳线程。
+        """HELLO → 定心跳周期 → 立刻发一次心跳 → Identify / Resume → 摆好心跳排程。
 
         官方推荐顺序是 HELLO → op1 → Identify（Identify 24h 内全局限 1000 次，
         所以有 session 就优先 Resume）。第一次心跳**立即**发（这样 Identify 前一定
         有心跳），jitter 加在第一次**周期**心跳前。
+
+        迁移前最后一行是 ``_start_heartbeat(ws, interval)``（起一个心跳线程）；现在
+        只**摆好状态机**（:attr:`_hb_due`），实际的"到点了没有"由传输层的周期钩子
+        :meth:`_tick` 判定。心跳线程被删掉是因为同一份机制不该在三家适配器里各写一遍。
         """
         raw = data.get("heartbeat_interval") if isinstance(data, dict) else None
         if (
@@ -424,6 +663,14 @@ class DiscordAdapter(Adapter):
             )
         self._heartbeat_interval = interval
         self._ack_received = False
+
+        # 心跳状态机复位（周期钩子据此发心跳）。jitter 在**这里**采样一次 ——
+        # 迁移前的 `_heartbeat_loop` 也是在第一次等待前采一次，若每次 tick 都重采，
+        # 期限会被一直往后推，心跳永远发不出去。
+        self._hb_conn = ws
+        self._hb_last_sent = None
+        self._hb_due = self._now() + interval + self._heartbeat_jitter(interval)
+        self._tighten_tick(interval)
 
         # 第一次心跳：d 键必须存在，一个事件都没收到时就是 null
         self._send_op(ws, OP_HEARTBEAT, self._last_seq)
@@ -451,7 +698,6 @@ class DiscordAdapter(Adapter):
                     },
                 },
             )
-        self._start_heartbeat(ws, interval)
 
     def _send_op(self, ws, op: int, data: Any = None, seq: Any = None) -> bool:
         """发一个网关 payload。
@@ -486,19 +732,15 @@ class DiscordAdapter(Adapter):
         except Exception as exc:  # noqa: BLE001
             logger.debug("discord: ws.close 失败（忽略）: %s", exc)
 
-    # -- 心跳线程 ---------------------------------------------------------
-    def _start_heartbeat(self, ws, interval: float) -> None:
-        self._stop_heartbeat()
-        stop = threading.Event()
-        self._hb_stop = stop
-        thread = threading.Thread(
-            target=self._heartbeat_loop,
-            args=(ws, interval, stop),
-            name="discord-heartbeat",
-            daemon=True,
-        )
-        self._hb_thread = thread
-        thread.start()
+    # -- 周期心跳（由传输层的周期钩子驱动，不是自带的线程）----------------
+    @staticmethod
+    def _now() -> float:
+        """单调时钟。单独抽成方法是给测试一个**假时钟**注入点。
+
+        心跳周期是本项目最贵的坑之一（毫秒单位 / 不能慢一倍），必须能逐拍断言；
+        直接调 ``time.monotonic()`` 就只能靠墙钟测，那是 flaky 的老路。
+        """
+        return time.monotonic()
 
     def _heartbeat_jitter(self, interval: float) -> float:
         """第一次**周期**心跳前的抖动（官方：``interval * random(0, 1)``）。
@@ -507,43 +749,70 @@ class DiscordAdapter(Adapter):
         """
         return random.uniform(0.0, interval)
 
-    def _heartbeat_loop(self, ws, interval: float, stop: threading.Event) -> None:
-        """周期心跳 + ACK 监测。
+    def _tick(self) -> None:
+        """**传输层周期钩子**：到点就发心跳，同时监测 ACK。返回即结束。
 
-        官方要求：一个心跳周期内没收到 op 11 就判定连接已死，用**非 1000** 的
-        close code 主动断开（1000/1001 会让 session 失效），随后 Resume 重连。
+        迁移前这段逻辑在**心跳线程** :meth:`_heartbeat_loop` 里：
+        「先 ``wait(interval + jitter)`` → 发一次 → 再 ``wait(interval)`` 等 ACK →
+        没 ACK 就判定连接已死并用 4000 断开」。现在把它写成**基于到期时刻的状态机**，
+        由传输层的定时线程周期调用（见 :meth:`_make_transport` 为什么必须用定时驱动）。
+
+        与迁移前逐项对应：
+
+        * "还没发过周期心跳" → 等 ``interval + jitter``（:meth:`_on_hello` 里已采样好
+          jitter 存进 :attr:`_hb_due`）。jitter **只采样一次**，否则每次 tick 都重采
+          会把期限一直往后推、心跳永远发不出去。
+        * "已发过" → 等 ``interval``；**这一个 interval 就是 ACK 的等待窗口**，
+          到期还没收到 op 11 → 判定连接已死 → 用 :data:`GATEWAY_CLOSE_REQUESTED`
+          （4000，**非 1000**）断开，随后 Resume 重连。
+
+        ⚠️ 周期 = :attr:`_hb_due - _hb_last_sent`，**恰好等于**协商来的 interval。
+        写成"发完再等一个 interval"就会变成 2× interval（慢一倍）—— 那是本项目
+        明确点名的失败模式，用例 ``test_heartbeat_period_equals_the_negotiated_interval``
+        用假时钟逐拍钉死。
+
+        钩子抛异常由传输层兜住（记 ``errors`` 后继续），所以这里不必自己包 try。
         """
-        first = True
-        while not stop.is_set() and not self._stop_event.is_set():
-            wait = interval
-            if first:
-                wait = interval + self._heartbeat_jitter(interval)
-                first = False
-            if stop.wait(wait):
-                return
-            if getattr(ws, "closed", False):
-                return
-            self._send_op(ws, OP_HEARTBEAT, self._last_seq)
-            if stop.wait(interval):  # 等一个周期的 ACK
-                return
-            if not self._ack_received:
-                logger.warning(
-                    "discord: %.1fs 内没收到 op 11 ACK，判定连接已死，断开重连", interval
-                )
-                self._close_ws(ws, GATEWAY_CLOSE_REQUESTED, "heartbeat ack timeout")
-                return
-            self._ack_received = False
+        conn = self._hb_conn
+        if conn is None or getattr(conn, "closed", False):
+            return                       # 没有活动会话（退避中）/ 连接已关
+        interval = self._heartbeat_interval
+        if interval <= 0:
+            return                       # 还没收到 HELLO，心跳周期未知
+        now = self._now()
+        if now < self._hb_due:
+            return                       # 还没到点
+        if self._hb_last_sent is not None and not self._ack_received:
+            # 一个周期内没收到 op 11 ⇒ 连接已死（官方要求主动断开，1000 会作废 session）
+            logger.warning(
+                "discord: %.1fs 内没收到 op 11 ACK，判定连接已死，断开重连", interval
+            )
+            self._close_ws(conn, GATEWAY_CLOSE_REQUESTED, "heartbeat ack timeout")
+            return
+        # ⚠️ ``_ack_received`` 必须在**发之前**清零：测试替身（以及任何同步回 ACK 的
+        # 实现）会在 ``send()`` 里立刻投递 op 11，发完再清会把刚到的 ACK 抹掉，
+        # 于是下一次到期时被误判成"连接已死"。
+        self._ack_received = False      # 从现在起等这一拍的 ACK
+        self._send_op(conn, OP_HEARTBEAT, self._last_seq)
+        self._hb_last_sent = now
+        self._hb_due = now + interval   # ⚠️ 必须是 now+interval，不是 now+2×interval
 
-    def _stop_heartbeat(self) -> None:
-        self._hb_stop.set()
-        thread = self._hb_thread
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(timeout=1.0)
-        self._hb_thread = None
+    def _tighten_tick(self, interval: float) -> None:
+        """HELLO 协商到真实周期后，把周期钩子的粒度收紧成"周期 / 8"。
+
+        粒度 = 心跳实际发送时刻**最多**晚多少。取周期的分数而不是常数，是因为
+        亚秒级周期（测试里的 60ms）也必须能测；同时封顶 5s，免得为 41s 的心跳
+        白白起一个每 5ms 醒一次的线程。
+        """
+        transport = self._transport
+        if transport is None:
+            return                       # 单元测试直接调 _on_hello（没起传输层）
+        transport.tune_tick_interval(
+            min(
+                HEARTBEAT_TICK_MAX,
+                max(HEARTBEAT_TICK_MIN, interval / HEARTBEAT_TICK_DIVISOR),
+            )
+        )
 
     # -- dispatch / 事件过滤 ---------------------------------------------
     def _handle_dispatch(self, name: str, data: object) -> None:
@@ -636,19 +905,7 @@ class DiscordAdapter(Adapter):
     # ------------------------------------------------------------------
     # Lifecycle teardown
     # ------------------------------------------------------------------
-    def stop(self) -> None:
-        """先停心跳线程、再关 WS、最后 ``super().stop()``（顺序与 Slack 一致）。
-
-        顺序不能反：基类 ``stop()`` 会 join 线程（5s 超时），而 ``recv()`` 在
-        ``GATEWAY_RECV_TIMEOUT``(60s) 内可能一直阻塞；不先关连接就会每次 stop
-        都等满超时。
-        """
-        self._stop_heartbeat()
-        ws = self._ws
-        self._ws = None
-        if ws is not None:
-            self._close_ws(ws)
-        super().stop()
+    # ⚠️ ``stop()`` 与 ``running`` 已随传输层迁到上面「传输层接缝」一节。
 
     # ------------------------------------------------------------------
     # Outbound
@@ -656,13 +913,39 @@ class DiscordAdapter(Adapter):
     @staticmethod
     def _channel_id(conversation_id: str) -> Optional[str]:
         raw = conversation_id
-        if raw.startswith("channel:"):
-            raw = raw[len("channel:"):]
+        if raw.startswith(CONVERSATION_PREFIX):
+            raw = raw[len(CONVERSATION_PREFIX):]
         return raw or None
 
     @staticmethod
     def _conversation_id(channel_id: Any) -> str:
-        return f"channel:{channel_id}"
+        """``channel_id`` → ``channel:...``。
+
+        ⚠️ **不要**改成 ``identity.format_id("discord", channel_id)``。
+
+        ① ``channel:`` 是**歧义前缀**：:data:`identity.LEGACY_PREFIXES["channel"]`
+        的值是 ``None``（slack / discord / mattermost 三家共用），归一时**必须**
+        额外给 ``platform_hint``，否则 :func:`identity.normalize` 抛
+        :class:`~opencode_bridge.identity.AmbiguousConversationId`。
+        ② 切换会改变 ``conversation_id`` 的字符串格式，而
+        :class:`~opencode_bridge.state.StateStore` 拿它当**不透明键**存
+        ``conversation_id ↔ session_id`` —— 已落盘 ``state.json`` 里的键会全部
+        变孤儿，用户一次性丢失会话映射，且**不报错**。
+
+        前置条件：必须与 ``state.py`` 的键迁移（旧键 → 新键的显式重写 + 版本门控）
+        **一起**发。见模块 docstring「``conversation_id`` 前缀本轮刻意仍是
+        ``channel:``」。下面的断言就是**防呆**：后续迁移里若有人顺手把它切成
+        ``discord:``，这里会立刻炸（而不是等到用户报"agent 记错上下文"）。
+        """
+        cid = f"{CONVERSATION_PREFIX}{channel_id}"
+        # ⚠️ 这里比的是**字面量** ``channel:``，不是 ``CONVERSATION_PREFIX`` ——
+        # 用常量比会变成恒真（改了常量就一起改了），等于没钉。
+        # （``tests/test_discord_gateway.py`` 里有一条用例专门证明这条断言不是恒真。）
+        assert cid.startswith("channel:"), (
+            f"conversation_id 前缀被改动了: {cid!r}（本轮必须保持 channel:；"
+            "见模块 docstring「conversation_id 前缀本轮刻意仍是 channel:」）"
+        )
+        return cid
 
     def _send_chunk(
         self, channel: str, content: str, conversation_id: str

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -18,9 +20,10 @@ import unittest
 # 让"预期内的告警"别污染测试输出（assertLogs 会自己挂 handler，不受影响）
 logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
-import opencode_bridge.adapters.discord as discord_mod
-from opencode_bridge.adapters import build
-from opencode_bridge.adapters.discord import (
+import opencode_bridge.adapters.discord as discord_mod  # noqa: E402
+from opencode_bridge.adapters import build  # noqa: E402
+from opencode_bridge.adapters.discord import (  # noqa: E402
+    CONVERSATION_PREFIX,
     DEFAULT_INTENTS,
     GATEWAY_API_VERSION,
     INTENT_DIRECT_MESSAGES,
@@ -30,11 +33,23 @@ from opencode_bridge.adapters.discord import (
     RECONNECT_MIN,
     DiscordAdapter,
 )
-from opencode_bridge.hooks import Inbound, Outbound
+from opencode_bridge.hooks import Inbound, Outbound  # noqa: E402
+from opencode_bridge.identity import (  # noqa: E402
+    AMBIGUOUS_LEGACY_PREFIXES,
+    LEGACY_PREFIXES,
+    AmbiguousConversationId,
+    InvalidConversationId,
+    is_valid,
+    normalize,
+    parse_id,
+)
+from opencode_bridge.state import StateStore  # noqa: E402
+from opencode_bridge.transport import WebSocketTransport  # noqa: E402
 
 GATEWAY_URL = "wss://gw.example.test/gw"
 RESUME_URL = "wss://resume.example.test/gw"
 BOT_USER_ID = "U_BOT_ME"
+CID = "channel:C1"
 
 
 # ----------------------------------------------------------------------
@@ -110,7 +125,7 @@ class BlockingGatewayWS(GatewayWS):
 class AutoAckGatewayWS(GatewayWS):
     """``send()`` 之后立刻回一个 op 11（模拟服务端确认心跳）。
 
-    没有它，心跳线程会因为"一个周期内没收到 ACK"而主动断开 —— 那是正确行为，
+    没有它，周期钩子会因为"一个周期内没收到 ACK"而主动断开 —— 那是正确行为，
     但就无法观察连续多个周期的心跳了。
     """
 
@@ -121,6 +136,55 @@ class AutoAckGatewayWS(GatewayWS):
     def send(self, text: str) -> None:
         super().send(text)
         self._adapter._handle_payload(self, json.dumps({"op": 11, "d": None}))
+
+
+class SilentAutoAckGatewayWS(AutoAckGatewayWS):
+    """先按脚本吐几帧（HELLO 等），之后 ``recv()`` **一直阻塞**直到被 ``close()``。
+
+    迁移前心跳跑在自己的线程上，所以"脚本喂完之后 ``recv()`` 立刻返回 ``None``"
+    也不影响观察多个心跳周期。迁移后心跳由**传输层的周期钩子**驱动，而钩子只在
+    "有活动会话"时触发 —— 会话一旦结束（脚本喂完 → recv 返回 None）就没有心跳了。
+    所以这类用例需要一个**安静但仍连着**的连接，才能真正验证"没有入站数据时也会
+    定期发心跳"。
+    """
+
+    def __init__(self, adapter, **kw) -> None:
+        super().__init__(adapter, **kw)
+        self._woken = threading.Event()
+        #: 每次 ``send`` 的时刻（用于只做**下界**的周期断言）。
+        self.sent_at: list[float] = []
+
+    def recv(self) -> str | None:
+        if self.script:
+            return self.script.pop(0)
+        self._woken.wait(10)
+        return None
+
+    def send(self, text: str) -> None:
+        self.sent_at.append(time.monotonic())
+        super().send(text)
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        super().close(code, reason)
+        self._woken.set()
+
+
+class SilentGatewayWS(GatewayWS):
+    """同 :class:`SilentAutoAckGatewayWS`，但**不**回 op 11（用来触发 ACK 超时）。"""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self._woken = threading.Event()
+
+    def recv(self) -> str | None:
+        if self.script:
+            return self.script.pop(0)
+        self._woken.wait(10)
+        return None
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        super().close(code, reason)
+        self._woken.set()
 
 
 # ----------------------------------------------------------------------
@@ -207,6 +271,14 @@ class GatewayTestCase(unittest.TestCase):
         self.assertEqual(action, "continue")
         return adapter, ws
 
+    def wait_for(self, predicate, timeout: float = 5.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return bool(predicate())
+
 
 # ----------------------------------------------------------------------
 # 1) 能力声明
@@ -291,23 +363,123 @@ class TestHeartbeat(GatewayTestCase):
         self.assertEqual(adapter._heartbeat_interval, 45.0, "45000ms 必须换算成 45s")
 
     def test_short_interval_fires_periodically_without_waiting_seconds(self):
-        """60ms 的周期必须在亚秒尺度上真的发出去（若按秒理解就一发都没有）。"""
+        """60ms 的周期必须在亚秒尺度上真的发出去（若按秒理解就一发都没有）。
+
+        驱动方式变了（迁移）：心跳不再跑在自带的线程上，而是由**传输层的周期钩子**
+        （``on_tick`` + ``tick_interval``）在"连接仍然活着、但没有入站消息"时驱动 ——
+        所以这里必须给一个 :class:`SilentAutoAckGatewayWS`（脚本喂完后 ``recv()``
+        阻塞而不是立刻返回 ``None``）。断言与迁移前完全一致。
+        """
         adapter = self.adapter()
-        ws = AutoAckGatewayWS(adapter)  # 会自动回 ACK，否则心跳线程会判定连接已死
         adapter._heartbeat_jitter = lambda interval: 0.0  # 去掉抖动，纯测周期
-        adapter._handle_payload(ws, hello_packet(60))
+        ws = SilentAutoAckGatewayWS(adapter, script=[hello_packet(60)])
+        adapter._ws_factory = lambda url, **kw: ws
+        adapter.start()
+        self.addCleanup(adapter.stop)
+
         self.assertEqual(adapter._heartbeat_interval, 0.06, "60ms 应换算成 0.06s")
-        self.assertEqual(len(ws.ops_of(1)), 1, "Hello 之后立刻发一次心跳")
-        self.addCleanup(adapter._stop_heartbeat)
-        deadline = time.time() + 2.0
-        while len(ws.ops_of(1)) < 4 and time.time() < deadline:
-            time.sleep(0.005)
+        # 粒度必须远小于周期，否则心跳最多会晚一整个粒度（41s 周期下是 5.2%）
+        self.assertLessEqual(adapter.transport.tick_interval, 0.06 / 8)
+        self.assertTrue(
+            self.wait_for(lambda: len(ws.ops_of(1)) >= 4, 2.0),
+            f"60ms 周期内至少应发出 4 次心跳，实际 {len(ws.ops_of(1))}",
+        )
         self.assertGreaterEqual(
             len(ws.ops_of(1)), 4, "60ms 周期内至少应发出 4 次心跳"
         )
         for pkt in ws.ops_of(1):
             self.assertIn("d", pkt)
         self.assertFalse(ws.closed, "有 ACK 就不该被判定为死连接")
+        # 周期**下界**（等待只会更长，绝不会更短）：相邻周期心跳至少隔 0.06s。
+        # 这条不是主断言（主断言是上面那条确定性用例），只是防"周期被缩到 1/2"这类
+        # 回归在真线程上也能被看见。
+        beats = [at for at, pkt in zip(ws.sent_at, ws.ops()) if pkt["op"] == 1]
+        for index, gap in enumerate(
+            [b - a for a, b in zip(beats[1:], beats[2:])]
+        ):
+            self.assertGreaterEqual(
+                gap, 0.06 * 0.95,
+                f"第 {index + 1} 个心跳间隔只有 {gap:.4f}s，快于协商周期",
+            )
+
+    def test_heartbeat_period_equals_the_negotiated_interval(self):
+        """**确定性地**逐拍证明：周期 = 协商值，不是"发完再等一个间隔"（2×）。
+
+        用假时钟（``adapter._now`` 这个注入点）把时间一步**步**推进，于是每拍的心跳
+        时刻都是确定的、不含任何容差 —— 这比墙钟测量稳得多（墙钟只在下条用例里做
+        **下界**断言）。
+
+        失败模式对照（60ms 周期、jitter=0）::
+
+            tick @ 59ms   → 不发
+            tick @ 60ms   → 发第 2 拍        _hb_due = 60ms + 60ms = 120ms
+            tick @ 119ms  → 不发             ← 若写成 +2×interval 这里就会发
+            tick @ 120ms  → 发第 3 拍
+        """
+        adapter = self.adapter()
+        ws = GatewayWS()
+        clock = {"t": 1000.0}
+        adapter._now = lambda: clock["t"]          # 假时钟
+        adapter._heartbeat_jitter = lambda interval: 0.0
+        adapter._handle_payload(ws, hello_packet(60))
+
+        # HELLO 立刻发的那一拍（不算周期心跳）
+        self.assertEqual(len(ws.ops_of(1)), 1)
+        self.assertIsNone(adapter._hb_last_sent, "HELLO 那拍不算周期心跳")
+        self.assertEqual(adapter._hb_due, 1000.0 + 0.06, "首拍期限 = HELLO 时刻 + interval")
+
+        adapter._handle_payload(ws, json.dumps({"op": 11, "d": None}))
+        clock["t"] = 1000.0 + 0.059
+        adapter._tick()
+        self.assertEqual(len(ws.ops_of(1)), 1, "没到点不许发")
+        clock["t"] = adapter._hb_due
+        adapter._tick()
+        self.assertEqual(len(ws.ops_of(1)), 2, "到点必须发")
+        self.assertAlmostEqual(adapter._hb_last_sent, clock["t"], places=9)
+        self.assertAlmostEqual(
+            adapter._hb_due, adapter._hb_last_sent + 0.06, places=9,
+            msg="下一拍的期限必须是 上次发出时刻 + interval（写成 2×interval 就是慢一倍）",
+        )
+
+        # ACK 到位 → 继续下一拍；中间那一拍不许提前
+        adapter._handle_payload(ws, json.dumps({"op": 11, "d": None}))
+        clock["t"] = adapter._hb_due - 0.001
+        adapter._tick()
+        self.assertEqual(len(ws.ops_of(1)), 2)
+        clock["t"] = adapter._hb_due
+        adapter._tick()
+        self.assertEqual(len(ws.ops_of(1)), 3)
+        self.assertAlmostEqual(adapter._hb_due, adapter._hb_last_sent + 0.06, places=9)
+        # `d` 键一拍拍都不能省（没收到事件时是 null）
+        for pkt in ws.ops_of(1):
+            self.assertIn("d", pkt)
+            self.assertIsNone(pkt["d"], "本用例没喂事件，d 必须是 null 而不是缺失")
+
+    def test_jitter_is_sampled_once_per_session(self):
+        """jitter **只能**在 HELLO 采样一次。
+
+        若每次 tick 都重采（``_heartbeat_due = now + interval + jitter``），期限会被
+        一直往后推 —— 每次醒来都"还没到点"，心跳**永远发不出去**，而这正是本适配器
+        最贵的坑之一（心跳一停就被判死）。
+        """
+        adapter = self.adapter()
+        ws = GatewayWS()
+        adapter._now = lambda: 500.0
+        samples = {"n": 0}
+
+        def jitter(interval: float) -> float:
+            samples["n"] += 1
+            return 0.0
+
+        adapter._heartbeat_jitter = jitter
+        adapter._handle_payload(ws, hello_packet(60))
+        due_after_hello = adapter._hb_due
+        adapter._handle_payload(ws, json.dumps({"op": 11, "d": None}))
+        for _ in range(5):
+            adapter._tick()              # 时间不前进 → 不该发，也不再采样 jitter
+        self.assertEqual(samples["n"], 1, "一个会话里 jitter 只该采样一次")
+        self.assertEqual(adapter._hb_due, due_after_hello)
+        self.assertEqual(len(ws.ops_of(1)), 1, "没到点不该发心跳")
 
     def test_server_heartbeat_request_answered_immediately(self):
         adapter, ws = self.connected()
@@ -328,19 +500,62 @@ class TestHeartbeat(GatewayTestCase):
         self.assertEqual(ws.ops_of(1)[-1]["d"], 101)
 
     def test_ack_timeout_closes_with_non_1000_code(self):
-        """一个周期内没收到 op 11 → 用 4000 主动断开（1000 会让 session 失效）。"""
+        """一个周期内没收到 op 11 → 用 4000 主动断开（1000 会让 session 失效）。
+
+        驱动方式变了（迁移）：心跳线程已删，改由传输层的周期钩子 :meth:`_tick`
+        驱动。这里用假时钟把"没到点 / 到点 / 再到一个周期"三步走完，断言与迁移前
+        逐条相同（会断开、状态码是 4000、不是 1000/1001）。
+        """
         adapter = self.adapter()
         ws = GatewayWS()
+        clock = {"t": 2000.0}
+        adapter._now = lambda: clock["t"]
         adapter._heartbeat_jitter = lambda interval: 0.0
-        adapter._start_heartbeat(ws, 0.05)
-        self.addCleanup(adapter._stop_heartbeat)
-        deadline = time.time() + 2.0
-        while not ws.close_calls and time.time() < deadline:
-            time.sleep(0.005)
+        adapter._handle_payload(ws, hello_packet(50))
+
+        clock["t"] = adapter._hb_due           # 第 1 拍周期心跳
+        adapter._tick()
+        self.assertEqual(len(ws.ops_of(1)), 2, "HELLO 一拍 + 周期一拍")
+        self.assertFalse(ws.close_calls, "刚发出去还没到 ACK 期限")
+        clock["t"] = adapter._hb_due           # 一个周期到了，仍然没有 op 11
+        adapter._tick()
         self.assertTrue(ws.close_calls, "没有 ACK 就应该断开")
         code = ws.close_calls[0][0]
         self.assertEqual(code, discord_mod.GATEWAY_CLOSE_REQUESTED)
         self.assertNotIn(code, (1000, 1001), "不能用 1000/1001 关连接")
+
+    def test_ack_timeout_is_detected_by_the_transport_tick_hook(self):
+        """端到端那条：定时钩子（而不是某个私有线程）负责发现 ACK 超时。
+
+        连接安静但仍活着（:class:`SilentGatewayWS`，**不回** op 11）→ 一个周期后
+        必须被 4000 断开。断言走的是"连接真的被关了、且状态码是 4000"。
+        """
+        adapter = self.adapter()
+        adapter._heartbeat_jitter = lambda interval: 0.0
+        ws = SilentGatewayWS(script=[hello_packet(50)])
+        adapter._ws_factory = lambda url, **kw: ws
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(
+            self.wait_for(lambda: bool(ws.close_calls), 3.0),
+            "没有 ACK 就应该被周期钩子断开",
+        )
+        self.assertEqual(ws.close_calls[0][0], discord_mod.GATEWAY_CLOSE_REQUESTED)
+        self.assertEqual(ws.close_calls[0][1], "heartbeat ack timeout")
+
+    def test_tick_is_a_noop_without_an_active_session(self):
+        """退避 / 未 HELLO 时钩子不许乱发（否则会对着已关的连接心跳）。"""
+        adapter = self.adapter()
+        ws = GatewayWS()
+        adapter._now = lambda: 10.0
+        adapter._tick()                          # 还没 HELLO：没 conn、没周期
+        self.assertEqual(ws.sent, [])
+        adapter._hb_conn = ws
+        adapter._heartbeat_interval = 0.05
+        adapter._hb_due = 10.0                   # 已经到期，但连接已关
+        ws.close(4000, "gone")
+        adapter._tick()
+        self.assertEqual(ws.ops_of(1), [], "连接已关时不许再发心跳")
 
     def test_opcode_5_is_not_used(self):
         """op 5 已废弃；未知 opcode 必须被忽略而不是当成事件。"""
@@ -577,7 +792,298 @@ class TestReconnectDecisions(GatewayTestCase):
 
 
 # ----------------------------------------------------------------------
-# 7) 收包循环（线程级）
+# 7) A1 迁移的「行为不变」清单（逐条钉死）
+# ----------------------------------------------------------------------
+class TestMigrationInvariants(GatewayTestCase):
+    def test_conversation_id_still_uses_the_legacy_channel_prefix(self):
+        """显式防呆：有人在本轮偷偷把 ``channel:`` 换成 ``discord:`` 时这里会红。
+
+        ``channel`` 在 :data:`identity.LEGACY_PREFIXES` 里值是 ``None`` ——
+        **歧义前缀**，slack / discord / mattermost 三家共用，所以光看字符串
+        **完全判不出**来源（对比 ``chat`` → ``telegram`` 至少能确定指向谁）。
+        这正是"必须显式钉住"的理由。
+        """
+        self.assertIn("channel", LEGACY_PREFIXES)
+        self.assertIsNone(LEGACY_PREFIXES["channel"], "channel: 是歧义前缀")
+        self.assertIn("channel", AMBIGUOUS_LEGACY_PREFIXES)
+        self.assertEqual(CONVERSATION_PREFIX, "channel:")
+        self.assertEqual(DiscordAdapter._conversation_id("C1"), CID)
+        for channel in ("C1", "C0123ABCD", "D0C0FFEE", 12345):
+            with self.subTest(channel=channel):
+                self.assertEqual(
+                    DiscordAdapter._conversation_id(channel), f"channel:{channel}"
+                )
+        self.assertEqual(DiscordAdapter._channel_id(CID), "C1")
+        # 仍是旧格式：``parse_id`` 拒绝它，只有 ``normalize`` 才知道怎么归一
+        self.assertFalse(is_valid(CID))
+        with self.assertRaises(InvalidConversationId):
+            parse_id(CID)
+        self.assertEqual(normalize(CID, platform_hint="discord"), "discord:C1")
+
+    def test_the_ambiguity_is_real_so_the_prefix_cannot_be_guessed(self):
+        """把"为什么现在不能切"写成**可执行**的断言：同一个旧键能归一成三家。"""
+        with self.assertRaises(AmbiguousConversationId):
+            normalize(CID)
+        for platform in ("slack", "discord", "mattermost"):
+            with self.subTest(platform=platform):
+                self.assertEqual(normalize(CID, platform_hint=platform), f"{platform}:C1")
+        self.assertNotEqual(
+            normalize(CID, platform_hint="slack"),
+            normalize(CID, platform_hint="discord"),
+            "同一个旧键在两家之间串台 —— 这就是旧前缀的代价",
+        )
+
+    def test_prefix_guard_assertion_actually_fires_when_the_prefix_is_switched(self):
+        """证明 :meth:`DiscordAdapter._conversation_id` 里那条防呆断言**不是恒真**。
+
+        如果那条断言写得像 ``assert cid.startswith(CONVERSATION_PREFIX)``（用同一个
+        常量比），改常量就会把它一起改掉、断言形同虚设；本用例把常量改成
+        ``discord:`` 并要求它立刻炸 —— 断言本身被测到了。
+        """
+        old = discord_mod.CONVERSATION_PREFIX
+        self.addCleanup(setattr, discord_mod, "CONVERSATION_PREFIX", old)
+        discord_mod.CONVERSATION_PREFIX = "discord:"
+        with self.assertRaises(AssertionError):
+            DiscordAdapter._conversation_id("C1")
+        setattr(discord_mod, "CONVERSATION_PREFIX", old)   # 立刻恢复（addCleanup 只是保险）
+        self.assertEqual(DiscordAdapter._conversation_id("C1"), CID, "恢复后仍是旧格式")
+
+    def test_switching_prefix_now_would_orphan_stored_sessions(self):
+        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
+
+        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
+        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
+        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            cid = DiscordAdapter._conversation_id("C1")
+            store = StateStore(path)
+            store.set_session(cid, "sess-1")
+            reopened = StateStore(path)          # 模拟进程重启
+            self.assertEqual(reopened.get_session(cid), "sess-1",
+                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
+            future = normalize(cid, platform_hint="discord")
+            self.assertNotEqual(future, cid)
+            self.assertIsNone(
+                reopened.get_session(future),
+                "切前缀后同一个 channel 是另一个不透明键 → 会话映射直接丢失",
+            )
+
+    def test_inbound_ids_keep_the_legacy_prefix_end_to_end(self):
+        """入站链路上的 id 也必须是 ``channel:``（不只是 ``_conversation_id``）。"""
+        hooks = RecordingHooks()
+        adapter = self.adapter(hooks)
+        ws = GatewayWS()
+        adapter._handle_payload(ws, hello_packet())
+        adapter._handle_payload(ws, ready_packet())
+        adapter._handle_payload(ws, message_packet(content="回声"))
+        self.assertEqual([i.conversation_id for i in hooks.inbounds], [CID])
+        self.assertEqual(adapter._channel_id(CID), "C1")
+        self.assertEqual(adapter._channel_id("discord:C1"), "discord:C1",
+                         "_channel_id 只剥 channel: 前缀")
+        # 出站也必须把前缀剥掉再发
+        calls: list[tuple] = []
+        adapter._request = lambda m, p, pl, *, timeout=None: (
+            calls.append((m, p, dict(pl))) or (200, {"id": "999"})
+        )
+        handle = adapter.send(Outbound(conversation_id=CID, text="hi"))
+        self.assertIsNotNone(handle)
+        self.assertEqual(handle.conversation_id, CID)
+        self.assertEqual(calls[-1][1], "channels/C1/messages")
+
+    # -- 传输层接线值 ---------------------------------------------------
+    def test_backoff_wiring_matches_the_legacy_constants(self):
+        adapter = self.adapter()
+        transport = adapter._make_transport()
+        self.assertIsInstance(transport, WebSocketTransport)
+        self.assertEqual(RECONNECT_MIN, 1.0, "迁移前的下限就是 1s")
+        self.assertEqual(RECONNECT_MAX, 60.0)
+        self.assertEqual(transport.min_backoff, RECONNECT_MIN)
+        self.assertEqual(transport.max_backoff, RECONNECT_MAX)
+        self.assertEqual(
+            transport.reset_after, RECONNECT_MIN,
+            "迁移前的判定是 lived >= RECONNECT_MIN（started 取在建连之前）；"
+            "传 0（基类默认）会变成'只要连上过就重置'，那不是逐字等价",
+        )
+        self.assertEqual(transport.label, "discord")
+        self.assertEqual(transport._idle_delay(), 0.0,
+                         "WS 类传输阻塞在 recv()，不该有空转节流")
+        # 1s 起、×2、封顶 60s
+        self.assertEqual(
+            [transport._next_backoff(survived=False) for _ in range(4)],
+            [1.0, 2.0, 4.0, 8.0],
+        )
+        # 心跳必须走**定时驱动**（recv() 会阻塞 60s，循环驱动来不及）
+        self.assertEqual(transport.on_tick, adapter._tick)
+        self.assertGreater(transport.tick_interval, 0.0)
+        self.assertTrue(transport._timer_ticks)
+        self.assertFalse(transport._loop_ticks)
+
+    def test_proactive_disconnect_uses_close_4000_not_1000(self):
+        """**我们**主动断开的每一次都必须用 4000（1000/1001 会作废 session）。"""
+        adapter = self.adapter()
+        transport = adapter._make_transport()
+        self.assertEqual(transport._close_code, discord_mod.GATEWAY_CLOSE_REQUESTED)
+        self.assertEqual(discord_mod.GATEWAY_CLOSE_REQUESTED, 4000)
+        ws = GatewayWS()
+        adapter._handle_payload(ws, hello_packet())
+        ws.sent.clear()
+        adapter._close_ws(ws)
+        self.assertEqual([code for code, _ in ws.close_calls], [4000])
+
+    def test_session_teardown_also_closes_with_4000(self):
+        """会话收尾（重连 / stop）也必须是 4000 —— 否则 Resume 形同虚设。
+
+        ⚠️ 迁移前这一条是**用默认 1000 关的**，等于每次重连都作废 session。这不是
+        放松，而是把 :data:`GATEWAY_CLOSE_REQUESTED` 的注释（"用 4000 才能保住
+        session 供 Resume"）落到实处：4000 现在覆盖两种断开路径。
+        """
+        adapter = self.adapter()
+        ws = SilentAutoAckGatewayWS(adapter, script=[hello_packet(60000)])
+        adapter._ws_factory = lambda url, **kw: ws
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(self.wait_for(lambda: adapter.transport.connection is ws, 2.0))
+        adapter.stop()
+        self.assertTrue(ws.close_calls)
+        self.assertEqual({code for code, _ in ws.close_calls}, {4000})
+
+    def test_heartbeat_tick_granularity_is_a_small_fraction_of_the_period(self):
+        """粒度必须远小于周期：否则心跳最多会晚一整个粒度。
+
+        41s 的生产周期下粒度封顶 5s（= 12%）；亚秒级周期（测试用的 60ms）则按
+        周期/8 收紧，否则根本没法在亚秒尺度上观察心跳。
+        """
+        adapter = self.adapter()
+        transport = adapter._make_transport()
+        adapter._transport = transport        # 只为让 _on_hello 能调 tune_tick_interval
+        self.addCleanup(setattr, adapter, "_transport", None)
+        for interval_ms, expect_le in ((45000, 5.0), (60, 0.06 / 8)):
+            with self.subTest(interval_ms=interval_ms):
+                adapter._handle_payload(GatewayWS(), hello_packet(interval_ms))
+                self.assertLessEqual(
+                    transport.tick_interval, expect_le,
+                    f"{interval_ms}ms 周期下粒度太大，心跳会明显偏晚",
+                )
+
+    # -- 线程 / 异常 ----------------------------------------------------
+    def test_thread_and_connection_are_owned_by_the_transport(self):
+        adapter = self.adapter()
+        ws = SilentAutoAckGatewayWS(adapter, script=[hello_packet(60000)])
+        adapter._ws_factory = lambda url, **kw: ws
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(self.wait_for(lambda: adapter.running, 2.0))
+        self.assertIsNone(adapter._thread, "入站线程归传输层所有，_thread 必须恒为 None")
+        transport = adapter.transport
+        self.assertIsInstance(transport, WebSocketTransport)
+        self.assertIs(transport.connection, ws, "连接也归传输层持有")
+        self.assertTrue(adapter.running, "running 必须代理到传输层")
+        adapter.stop()
+        self.assertFalse(adapter.running)
+        self.assertIsNone(adapter.transport, "stop() 之后传输层引用必须清掉")
+
+    def test_transport_exception_does_not_silently_kill_the_thread(self):
+        """WS 读抛异常 → 记成会话错误 → 退避重连；线程必须还活着。
+
+        ⚠️ 这条来自一个真实风险：``running`` 读的是传输层的线程引用，如果异常把
+        消费线程带走了，``--status`` 仍会说"在跑"而实际早就不收信了（反之亦然）。
+        所以断言的是**内部状态**（``errors`` / ``connects`` / ``running``），
+        不是墙钟。
+        """
+
+        class _RaisingWS(GatewayWS):
+            def recv(self):
+                raise OSError("tcp reset by peer")
+
+        adapter = self.adapter()
+        made: list[object] = []
+
+        def factory(url, **kw):
+            ws = _RaisingWS()
+            made.append(ws)
+            return ws
+
+        adapter._ws_factory = factory
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(self.wait_for(lambda: len(made) >= 2, 5.0), "读异常后必须重连")
+        transport = adapter.transport
+        self.assertGreaterEqual(transport.stats()["errors"], 1, "读异常要记成会话错误")
+        self.assertGreaterEqual(transport.stats()["connects"], 2)
+        self.assertTrue(adapter.running, "异常不许静默杀死消费线程")
+
+    def test_stop_stops_heartbeat_before_closing_the_socket(self):
+        """``stop()`` 三段式：**停心跳 → 关 WS 唤醒阻塞的 recv() → 才 join**。
+
+        顺序用"关连接的那一刻已经不再有心跳"来证明（与 IRC 不变量 1 同一手法）：
+        :class:`Transport` 在 ``_close_conn`` **之前**就 join 了周期钩子线程。
+        """
+        adapter = self.adapter()
+        adapter._heartbeat_jitter = lambda interval: 0.0
+        ws = SilentAutoAckGatewayWS(adapter, script=[hello_packet(30)])
+        adapter._ws_factory = lambda url, **kw: ws
+        adapter.start()
+        self.assertTrue(self.wait_for(lambda: len(ws.ops_of(1)) >= 3, 3.0),
+                        "心跳必须真的在跑，否则这条用例没有意义")
+        transport = adapter.transport
+        beats_at_close: list[int] = []
+        original = transport._close_conn
+
+        def spy(conn):
+            beats_at_close.append(len(ws.ops_of(1)))
+            original(conn)
+
+        transport._close_conn = spy            # type: ignore[method-assign]
+        adapter.stop()
+        self.assertTrue(beats_at_close, "stop() 必须关连接")
+        self.assertEqual(
+            beats_at_close[0], len(ws.ops_of(1)),
+            "关连接的那一刻已经不该再有心跳 ⇒ 周期钩子先于关连接停下",
+        )
+        self.assertEqual(set(beats_at_close), {len(ws.ops_of(1))}, beats_at_close)
+        self.assertTrue(ws.closed, "必须关 WS 唤醒阻塞的 recv()")
+        self.assertFalse(adapter.running, "最后才 join，且 join 得完")
+        settled = len(ws.ops_of(1))
+        time.sleep(0.15)
+        self.assertEqual(len(ws.ops_of(1)), settled, "stop() 之后不再发心跳")
+
+    # -- close code 逐个 -------------------------------------------------
+    def test_each_fatal_close_code_reports_its_own_reason(self):
+        """六个 fatal close code 一个一个核对，且**各自带可执行的诊断**。
+
+        ⚠️ **invalid token 是 4004**，不是常被误传的 4010（4010 是 shard 参数非法）。
+        """
+        adapter = DiscordAdapter({"bot_token": "t"}, RecordingHooks())
+        needles = {
+            4004: "bot_token",
+            4010: "shard",
+            4011: "分片",
+            4012: "API 版本",
+            4013: "intent 位值",
+            4014: "开发者后台",
+        }
+        self.assertEqual(set(needles), set(discord_mod.FATAL_CLOSE_CODES),
+                         "停止重连的集合不能变")
+        for code, needle in needles.items():
+            with self.subTest(code=code):
+                with self.assertLogs("opencode_bridge.adapters.discord",
+                                     level="ERROR") as cap:
+                    self.assertEqual(adapter._action_for_close(code), "fatal")
+                joined = "\n".join(cap.output)
+                self.assertIn(str(code), joined)
+                self.assertIn(needle, joined, "必须给出这条 code 专属的诊断")
+        self.assertIn("认证失败", discord_mod.FATAL_CLOSE_CODES[4004])
+        self.assertIn("shard", discord_mod.FATAL_CLOSE_CODES[4010])
+        # 4004（token 失效）确实是 fatal，且**不是**靠 4010 兜住的
+        self.assertEqual(discord_mod.FATAL_CLOSE_CODES[4010],
+                         discord_mod.FATAL_CLOSE_CODES[4010])
+        self.assertNotIn("token", discord_mod.FATAL_CLOSE_CODES[4010])
+
+
+# ----------------------------------------------------------------------
+# 8) 收包循环（线程级）
 # ----------------------------------------------------------------------
 class LoopTestCase(GatewayTestCase):
     def setUp(self):
@@ -591,16 +1097,8 @@ class LoopTestCase(GatewayTestCase):
 
         self.addCleanup(restore)
 
-    def wait_for(self, predicate, timeout: float = 5.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if predicate():
-                return True
-            time.sleep(0.005)
-        return predicate()
-
     def run_loop(self, adapter: DiscordAdapter, sockets: list[GatewayWS]) -> list[str]:
-        """让 ``_inbound_loop`` 依次使用给定的假连接，返回建连时用过的 URL。"""
+        """让消费循环依次使用给定的假连接，返回建连时用过的 URL。"""
         urls: list[str] = []
         created: list[GatewayWS] = []
 
@@ -745,10 +1243,16 @@ class TestInboundLoop(LoopTestCase):
         adapter.start()
         self.addCleanup(adapter.stop)
         self.assertTrue(self.wait_for(lambda: ws.closed, 3.0), "钩子异常不能让线程退出")
+        # A1：断言的是**内部状态**（传输层还在跑、异常记成了会话错误），不是墙钟。
+        self.assertTrue(adapter.running, "running 代理到传输层，消费线程必须仍活着")
+        self.assertGreaterEqual(
+            adapter.transport.stats()["errors"], 1,
+            "on_inbound 抛异常要走 log.exception 而不是让消费线程静默退出",
+        )
 
 
 # ----------------------------------------------------------------------
-# 8) 出站未被入站改动波及（回归）
+# 9) 出站未被入站改动波及（回归）
 # ----------------------------------------------------------------------
 class TestOutboundUnaffected(unittest.TestCase):
     def test_send_and_edit_still_work(self):

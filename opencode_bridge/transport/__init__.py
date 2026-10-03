@@ -16,6 +16,13 @@
 全部归适配器 —— 所以本包不 import ``opencode_bridge.adapters``（既避免循环依赖，
 也让传输层可以独立测试）。
 
+跨平台能力
+----------
+:attr:`~.base.Transport.on_tick` + :attr:`~.base.Transport.tick_interval`
+（周期钩子）："没有入站数据时也要定期做点事"（Discord 心跳、Twitch 保活与注册
+超时判定）。两种触发源见 :mod:`.base` 的模块 docstring「周期钩子」。没配钩子的
+传输层**零额外开销**（不起线程、循环里只有一次布尔判断）。
+
 最小例子::
 
     from opencode_bridge.transport import PollingTransport, NOTHING

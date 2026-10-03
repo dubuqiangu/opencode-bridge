@@ -11,6 +11,9 @@
   （``127.0.0.1:0``，仍不算外网）：半行/多行重组、坏字节 replace、
   ``on_connect``、``send_line``。
 * :class:`Transport` 基类 6 条不变量**逐条**锁住。
+* :class:`TestPeriodicHook` —— ``on_tick`` / ``tick_interval``：循环驱动（IRC 等价
+  语义）与定时驱动（WS 这类 ``recv()`` 会长时间阻塞的长连接）两条触发时机、异常
+  隔离、"只在有活动会话时调"、"未配置时零开销"。
 
 线程用例最容易 flaky，所以：一律用 :func:`wait_until` 等条件而不是裸 sleep，
 每个用例 ``addCleanup(stop)``，超时给得比真实需求宽裕得多。
@@ -1102,6 +1105,259 @@ class TestBaseInvariants(TransportTestCase):
         t = _ScriptedBase(name=uniq_name("bo"))
         with self.assertRaises(TypeError):
             t.start(None)                # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------
+# 周期钩子（on_tick / tick_interval）
+# ----------------------------------------------------------------------
+class _OrderTicked(_ScriptedBase):
+    """把 ``tick`` 与 ``_next`` 的调用顺序记进一条共享日志。"""
+
+    def __init__(self, order: list[str], tick, **kw) -> None:
+        self.order = order
+        super().__init__(on_tick=tick, **kw)
+
+    def _next(self, conn):
+        self.order.append("next")
+        return super()._next(conn)
+
+
+class TestPeriodicHook(TransportTestCase):
+    """``on_tick`` / ``tick_interval`` 的两条触发时机 + 三条铁律。
+
+    两种模式（见 ``transport/base.py`` 模块 docstring「周期钩子」）：
+
+    * ``tick_interval <= 0`` —— **循环驱动**：每次取下一条数据之前调一次。IO 超时
+      也算一轮，所以与 IRC 迁移前 ``_IrcTransport._next`` 里的 tick 逐项等价。
+    * ``tick_interval > 0`` —— **定时驱动**：另起 daemon 线程，给"``_next`` 会
+      长时间阻塞"的长连接用（WS ``recv()``；Discord 心跳就靠它）。
+    """
+
+    # -- 循环驱动 -------------------------------------------------------
+    def test_loop_tick_runs_before_every_fetch(self):
+        order: list[str] = []
+        t = _OrderTicked(
+            order, lambda: order.append("tick"),
+            open_script=[_GateConn()], next_script=["a", "b"],
+            min_backoff=0.01, idle_delay=0.01, name=uniq_name("tick"),
+        )
+        events = self.start_transport(t)
+        self.assertTrue(wait_until(lambda: events[:2] == ["a", "b"]))
+        # 严格交替：tick 必须在对应那次 _next **之前**（不是攒到后面一起发）
+        self.assertGreaterEqual(order.count("tick"), 2, order)
+        for index, item in enumerate(order[:4]):
+            self.assertEqual(
+                item, "tick" if index % 2 == 0 else "next",
+                f"tick 与 _next 的顺序不对: {order[:6]}",
+            )
+
+    def test_io_timeout_round_still_ticks(self):
+        """IO 超时（:data:`NOTHING`）也是一轮 —— 这正是 IRC 迁移前的语义。"""
+        t = _ScriptedBase(
+            open_script=[_GateConn()], next_script=[NOTHING],
+            min_backoff=0.01, idle_delay=0.005,
+            on_tick=lambda: None, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: t.stats()["idle"] >= 3))
+        self.assertGreaterEqual(
+            t.stats()["ticks"], t.stats()["idle"],
+            f"每一轮空转都要 tick 一次: {t.stats()}",
+        )
+        self.assertEqual(t.stats()["connects"], 1, "IO 超时不是掉线，不该重连")
+        self.assertEqual(t.stats()["errors"], 0)
+
+    # -- 定时驱动 -------------------------------------------------------
+    def test_timer_tick_fires_while_the_read_is_blocked(self):
+        """``_next`` 一直阻塞时也必须按 ``tick_interval`` 触发。
+
+        这条是 Discord 心跳能成立的前提：WS 的 ``recv()`` 会阻塞整整一个读超时，
+        而心跳周期比它短 —— 靠循环驱动的话心跳会被拖到读超时之后（超过服务端容忍
+        的 1.25 倍）→ 连接被判死。
+        """
+        ticks: list[int] = []
+        conn = _GateConn()
+        t = _BlockingTransport(
+            conn, block=30.0, on_tick=lambda: ticks.append(1),
+            tick_interval=0.01, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(
+            wait_until(lambda: len(ticks) >= 5, timeout=3.0),
+            f"阻塞中的读也要触发周期钩子，实际 {len(ticks)} 次",
+        )
+        self.assertEqual(t.stats()["connects"], 1)
+
+    def test_timer_tick_only_fires_while_a_session_is_active(self):
+        """退避（没有活动会话）期间**不许**触发 —— 否则适配器会对着已关的连接保活。"""
+        ticks: list[int] = []
+        t = _ScriptedBase(
+            open_script=[ConnectionError("down")] * 999,
+            on_tick=lambda: ticks.append(1), tick_interval=0.01,
+            min_backoff=0.01, max_backoff=0.02, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: t.stats()["sessions"] >= 2))
+        time.sleep(0.08)                       # 足够它"想" tick 十几次
+        self.assertEqual(ticks, [], "没有活动会话时不该触发周期钩子")
+        self.assertEqual(t.stats()["ticks"], 0)
+
+    def test_timer_tick_interval_can_be_tightened_at_runtime(self):
+        """适配器在协商到周期之后才收紧粒度（Discord 在 HELLO 之后才拿到 41s）。
+
+        手法：先按 0.2s 粒度跑（计数**上界**断言 —— 只会更少），再在运行期改成
+        0.01s，计数必须**涨**（下界断言 —— 等待只会更长）。两条断言都不含容差，
+        所以不会因机器负载而 flaky。
+        """
+        ticks: list[int] = []
+        conn = _GateConn()
+        t = _BlockingTransport(
+            conn, block=30.0, on_tick=lambda: ticks.append(1),
+            tick_interval=0.2, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: len(ticks) >= 1))
+        time.sleep(0.25)
+        coarse = len(ticks)
+        self.assertLessEqual(coarse, 3, f"tick_interval=0.2 不该这么密: {coarse}")
+        # 用 tune_tick_interval：光改属性的话定时线程还睡在当前那一拍（0.2s）里，
+        # 第一次心跳会被拖满 —— 那正是"周期看起来慢一倍"的错觉来源。
+        t.tune_tick_interval(0.01)
+        self.assertEqual(t.tick_interval, 0.01)
+        self.assertTrue(
+            wait_until(lambda: len(ticks) >= coarse + 5, timeout=3.0),
+            "tune_tick_interval 必须立刻生效（唤醒定时线程）",
+        )
+
+    # -- 铁律：异常隔离 -------------------------------------------------
+    def test_loop_tick_exception_does_not_end_the_session(self):
+        """循环驱动：钩子抛异常不许换连接、不许停消费 —— 继续派发后续事件。"""
+        calls = {"n": 0}
+
+        def boom() -> None:
+            calls["n"] += 1
+            raise RuntimeError("heartbeat blew up")
+
+        t = _ScriptedBase(
+            open_script=[_GateConn()], next_script=list(range(6)),
+            min_backoff=0.01, idle_delay=0.005,
+            on_tick=boom, name=uniq_name("tick"),
+        )
+        with self.assertLogs("opencode_bridge.transport.base", level="WARNING"):
+            events = self.start_transport(t)
+            self.assertTrue(wait_until(lambda: len(events) >= 6))
+        self.assertGreaterEqual(calls["n"], 6, "钩子每一轮都要试一次")
+        self.assertEqual(t.stats()["connects"], 1, "钩子出错不是连接出错，不该重连")
+        self.assertGreaterEqual(t.stats()["errors"], 6, f"异常要记进 errors: {t.stats()}")
+        self.assertTrue(t.running)
+
+    def test_timer_tick_exception_does_not_end_the_session(self):
+        """定时驱动同样隔离 —— 而且**不许**杀掉定时线程自己。"""
+        calls = {"n": 0}
+
+        def boom() -> None:
+            calls["n"] += 1
+            raise RuntimeError("ack check exploded")
+
+        conn = _GateConn()
+        t = _BlockingTransport(
+            conn, block=30.0, on_tick=boom, tick_interval=0.01,
+            name=uniq_name("tick"),
+        )
+        with self.assertLogs("opencode_bridge.transport.base", level="WARNING"):
+            self.start_transport(t)
+            self.assertTrue(wait_until(lambda: calls["n"] >= 3, timeout=3.0))
+        self.assertEqual(t.stats()["connects"], 1)
+        self.assertGreaterEqual(t.stats()["errors"], 3, f"{t.stats()}")
+        self.assertTrue(t.running, "钩子异常不许杀死消费线程")
+
+    # -- 铁律：未配置时零开销 -------------------------------------------
+    def test_no_hook_means_no_thread_and_no_ticks(self):
+        t = _ScriptedBase(
+            open_script=[_GateConn()], next_script=["a"], min_backoff=0.01,
+            name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: t.stats()["events"] >= 1))
+        self.assertIsNone(t.on_tick)
+        self.assertFalse(t._loop_ticks, "未配钩子时循环里不该有 tick 分支")
+        self.assertFalse(t._timer_ticks)
+        self.assertIsNone(t._tick_thread, "不该起定时线程")
+        self.assertEqual(t.stats()["ticks"], 0)
+        names = [th.name for th in threading.enumerate()]
+        self.assertNotIn(t.tick_thread_name, names)
+        t.stop()                # stop() 不该去 join 一个不存在的线程
+        self.assertFalse(t.running)
+
+    def test_non_callable_hook_rejected(self):
+        with self.assertRaises(TypeError):
+            _ScriptedBase(on_tick="not callable")  # type: ignore[arg-type]
+
+    def test_stop_interrupts_a_coarse_tick_wait(self):
+        """``stop()`` 必须**立刻**唤醒定时线程，哪怕粒度是 30s。
+
+        这条来自一个真 bug：定时线程阻塞在 ``_tick_wake.wait(粒度)`` 上，只置
+        ``_tick_stop`` 唤不醒它 → ``join`` 白等满超时，而那个线程会在关连接之后
+        继续往一条正在关的连接上写（生产里粒度是 5s，所以表现为"stop() 之后还冒出
+        一拍心跳"）。
+
+        断言用**线程是否消失**（内部状态）而不是墙钟。
+        """
+        ticks: list[int] = []
+        conn = _GateConn()
+        t = _BlockingTransport(
+            conn, block=30.0, on_tick=lambda: ticks.append(1),
+            tick_interval=30.0, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: t.running))
+        self.assertTrue(
+            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            "定时线程应该已经起来",
+        )
+        t.stop(timeout=5.0)
+        self.assertFalse(
+            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            "粒度 30s 时 stop() 也必须立刻收掉定时线程（不许睡满那一拍）",
+        )
+        self.assertIsNone(t._tick_thread)
+        self.assertFalse(t.running)
+        settled = len(ticks)
+        time.sleep(0.05)
+        self.assertEqual(len(ticks), settled, "stop() 之后不该再有任何 tick")
+
+    def test_stop_halts_the_hook_before_closing_the_connection(self):
+        """``stop()`` 的三段式：**停钩子 → 关连接 → join**。
+
+        顺序用事件日志证明（与不变量 1 同一手法）：``Transport.stop()`` 会 join
+        定时线程之后才调 ``_close_conn``，所以**任何** tick 都必须排在 ``close``
+        之前；消费线程的 ``thread_end`` 又必须排在 ``close`` 之后。
+        """
+        order: list[str] = []
+        conn = _GateConn(order)
+        t = _BlockingTransport(
+            conn, block=30.0,
+            on_tick=lambda: order.append("tick"),
+            tick_interval=0.01, name=uniq_name("tick"),
+        )
+        self.start_transport(t)
+        self.assertTrue(wait_until(lambda: order.count("tick") >= 2))
+        t.stop()
+        self.assertEqual(order.count("close"), 1)
+        last_tick = max(i for i, x in enumerate(order) if x == "tick")
+        self.assertLess(
+            last_tick, order.index("close"),
+            f"周期钩子必须先于关连接停下: {order}",
+        )
+        self.assertLess(
+            order.index("close"), len(order) - 1,
+            f"关连接必须先于消费线程结束: {order}",
+        )
+        self.assertEqual(order[-1], "thread_end")
+        self.assertFalse(
+            any(th.name == t.tick_thread_name for th in threading.enumerate()),
+            "stop() 之后定时线程必须已退出",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -24,6 +24,17 @@
   要求换连接的正解）；抛别的异常只记 log，连接继续。
 * ``_close_conn`` 做成"先 ``shutdown`` 再 ``close()"：阻塞在 ``recv()`` 里时
   只有 ``shutdown`` 能立刻唤醒它，否则 ``stop()`` 每次都要等满 WS 读超时。
+
+⚠️ 周期钩子在这里只能走**定时驱动**
+----------------------------------------
+``recv()`` 会**阻塞到真有帧到达或连接关闭**，所以"每次取下一条之前调钩子"（循环
+驱动）在 WS 上等于"每次有帧时调"—— 完全无法做保活/心跳。
+
+而且**不能靠调小 WS 读超时来换周期**：:mod:`opencode_bridge.ws` 的
+``_recv_exact`` 在读超时时会抛 ``WebSocketError`` 并**丢掉已读到的半帧字节**，
+把 socket 超时调小等于让流损坏。所以 Discord 的心跳必须用
+``tick_interval > 0`` 的**定时驱动**模式（另起一个 daemon 线程），与
+:mod:`.base` 模块 docstring「周期钩子」一节一致。
 """
 
 from __future__ import annotations
@@ -47,6 +58,8 @@ class WebSocketTransport(Transport):
         调用（ack / 应答心跳 / 解析前置动作）。
     :param close_code: **本端主动关闭**时使用的状态码（默认 1000）。收到对端
         的 close 帧时用客户端自带的 ``close_code`` 属性，不受此参数影响。
+        ⚠️ 平台对"我们主动断开"有要求的（Discord 必须用 4000，否则 session 失效），
+        那就在这里传过去 —— 见 :mod:`opencode_bridge.adapters.discord`。
     """
 
     def __init__(

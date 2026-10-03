@@ -31,6 +31,7 @@ from opencode_bridge.adapters.mattermost import (
     MattermostAdapter,
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
+from opencode_bridge.transport import WebSocketTransport
 
 SITE_URL = "https://mm.example.test"
 TOKEN = "tok-abcdefghijklmnopqrstuvwxyz0123"
@@ -1240,6 +1241,74 @@ class TestPingPongGuarantee(unittest.TestCase):
         source = inspect.getsource(ws_mod.WebSocketClient._handle_control_frame)
         self.assertIn("_OP_PING", source)
         self.assertIn("_OP_PONG", source)
+
+
+# ----------------------------------------------------------------------
+# 18) 传输层接线值（G4 迁移）
+# ----------------------------------------------------------------------
+class TestTransportWiring(MattermostTestCase):
+    """退避 / 钩子接线：这些值决定"什么时候重连、等多久重连"。
+
+    迁移前它们散在 ``_inbound_loop`` 末尾那几行里，没有测试守着；迁移后它们成了
+    构造 :class:`~opencode_bridge.transport.WebSocketTransport` 的四个实参 ——
+    **值改错不会让任何功能用例失败**（重连只是慢一点/快一点），所以必须显式钉住。
+    """
+
+    def test_backoff_wiring_matches_the_legacy_constants(self):
+        adapter, _ = make_adapter()
+        transport = adapter._make_transport()
+        self.assertIsInstance(transport, WebSocketTransport)
+        self.assertEqual(mm_mod.RECONNECT_MIN, 1.0, "迁移前的下限就是 1s")
+        self.assertEqual(mm_mod.RECONNECT_MAX, 60.0)
+        self.assertEqual(transport.min_backoff, mm_mod.RECONNECT_MIN)
+        self.assertEqual(transport.max_backoff, mm_mod.RECONNECT_MAX)
+        self.assertEqual(
+            transport.reset_after, mm_mod.RECONNECT_MIN,
+            "迁移前的判定是 _connected_at and (now - _connected_at) >= RECONNECT_MIN；"
+            "传 0（基类默认）会把'压根没连上'也当成'连上过'，于是建连失败不再 ×2 增长",
+        )
+        self.assertEqual(transport.label, "mattermost")
+        self.assertEqual(transport._idle_delay(), 0.0,
+                         "WS 类传输阻塞在 recv()，不该有空转节流")
+        # 1s 起、×2、封顶 60s
+        self.assertEqual(
+            [transport._next_backoff(survived=False) for _ in range(4)],
+            [1.0, 2.0, 4.0, 8.0],
+        )
+
+    def test_session_hooks_are_wired_to_the_adapter(self):
+        adapter, _ = make_adapter()
+        transport = adapter._make_transport()
+        self.assertEqual(transport._on_message, adapter._handle_packet)
+        # 断开诊断必须在会话结束时跑（迁移前是 _inbound_loop 的 finally）
+        self.assertEqual(transport._on_close_fn, adapter._on_close)
+        self.assertIsNone(transport._on_open_fn,
+                          "Mattermost 没有'连上后要发什么'，不需要 on_open")
+        self.assertEqual(transport._close_code, 1000,
+                         "Mattermost 没有'必须用某个 close code'的要求")
+
+    def test_thread_and_connection_belong_to_the_transport(self):
+        adapter, _ = make_adapter()
+        adapter.user_id = MY_USER_ID
+        self.assertIsNone(adapter._thread, "入站线程归传输层所有，_thread 必须恒为 None")
+        adapter._ws_factory = lambda url, **kw: BlockingWS()
+        adapter._request = lambda *a, **k: (200, {"config": {"MaxPostSize": "4000"}})  # type: ignore[method-assign]
+        adapter.start()
+        try:
+            self.assertTrue(adapter.running, "running 必须代理到传输层")
+            self.assertIsInstance(adapter.transport, WebSocketTransport)
+            self.assertIsNotNone(adapter.transport.connection)
+        finally:
+            adapter.stop()
+        self.assertFalse(adapter.running)
+        self.assertIsNone(adapter.transport, "stop() 之后传输层引用必须清掉")
+
+    def test_running_is_overridden_not_inherited(self):
+        """基类 ``running`` 读 ``self._thread``（永远是 None）⇒ 继承它就永远 False。"""
+        from opencode_bridge.adapters.base import Adapter as BaseAdapter
+
+        self.assertIn("running", MattermostAdapter.__dict__)
+        self.assertIsNot(MattermostAdapter.running, BaseAdapter.running)
 
 
 if __name__ == "__main__":  # pragma: no cover

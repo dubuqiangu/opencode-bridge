@@ -18,6 +18,7 @@ import urllib.request
 
 logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
+import opencode_bridge.adapters.twitch as twitch_mod
 from opencode_bridge.adapters import adapter_class, build, registered_names
 from opencode_bridge.adapters.twitch import (
     CAP_COMMANDS,
@@ -32,6 +33,7 @@ from opencode_bridge.adapters.twitch import (
     _unescape_tag_value,
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
+from opencode_bridge.transport import WebSocketTransport
 
 NICK = "opencodebot"
 CHAN = "#foo"
@@ -1269,6 +1271,81 @@ class TestTwitchLifecycle(TwitchTestCase):
         adapter, _ = make_twitch()
         adapter.stop()
         self.assertFalse(adapter.running)
+
+
+# ----------------------------------------------------------------------
+# 传输层接线值（G4 迁移）
+# ----------------------------------------------------------------------
+class TestTwitchTransportWiring(TwitchTestCase):
+    """退避 / 钩子接线：这些值决定"什么时候重连、等多久重连"。
+
+    迁移前它们散在 ``_session_loop`` 里，没有测试守着；迁移后成了构造
+    :class:`~opencode_bridge.transport.WebSocketTransport` 的实参 —— **值改错不会
+    让任何功能用例失败**（重连只是慢一点/快一点），所以必须显式钉住。
+    """
+
+    def test_backoff_wiring_matches_the_legacy_semantics(self):
+        adapter, _ = make_twitch()
+        transport = adapter._make_transport()
+        self.assertIsInstance(transport, WebSocketTransport)
+        self.assertEqual(transport.min_backoff, adapter.reconnect_delay,
+                         "迁移前'连上过之后'每次都等固定的 reconnect_delay")
+        self.assertEqual(transport.max_backoff, adapter.max_reconnect_delay)
+        self.assertEqual(
+            transport.reset_after, twitch_mod.RECONNECT_STABLE_AFTER,
+            "建连失败那一支是 wait(min(delay,max)); delay*=2 —— 所以 reset_after 必须是"
+            "**正数**（极小值即可）；传 0 会让连不上时永远只等下限，退避形同虚设",
+        )
+        self.assertGreater(transport.reset_after, 0.0)
+        self.assertEqual(transport.label, "twitch")
+        self.assertEqual(transport._idle_delay(), 0.0,
+                         "WS 类传输阻塞在 recv()，不该有空转节流")
+        # make_twitch 把 reconnect_delay 调成 0.05s；max_reconnect_delay 仍是类默认 60s
+        self.assertEqual(
+            [transport._next_backoff(survived=False) for _ in range(4)],
+            [0.05, 0.1, 0.2, 0.4],
+        )
+        self.assertEqual(transport.max_backoff, twitch_mod.MAX_RECONNECT_DELAY)
+        # 建连成功 ⇒ 立刻重置回下限（迁移前那句 delay = self.reconnect_delay）
+        self.assertEqual(transport._next_backoff(survived=True), 0.05)
+        self.assertEqual(transport._next_backoff(survived=False), 0.05,
+                         "重置之后的第一拍就是下限，不能接着上一次的增长继续涨")
+
+    def test_session_hooks_are_wired_to_the_adapter(self):
+        adapter, _ = make_twitch()
+        transport = adapter._make_transport()
+        self.assertEqual(transport._on_open_fn, adapter._on_open)
+        self.assertEqual(transport._on_message, adapter._on_frame)
+        self.assertEqual(transport._on_close_fn, adapter._on_close)
+
+    def test_thread_and_connection_belong_to_the_transport(self):
+        server = self.make_server()
+        adapter, _ = make_twitch()
+        self.connect_adapter(adapter, server)
+        self.assertIsNone(adapter._thread, "入站线程归传输层所有，_thread 必须恒为 None")
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertIsNotNone(server.wait_for(lambda x: x.startswith("JOIN ")))
+        self.assertTrue(adapter.running, "running 必须代理到传输层")
+        self.assertIsInstance(adapter.transport, WebSocketTransport)
+        self.assertIsNotNone(adapter._current_ws())
+        adapter.stop()
+        self.assertFalse(adapter.running)
+        self.assertIsNone(adapter.transport, "stop() 之后传输层引用必须清掉")
+
+    def test_running_is_overridden_not_inherited(self):
+        """基类 ``running`` 读 ``self._thread``（永远是 None）⇒ 继承它就永远 False。"""
+        from opencode_bridge.adapters.base import Adapter as BaseAdapter
+
+        self.assertIn("running", TwitchAdapter.__dict__)
+        self.assertIsNot(TwitchAdapter.running, BaseAdapter.running)
+
+    def test_dedup_window_survives_reconnects(self):
+        """去重窗口是**实例级**的（不随会话重置）—— 重连后 Twitch 重发要靠它挡掉。"""
+        adapter, _ = make_twitch()
+        self.assertTrue(adapter._remember_id("msg-1"))
+        self.assertFalse(adapter._remember_id("msg-1"))
+        self.assertTrue(adapter._remember_id("msg-2"))
 
 
 if __name__ == "__main__":

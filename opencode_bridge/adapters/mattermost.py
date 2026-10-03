@@ -4,6 +4,35 @@
 WebSocket，复用 :mod:`opencode_bridge.ws`（T2.0，纯标准库自研的最小 RFC 6455 客户端）；
 出站走 REST（``POST /api/v4/posts`` / ``PUT /api/v4/posts/{id}/patch``）。零第三方依赖。
 
+G4：WS 连接 / 收包循环 / 退避 / 线程 / ``stop()`` 语义已迁到
+:class:`~opencode_bridge.transport.WebSocketTransport`。本文件只留 Mattermost 语义：
+两个信封的判别、**seq 记账**、可靠重连的 ``connection_id``、challenge 回应、
+断开诊断（鉴权失败 vs 网络抖动）、事件过滤、出站 REST。
+
+⚠️ 迁移里有两处**刻意保留**的细节，动了就会造成重复 / 丢失消息
+----------------------------------------------------------------------
+1. **先记 seq、再过滤**（:meth:`MattermostAdapter._handle_packet`）：``seq`` 由
+   **服务端分配**，被过滤掉的事件（自己发的、系统消息、已删除、未授权频道…）
+   **同样占用了一个 seq**。不记它，可靠重连就会把那条事件再投一次。
+   同理，**响应信封（带 ``status`` 的）绝不能推进 ``_last_seq``** —— 它的
+   ``seq_reply`` 回应的是我们自己的请求，不是事件流的位置。
+2. **可靠重连的两个参数必须同时给**（:meth:`MattermostAdapter._ws_url`）：只有
+   ``connection_id`` + ``sequence_number`` **都在**时服务端才会去查事件队列补发；
+   只给一个等于没给，下次重连会从头开始（于是重放窗口内的消息重复投递）。
+   ``_connection_id`` 必须在 ``hello`` 里**覆盖**成新的 —— 服务端没命中队列时会
+   重新发 ``hello`` 并换新的 id。
+
+三处**刻意**的日志差异（不是行为变更）
+------------------------------------
+入站侧原本会区分「建连失败（地址 / TLS / 网络）」与「入站异常」两条 warning。迁移后：
+
+* 「建连失败」仍由 :meth:`_open_socket` 用**同样的文案**打出来（它就发生在建连那一步）；
+* 「入站异常」与「对端正常关闭」改由共享传输层统一打
+  ``transport[mattermost]: 会话出错: …``（WARNING），随后照旧由
+  :meth:`_on_close` → :meth:`_log_disconnect` 打出**平台级**诊断。
+
+级别、异常文本、诊断信息都还在，变的只是前缀与归属的 logger。
+
 协议细节均按官方 OpenAPI 与 ``mattermost/mathermost@master`` 源码核实，几处**反直觉**
 的点写在下面，实现处都有对应注释：
 
@@ -48,6 +77,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
+from ..transport import WebSocketTransport
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.mattermost")
@@ -185,7 +215,8 @@ class MattermostAdapter(Adapter):
         self.user_id: str = str(self.config.get("user_id") or "").strip()
 
         # --- WebSocket 入站状态 ----------------------------------------
-        self._ws = None                  # 当前连接，stop() 时关掉
+        # 线程与连接都归传输层所有（``start()`` 之后才有；见「传输层接缝」一节）。
+        self._transport: Optional[WebSocketTransport] = None
         self._ws_factory = None          # 测试注入点
         self._connection_id: Optional[str] = None   # hello 给的 26 字符连接 id
         self._server_version: Optional[str] = None
@@ -450,6 +481,85 @@ class MattermostAdapter(Adapter):
             self._apply_max_post_size(None)
 
     # ------------------------------------------------------------------
+    # 传输层接缝
+    # ------------------------------------------------------------------
+    @property
+    def transport(self) -> Optional[WebSocketTransport]:
+        """当前传输层（``start()`` 之后才有；连接由它持有，见 ``transport.connection``）。"""
+        return self._transport
+
+    @property
+    def running(self) -> bool:
+        """消费线程是否活着（代理到传输层）。
+
+        ⚠️ 基类的 :attr:`Adapter._thread` 现在**恒为 None**（入站线程由传输层持有，
+        名字是 ``transport:mattermost``）。``core.py`` 的 ``_adapter_for`` 靠前缀 /
+        映射找适配器，不依赖线程匹配。
+        """
+        transport = self._transport
+        return transport is not None and transport.running
+
+    def _make_transport(self) -> WebSocketTransport:
+        """构造本次运行用的传输层（测试注入点：退避接线值）。
+
+        退避**逐字对齐迁移前** ``_inbound_loop`` 末尾那几行
+        （``delay = RECONNECT_MIN`` 起、×2、封顶 ``RECONNECT_MAX``、连接稳定后重置）：
+
+        * ``min_backoff=RECONNECT_MIN`` / ``max_backoff=RECONNECT_MAX`` —— 1s 起、
+          ×2、封顶 60s，与迁移前一致；
+        * ``reset_after=RECONNECT_MIN`` —— 迁移前的判定是
+          ``self._connected_at and (monotonic() - _connected_at) >= RECONNECT_MIN``，
+          而传输层把「``_open()`` 直接失败」也算成 ``lived = 0.0``；**只有传这个正数**
+          才能让「压根没连上」与「连上了但没活够 1s」都走 ×2 增长，与迁移前逐项一致
+          （传基类默认的 0 会让这两种情况永远只等下限）。
+
+        ⚠️ 刻意读**模块全局**而不是类属性：迁移前就是运行时读全局
+        ``RECONNECT_MIN`` / ``RECONNECT_MAX``，既有测试
+        （``tests/test_mattermost.py`` 的 ``TestInboundLoop``）靠 monkeypatch
+        那两个全局来缩短等待。
+        """
+        return WebSocketTransport(
+            self._open_socket,
+            on_message=self._handle_packet,
+            on_close=self._on_close,
+            name="mattermost",
+            min_backoff=RECONNECT_MIN,
+            max_backoff=RECONNECT_MAX,
+            reset_after=RECONNECT_MIN,
+        )
+
+    def _open_socket(self) -> Any:
+        """建一次会话：重置诊断状态 → 定 URL（可靠重连参数）→ 建 WS → 记日志。
+
+        对应迁移前 ``_inbound_loop`` 开头那几行，逐字保留顺序、日志文本与那句
+        「建连失败（地址 / TLS / 网络）」的 warning（迁移后入站侧异常改由共享
+        传输层记 ``transport[...] 会话出错``，见模块 docstring）。
+        """
+        self._connected_at = 0.0
+        self._got_hello = False
+        try:
+            url = self._ws_url()
+            ws = self._make_ws(url)
+        except Exception as exc:  # noqa: BLE001 - 交给传输层退避重试
+            logger.warning("mattermost: 建连失败（地址 / TLS / 网络）: %s", exc)
+            raise
+        self._connected_at = time.monotonic()
+        logger.info("mattermost: websocket 已连接 %s", self._redact(url))
+        return ws
+
+    def _on_event(self, item: Any) -> None:
+        """传输层的 ``on_event`` 回调：**刻意是 no-op**。
+
+        :class:`~opencode_bridge.transport.WebSocketTransport` 在每条原始帧到达时
+        先调 ``on_message(conn, frame)``（本适配器接的是
+        :meth:`_handle_packet`，信封判别 / seq 记账都在那里做完了）、**再**把同一帧
+        交给 ``on_event``。这里必须什么都不做，否则同一条消息会被投递两次
+        （core 会当成两条消息，bot 也会回两次）。
+        保留这个空实现（而不是给 ``start()`` 传 ``lambda _: None``）是为了让
+        「同一帧会被两个钩子看到」这件事在代码里是**显式可见**的。
+        """
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -471,11 +581,9 @@ class MattermostAdapter(Adapter):
                 "mattermost: 拿不到自己的 user id（GET /users/me 失败），已暂停入站处理"
                 "以避免自问自答回环；可在配置里显式给 user_id"
             )
-        thread = threading.Thread(
-            target=self._inbound_loop, name="mattermost-websocket", daemon=True
-        )
-        self._thread = thread
-        thread.start()
+        transport = self._make_transport()
+        self._transport = transport
+        transport.start(self._on_event)
 
     # ------------------------------------------------------------------
     # Inbound（WebSocket 事件流）
@@ -491,46 +599,21 @@ class MattermostAdapter(Adapter):
             from ..ws import connect as factory  # 延迟导入：没开入站也不加载它
         return factory(url, timeout=WS_RECV_TIMEOUT, headers=self._auth_headers())
 
-    def _inbound_loop(self) -> None:
-        """连接 → 收包 → 断开重连，直到 stop。**任何异常都不许逃出线程。"""
-        delay = RECONNECT_MIN
-        while not self._stop_event.is_set():
-            ws = None
-            self._connected_at = 0.0
-            self._got_hello = False
-            try:
-                url = self._ws_url()
-                ws = self._make_ws(url)
-                self._ws = ws
-                self._connected_at = time.monotonic()
-                logger.info("mattermost: websocket 已连接 %s", self._redact(url))
-                while not self._stop_event.is_set():
-                    raw = ws.recv()
-                    if raw is None:  # 对端关闭 → 退出内层循环走重连
-                        break
-                    self._handle_packet(ws, raw)
-            except Exception as exc:  # noqa: BLE001 - 线程里绝不外抛
-                if not self._stop_event.is_set():
-                    if not self._connected_at:
-                        logger.warning("mattermost: 建连失败（地址 / TLS / 网络）: %s", exc)
-                    else:
-                        logger.warning("mattermost: 入站异常: %s", exc)
-            finally:
-                current, self._ws = self._ws, None
-                if current is not None:
-                    try:
-                        current.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._log_disconnect(ws)
-            if self._stop_event.is_set():
-                break
-            # 退避：连上并活过一段时间就把间隔重置回下限
-            if self._connected_at and (time.monotonic() - self._connected_at) >= RECONNECT_MIN:
-                delay = RECONNECT_MIN
-            if self._stop_event.wait(delay):
-                break
-            delay = min(delay * 2, RECONNECT_MAX)
+    def _on_close(self, conn: Any) -> None:
+        """传输层的 ``on_close`` 钩子：会话结束 → 打**平台级**断开诊断。
+
+        对应迁移前 ``_inbound_loop`` 的 ``finally`` 末尾那句 ``self._log_disconnect(ws)``。
+        迁移前它紧跟在 ``ws.close()`` 之后，现在由基类保证在 ``_close_conn`` **之前**
+        调用 —— 顺序不构成差异：:meth:`opencode_bridge.ws.WebSocketClient.close` 只发
+        close 帧并关 socket，**不写** ``close_code``（那个字段只在**收到**对端 close 帧时
+        才被填），所以关连接前后读到的 ``close_code`` 完全一样。
+
+        ⚠️ 这里只在**确实建上过连接**时才会被调用（``_open()`` 直接失败时基类不调）。
+        迁移前那次「压根没连上」的 ``_log_disconnect(None)`` 已被 ``_open_socket`` 里
+        更准确的「建连失败」取代 —— 迁移前那两句在连不上时会同时打出来，其中
+        「尚未收到 hello 就断开（可能是网络抖动）」对建连失败其实是**误报**。
+        """
+        self._log_disconnect(conn)
 
     # -- 断开诊断 ---------------------------------------------------------
     @staticmethod
@@ -579,6 +662,11 @@ class MattermostAdapter(Adapter):
     # -- 收包 -------------------------------------------------------------
     def _handle_packet(self, ws, raw: str) -> bool:
         """处理一个 WebSocket 信封，返回"这条是不是 hello"。
+
+        本方法是入站的**唯一**语义入口：迁移后它由传输层的 ``on_message`` 钩子
+        （签名正好是 ``(conn, frame)``）逐帧调用，**没有**第二份实现。
+        返回值只给测试与调试看 —— 传输层不解释它（更早的框架版本没有"要求重连"
+        这类返回值，重连一律由"关连接 / 对端关闭"驱动）。
 
         **两个信封要分清**：事件是 ``{"event", "data", "broadcast", "seq"}``，
         响应是 ``{"status", "seq_reply", ...}``。判别方式就是**有没有 ``status`` 键**
@@ -748,20 +836,19 @@ class MattermostAdapter(Adapter):
     # Lifecycle teardown
     # ------------------------------------------------------------------
     def stop(self) -> None:
-        """先关 WS 再 ``super().stop()``（顺序不能反）。
+        """置停止位 → **关 WS 唤醒阻塞的 ``recv()`` → join 线程**（**幂等**）。
 
-        基类 ``stop()`` 会 join 线程（5s 超时），而 ``recv()`` 在
-        :data:`WS_RECV_TIMEOUT`(75s) 内可能一直阻塞；不先关连接就会每次 stop 都等满
-        超时。
+        顺序不能反：传输层的 ``join`` 只等 5s，而 ``recv()`` 在
+        :data:`WS_RECV_TIMEOUT`（75s）内可能一直阻塞；不先把连接关掉就会每次
+        stop 都等满超时。迁移前这段是手写的（取 ``self._ws`` → ``close()`` →
+        ``super().stop()``），现在由
+        :meth:`~opencode_bridge.transport.Transport.stop` 统一保证
+        （关连接那步还多了 ``shutdown`` 唤醒阻塞中的读），语义没变。
         """
-        ws = self._ws
-        self._ws = None
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("mattermost: ws close during stop failed: %s", exc)
-        super().stop()
+        super().stop()                      # 置停止位（_throttle 依赖它）
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.stop()
 
     # ------------------------------------------------------------------
     # Outbound（REST）

@@ -1,8 +1,11 @@
 """WebSocket 长连接传输（基于 :mod:`opencode_bridge.ws` 的客户端）。
 
-覆盖的平台：Slack Socket Mode / Discord Gateway / Mattermost。
-⚠️ Twitch 的 IRC-over-WSS **不走这里**（它是行协议，见 :mod:`.tcp_lines` 的
-同类思路）—— 不过 ``ws.recv()`` 同样可能一帧多行，适配器仍需自己分行。
+覆盖的平台：Slack Socket Mode / Discord Gateway / Mattermost / Twitch（IRC over WSS）。
+⚠️ Twitch 是**行**协议（IRC over WS）：``ws.recv()`` 同样可能**一帧多行**、也可能只给
+半行，所以它用本类收帧、在**适配器侧**自己按 ``\n`` 切行并维护跨帧缓冲
+（见 :meth:`opencode_bridge.adapters.twitch.TwitchAdapter._on_frame`）。
+⚠️ 也就是说本类**不做**行缓冲 —— 需要行的协议要么像 Twitch 那样在 ``on_message``
+钩子里自己切，要么改用 :mod:`.tcp_lines`（它内建行缓冲）。
 
 注入点
 ------
@@ -54,8 +57,19 @@ class WebSocketTransport(Transport):
     """基于 :mod:`opencode_bridge.ws` 的长连接传输。
 
     :param connect: 返回**已连接**的 WS 客户端的可调用（测试注入点）。
+    :param on_open: 可选，``on_open(conn)`` 在连上之后、消费第一帧之前被调一次
+        （发登录 / Identify / CAP 协商 / IRC 注册）。抛异常 = 本次会话作废
+        （"连上但注册不通过"就该重连，而不是卡在那里）—— 基类会关连接、退避重试。
+        与 :class:`~opencode_bridge.transport.tcp_lines.TcpLineTransport` 的
+        ``on_connect`` 是同一件事，只是本类按 WS 适配器的习惯叫 ``on_open``。
     :param on_message: 可选，``on_message(conn, frame)`` 在每条原始帧到达时
         调用（ack / 应答心跳 / 解析前置动作）。
+    :param on_close: 可选，``on_close(conn)`` 在**每次会话结束时**调一次（掉线、
+        注册失败、以及 ``stop()`` 关掉连接之后都会调；``_open()`` 直接失败、
+        从未建上过连接时**不**调）。适配器用它做"会话收尾"：Mattermost 打断开
+        诊断、Twitch 取消注册定时器并清掉半行缓冲。
+        在这里抛 :class:`~opencode_bridge.transport.ReconnectNow` 可以要求**立刻**
+        重连、不退避（基类 :meth:`Transport._safe_on_close` 会识别）。
     :param close_code: **本端主动关闭**时使用的状态码（默认 1000）。收到对端
         的 close 帧时用客户端自带的 ``close_code`` 属性，不受此参数影响。
         ⚠️ 平台对"我们主动断开"有要求的（Discord 必须用 4000，否则 session 失效），
@@ -66,21 +80,39 @@ class WebSocketTransport(Transport):
         self,
         connect: Callable[[], Any],
         *,
+        on_open: Callable[[Any], None] | None = None,
         on_message: Callable[[Any, Any], None] | None = None,
+        on_close: Callable[[Any], None] | None = None,
         close_code: int = 1000,
         **kw: Any,
     ) -> None:
         if not callable(connect):
             raise TypeError("connect 必须可调用")
+        if on_open is not None and not callable(on_open):
+            raise TypeError("on_open 必须可调用")
         if on_message is not None and not callable(on_message):
             raise TypeError("on_message 必须可调用")
+        if on_close is not None and not callable(on_close):
+            raise TypeError("on_close 必须可调用")
         self._connect = connect
+        self._on_open_fn = on_open
         self._on_message = on_message
+        self._on_close_fn = on_close
         self._close_code = int(close_code)
         super().__init__(**kw)
 
     def _open(self) -> Any:
         return self._connect()
+
+    def _on_open(self, conn: Any) -> None:
+        """转接 ``on_open`` 钩子（默认 no-op，与基类契约一致：抛异常 = 会话作废）。"""
+        if self._on_open_fn is not None:
+            self._on_open_fn(conn)
+
+    def _on_close(self, conn: Any) -> None:
+        """转接 ``on_close`` 钩子（默认 no-op，与基类契约一致：不许抛）。"""
+        if self._on_close_fn is not None:
+            self._on_close_fn(conn)
 
     def _next(self, conn: Any) -> Any:
         """收一帧。``None``（对端关闭）→ 视为会话结束，交给基类重连。"""

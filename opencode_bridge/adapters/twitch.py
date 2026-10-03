@@ -32,6 +32,21 @@ Twitch 的聊天就是 **IRC over WebSocket**：底层是 ``wss://irc-ws.chat.tw
 4. **限流**：未认证（unverified）应用在 Twitch IRC 上约 **20 条 / 30 秒**
    （社区经验值，非官方文档常量），超了会被断开。:meth:`TwitchAdapter._throttle`
    用 1.5s 最小间隔折算这个上限。
+
+G4：连接 / 收帧 / 退避 / 线程 / ``stop()`` 语义已迁到
+:class:`~opencode_bridge.transport.WebSocketTransport`。本文件只留 Twitch 语义：
+IRCv3 标签解析、**帧≠行的重组**（:meth:`TwitchAdapter._on_frame`）、注册时序、
+JOIN 时机、去重窗口、提及识别、出站分片。
+
+两处**必须逐字保留**的时序（动了就会丢消息）
+--------------------------------------------
+1. **JOIN 必须在收到 001 之后、下一行被处理之前发出**。迁移前是"读循环读到 001 就
+   返回 → :meth:`TwitchAdapter._join`"；现在读循环归传输层，所以 JOIN 在
+   :meth:`_handle_numeric` 里就地发出 —— 两者对服务端是**同一顺序**。
+2. **注册超时靠"关掉连接"作废会话**，不靠抛异常：传输层的 ``on_message`` 会把普通
+   异常吞掉并继续消费这条连接（抛了等于没抛），而 ``ReconnectNow`` 会跳过退避 ——
+   两者都会改变迁移前"结束会话 → 等 ``reconnect_delay`` → 重连"的时序。
+   详见 :meth:`TwitchAdapter._void_session`。
 """
 
 from __future__ import annotations
@@ -49,6 +64,7 @@ from typing import Any, List, Optional, Tuple
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
+from ..transport import WebSocketTransport
 from .base import Adapter, classify_http, register
 # 纯解析/文本工具复用 IRC 适配器的唯一实现（不重复实现，也不修改它）
 from .irc import (
@@ -90,6 +106,16 @@ MAX_RECONNECT_DELAY = 60.0   # 重连退避上限（秒）
 MIN_SEND_INTERVAL = 1.5      # ≈ 20 条 / 30 秒（社区经验值）
 API_TIMEOUT = 10.0           # Helix 查询自己的超时
 SEEN_IDS_MAX = 1024          # 入站消息 id 去重窗口（防重连后重复投递）
+
+#: 传给传输层的 ``reset_after``：**刻意取一个极小的正数**，而不是基类默认的 0。
+#:
+#: 迁移前的 ``_session_loop`` 规则是「**建连成功**就把退避重置回 ``reconnect_delay``；
+#: **建连失败**才 ×2 增长」，也就是说"连不上"与"连上了但很快断"是**两种**退避。
+#: 而传输层把「``_open()`` 直接失败」也算成 ``lived = 0.0``，于是 ``reset_after=0``
+#: 会让两种情况都永远只等下限 —— Twitch 挂掉时会每 5s 猛重连一次、退避形同虚设。
+#: 取这个极小正数就精确复刻那条规则：建连失败 ⇒ 不算稳定 ⇒ 走 ×2 增长；
+#: 建连成功（哪怕下一毫秒就断）⇒ 算稳定 ⇒ 重置回下限。
+RECONNECT_STABLE_AFTER = 0.001
 
 CAP_TAGS = "twitch.tv/tags"
 CAP_COMMANDS = "twitch.tv/commands"
@@ -261,8 +287,8 @@ class TwitchAdapter(Adapter):
         self.channel: str = self._normalize_channel(self.raw_channel)
         self.user_id: str = str(self.config.get("user_id") or "").strip()
         self._identity: dict[str, str] = {}
-        self._ws: Any = None
-        self._ws_lock = threading.Lock()
+        # 线程与连接都归传输层所有（``start()`` 之后才有；见「传输层接缝」一节）。
+        self._transport: Optional[WebSocketTransport] = None
         self._send_lock = threading.Lock()
         self._throttle_lock = threading.Lock()
         self._last_send: dict[str, float] = {}
@@ -270,6 +296,11 @@ class TwitchAdapter(Adapter):
         self._seq = 0
         self._rbuf = ""
         self._registered = False
+        #: 本次会话是否已被适配器主动作废（见 :meth:`_void_session`）。置位后，
+        #: 同一帧里剩下的 IRC 行不再处理（迁移前是抛异常跳出读循环）。
+        self._session_voided = False
+        #: 注册超时定时器（收到 001 或会话结束时取消，见 :meth:`_on_open` / :meth:`_on_close`）。
+        self._register_timer: Optional[threading.Timer] = None
         self._room_users = 0               # membership 粗略计数（近似值）
         self._seen_lock = threading.Lock()
         self._seen_ids: List[str] = []
@@ -331,11 +362,9 @@ class TwitchAdapter(Adapter):
             logger.warning("twitch: channel missing; adapter not started")
             return
         self._stop_event.clear()
-        thread = threading.Thread(
-            target=self._session_loop, name="twitch-irc", daemon=True
-        )
-        self._thread = thread
-        thread.start()
+        transport = self._make_transport()
+        self._transport = transport
+        transport.start(self._on_event)
         logger.info(
             "twitch: connecting to %s as %s, channel %s (client_id=%s, membership=%s)",
             self.endpoint,
@@ -346,16 +375,18 @@ class TwitchAdapter(Adapter):
         )
 
     def stop(self) -> None:
-        """先关 WS 让阻塞中的 ``recv()`` 立刻返回，再停线程。
+        """置停止位 → 关 WS 让阻塞中的 ``recv()`` 立刻返回 → join 线程（**幂等**）。
 
-        顺序不能反：基类 ``stop()`` 会 join 线程（5s 超时），而读循环阻塞在
-        ``ws.recv()`` 上最长 ``ws_timeout``（默认 30s）。
+        顺序不能反：传输层的 ``join`` 只等 5s，而读循环阻塞在 ``ws.recv()`` 上
+        最长 ``ws_timeout``（默认 30s）。迁移前这段是手写的（``_ws_lock`` 里取出连接
+        → :meth:`_close_ws` → ``super().stop()``），现在由
+        :meth:`~opencode_bridge.transport.Transport.stop` 统一保证
+        （关连接那步还多了 ``shutdown`` 唤醒阻塞中的读），语义没变。
         """
-        with self._ws_lock:
-            ws, self._ws = self._ws, None
-        if ws is not None:
-            self._close_ws(ws)
-        super().stop()
+        super().stop()                      # 置停止位（_throttle 依赖它）
+        transport, self._transport = self._transport, None
+        if transport is not None:
+            transport.stop()
 
     @staticmethod
     def _close_ws(ws: Any) -> None:
@@ -381,45 +412,81 @@ class TwitchAdapter(Adapter):
         return factory(self.endpoint, timeout=self.ws_timeout)
 
     # ------------------------------------------------------------------
-    # 会话：连接 → 注册 → JOIN → 读循环 → 退避重连
+    # 传输层接缝（会话：连接 → 注册 → JOIN → 读帧 → 退避重连）
     # ------------------------------------------------------------------
-    def _session_loop(self) -> None:
-        delay = self.reconnect_delay
-        while not self._stop_event.is_set():
-            try:
-                ws = self._make_ws()
-            except Exception as exc:
-                logger.warning("twitch: connect failed: %s", exc)
-                if self._stop_event.wait(min(delay, self.max_reconnect_delay)):
-                    return
-                delay = min(delay * 2, self.max_reconnect_delay)
-                continue
-            with self._ws_lock:
-                self._ws = ws
-            delay = self.reconnect_delay
-            try:
-                self._register(ws)
-                if not self._stop_event.is_set():
-                    self._join(ws)
-                    self._read_loop(ws)
-            except Exception as exc:
-                logger.warning("twitch: session ended: %s", exc)
-            finally:
-                self._registered = False
-                self._rbuf = ""            # 丢弃残留缓冲：半行说明连接已错位
-                with self._ws_lock:
-                    if self._ws is ws:
-                        self._ws = None
-                self._close_ws(ws)
-            if self._stop_event.wait(self.reconnect_delay):
-                return
+    @property
+    def transport(self) -> Optional[WebSocketTransport]:
+        """当前传输层（``start()`` 之后才有；测试与 :meth:`_current_ws` 看它）。"""
+        return self._transport
 
-    def _register(self, ws: Any) -> None:
-        """PASS → NICK → USER → CAP REQ，并等待 001 (RPL_WELCOME)。
+    @property
+    def running(self) -> bool:
+        """消费线程是否活着（代理到传输层）。
 
-        Twitch 明确要求：``NICK`` 只填**用户名**（小写），不是老式的
-        ``NICK user justin``；``USER`` 虽被 Twitch 忽略，但协议要求必须有。
-        没等到 001 就抛异常 → 上层按断线重连（静默卡在"连上但没注册"最难查）。
+        ⚠️ 基类的 :attr:`Adapter._thread` 现在**恒为 None**（入站线程由传输层持有，
+        名字是 ``transport:twitch``）。``core.py`` 的 ``_adapter_for`` 靠前缀 / 映射
+        找适配器，不依赖线程匹配。
+        """
+        transport = self._transport
+        return transport is not None and transport.running
+
+    def _make_transport(self) -> WebSocketTransport:
+        """构造本次运行用的传输层（测试注入点：退避接线值）。
+
+        退避**逐字对齐迁移前** ``_session_loop`` 那两条路径：
+
+        * ``min_backoff=self.reconnect_delay`` / ``max_backoff=self.max_reconnect_delay``
+          —— 迁移前"连上过之后"每次都等固定的 ``reconnect_delay``（原代码那一支是
+          ``wait(self.reconnect_delay)``，**没有** ×2 增长），所以传输层的
+          ``min_backoff`` 必须正好等于它；
+        * ``reset_after=RECONNECT_STABLE_AFTER``（极小的正数，见常量注释）——
+          传输层把「``_open()`` 直接失败」也算 ``lived = 0.0``，只有这个值才能让
+          **建连失败**继续走 ×2 增长（迁移前那支是
+          ``wait(min(delay, max)); delay = min(delay*2, max)``），而**建连成功**
+          立刻把退避重置回下限。
+
+        ⚠️ 刻意读**实例属性** ``self.reconnect_delay``（不是模块全局）：迁移前
+        ``_session_loop`` 也是运行时读实例属性，既有测试靠在实例上覆盖它来缩短等待。
+        """
+        return WebSocketTransport(
+            self._open_socket,
+            on_open=self._on_open,
+            on_message=self._on_frame,
+            on_close=self._on_close,
+            name="twitch",
+            min_backoff=self.reconnect_delay,
+            max_backoff=self.max_reconnect_delay,
+            reset_after=RECONNECT_STABLE_AFTER,
+        )
+
+    def _open_socket(self) -> Any:
+        """建一次连接；失败按原样抛给传输层退避重试。
+
+        对应迁移前 ``_session_loop`` 开头那两行（``try: ws = self._make_ws()`` +
+        ``logger.warning("twitch: connect failed: %s", exc)``），两者都逐字保留。
+        """
+        try:
+            return self._make_ws()
+        except Exception as exc:  # noqa: BLE001 - 交给传输层退避重试
+            logger.warning("twitch: connect failed: %s", exc)
+            raise
+
+    def _on_open(self, conn: Any) -> None:
+        """传输层的 ``on_open`` 钩子：每次连上（每次重连）都跑一遍。
+
+        PASS → NICK → USER → CAP REQ，并起一个注册超时定时器。对应迁移前
+        ``_register`` 的前半段，逐字保留顺序与命令内容。Twitch 明确要求：``NICK``
+        只填**用户名**（小写），不是老式的 ``NICK user justin``；``USER`` 虽被 Twitch
+        忽略，但协议要求必须有。
+
+        ⚠️ **这里不再读数据**。迁移前 ``_register`` 自己调 :meth:`_read_loop` 读到
+        001 为止（读不到就 ``raise TimeoutError``）；现在读一律由传输层的消费循环做
+        （本适配器的 ``on_message`` 钩子），于是"等 001"变成一个**超时判定**：
+        定时器到点就 :meth:`_void_session` 关掉连接，阻塞中的 ``recv()`` 立刻返回，
+        会话结束 → 退避 → 重连。归宿与迁移前那条 ``raise TimeoutError`` 完全一样。
+
+        抛异常 = 本次会话作废（拿不到 nick 时就是：既没配 nick 也没 client_id）——
+        基类关连接、退避重试，**不会**卡在"连上但没注册"。
         """
         self._resolve_identity()
         if not self.nick:
@@ -428,64 +495,96 @@ class TwitchAdapter(Adapter):
             )
         self._rbuf = ""
         self._registered = False
-        self._send_line(ws, f"PASS oauth:{self.raw_token}")
-        self._send_line(ws, f"NICK {self.nick.lower()}")
-        self._send_line(ws, f"USER {self.nick.lower()} 0 * :{self.display_name or self.nick}")
-        self._send_line(ws, f"CAP REQ :{self._caps()}")
+        self._session_voided = False
+        self._send_line(conn, f"PASS oauth:{self.raw_token}")
+        self._send_line(conn, f"NICK {self.nick.lower()}")
+        self._send_line(conn, f"USER {self.nick.lower()} 0 * :{self.display_name or self.nick}")
+        self._send_line(conn, f"CAP REQ :{self._caps()}")
         # 读循环是**阻塞**在 ``ws.recv()`` 上的（socket 超时 ``ws_timeout`` 默认 30s），
-        # 所以注册超时不能靠"循环里检查 deadline"—— 那样要等 30s 才发现。改为起一个
-        # 定时器，到点直接关掉 WS，把阻塞中的 recv 唤醒，让下面正常走超时重连。
-        timer = threading.Timer(self.register_timeout, self._force_close, args=(ws,))
+        # 所以注册超时不能靠"消费循环里检查 deadline"—— 那样要等 30s 才发现。改为起一个
+        # 定时器，到点直接关掉 WS，把阻塞中的 recv 唤醒，让传输层正常走退避重连。
+        timer = threading.Timer(self.register_timeout, self._force_close, args=(conn,))
         timer.daemon = True
+        self._register_timer = timer
         timer.start()
-        try:
-            self._read_loop(ws, deadline=time.monotonic() + self.register_timeout)
-        finally:
+
+    def _on_close(self, conn: Any) -> None:
+        """传输层的 ``on_close`` 钩子：会话收尾。对应迁移前 ``_session_loop`` 的 ``finally``。
+
+        三件事，顺序与迁移前一致：取消注册定时器 → 清 ``_registered`` → 丢弃残留
+        半行缓冲（半行说明连接已错位，重连后必须重新开始）。关连接那步由基类在本钩子
+        **之后**做（迁移前是适配器自己关）；顺序反过来无差异 —— :meth:`_close_ws`
+        不读也不写上面任何一个状态。
+        """
+        timer, self._register_timer = self._register_timer, None
+        if timer is not None:
             timer.cancel()
-        if not self._registered:
-            raise TimeoutError("001 RPL_WELCOME not received in time")
+        self._registered = False
+        self._rbuf = ""
 
-    def _force_close(self, ws: Any) -> None:
-        """注册超时：关掉当前 WS，唤醒阻塞中的 ``recv()``。"""
-        logger.warning("twitch: registration timed out; closing connection")
-        self._close_ws(ws)
-
-    def _join(self, ws: Any) -> None:
-        self._send_line(ws, f"JOIN {self.channel}")
-        logger.info("twitch: joined %s as %s", self.channel, self.nick)
-
-    def _read_loop(self, ws: Any, *, deadline: Optional[float] = None) -> None:
-        """收帧 → 按 ``\\n`` 切行 → 派发。
+    def _on_frame(self, conn: Any, frame: Any) -> None:
+        """传输层的 ``on_message`` 钩子：一条**原始帧** → 按 ``\\n`` 切行 → 逐行派发。
 
         **一帧不等于一行**：Twitch 常把多行塞进同一帧，:mod:`ws` 聚合分片后也可能
-        只给出半行。因此缓冲必须跨 ``recv()`` 存活（本方法是唯一读入口，缓冲是
-        实例字段）。读到 ``None``（对端 close）或抛错 = 掉线，交给上层重连。
+        只给出半行。因此缓冲必须跨帧存活（:attr:`_rbuf` 是唯一读入口的实例状态）。
+        迁移前这段是 :meth:`_read_loop` 的循环体，逐行保留。
 
         注意缓冲是 **str**（不可变），所以每次改动都必须写回 :attr:`_rbuf` ——
-        用局部变量 ``buf += frame`` 只会重绑局部名，残留半行会随函数返回一起丢掉。
+        用局部变量 ``buf += frame`` 只会重绑局部名，残留半行会跟着丢掉。
         """
-        while not self._stop_event.is_set():
-            if deadline is not None and time.monotonic() >= deadline:
+        if not isinstance(frame, str):
+            logger.warning("twitch: 非文本帧 %r，已忽略", type(frame))
+            return
+        self._rbuf += frame
+        while "\n" in self._rbuf:
+            line, _, _rest = self._rbuf.partition("\n")
+            self._rbuf = self._rbuf[len(line) + 1:]
+            self._handle_line(conn, line.rstrip("\r"))
+            if self._session_voided:
+                # 本次会话已被作废（RECONNECT / 注册超时 → 连接已关）：
+                # 同一帧里剩下的行不再处理 —— 迁移前是抛异常跳出这个循环。
                 return
-            frame = ws.recv()
-            if frame is None:
-                raise ConnectionError("twitch: 对端关闭了 WebSocket")
-            if not isinstance(frame, str):
-                logger.warning("twitch: 非文本帧 %r，已忽略", type(frame))
-                continue
-            self._rbuf += frame
-            while "\n" in self._rbuf:
-                line, _, _rest = self._rbuf.partition("\n")
-                self._rbuf = self._rbuf[len(line) + 1:]
-                self._handle_line(ws, line.rstrip("\r"))
-                if self._registered and deadline is not None:
-                    return
-            if len(self._rbuf.encode("utf-8")) > self.inbound_line_limit:
-                logger.warning(
-                    "twitch: 入站行超长（%d 字节），丢弃",
-                    len(self._rbuf.encode("utf-8")),
-                )
-                self._rbuf = ""
+        if len(self._rbuf.encode("utf-8")) > self.inbound_line_limit:
+            logger.warning(
+                "twitch: 入站行超长（%d 字节），丢弃",
+                len(self._rbuf.encode("utf-8")),
+            )
+            self._rbuf = ""
+
+    def _on_event(self, item: Any) -> None:
+        """传输层的 ``on_event`` 回调：**刻意是 no-op**。
+
+        :class:`~opencode_bridge.transport.WebSocketTransport` 在每条原始帧到达时
+        先调 ``on_message(conn, frame)``（本适配器接的是 :meth:`_on_frame`，切行与派发
+        都在那里做完了）、**再**把同一帧交给 ``on_event``。这里必须什么都不做，
+        否则同一条消息会被投递两次（core 会当成两条消息，bot 也会回两次）。
+        保留这个空实现（而不是给 ``start()`` 传 ``lambda _: None``）是为了让
+        「同一帧会被两个钩子看到」这件事在代码里是**显式可见**的。
+        """
+
+    def _void_session(self, conn: Any) -> None:
+        """主动结束本次会话：置标记 + 关连接，让下一次 ``recv()`` 返回 ``None``。
+
+        为什么**关连接**而不是抛异常：传输层的 ``on_message`` 钩子会把普通异常
+        **吞掉并继续消费这条连接**（见 :mod:`opencode_bridge.transport.websocket` 的
+        :meth:`~opencode_bridge.transport.WebSocketTransport._next`），抛了等于没抛；
+        能立刻重连的只有 :class:`~opencode_bridge.transport.ReconnectNow`，但它会
+        **跳过退避**。而迁移前这两条路径（服务端 ``RECONNECT``、注册超时）都是
+        「抛异常 → 结束会话 → 等 ``reconnect_delay`` → 重连」。关连接走的正是基类
+        正常的"会话结束 → 退避 → 重连"路径，时序逐字不变。
+        """
+        self._session_voided = True
+        self._close_ws(conn)
+
+    def _force_close(self, ws: Any) -> None:
+        """注册超时：作废本次会话（关掉 WS，唤醒阻塞中的 ``recv()``）。"""
+        logger.warning("twitch: registration timed out; closing connection")
+        self._void_session(ws)
+
+    def _join(self, ws: Any) -> None:
+        """发 ``JOIN``。**只在收到 001 之后调一次**（见 :meth:`_handle_numeric`）。"""
+        self._send_line(ws, f"JOIN {self.channel}")
+        logger.info("twitch: joined %s as %s", self.channel, self.nick)
 
     # ------------------------------------------------------------------
     # 行派发
@@ -508,9 +607,12 @@ class TwitchAdapter(Adapter):
                 logger.info("twitch: CAP ACK %s", params[-1])
             return
         if command == "RECONNECT":
-            # Twitch 让客户端重连（做服务端侧重平衡）；正常收尾即可触发重连。
+            # Twitch 让客户端重连（做服务端侧重平衡）；作废本次会话即可触发重连。
+            # ⚠️ 迁移前这里是 ``raise ConnectionError(...)``，见 :meth:`_void_session`
+            # 说明为什么改成"关连接"（抛异常会被传输层的 on_message 吞掉）。
             logger.info("twitch: server requested RECONNECT")
-            raise ConnectionError("server sent RECONNECT")
+            self._void_session(ws)
+            return
         if command == "NOTICE":
             logger.info("twitch: notice: %s", params[-1] if params else "")
             return
@@ -524,6 +626,10 @@ class TwitchAdapter(Adapter):
         if code == RPL_WELCOME:
             self._registered = True
             logger.info("twitch: registered as %s (001)", self.nick)
+            # 迁移前这里是"注册用的读循环读到 001 就返回 → 上层调 :meth:`_join`"；
+            # 现在读循环归传输层，所以 JOIN 就地发出 —— **仍在下一行被处理之前**，
+            # 对服务端是同一个顺序（Twitch 也是 JOIN 之后才开始推成员事件）。
+            self._join(self._current_ws())
         # 375/372/376（MOTD）与 353/366（names）都不需要处理，忽略即可。
 
     def _handle_membership(self, command: str, prefix: str, params: List[str]) -> None:
@@ -542,8 +648,12 @@ class TwitchAdapter(Adapter):
         return self._room_users
 
     def _current_ws(self) -> Any:
-        with self._ws_lock:
-            return self._ws
+        """当前 WS 连接（**未连接时为 ``None``**；由传输层持有）。
+
+        出站 :meth:`send` 与 :meth:`_handle_numeric` 都要用它。
+        """
+        transport = self._transport
+        return transport.connection if transport is not None else None
 
     def _handle_privmsg(
         self, raw: str, tags: dict[str, str], prefix: str, params: List[str]

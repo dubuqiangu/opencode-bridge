@@ -95,7 +95,7 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | **G1** | **桥每 5~7 分钟退出一次** | 高 | 退出期间消息进不来 | ◐ **症状已消失，根因未证实** |
 | **G2** | **at-most-once：崩溃窗口内静默丢消息** | 高 | 崩溃窗口**主体已修**（写前收件箱+ 启动重放）；**残留**：「游标已落盘 → on_inbound」段未覆盖 | ◐ **主体已修，残留窗口未闭合** |
 | G3 | 无法指定模型 | 中 | **已实现** `/model`（看当前 / 切换 / 搜819 个目录），实测换模型真的生效 | ✅ **已完成**（`3518c61`） |
-| G4 | A1 迁移剩 2/8 | 中 | Mattermost / Twitch 仍走各自老实现 | ☐ 未修 |
+| G4 | A1 迁移剩 2/8 | 中 | **已完成**：Mattermost / Twitch 已上共享 transport 层，8/8 迁移完毕 | ✅ **已完成** |
 | G5 | A2 前缀切换剩 5 家 | 低 | telegram/matrix/slack/discord/mattermost 仍发旧前缀 | ☐ 未修 |
 | **G6** | **测试夹具硬编码本机 opencode 口令** | 中 | 口令已随origin/main 公开（仅指向 127.0.0.1:4097，实际可利用性低） | ⏸ **用户决定暂不修** |
 
@@ -137,7 +137,7 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 用户新立规则「类里代码多就拆类」（见 `AGENTS.md` 5.1）时，顺手用 `ast`
 普查了全库，**当前债务不小**：
 
-**18/65 个类超阈值**（方法数 ≥15 或自有代码行 ≥250）：
+**18/65 个类超阈值**（方法数 ≥15 或自有代码行 ≥250）。⚠️ 其中 `MattermostAdapter` / `TwitchAdapter` 的数字是 **G4 迁移后**重新实测的（迁移把缝合层搬进了适配器，两者都更胖了）：
 
 | 类 | 文件 | 方法数 | 自有代码行 |
 |---|---|---|---|
@@ -146,8 +146,8 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | `DiscordAdapter` | `adapters/discord.py` | 43 | 678 |
 | `QQBotAdapter` | `adapters/qqbot.py` | 42 | 828 |
 | `NextcloudAdapter` | `adapters/nextcloud.py` | 38 | 669 |
-| `MattermostAdapter` | `adapters/mattermost.py` | 36 | 639 |
-| `TwitchAdapter` | `adapters/twitch.py` | 36 | 532 |
+| `MattermostAdapter` | `adapters/mattermost.py` | 41 | 677 |
+| `TwitchAdapter` | `adapters/twitch.py` | 42 | 586 |
 | `IRCAdapter` | `adapters/irc.py` | 35 | 417 |
 | `A2aAdapter` | `adapters/a2a.py` | 34 | 747 |
 | `EmailAdapter` | `adapters/email.py` | 32 | 570 |
@@ -404,6 +404,82 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 **持久性**：模型存在**服务端会话**里，而桥把 `session_id` 持久化在
 `state.json`（`core._ensure_session`）—— 所以模型**跨桥重启天然保持**，
 不需要桥额外存。
+
+#### G4 已完成：Mattermost / Twitch 上共享 transport
+
+**A1 迁移到此 8/8 收口**。已迁移：telegram、matrix、email、ntfy（Polling）；
+discord、slack、qqbot、homeassistant（WebSocket）；本轮补上 **mattermost、twitch**。
+`a2a`（HTTP 请求/响应，无流式入站）、`irc`、`nextcloud` 不在目标集。
+
+参照物是 `discord.py`——同为 WebSocket 型，结构最接近。
+
+##### 共享层的一处**必要**扩展（半径比预期大，如实记录）
+
+`WebSocketTransport` 原本只有供子类覆盖的 `_on_open` / `_on_close` **方法**，
+**没有回调参数**（IRC 的子类因此自己卷了一套）。两个新适配器都需要这两个钩子，
+所以给共享层**加性**补了 `on_open(conn)` / `on_close(conn)` 可选参数
+（默认 `None`，对既有 4 个消费者零影响，带 `TypeError` 守卫）。
+
+实现者撞到过一个真实问题：**适配器上定义的 `_on_close` / `_on_open`
+不会被 transport 调用**——钩子是死代码。这正是必须扩展共享层的原因。
+
+同时修正了 `websocket.py` 模块 docstring 里一句**事实错误**：原文写
+「Twitch 不走这里」，迁移后这句变成假的，已改为「Twitch 也走这里，
+自己按 `\n` 分行」。这是我核对`git diff` 时确认的**唯一**删除行——
+逻辑零删除，纯增量。
+
+##### 一处真实的语义变更，以及**更正实现者给错的理由**
+
+**变更**：入站处理抛异常时，**不再结束会话 + 重连**，改为记日志后继续消费
+（`websocket.py:127` 吞掉非 `ReconnectNow` 的异常，`:133` 正常返回 frame）。
+迁移前：mattermost 的 `_inbound_loop:512` 捕获后`finally` 关WS 再退避重连；
+twitch 的 `_handle_line` 没有 try，异常上抛、结束会话。
+
+**实现者给的安全理由是错的**：它称「两个函数体内部都充分 try/except 守护」。
+实测 `twitch._on_frame` 内部 `except` 计数为 **0**，`_handle_packet` 只有 1 处。
+
+**真正让这条变更安全的是语句顺序**——`twitch._on_frame`：
+
+```
+L541   self._rbuf = self._rbuf[len(line) + 1:]   ← 缓冲**先**消费掉该行
+L542   self._handle_line(...)                     ← 后派发，可能抛
+```
+
+缓冲在派发之前就已前进，所以抛异常时 `_rbuf` 处于**一致状态**、不会被写坏；
+同帧剩余行**留在缓冲里等下一帧**。而旧行为是抛出去 -> 结束会话 -> 重连 ->
+**同帧剩余行全丢**。即新行为严格更优或持平。
+
+**结论保留，实现者的结论对、理由错。** 新行为也与已迁移的
+discord / slack / qqbot 一致。
+
+##### 实现者自己找到并补上的测试盲区
+
+它做了 15 处变异验证，发现 **`reset_after` / `min_backoff`（重连节奏）
+被改成0 时没有任何测试失败**——而重连节奏正是 G2 守着的那条
+「重复 / 丢失消息」轴上最要命的部分。已补
+`test_backoff_wiring_matches_the_legacy_*` 覆盖，现在能被抓住。
+**这是本轮最有价值的产出**：迁移把这段代码换了个调用路径，
+旧测试就不再覆盖它了。
+
+##### 类体量债务新增两条
+
+| 类 | 变化 |
+|---|---|
+| `MattermostAdapter` | 36 -> **41** 方法 |
+| `TwitchAdapter` | 36 -> **42** 方法 |
+
+增长全部是 transport 缝合层，与 discord / slack / irc 已有的形状相同。
+实现者**刻意不做**抵消性重构（那会增加迁移之外的改动面，
+与「行为零变化」冲突）。记入下方债务表，**未排期**。
+
+##### 独立复核（不采信报告）
+
+- 全量 **1546 tests OK (skipped=1)**、compileall exit 0（我自己跑的，
+  含 discord / slack / qqbot / homeassistant 四个未改动适配器的测试）
+- `git diff` 确认**只动了 5 个文件**，那 4 个已迁移适配器**完全未碰**
+- `tests/test_mattermost.py` / `tests/test_twitch.py` **零删除行**，纯新增
+- `websocket.py` 唯一删除行是 docstring 那句事实错误，逻辑零删除
+- 报告称「`BridgeCore` 53 -> 54」这类数字我一律自己量（上一轮就发现它基线数错）
 
 #### G3 已实现（`3518c61`）
 

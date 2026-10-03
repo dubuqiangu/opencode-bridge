@@ -343,9 +343,8 @@ class BridgeCore:
         #: 事件名出现但没有 handler 时记进这里，便于 `_dispatch` 打汇总日志，
         #: 免得刷屏（一个未知事件可能每秒来几百条）。有界，不无限增长。
         self._unhandled_event_names: dict[str, int] = {}
-        #: 上一次打了"新事件"或"汇总"日志的事件名，用来识别"连续刷屏"，
-        #: 从而避免同一个未知事件被逐条记日志。
-        self._last_unhandled_name: str = ""
+        #: 上一次打"未处理事件"日志的时刻，用于按时间节流汇总。
+        self._last_unhandled_log_at: float = 0.0
 
     @staticmethod
     def _positive_float(value: Any, default: float) -> float:
@@ -1124,59 +1123,75 @@ class BridgeCore:
         logger.debug("event loop exited")
 
     def _note_unhandled_event(self, event_name: str) -> None:
-        """记账一个"事件名认识但没有 handler"的事件，并按需打日志。
+        """记账一个"事件名认识但没有 handler"的事件，并**按时间节流**打日志。
 
-        为什么要记账而不是逐条打：未知的 delta 类事件每秒可达数百条，
-        逐条 INFO 会把真正需要关注的信息淹掉。策略是
-        **首次见到打一行**、之后静默计数、**下次再见到未知事件时打一行汇总**。
-        这样"静默失败"变成"看得见的静默"。
+        为什么必须按时间节流：曾以为"同一个名字会连续出现"，于是用
+        "事件名变了没有"来决定要不要打汇总。**实测证明这个前提不成立**——
+        事件是多路交替的（`reasoning.delta` 一边涨一边夹着几十种其它事件），
+        于是每来一个新事件名就打一行含 30+ 项的全量汇总，日志被自己的
+        "降噪机制"冲垮（实测半小时内刷出上千行）。
+
+        所以改成：**首次见到打一行，之后每 60 秒最多打一行汇总**，
+        噪音有了硬上限。汇总行只取计数最多的若干项，避免一行几百字符。
         """
         previous_count = self._unhandled_event_names.get(event_name, 0)
         self._unhandled_event_names[event_name] = previous_count + 1
+
+        now = time.monotonic()
         if previous_count == 0:
             logger.info(
-                "收到未处理事件 %r（已记账；这类事件会被忽略，若你正在等某条回复"
-                "却没下文，先查这里）",
+                "收到未处理事件 %r（已记账；若你正在等某条回复却没下文，先查这里。"
+                "若是 opencode 升版新增的事件，需在 _handlers 里补处理器）",
                 event_name,
             )
-            self._last_unhandled_name = event_name
+            self._last_unhandled_log_at = now
             return
-        if event_name == self._last_unhandled_name:
-            # 同一个名字连续刷屏：静默计数。delta 类事件每秒可达数百条，
-            # 逐条打日志会把真正的错误淹掉——那正是这个方法要避免的。
+
+        if (now - self._last_unhandled_log_at) < self._UNHANDLED_LOG_INTERVAL_SECONDS:
             return
-        # 出现了另一个名字 = 上一批被忽略的事件已经告一段落，汇总一次
-        self._last_unhandled_name = event_name
+        self._last_unhandled_log_at = now
+
+        top = sorted(
+            self._unhandled_event_names.items(), key=lambda item: -item[1]
+        )[:10]
         logger.info(
-            "未处理事件累计：%s",
-            ", ".join(
-                "%s x%d" % (name, count)
-                for name, count in sorted(self._unhandled_event_names.items())
-            ),
+            "未处理事件累计（%d 种，仅列前 10）：%s",
+            len(self._unhandled_event_names),
+            ", ".join("%s x%d" % (name, count) for name, count in top),
         )
 
     def _dispatch(self, event: dict) -> None:
-        handler = self._handlers.get(str(event.get("type") or ""))
+        event_name = str(event.get("type") or "")
+        handler = self._handlers.get(event_name)
         if handler is None:
-            # 未知**事件名**不许静默丢弃（可能是契约不匹配的信号，要能查）
-            self._note_unhandled_event(str(event.get("type") or ""))
+            # 区分两种"没有 handler"，这是实测踩出来的教训：
+            #
+            # (A) **认识但故意不处理**（例如思考流 `session.reasoning.*` 不该上IM）
+            #     -> 完全静默。它们是协议的一部分，不是我们漏实现了什么。
+            # (B) **不认识**（可能是 opencode 升版后新增了我们没跟上的事件）
+            #     -> 记账 + 打日志，但要**严格节流**。
+            #
+            # 曾经这里没区分，把 `session.reasoning.delta`（实测 30 分钟 2800+ 条）
+            # 当成"未知事件"反复记账；又因为多路事件交替出现，"同一名字连续"的
+            # 判断永远不成立，于是每次都打一行含 30+ 项的全量汇总 ——
+            # **为了避免噪音淹掉真信号，结果自己制造了噪音**，把日志冲垮。
+            if event_name not in self._KNOWN_BUT_IGNORED_EVENTS:
+                self._note_unhandled_event(event_name)
             return
         data = _as_dict(event.get("data"))
-        if not self._owns_session_event(str(event.get("type") or ""), data):
+        if not self._owns_session_event(event_name, data):
             # 已知事件名，但**属于别的会话** —— 这是正常情况，不是错误。
             #
             # `/api/event` 是**全服务器广播**：同机跑的其它 agent 会话（本项目里
             # 就包括开发者自己正在跑的 opencode 会话）的事件同样会推过来。
             # 实测曾刷出 `permission request for unknown session ses_effe80...`，
-            # 那是我们自己的会话，与Telegram 毫无关系。
+            # 那是我们自己的会话，与 Telegram 毫无关系。
             #
             # 所以这里与上面的"未知事件名"必须区别对待：
             #   未知**名字** = 可能是我们漏实现了什么 -> 记账 + 打日志
             #   已知名字但**别人的会话** = 正常 -> debug 级，不惊动人
             logger.debug(
-                "忽略非本桥会话的事件 %s (session=%s)",
-                event.get("type"),
-                _session_id(data),
+                "忽略非本桥会话的事件 %s (session=%s)", event_name, _session_id(data)
             )
             return
         with self._lock:
@@ -1342,6 +1357,87 @@ class BridgeCore:
         "session.tool.success",
         "session.tool.failed",
     })
+
+    #: **认识但故意不处理**的事件：完全静默，不记账、不打日志。
+    #:
+    #: 这些是协议的一部分、不是我们漏实现了什么。把它们当"未知事件"记账是错的
+    #: ——实测 `session.reasoning.delta` 半分钟就有 2800+ 条（思考流不该上IM），
+    #: 足以把真正的错误彻底淹掉。
+    #:
+    #: 判断标准：**IM 里该不该出现**。思考过程、shell 生命周期、工具入参/出参、
+    #: 配额与用量统计，对聊天用户都没有意义，就不该走"未知事件"那套记账。
+    _KNOWN_BUT_IGNORED_EVENTS = frozenset({
+        # 思考流：不上 IM
+        "session.reasoning.started",
+        "session.reasoning.delta",
+        "session.reasoning.ended",
+        # 工具细节：只有简短的"正在做什么"提示才有意义，进出参全文没有
+        "session.tool.input.delta",
+        "session.tool.progress",
+        "session.step.streamed",
+        "session.synthetic",
+        "session.instructions.updated",
+        # 会话元信息
+        "session.viewed",
+        "session.usage.updated",
+        "session.metadata.updated",
+        "session.permissions",
+        "session.renamed",
+        "session.agent.selected",
+        "session.model.selected",
+        "session.moved",
+        "session.inbox.enqueued",
+        "session.inbox.delivered",
+        "session.inbox.cancelled",
+        "session.inbox.delivery.changed",
+        "session.created",
+        "session.deleted",
+        "session.forked",
+        # 注意：`session.retry.scheduled` **不在**这里 —— 它有处理器
+        # （`_on_retry_scheduled`），放进本集合会让人误以为它被忽略。
+        # 压缩（上下文自动压缩）：值得单独提示，但当前实现里没有对应 handler
+        "session.compaction.started",
+        "session.compaction.delta",
+        "session.compaction.ended",
+        "session.compaction.failed",
+        "session.revert.staged",
+        "session.revert.cleared",
+        "session.revert.committed",
+        "session.shell.started",
+        "session.shell.ended",
+        "session.skill.activated",
+        # 连接与全局状态：与本桥无关
+        "server.connected",
+        "provider.updated",
+        "model.updated",
+        "agent.updated",
+        "command.updated",
+        "config.updated",
+        "skill.updated",
+        "plugin.updated",
+        "reference.updated",
+        "project.updated",
+        "filesystem.changed",
+        "credential.updated",
+        "credential.switched",
+        "integration.updated",
+        "models-dev.refreshed",
+        "websearch.updated",
+        "worktree.updated",
+        "worktree.resolved",
+        "installation.updated",
+        "installation.update-available",
+        "vcs.branch.updated",
+        "mcp.status.changed",
+        "mcp.resources.changed",
+        "location.shutdown",
+        "permission.replied",
+    })
+
+    #: 未知事件记账日志的最小间隔（秒）。多路事件交替出现时"同一个名字连续"
+    #: 这个前提**不成立**，所以不能靠事件名判断该不该打；一律按时间节流，
+    #: 保证噪音有硬上限。
+    _UNHANDLED_LOG_INTERVAL_SECONDS = 60.0
 
     def _owns_session_event(self, event_name: str, data: dict) -> bool:
         """这个事件是否属于本桥关心的会话。

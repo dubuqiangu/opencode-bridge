@@ -1018,50 +1018,81 @@ class StreamingTests(unittest.TestCase):
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["说到一半被打断"])
 
-    def test_unhandled_event_is_recorded_and_logged_once_per_name(self):
-        """未知事件必须**可观测**：记账 + 打日志，绝不静默丢弃。
+    def test_unhandled_event_is_recorded_and_logged_with_time_throttle(self):
+        """未知事件必须**可观测**：记账 + 打日志，且日志有**硬上限**。
 
-        曾经 `_dispatch` 对未知事件裸`return`，于是"事件名写错"在生产里
-        表现为完全无迹可循——A4 真实验证时被这个坑了两天。
+        两版语义都踩过坑，这两条断言就是它们的边界：
+
+        -曾按"事件名切换"决定要不要打汇总。**前提不成立**——事件是多路交替的，
+          于是每来一个新名字就打一行含 30+ 项的全量汇总，日志被自己的"降噪
+          机制"冲垮（实测半小时上千行）。
+        - 现在一律**按时间节流**：首次见到打一行，之后每 60 秒最多一行汇总。
         """
         with tempfile.TemporaryDirectory() as td:
             core, _client, _adapter, _, _, _ = make_env(td)
+
+            # 首次见到未知事件名 -> 打一行
             with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
                 core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
             self.assertIn("session.brand.new.event", core._unhandled_event_names)
-            self.assertTrue(
-                any("未处理事件" in line for line in logs.output),
-                "首次见到未知事件应打一行日志，实际: %r" % (logs.output,),
-            )
-
-            # 同一个名字再刷 3 次：**一行都不许打**。delta 类事件每秒可达数百条，
-            # 逐条记日志会把真正的错误淹掉——那正是要避免的。
-            with self.assertNoLogs("opencode_bridge.core", level="INFO"):
-                for _ in range(3):
-                    core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
-            self.assertEqual(
-                core._unhandled_event_names["session.brand.new.event"], 4,
-                "记账要累加（4 次），但日志不该刷屏",
-            )
-
-            # 换一个**没见过的**名字：仍走"首次见到"分支，打新事件那行
-            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
-                core._dispatch(ev("session.another.new.event", sessionID="ses_x"))
-            self.assertIn("session.another.new.event", core._unhandled_event_names)
             self.assertEqual(len(logs.output), 1)
-            self.assertTrue(
-                any("another.new.event" in line for line in logs.output),
-                "新事件名应各打一行，实际: %r" % (logs.output,),
-            )
 
-            # 回头再发一个**见过但不是最后一个**的名字 -> 汇总一行
+            # 节流窗口内：反复来**同一个**名字也不许打日志（但要记账）
+            with self.assertNoLogs("opencode_bridge.core", level="INFO"):
+                for _ in range(5):
+                    core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
+            self.assertEqual(core._unhandled_event_names["session.brand.new.event"], 6)
+
+            # 注意：**新出现的名字**不受节流限制，每个都打一行——
+            # 这正是"看得见的静默"的意义（opencode 升版新增了什么，一眼就知道）。
+            # 上界是"不同名字的个数"，不是事件条数，所以是安全的。
+            with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
+                core._dispatch(ev("session.other.unknown.event", sessionID="ses_x"))
+            self.assertEqual(len(logs.output), 1)
+            self.assertEqual(core._unhandled_event_names["session.other.unknown.event"], 1)
+
+            # 把时钟往前推过节流窗口 -> 才允许再打一行汇总
+            core._last_unhandled_log_at -= (
+                core._UNHANDLED_LOG_INTERVAL_SECONDS + 1
+            )
             with self.assertLogs("opencode_bridge.core", level="INFO") as logs:
                 core._dispatch(ev("session.brand.new.event", sessionID="ses_x"))
-            self.assertEqual(len(logs.output), 1)
-            self.assertTrue(
-                any("累计" in line for line in logs.output),
-                "切回旧事件名时应打一行累计汇总，实际: %r" % (logs.output,),
+            self.assertEqual(len(logs.output), 1, "过窗口后应打一行汇总")
+            self.assertTrue(any("累计" in line for line in logs.output))
+
+    def test_known_but_ignored_events_are_not_recorded(self):
+        """**认识但故意不处理**的事件（如思考流）必须完全静默，不许记账。
+
+        实测 `session.reasoning.delta` 半分钟 2800+ 条。若把它当"未知事件"
+        记账并打汇总，会把真正的错误彻底淹掉——而它只是"思考过程不该上IM"，
+        不是我们漏实现了什么。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, _client, _adapter, _, _, _ = make_env(td)
+            with self.assertNoLogs("opencode_bridge.core", level="INFO"):
+                for name in sorted(core._KNOWN_BUT_IGNORED_EVENTS)[:12]:
+                    core._dispatch(
+                        ev(name, sessionID="ses_x", assistantMessageID="msg_a",
+                           ordinal=0, delta="思考中")
+                    )
+            self.assertEqual(
+                core._unhandled_event_names, {},
+                "故意忽略的事件不该进未处理记账：%r" % core._unhandled_event_names,
             )
+
+    def test_thinking_stream_never_reaches_the_im_bridge(self):
+        """思考流既不上IM、也不进未处理记账——它是协议的一部分，不是错误。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "go"))
+            session_id = client.created_ids[0]
+            core._dispatch(ev("session.execution.started", sessionID=session_id))
+            core._dispatch(
+                ev("session.reasoning.delta", sessionID=session_id,
+                   assistantMessageID="msg_r", ordinal=0, delta="让我想想")
+            )
+            self.assertEqual(adapter.edited, [], "思考过程不该被渲染给用户")
+            self.assertEqual(core._unhandled_event_names, {})
 
 
 # ----------------------------------------------------------------------

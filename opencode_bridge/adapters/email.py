@@ -39,8 +39,15 @@
    再取一次、再抛一次 —— 那是**死循环**。代价是崩溃时最多丢当前批次里还没处理
    完的那几封（at-most-once），这与另外两个平台一致，取舍见 ``_pull_batch``。
 
-   启动同样**不重放历史**：首次连上时先 ``UID SEARCH ALL`` 取当前最大 UID 直接
-   当游标（一封正文都不取），语义等价于 ntfy 的 ``since=<当前时间戳>``。
+   启动**只在确实没有历史水位时**才跳过历史：首次连上（或换了账号 / 邮箱而
+   落盘里没有对应游标）时先 ``UID SEARCH ALL`` 取当前最大 UID 直接当游标
+   （一封正文都不取），语义等价于 ntfy 的 ``since=<当前时间戳>``。
+
+   ⚠️ **这个"跳过"必须只发生在首次运行**。游标要经 :class:`Hooks` 的
+   ``load_stream_cursor`` / ``save_stream_cursor`` 落到 ``state.json``（作用域
+   = 账号 + 邮箱，见 :meth:`EmailAdapter._cursor_scope`）：不落盘的话，每次
+   重启都会重跑 bootstrap，于是**停机期间到达的邮件被无声丢弃**——用户既收不到，
+   日志里也看不到任何解释。当年正是缺了这一步，重启一次就丢一次收件箱。
 
 3. **不用 IMAP IDLE**
    IDLE 是长连接推送，``stop()`` 要能干净打断它就得去 ``shutdown()`` 一个正卡在
@@ -289,6 +296,82 @@ class _ParsedMail:
     references: str = ""
 
 
+class _StreamCursorPersistence:
+    """把一条消息流的"读到哪了"经 :class:`Hooks` 落到 ``state.json``。
+
+    为什么单独一个类：这个通道的职责只有一件 —— **跨重启续跑游标**，而且它有两种
+    退化路径（钩子不存在 / 落盘抛异常）需要各自处理并告警。塞进
+    :class:`EmailAdapter` 只会给那个已经很重的类再加两个方法。
+
+    适配器**拿不到** ``StateStore``（:meth:`Adapter.__init__` 只给 ``config`` 与
+    ``hooks``），所以持久化只能经 :meth:`Hooks.load_stream_cursor` /
+    :meth:`Hooks.save_stream_cursor` 这两个**可选**钩子。
+    """
+
+    def __init__(self, hooks: Hooks, stream_scope: str) -> None:
+        self._load_cursor_hook = getattr(hooks, "load_stream_cursor", None)
+        self._save_cursor_hook = getattr(hooks, "save_stream_cursor", None)
+        self._stream_scope = str(stream_scope)
+        #: "落不了盘"只告警一次 —— 每个进程一次足够，再多就是刷屏。
+        self._warned_unavailable = False
+
+    @property
+    def available(self) -> bool:
+        """``hooks`` 是否实现了那两个游标钩子（测试替身 / 无存储的嵌入方为否）。"""
+        return callable(self._load_cursor_hook) and callable(self._save_cursor_hook)
+
+    def load(self) -> Optional[int]:
+        """读回上次的位置；没有（或读不到有效值）返回 ``None``。
+
+        ``None`` 的含义是"确实没有已存状态"，调用方据此走**首次启动**的语义
+        （把游标抬到当前水位、不重放历史）。读失败也退化成 ``None``：最坏是多
+        跳一次历史，而拿着一个半可信的值去算 ``UID a:*`` 区间更糟。
+        """
+        if not callable(self._load_cursor_hook):
+            return None
+        try:
+            stored = self._load_cursor_hook(self._stream_scope)
+        except Exception as exc:  # noqa: BLE001 - 读失败退化成"首次启动"
+            logger.warning(
+                "email: cannot read the stored UID cursor (%s); this start will "
+                "skip the mailbox history", exc,
+            )
+            return None
+        if stored is None:
+            return None
+        try:
+            return int(stored)
+        except (TypeError, ValueError):
+            logger.warning(
+                "email: stored UID cursor %r is not an integer; treating it as "
+                "a first start (mailbox history will be skipped)", stored,
+            )
+            return None
+
+    def save(self, position: int) -> None:
+        """把当前位置写下去。**不抛异常** —— 写失败只告警。
+
+        抛出去会打断轮询线程，而这一轮已经取到的正文会随之丢掉（比重复投递
+        严重得多）。位置丢了的最坏后果是"重启后可能重投一封"，可接受。
+        """
+        if not callable(self._save_cursor_hook):
+            if not self._warned_unavailable:
+                self._warned_unavailable = True
+                logger.warning(
+                    "email: hooks 未实现 load_stream_cursor/save_stream_cursor，"
+                    "UID 游标无法落盘 —— 每次启动都会把游标抬到最新 UID，"
+                    "停机期间到达的信件将被丢弃",
+                )
+            return
+        try:
+            self._save_cursor_hook(self._stream_scope, int(position))
+        except Exception as exc:  # noqa: BLE001 - 落盘失败不该打断收信
+            logger.warning(
+                "email: cannot persist the UID cursor (%s); a restart may "
+                "re-process mail that was already handled", exc,
+            )
+
+
 class _BoundedIdSet:
     """有界字符串集合：满了就按 **FIFO（最旧先淘汰）** 丢。
 
@@ -398,6 +481,13 @@ class EmailAdapter(Adapter):
         self._queue = EventQueue()
         #: IMAP UID 游标。``None`` = 尚未 bootstrap（首次连上时只取"当前水位"）。
         self._uid: Optional[int] = None
+        #: 游标的落盘通道 —— **跨重启续跑靠它**，否则每次启动都会重新跳到最新 UID
+        #: （那等于每次重启都把整个未读收件箱悄悄丢掉）。
+        self._cursor_persistence = _StreamCursorPersistence(
+            self.hooks, self._cursor_scope()
+        )
+        #: 游标**只从落盘恢复一次**：之后以内存里的 :attr:`_uid` 为准。
+        self._cursor_restored = False
         self._transport: Optional[PollingTransport] = None
         #: 当前轮询用的 IMAP 连接（``stop()`` 要能打断它）。
         self._live_conn: Any = None
@@ -649,6 +739,35 @@ class EmailAdapter(Adapter):
             return NOTHING
         return self._queue.pop()
 
+    def _cursor_scope(self) -> str:
+        """游标的落盘作用域：**按账号 + 邮箱**区分。
+
+        必须是稳定的字符串：同一个 scope 每次启动都要算出同一个值，否则等于
+        每次都"首次运行"。带上邮箱名是因为同一个 IMAP 账号可以同时看 INBOX 与
+        若干文件夹，各自有独立的 UID 空间，游标不能共用。
+
+        它**故意不是**一个 ``conversation_id``（那会与真实会话键混在同一命名
+        空间里），所以前缀用了平台名加点的形式，:mod:`identity` 判不出平台段。
+        """
+        return f"{self.name}.imap-uid-cursor:{self.address}/{self.mailbox}"
+
+    def _restore_cursor_once(self) -> None:
+        """第一次拉取前把游标从落盘恢复回来（只做一次，之后以内存值为准）。
+
+        恢复不到（首次运行 / 落盘不可用）就保持 ``_uid is None`` —— 那一刻
+        :meth:`_pull_batch` 会走既定的"首次连接：不重放历史"分支。
+        """
+        if self._cursor_restored:
+            return
+        self._cursor_restored = True
+        stored = self._cursor_persistence.load()
+        if stored is None:
+            return
+        self._uid = stored
+        logger.info(
+            "email: 从落盘恢复 UID 游标 %s（停机期间到达的邮件会补上）", stored
+        )
+
     def _pull_batch(self) -> None:
         """连一次 IMAP、取一批原始邮件填进队列。失败时抛异常（交给传输层退避重连）。
 
@@ -656,6 +775,7 @@ class EmailAdapter(Adapter):
         不会残留一个半开的 socket，也不用处理"连接被服务端悄悄断掉"的状态机。
         代价是每轮多一次握手 —— 60s 轮询下可忽略。
         """
+        self._restore_cursor_once()
         conn: Any = None
         with self._conn_lock:
             self._live_conn = None
@@ -667,12 +787,15 @@ class EmailAdapter(Adapter):
             if not uids:
                 return
             if self._uid is None:
-                # bootstrap：只把游标抬到当前最大值，**不取任何正文**。
+                # 首次连接（**确实没有**已存游标）：只把游标抬到当前最大值，
+                # **不取任何正文**。但立刻把新水位落盘 —— 否则下一次启动又会
+                # 重来一遍，把这之后到达的邮件全丢掉。
                 logger.info(
                     "email: 首次连接，从 UID %s 之后开始接收（不重放历史收件箱）",
                     uids[-1],
                 )
                 self._uid = uids[-1]
+                self._cursor_persistence.save(uids[-1])
                 return
             items = []
             fetched_through = self._uid
@@ -688,6 +811,7 @@ class EmailAdapter(Adapter):
             # 否则就是死循环。代价是崩溃时最多丢本批还没处理完的那几封
             # （at-most-once）—— 与 telegram offset / matrix next_batch 的取舍一致。
             self._uid = fetched_through
+            self._cursor_persistence.save(fetched_through)
             self._queue.push_many(items)
         finally:
             with self._conn_lock:

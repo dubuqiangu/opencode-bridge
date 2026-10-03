@@ -120,3 +120,33 @@ class Hooks(Protocol):
         Implementations MUST NOT assume the adapter already acknowledged the
         query; call ``Adapter.answer(query_id, text)`` for that.
         """
+
+    # ------------------------------------------------------------------
+    # Stream cursors（**可选**实现）
+    # ------------------------------------------------------------------
+    # 适配器只拿到 ``config`` 与 ``hooks``，**拿不到** ``StateStore``；而轮询型
+    # 平台（email 的 IMAP UID、telegram 的 offset、matrix 的 next_batch）必须把
+    # "读到哪了"落盘，否则**每次重启都会重新从最新位置开始**，于是停机期间到达
+    # 的消息被无声丢弃。所以持久化只经由下面两个钩子，适配器不直接接触存储。
+    #
+    # ⚠️ 之所以是**可选**的：测试替身、以及没有状态存储的嵌入式调用方都不实现
+    # 它们。因此调用方必须用 ``getattr`` 探测，缺失时退化成"没有已存位置"，
+    # **并且必须告警**——静默的历史跳过正是本仓库反复修的那类数据丢失。
+
+    def load_stream_cursor(self, stream_scope: str) -> Optional[int]:
+        """读回 ``stream_scope`` 这条消息流上次持久化的位置，没有则返回 ``None``。
+
+        ``stream_scope`` 是适配器自选的**稳定**字符串（必须区分账号 / 频道 /
+        邮箱），因为多条流会共用同一个 ``state.json``。
+
+        ``None`` 表示"确实没有已存状态"（首次运行），调用方据此走首次启动的
+        语义；不要用它表达"读失败"，读失败应抛异常或退化成 ``None`` 并告警。
+        """
+
+    def save_stream_cursor(self, stream_scope: str, position: int) -> None:
+        """把 ``stream_scope`` 的位置写成 ``position``，供下次启动续跑。
+
+        从适配器的轮询线程调用，实现必须线程安全，且**不应抛异常**：写失败的
+        代价只是重启后可能重投一封（由写前日志兜底），而抛出去会打断整个
+        收信循环。
+        """

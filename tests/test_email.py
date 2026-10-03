@@ -4,20 +4,24 @@ IMAP / SMTP 的调用面被收敛到两个可覆写的方法：:meth:`EmailAdapt
 （返回连接对象）与 :meth:`EmailAdapter._smtp_send`（真正投递）。测试替换这两个，
 **不去 mock 标准库内部** —— 这样测的是协议逻辑本身，而不是 mock 的行为。
 
-覆盖重点（本平台最容易写错的六处）：
+覆盖重点（本平台最容易写错的七处）：
 1. **防回环**：自己发出的信必须被丢；但用户点"回复"得到的 ``Re: [opencode] ...``
    **必须放行**（否则用户永远无法追问）。且**绝不用 From 地址判断**。
 2. **Message-ID 去重**：重复投递只处理一次；集合满时按 FIFO 淘汰最旧。
 3. **游标先推进再处理**：处理抛异常也不重放（否则毒邮件 = 死循环）。
-4. **非 ASCII**：中文 Subject / 正文正确编码，且报文最长行不超过 RFC 5322 的 998。
-5. **拿不到纯文本就丢**：HTML-only、未知 charset 都不能塞给 agent。
-6. **只读**：不设 ``\\Seen``（用 ``BODY.PEEK[]``），且邮箱以 readonly 方式打开。
+4. **游标跨重启存活**：只有**首次**运行才跳过历史；重启必须从已存水位续跑，
+   否则每次重启都会把整个未读收件箱悄悄丢掉。
+5. **非 ASCII**：中文 Subject / 正文正确编码，且报文最长行不超过 RFC 5322 的 998。
+6. **拿不到纯文本就丢**：HTML-only、未知 charset 都不能塞给 agent。
+7. **只读**：不设 ``\\Seen``（用 ``BODY.PEEK[]``），且邮箱以 readonly 方式打开。
 """
 
 from __future__ import annotations
 
 import importlib
+import os
 import smtplib
+import tempfile
 import unittest
 
 from opencode_bridge.adapters.base import adapter_class, registered_names
@@ -31,8 +35,11 @@ from opencode_bridge.adapters.email import (
     _max_line_octets,
     _strip_reply_prefixes,
 )
-from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
+from opencode_bridge.config import Config
+from opencode_bridge.core import BridgeCore
+from opencode_bridge.hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from opencode_bridge.identity import platform_of
+from opencode_bridge.state import StateStore
 from opencode_bridge.transport import NOTHING
 
 _email_message = importlib.import_module("email.message")
@@ -120,6 +127,47 @@ class FakeSMTPError(smtplib.SMTPResponseException):
         super().__init__(code, message)
 
 
+class CursorStoreHooks(RecordingHooks):
+    """带真实 :class:`StateStore` 的 hooks：实现那两个**可选**的游标钩子。
+
+    刻意**自己实现**一遍而不是直接用 :class:`BridgeCore`：下面绝大多数用例要验的是
+    "适配器 ⇄ 存储"这条契约，把 core 也拉进来会让失败时分不清是谁的问题。
+    （``BridgeCore`` 自己那一层由 :class:`TestCoreCursorHookWiring` 单独覆盖。）
+    """
+
+    def __init__(self, store: StateStore):
+        super().__init__()
+        self.store = store
+        self.read_scopes: list[str] = []
+        self.written_positions: list[tuple[str, int]] = []
+
+    def load_stream_cursor(self, stream_scope: str):
+        self.read_scopes.append(stream_scope)
+        return self.store.get_meta(stream_scope, "stream_cursor", None)
+
+    def save_stream_cursor(self, stream_scope: str, position: int) -> None:
+        self.written_positions.append((stream_scope, int(position)))
+        self.store.set_meta(stream_scope, "stream_cursor", int(position))
+
+
+class UnusedOpenCodeClient:
+    """游标落盘这条路上 core 不会碰 opencode 服务，只需要一个占位实现。"""
+
+
+class FailingCursorStoreHooks(CursorStoreHooks):
+    """落盘必定失败的 hooks（模拟磁盘满 / state.json 不可写）。"""
+
+    def save_stream_cursor(self, stream_scope: str, position: int) -> None:
+        raise OSError("disk full")
+
+
+class UnreadableCursorStoreHooks(CursorStoreHooks):
+    """读取必定失败的 hooks（模拟 state.json 被移走 / 权限不足）。"""
+
+    def load_stream_cursor(self, stream_scope: str):
+        raise OSError("state file is gone")
+
+
 def make_mail(
     *,
     sender="user@example.com",
@@ -145,7 +193,12 @@ def make_mail(
     return msg.as_bytes()
 
 
-def make_email(**cfg) -> tuple[EmailAdapter, RecordingHooks]:
+def make_email(*, hooks=None, **cfg) -> tuple[EmailAdapter, RecordingHooks]:
+    """造一个不发真实网络的适配器。
+
+    ``hooks`` 默认用 :class:`RecordingHooks`（它**不**实现游标钩子，正好代表
+    "没有落盘通道"那种配置）；传入别的实现即可测游标持久化那条路。
+    """
     base = {
         "address": "bot@example.com",
         "password": "app-password",
@@ -153,7 +206,8 @@ def make_email(**cfg) -> tuple[EmailAdapter, RecordingHooks]:
         "smtp_host": "smtp.example.com",
     }
     base.update(cfg)
-    hooks = RecordingHooks()
+    if hooks is None:
+        hooks = RecordingHooks()
     adapter = EmailAdapter(base, hooks)
     adapter.min_interval = 0            # 测试里不要人为 sleep
     return adapter, hooks
@@ -1157,6 +1211,262 @@ class TestLifecycle(unittest.TestCase):
         finally:
             adapter.stop()
         self.assertFalse(adapter.running)
+
+
+class TestCursorPersistence(unittest.TestCase):
+    """游标必须**跨重启**存活：只有首次运行才跳过历史。
+
+    这个 bug 的形态：游标只活在内存里，于是"跳过历史"那条分支**每次启动都重跑**，
+    于是每次重启都把整个未读收件箱悄悄丢掉 —— 用户既收不到，日志里也没有任何
+    解释。所以这里覆盖的是"两次运行"而不是"一次运行"。
+    """
+
+    def setUp(self):
+        # ``TemporaryDirectory`` 由 ``addCleanup`` 关闭：Windows 上文件句柄没关
+        # 干净时 ``rmtree`` 会 WinError 32。
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.state_path = os.path.join(temp_dir.name, "state.json")
+
+    def open_store(self) -> StateStore:
+        """新开一个 store —— 这就是"重启"：内存全空，只剩磁盘上的 ``state.json``。"""
+        return StateStore(self.state_path)
+
+    def run_first_start(self, mailbox_uids=(10, 20, 30)) -> str:
+        """跑一次"首次启动"（收件箱里已有历史邮件），返回落盘作用域键。
+
+        只断言内存里的游标抬到了水位；**不去断言落盘** —— 水位到底有没有写下去
+        由各条用例自己验，否则"写盘"一旦坏掉，所有用例都在**准备阶段**报错，
+        真正的场景断言根本没跑到。
+        """
+        adapter, _ = make_email(hooks=CursorStoreHooks(self.open_store()))
+        stub_network(adapter, [{"search": list(mailbox_uids)}])
+        self.assertIs(adapter._fetch_one(), NOTHING, "首次启动不该取任何正文")
+        self.assertEqual(adapter._uid, max(mailbox_uids))
+        return adapter._cursor_scope()
+
+    # -- 首次运行：仍然跳过历史，但必须留下水位 -------------------------
+    def test_first_run_still_skips_the_mailbox_history(self):
+        """既有语义不许变：首次连接一封正文都不取（否则历史邮件各触发一次 agent）。"""
+        adapter, hooks = make_email(hooks=CursorStoreHooks(self.open_store()))
+        fake, _ = stub_network(adapter, [{"search": [10, 20, 30]}])
+        with self.assertLogs("opencode_bridge.adapters.email", level="INFO") as logs:
+            self.assertIs(adapter._fetch_one(), NOTHING)
+        self.assertEqual(adapter._uid, 30)
+        self.assertEqual([c for c in fake.calls if c[0] == "FETCH"], [])
+        self.assertTrue(
+            any("不重放历史收件箱" in line for line in logs.output), logs.output
+        )
+
+    def test_first_run_records_the_watermark_on_disk(self):
+        """跳过历史之后**立刻**落盘水位 —— 否则下一次启动又重来一遍。"""
+        store_hooks = CursorStoreHooks(self.open_store())
+        adapter, _ = make_email(hooks=store_hooks)
+        stub_network(adapter, [{"search": [10, 20, 30]}])
+        adapter._fetch_one()
+        self.assertEqual(store_hooks.written_positions,
+                         [(adapter._cursor_scope(), 30)])
+        # 落盘而不只是内存：新 store 也要读得到。
+        self.assertEqual(
+            self.open_store().get_meta(adapter._cursor_scope(), "stream_cursor"), 30
+        )
+
+    # -- 重启：从已存水位续跑 -------------------------------------------
+    def test_restart_resumes_from_the_stored_cursor(self):
+        scope = self.run_first_start()
+
+        restarted_hooks = CursorStoreHooks(self.open_store())
+        restarted, _ = make_email(hooks=restarted_hooks)
+        fake, _ = stub_network(restarted, [{"search": []}])
+        restarted._fetch_one()
+
+        self.assertEqual(restarted._uid, 30, "重启后必须接着上次的游标")
+        self.assertEqual(restarted_hooks.read_scopes, [scope], "作用域必须稳定")
+        command, args = fake.calls[0]
+        self.assertEqual(command, "SEARCH")
+        self.assertIn("UID", args)
+        self.assertIn("31:*", args, "必须从已存水位之后开始搜，而不是重放全部")
+
+    def test_mail_that_arrived_while_stopped_is_delivered_after_restart(self):
+        """**真实场景**：停机期间用户发了一封信，重启后它必须被送到 agent。
+
+        修复前这条路径的结果是 bootstrap 直接跳到最新 UID，那封信连同它的正文
+        一起消失，且日志里只有"首次连接"那一行。
+        """
+        self.run_first_start(mailbox_uids=(10, 20, 30))
+
+        waiting = make_mail(body="停机期间收到的信", message_id="<while-down@x>")
+        restarted_hooks = CursorStoreHooks(self.open_store())
+        restarted, _ = make_email(hooks=restarted_hooks)
+        stub_network(restarted, [{"search": [31], "fetch": {31: waiting}}])
+
+        item = restarted._fetch_one()
+        self.assertEqual(item, waiting, "停机期间到达的信必须在重启后被取到")
+        self.assertEqual(restarted._uid, 31)
+
+        restarted._on_raw(item)
+        self.assertEqual(len(restarted_hooks.inbounds), 1)
+        self.assertIn("停机期间收到的信", restarted_hooks.inbounds[0].text)
+
+    def test_restart_does_not_replay_already_handled_mail(self):
+        """续跑的另一面：水位之前的那几封**不该**被重新投一次。"""
+        self.run_first_start(mailbox_uids=(10, 20, 30))
+
+        restarted_hooks = CursorStoreHooks(self.open_store())
+        restarted, _ = make_email(hooks=restarted_hooks)
+        stub_network(restarted, [{"search": [31], "fetch": {31: make_mail()}}])
+        self.assertIsNotNone(restarted._fetch_one())
+
+    # -- "先推进再处理"这条不变式现在还要同时落盘 -----------------------
+    def test_advance_is_persisted_before_the_message_is_processed(self):
+        """顺序不许反：先抬水位并落盘，再交给上层处理。
+
+        反过来的话，崩溃窗口就从"最多丢本批未处理完的几封"变成"位置已存、正文
+        还在队列里"，那封信**永远拿不到** —— 比 at-most-once 丢一封严重得多。
+        """
+        store_hooks = CursorStoreHooks(self.open_store())
+        adapter, _ = make_email(hooks=store_hooks)
+        adapter._uid = 1
+        stub_network(adapter, [{"search": [2],
+                                "fetch": {2: make_mail(message_id="<m2@x>")}}])
+
+        item = adapter._fetch_one()
+        self.assertEqual(adapter._uid, 2, "fetch 阶段就必须抬游标")
+        self.assertEqual(store_hooks.written_positions,
+                         [(adapter._cursor_scope(), 2)], "抬完就要落盘")
+
+        def boom(_inbound):
+            raise RuntimeError("core 炸了")
+
+        store_hooks.on_inbound = boom
+        adapter._on_raw(item)                 # 异常被吞，不影响游标
+        self.assertEqual(adapter._uid, 2)
+        self.assertEqual(store_hooks.written_positions,
+                         [(adapter._cursor_scope(), 2)],
+                         "处理阶段不得改动已落盘的水位")
+
+    def test_fetch_failure_leaves_the_stored_cursor_untouched(self):
+        """取不到正文时水位既不推进也不落盘（否则那封信永远拿不到）。"""
+        store_hooks = CursorStoreHooks(self.open_store())
+        adapter, _ = make_email(hooks=store_hooks)
+        adapter._uid = 1
+        stub_network(adapter, [{"search": [2], "fetch": {}}])   # FETCH 返回 NO
+
+        self.assertIs(adapter._fetch_one(), NOTHING)
+        self.assertEqual(adapter._uid, 1)
+        self.assertEqual(
+            self.open_store().get_meta(adapter._cursor_scope(), "stream_cursor"), 1,
+            "落盘的水位绝不许跳过取不到正文的那一封",
+        )
+
+    # -- 存不下 / 读不到时：退化成旧行为，但必须告警 ---------------------
+    def test_missing_cursor_hooks_warn_that_history_will_be_skipped(self):
+        """没有落盘通道时**必须**告警 —— 无解释的历史跳过就是丢信。"""
+        adapter, _ = make_email()              # RecordingHooks 不实现游标钩子
+        self.assertFalse(adapter._cursor_persistence.available)
+        stub_network(adapter, [{"search": [10, 20]}])
+        with self.assertLogs("opencode_bridge.adapters.email", level="WARNING") as logs:
+            adapter._fetch_one()
+        self.assertTrue(
+            any("游标无法落盘" in line for line in logs.output), logs.output
+        )
+
+    def test_missing_cursor_hooks_still_skip_history(self):
+        """退化方向不变：存不下时行为与修复前一致（跳过历史），只是不再沉默。"""
+        adapter, _ = make_email()
+        fake, _ = stub_network(adapter, [{"search": [10, 20, 30]}])
+        adapter._fetch_one()
+        self.assertEqual(adapter._uid, 30)
+        self.assertEqual([c for c in fake.calls if c[0] == "FETCH"], [])
+
+    def test_failing_write_does_not_break_inbound_delivery(self):
+        """落盘失败只告警：抛出去会把轮询线程打断，连已经取到的正文一起丢。"""
+        adapter, _ = make_email(hooks=FailingCursorStoreHooks(self.open_store()))
+        adapter._uid = 1
+        stub_network(adapter, [{"search": [2],
+                                "fetch": {2: make_mail(message_id="<kept@x>")}}])
+        with self.assertLogs("opencode_bridge.adapters.email", level="WARNING") as logs:
+            item = adapter._fetch_one()
+        self.assertIsNotNone(item, "落盘失败不许把已经取到的正文丢掉")
+        self.assertTrue(any("cannot persist" in line for line in logs.output),
+                        logs.output)
+
+    def test_failing_read_falls_back_to_first_start_semantics(self):
+        """读不到水位时退化成"首次启动"，而不是拿着半可信的值去算 UID 区间。"""
+        adapter, _ = make_email(hooks=UnreadableCursorStoreHooks(self.open_store()))
+        stub_network(adapter, [{"search": [7]}])
+        with self.assertLogs("opencode_bridge.adapters.email", level="WARNING") as logs:
+            adapter._fetch_one()
+        self.assertEqual(adapter._uid, 7)
+        self.assertTrue(any("cannot read the stored UID cursor" in line
+                            for line in logs.output), logs.output)
+
+    # -- 作用域 ---------------------------------------------------------
+    def test_cursor_scope_is_stable_across_instances(self):
+        """作用域每次启动都必须算出同一个值，否则等于每次都是首次运行。"""
+        store = self.open_store()
+        first, _ = make_email(hooks=CursorStoreHooks(store))
+        again, _ = make_email(hooks=CursorStoreHooks(store))
+        self.assertEqual(first._cursor_scope(), again._cursor_scope())
+
+    def test_cursor_scope_separates_mailboxes_and_accounts(self):
+        """一个 IMAP 账号可以同时看多个邮箱，各自的 UID 空间不能共用一个游标。"""
+        store = self.open_store()
+        inbox, _ = make_email(hooks=CursorStoreHooks(store))
+        archive, _ = make_email(mailbox="Archive", hooks=CursorStoreHooks(store))
+        other_account, _ = make_email(address="other@example.com",
+                                     hooks=CursorStoreHooks(store))
+        self.assertNotEqual(inbox._cursor_scope(), archive._cursor_scope())
+        self.assertNotEqual(inbox._cursor_scope(), other_account._cursor_scope())
+
+
+class TestCoreCursorHookWiring(unittest.TestCase):
+    """:class:`BridgeCore` 是那两个游标钩子的**生产实现**，必须真接到 state.json。"""
+
+    SCOPE = "email.imap-uid-cursor:bot@example.com/INBOX"
+
+    def test_hooks_protocol_declares_both_cursor_hooks(self):
+        for name in ("load_stream_cursor", "save_stream_cursor"):
+            self.assertTrue(hasattr(Hooks, name), f"Hooks 协议缺 {name}")
+
+    def test_cursor_written_by_core_survives_a_restart(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        state_path = os.path.join(temp_dir.name, "state.json")
+
+        core = BridgeCore(Config(), UnusedOpenCodeClient(), StateStore(state_path))
+        self.assertIsNone(core.load_stream_cursor(self.SCOPE))
+        core.save_stream_cursor(self.SCOPE, 42)
+
+        # "重启"：全新的 core + 从磁盘重新加载的 store。
+        restarted = BridgeCore(Config(), UnusedOpenCodeClient(),
+                               StateStore(state_path))
+        self.assertEqual(restarted.load_stream_cursor(self.SCOPE), 42)
+
+    def test_core_ignores_a_corrupted_stored_cursor(self):
+        """手改坏 / 旧版本写入的垃圾值必须按"没有已存位置"处理（并告警）。"""
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        state_path = os.path.join(temp_dir.name, "state.json")
+
+        store = StateStore(state_path)
+        store.set_meta(self.SCOPE, "stream_cursor", "not-a-number")
+        core = BridgeCore(Config(), UnusedOpenCodeClient(), store)
+        with self.assertLogs("opencode_bridge.core", level="WARNING"):
+            self.assertIsNone(core.load_stream_cursor(self.SCOPE))
+
+    def test_core_does_not_raise_when_the_store_cannot_be_written(self):
+        """写盘失败只告警：异常冒到适配器的轮询线程会把收信循环打断。"""
+        class UnwritableStore(StateStore):
+            def set_meta(self, conversation_id, key, value):
+                raise OSError("read-only file system")
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        core = BridgeCore(Config(), UnusedOpenCodeClient(),
+                          UnwritableStore(os.path.join(temp_dir.name, "s.json")))
+        with self.assertLogs("opencode_bridge.core", level="WARNING"):
+            core.save_stream_cursor(self.SCOPE, 7)
 
 
 if __name__ == "__main__":

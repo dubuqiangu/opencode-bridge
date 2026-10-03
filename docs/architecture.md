@@ -91,7 +91,7 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 | `hooks.py` | 122 | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
 | `identity.py` | 241 | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
 | `split.py` | 294 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
-| `state.py` | 488 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`migrate_keys=True` 才启用）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
+| `state.py` | 488 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
 | `status.py` | 436 | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
 | `transport/base.py` | 395 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
 | `transport/polling.py` | 94 | HTTP 短轮询/长轮询 | — |
@@ -136,18 +136,23 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
    `normalize()` **抛错**。猜错的后果是把用户映射到别人的会话，不报错、只表现为
    "agent 突然记错上下文"，比直接失败难查得多。
 9. **前缀切换必须与 `state.json` 键迁移一起发** —— 切前缀会让已落盘的键全部变孤儿，
-   用户一次性丢失会话映射。已完成的迁移（irc/twitch/nextcloud）**字节级不变**，
-   因为它们的前缀本就映射到自身；`chat:`/`room:`/`channel:` 尚待此步。
+   用户一次性丢失会话映射。键迁移已实现为 `StateStore(path, migrate_keys=True)`，
+   `__main__` **显式打开**它。已完成的迁移：irc/twitch/nextcloud **字节级不变**
+   （它们的前缀本就映射到自身）；**telegram（`chat:` → `telegram:`）与
+   matrix（`room:` → `matrix:`）已切换**，旧的 `chat:` / `room:` 键在加载时
+   被改写成新格式。歧义的 `channel:`（slack/discord/mattermost 共用）**尚待第 2 步**。
 
-   键迁移已实现为 `StateStore(path, migrate_keys=True)`，**默认关闭** —— 这是刻意的：
-   迁移若先于前缀切换单独上线，仓库会停在"文件已是新格式、适配器还在发旧前缀"的
-   **半迁移态**，那正是"agent 突然忘事"的成因。开启它必须与切换前缀、改写那 4 条
-   "切前缀会丢映射"的用例**在同一个变更里**完成。
+   `StateStore` 的默认值仍是**关闭**，而 `__main__` 打开它 —— 这个组合是有意的：
+   默认关，任何**不**经过 `__main__` 的调用方（脚本、测试）都不会意外改写用户的
+   文件；而桥本身必须开，否则就是上面那条"半迁移态"。
 
    歧义前缀 `channel:`（slack/discord/mattermost 共用）**原样保留**：
    `state.py` 拿到的只是不透明字符串，它没有依据判断是哪一家，
    而**猜错会把用户映射到别人的会话**。`get_session` 额外做一次"精确键 → 无歧义别名"
-   的回退查找，让迁移期不会出现"文件迁了但查找全落空"。
+   的回退查找，让迁移期不会出现"文件迁了但查找全落空"；同理 telegram / matrix 的
+   **反向解析**（`_chat_id` / `_room_id`）也继续认旧前缀 —— 写前收件箱把
+   `conversation_id` 持久化在盘上，切换前写入、切换后才重放的未投递消息带着旧前缀。
+   这两段兼容代码都要等 slack / discord / mattermost 也切完之后才谈得上删。
 
 ### 传输层
 

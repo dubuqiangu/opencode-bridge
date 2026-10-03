@@ -3,12 +3,14 @@
 A1 迁移（轮询循环收敛到 :mod:`opencode_bridge.transport.PollingTransport`）之后
 新增 :class:`TestMatrixMigrationInvariants`：把「行为不变」逐条钉死 —— 退避接线值
 （2s **恒定**，不是指数）、``reset_after=0``、stop 快且不泄漏线程、游标先推进再分发、
-失败时游标不动、事件过滤 8 条一条不少；以及一条**防呆**用例把 ``room:`` 前缀钉死
-（本轮刻意不切 ``matrix:``，切换的前置条件是 ``state.py`` 的键迁移）。
+失败时游标不动、事件过滤 8 条一条不少；以及一条**端到端**用例：切换前落盘的 ``room:``
+键在 ``state.json`` 的键迁移之后仍取回同一个会话（切前缀必须与 ``migrate_keys=True``
+同一个变更上线）。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -36,7 +38,6 @@ from opencode_bridge.adapters.matrix import (
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound, SendError
 from opencode_bridge.identity import (
     LEGACY_PREFIXES,
-    InvalidConversationId,
     is_valid,
     normalize,
     parse_id,
@@ -44,7 +45,10 @@ from opencode_bridge.identity import (
 from opencode_bridge.state import StateStore
 
 ROOM = "!abc:example.org"
-ROOM_CID = "room:!abc:example.org"
+ROOM_CID = "matrix:!abc:example.org"
+#: 切换**前**的前缀。断言"旧前缀不再出现"一律拿它和**字面量**比，绝不拿
+#: ``identity.LEGACY_PREFIXES`` 比 —— 后者被改了就变成恒真（tasks.md 记的教训）。
+LEGACY_ROOM_CID = "room:!abc:example.org"
 BOT = "@bot:example.org"
 
 
@@ -313,7 +317,7 @@ class TestMatrixInbound(unittest.TestCase):
         )
         adapter._sync_once()
         self.assertEqual(len(hooks.inbounds), 1)
-        self.assertEqual(hooks.inbounds[0].conversation_id, "room:!ok:example.org")
+        self.assertEqual(hooks.inbounds[0].conversation_id, "matrix:!ok:example.org")
 
     def test_empty_allowlist_admits_all(self):
         adapter, hooks = make_matrix()
@@ -570,50 +574,92 @@ class TestMatrixMigrationInvariants(unittest.TestCase):
     """
 
     # ------------------------------------------------------------------
-    # 前缀：本轮**刻意不切**
+    # 前缀：已从 ``room:`` 切到 ``matrix:``
     # ------------------------------------------------------------------
-    def test_conversation_id_still_uses_legacy_room_prefix(self):
-        """显式防呆：有人在本轮偷偷把 ``room:`` 换成 ``matrix:`` 时这里会红。
+    def test_conversation_id_uses_the_unified_platform_prefix(self):
+        """显式防呆：有人把 ``_conversation_id`` 悄悄改回 ``room:`` 时这里会红。
 
-        ``room`` 在 :data:`identity.LEGACY_PREFIXES` 里是**指向别的平台的旧别名**
-        （映射到 ``matrix``），所以现在的 id **不是**合法的新格式 —— 这一点本身
-        就是"前缀还没切"的证据。切换的前置条件是 ``state.py`` 的键迁移，见
-        ``matrix.py`` 模块 docstring。
+        ⚠️ "不许出现 ``room:``"这条比的是**字面量**，不是 ``LEGACY_PREFIXES`` 常量 ——
+        改了常量断言就恒真（tasks.md 记的教训）。反过来，"归一后等于新 id"那条**必须**
+        引用常量：那是 :data:`identity.LEGACY_PREFIXES` 的契约本身。
         """
         self.assertEqual(LEGACY_PREFIXES["room"], "matrix",
                          "room 是旧别名，映射到 matrix")
         self.assertEqual(MatrixAdapter._conversation_id(ROOM), ROOM_CID)
         for room in ("!abc:example.org", "!x.y:host:8443", "+plus:example.org"):
             with self.subTest(room=room):
-                self.assertEqual(MatrixAdapter._conversation_id(room), f"room:{room}")
-        # 仍是旧格式：parse_id 拒绝它，normalize 才知道怎么归一
-        self.assertFalse(is_valid(ROOM_CID))
-        with self.assertRaises(InvalidConversationId):
-            parse_id(ROOM_CID)
-        self.assertEqual(normalize(ROOM_CID, platform_hint="matrix"), f"matrix:{ROOM}")
+                self.assertEqual(MatrixAdapter._conversation_id(room),
+                                 f"matrix:{room}")
+                self.assertFalse(
+                    MatrixAdapter._conversation_id(room).startswith("room:"),
+                    "旧前缀不许复活：它已从 identity 的登记表里退出，"
+                    "新写的键会与迁移后的键对不上",
+                )
+        # 已是合法新格式：parse_id 收它（含冒号的房间 id 也不影响解析）
+        self.assertTrue(is_valid(ROOM_CID))
+        self.assertEqual(parse_id(ROOM_CID).platform, "matrix")
+        self.assertEqual(parse_id(ROOM_CID).local_id, ROOM)
+        self.assertEqual(normalize(ROOM_CID), ROOM_CID, "新格式必须幂等")
+        # 旧 id 仍能归一（迁移期在途的旧 conversation_id）
+        self.assertEqual(normalize(LEGACY_ROOM_CID, platform_hint="matrix"),
+                         ROOM_CID)
         self.assertEqual(MatrixAdapter._room_id(ROOM_CID), ROOM)
 
-    def test_switching_prefix_now_would_orphan_stored_sessions(self):
-        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
+    def test_room_id_still_accepts_the_legacy_prefix_and_a_bare_room_id(self):
+        """反向解析**必须**继续认旧前缀，否则盘上未投递的消息会被永久丢弃。
 
-        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
-        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
-        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        写前收件箱把 ``conversation_id`` 持久化在 SQLite 里：切换前写入、切换后才
+        重放的那几行带着 ``room:`` 前缀，认不出来就再也发不出去了。
+        """
+        for raw, expected in (
+            (ROOM_CID, ROOM),
+            (LEGACY_ROOM_CID, ROOM),   # 切换前落盘的旧 conversation_id
+            (ROOM, ROOM),              # 裸房间 id
+            ("room:", None),
+            ("matrix:", None),
+            ("", None),
+            (None, None),
+        ):
+            with self.subTest(conversation_id=raw):
+                self.assertEqual(MatrixAdapter._room_id(raw), expected)
+
+    def test_legacy_room_key_survives_the_prefix_cutover_through_state_migration(self):
+        """端到端：切换前落盘的 ``room:`` 键，升级后仍能取回同一个会话。
+
+        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**，所以切前缀必须与
+        :class:`StateStore` 的键迁移（``migrate_keys=True``）**同一个变更**上线 ——
+        否则已落盘的键全部作废，且不报错、只表现为"agent 突然记错上下文"。
+
+        这里真写一份**旧格式** ``state.json``（模拟升级前的用户磁盘），再用开启迁移
+        的 store 重开，断言新 id 取得到、且落盘键已改写成新格式。房间 id 自带冒号，
+        所以这条同时钉住"含冒号的 local 段迁移后不漂移"。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            cid = MatrixAdapter._conversation_id(ROOM)
-            store = StateStore(path)
-            store.set_session(cid, "sess-1")
-            reopened = StateStore(path)          # 模拟进程重启
-            self.assertEqual(reopened.get_session(cid), "sess-1",
-                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
-            future = f"matrix:{ROOM}"
-            self.assertNotEqual(future, cid)
-            self.assertIsNone(
-                reopened.get_session(future),
-                "切前缀后同一个房间是另一个不透明键 → 会话映射直接丢失",
-            )
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": {LEGACY_ROOM_CID: "sess-matrix"},
+                           "meta": {}}, fh)
+
+            store = StateStore(path, migrate_keys=True)
+
+            report = store.last_migration
+            self.assertEqual(report.migrated, 1)
+            self.assertEqual(report.collisions, 0)
+            # ⚠️ 用**字面量**断言旧键已消失，而不是拿 LEGACY_PREFIXES 常量比。
+            self.assertEqual(store.all_sessions(), {ROOM_CID: "sess-matrix"})
+            self.assertNotIn("room:", json.dumps(store.all_sessions()))
+            with open(path, "r", encoding="utf-8") as fh:
+                on_disk = json.load(fh)
+            self.assertEqual(on_disk["sessions"], {ROOM_CID: "sess-matrix"})
+
+            # 模拟进程重启：新 id 查得到，旧 id 也仍查得到（别名回退是活代码，
+            # slack/discord/mattermost 的 channel: 键还在盘上，它不能被删）
+            reopened = StateStore(path, migrate_keys=True)
+            self.assertEqual(reopened.get_session(MatrixAdapter._conversation_id(ROOM)),
+                             "sess-matrix")
+            self.assertEqual(reopened.get_session(LEGACY_ROOM_CID), "sess-matrix")
+            self.assertEqual(reopened.get_session(LEGACY_ROOM_CID),
+                             reopened.get_session(ROOM_CID))
 
     # ------------------------------------------------------------------
     # 退避接线：2s 恒定（不是指数）
@@ -1029,6 +1075,7 @@ class TestMatrixErrorHelpers(unittest.TestCase):
         self.assertEqual(MatrixAdapter._conversation_id(ROOM), ROOM_CID)
         self.assertEqual(MatrixAdapter._room_id(ROOM_CID), ROOM)
         self.assertEqual(MatrixAdapter._room_id(ROOM), ROOM)
+        self.assertIsNone(MatrixAdapter._room_id("matrix:"))
         self.assertIsNone(MatrixAdapter._room_id("room:"))
         self.assertIsNone(MatrixAdapter._room_id(""))
 

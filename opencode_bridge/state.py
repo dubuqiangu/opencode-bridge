@@ -54,12 +54,28 @@ legacy 前缀           指向                    用它的平台
 
     StateStore(path, migrate_keys=True)
 
-原因：仓库当前的前缀切换**还没发**（telegram/matrix/slack/discord/mattermost 仍
-产出旧前缀）。若此刻自动迁移，落盘键已是新格式而适配器还在写旧键，仓库就处于
-"半迁移"状态 —— 那正是"agent 记错上下文"的温床。正确的发版顺序是**同一个变更里**
-同时（a）给适配器切前缀、（b）打开本开关、（c）更新
-``test_switching_prefix_now_would_orphan_stored_sessions``（那几条用例编码的正是
-"迁移前键会成孤儿"这一**当前事实**，迁移上线后必须随之改写）。
+原因：**本模块的默认值必须保持关闭**，打开与否是调用方的决定。
+
+发版顺序必须是**同一个变更里**同时（a）给适配器切前缀、（b）打开本开关、
+（c）改写那几条编码"迁移前键会成孤儿"的用例 —— 只做一半就会让仓库停在
+"半迁移"状态，而那正是"agent 记错上下文"的温床。
+
+**当前进度（2026-10-04，分两步走）**：
+
+- **第一步已完成**：``telegram``（``chat:`` -> ``telegram:``）与
+  ``matrix``（``room:`` -> ``matrix:``）已切前缀，且 ``__main__`` 在同一个
+  commit 里传了 ``migrate_keys=True``。存量 ``chat:`` / ``room:`` 键会在加载时
+  被重写，会话映射不丢。``__main__`` 打开开关而**本模块默认仍关闭** ——
+  这样库本身不替调用方做决定，单测也因此能覆盖关闭态。
+- **第二步未做**：``slack`` / ``discord`` / ``mattermost`` 共用歧义前缀
+  ``channel:``，``normalize()``缺 ``platform_hint`` 无法归一，而线索**不在
+  ``state.json`` 里**。这一步需要单独的设计决定（按已挂载适配器逐个尝试归一），
+  所以本模块至今**不给任何 ``platform_hint``**，``channel:`` 键原样保留
+  （见 :attr:`MigrationReport.ambiguous_kept`）。
+
+对应用例已改名为 ``test_legacy_chat_key_survives_the_prefix_cutover_through_state_migration``
+与 ``test_legacy_room_key_survives_the_prefix_cutover_through_state_migration``
+（``tests/test_conversation_id_cutover.py`` 里另有``channel:`` 存活的覆盖）。
 
 迁移期的兼容读（``_legacy_alias``）
 ----------------------------------

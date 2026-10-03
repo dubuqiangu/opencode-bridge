@@ -8,22 +8,23 @@ A1：轮询循环 / 退避 / 线程 / ``stop()`` 语义已迁到
 ``getUpdates`` 的 offset 游标、事件过滤、授权闸门、callback query 与按钮、
 429 ``retry_after``、出站分片。
 
-⚠️ ``conversation_id`` 前缀**本轮刻意仍是 ``chat:``**，不要"顺手改好"
-------------------------------------------------------------------------
-``identity.LEGACY_PREFIXES`` 里 ``chat`` → ``telegram`` 就是 telegram 自己的
-旧别名（光看字符串完全合法，判不出来）。
+``conversation_id`` 前缀：已从 ``chat:`` 切到 ``telegram:``
+-------------------------------------------------------
+:meth:`TelegramAdapter._conversation_id` 现在走
+``identity.format_id("telegram", ...)``，产出统一格式 ``platform:local_id``。
 
-把 :meth:`TelegramAdapter._conversation_id` 改成 ``identity.format_id("telegram", ...)``
-会改变 ``conversation_id`` 的字符串格式，而 :class:`~opencode_bridge.state.StateStore`
-拿它当**不透明键**存 ``conversation_id ↔ session_id`` 映射 —— 于是**已落盘
-``state.json`` 里的所有 ``chat:`` 键会一次性变成孤儿**，用户会在迁移后一次性
-"忘记"所有历史会话映射。这种故障**不报错**，只表现为"agent 突然记错上下文"，
-比直接失败难查得多。
+切换的前置条件（旧前缀期间一直挂着的那条警告）已经满足：
+:class:`~opencode_bridge.state.StateStore` 的键迁移
+（旧键 → 新键的显式重写 + 版本门控）已上线，且 ``__main__`` **打开了**
+``migrate_keys=True``。这两件事**必须同一个变更**：只切前缀而不开迁移，
+``state.json`` 里所有 ``chat:`` 键会一次性变成孤儿，用户会在升级后一次性
+"忘记"所有历史会话映射 —— 不报错，只表现为"agent 突然记错上下文"。
 
-所以前缀切换必须是一个**单独的变更**，且必须与 ``state.py`` 的键迁移
-（旧键 → 新键的显式重写 + 版本门控）**一起**发。在那之前
-``_conversation_id`` 必须逐字节保持 ``chat:`` 前缀 ——
-``tests/test_telegram.py`` 里有专门的用例把这一点钉死。
+⚠️ **反向解析仍认旧前缀**（见 :attr:`TelegramAdapter._CONVERSATION_PREFIXES`）：
+写前收件箱把 ``conversation_id`` **持久化**在 SQLite 里，升级前写入、
+升级后才重放的未投递消息带着 ``chat:`` 前缀。认不出来就等于把那些回复永久丢弃。
+``state.py`` 的"精确键 → 无歧义别名"回退是同一类问题的另一半，两者都要留到
+slack / discord / mattermost 也切完之后才谈得上删。
 
 Telegram 特有的四点
 ------------------
@@ -62,6 +63,7 @@ import time
 from typing import Any, List, Optional
 
 from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text  # 统一分片实现（T1.4b），此处再导出保持向后兼容
 from ..transport import NOTHING, PollingTransport
 from .base import Adapter, classify_http, register
@@ -112,9 +114,8 @@ class TelegramAdapter(Adapter):
     线程与退避归 :class:`~opencode_bridge.transport.PollingTransport`；
     :attr:`running` / :meth:`stop` 是它的代理。
 
-    ⚠️ ``_conversation_id`` 刻意仍产出 ``chat:`` 前缀 —— 见模块 docstring
-    「``conversation_id`` 前缀本轮刻意仍是 ``chat:``」一节（切换的前置条件是
-    ``state.py`` 的键迁移，本轮不做）。
+    ``_conversation_id`` 产出统一格式 ``telegram:<chat_id>``（已从 ``chat:`` 切过来），
+    ``_chat_id`` 仍认旧前缀 —— 见模块 docstring「``conversation_id`` 前缀」一节。
     """
 
     name = "telegram"
@@ -128,6 +129,13 @@ class TelegramAdapter(Adapter):
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
     backoff_interval = BACKOFF_INTERVAL
+
+    #: ``conversation_id`` 的合法前缀：当前格式 + 切换前的旧别名（``chat:``）。
+    #: :meth:`_chat_id` 按这个列表剥前缀，所以**旧前缀必须继续认** ——
+    #: 写前收件箱把 ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的
+    #: 未投递消息带着 ``chat:``，认不出来就等于把那些回复永久丢弃。
+    #: 与 :data:`identity.LEGACY_PREFIXES` 同源（``chat`` → ``telegram``）。
+    _CONVERSATION_PREFIXES = ("telegram:", "chat:")
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
@@ -584,20 +592,21 @@ class TelegramAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(chat_id: Any) -> str:
-        """``chat_id`` → ``chat:...``。
-
-        ⚠️ **不要**改成 ``identity.format_id("telegram", chat_id)``。``chat`` 在
-        :data:`identity.LEGACY_PREFIXES` 里是 telegram 自己的旧别名，切换会让已落盘
-        ``state.json`` 的会话映射键全部失效 —— 前置条件是 ``state.py`` 的键迁移，
-        本轮不做。见模块 docstring「``conversation_id`` 前缀本轮刻意仍是 ``chat:``」。
-        """
-        return f"chat:{chat_id}"
+        """``chat_id`` → ``telegram:...``（统一 ``platform:local_id`` 格式）。"""
+        return format_id("telegram", chat_id)
 
     @staticmethod
     def _chat_id(conversation_id: str) -> Optional[int]:
-        raw = conversation_id
-        if raw.startswith("chat:"):
-            raw = raw[len("chat:"):]
+        """``conversation_id`` → 数字 ``chat_id``；不认得就返回 ``None``。
+
+        裸 ``chat_id``（``"55"``）也认，切换前后的两种前缀都认 ——
+        理由见 :attr:`TelegramAdapter._CONVERSATION_PREFIXES`。
+        """
+        raw = str(conversation_id or "")
+        for prefix in TelegramAdapter._CONVERSATION_PREFIXES:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
         try:
             return int(raw)
         except (TypeError, ValueError):

@@ -10,8 +10,8 @@ A1 把轮询循环 / 退避 / 线程 / ``stop()`` 语义搬到了
 * 长轮询两层超时的数值与大小关系（socket 超时 > 服务端挂起时长）；
 * 入站过滤逐条（含 ``allowed_updates`` 与客户端过滤是**两处不同机制**）；
 * 按钮能力（``callback_query`` → ``answer()``）一条不少；
-* 以及一条**防呆**用例把 ``chat:`` 前缀钉死（本轮刻意不切 ``telegram:``，
-  切换的前置条件是 ``state.py`` 的键迁移）。
+* 以及一条**端到端**用例：切换前落盘的 ``chat:`` 键在 ``state.json`` 的键迁移
+  之后仍取回同一个会话（切前缀必须与 ``migrate_keys=True`` 同一个变更上线）。
 
 ⚠️ 本项目铁律：断言"等了多久"一律**优先断言内部状态**（退避状态机 / 请求载荷 /
 计数器），墙钟只允许做**下界**断言（等待只会更长，绝不会更短）或 ``stop()``
@@ -20,6 +20,7 @@ A1 把轮询循环 / 退避 / 线程 / ``stop()`` 语义搬到了
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
@@ -41,7 +42,6 @@ from opencode_bridge.adapters.telegram import (
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.identity import (
     LEGACY_PREFIXES,
-    InvalidConversationId,
     is_valid,
     normalize,
     parse_id,
@@ -50,7 +50,10 @@ from opencode_bridge.state import StateStore
 from opencode_bridge.transport import NOTHING
 
 CHAT = 55
-CHAT_CID = "chat:55"
+CHAT_CID = "telegram:55"
+#: 切换**前**的前缀。断言一律拿它和**字面量**比，绝不拿
+#: ``identity.LEGACY_PREFIXES`` 比 —— 后者被改了就变成恒真（tasks.md 记的教训）。
+LEGACY_CHAT_CID = "chat:55"
 
 
 def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
@@ -151,31 +154,56 @@ class TestTelegramMigrationInvariants(unittest.TestCase):
     """A1 迁移的「行为不变」清单：逐条钉死。"""
 
     # ------------------------------------------------------------------
-    # 前缀：本轮**刻意不切**
+    # 前缀：已从 ``chat:`` 切到 ``telegram:``
     # ------------------------------------------------------------------
-    def test_conversation_id_still_uses_legacy_chat_prefix(self):
-        """显式防呆：有人在本轮偷偷把 ``chat:`` 换成 ``telegram:`` 时这里会红。
+    def test_conversation_id_uses_the_unified_platform_prefix(self):
+        """显式防呆：有人把 ``_conversation_id`` 悄悄改回 ``chat:`` 时这里会红。
 
-        ``chat`` 在 :data:`identity.LEGACY_PREFIXES` 里**指向 telegram 自己**，
-        所以光看字符串判不出来（对比 ``room`` → ``matrix`` 是别的平台）——
-        这正是"必须显式钉住"的理由。
+        ⚠️ "不许出现 ``chat:``"这条比的是**字面量**，不是 ``LEGACY_PREFIXES`` 常量 ——
+        改了常量断言就恒真（tasks.md 记的教训）。反过来，"归一后等于新 id"那条**必须**
+        引用常量：那是 :data:`identity.LEGACY_PREFIXES` 的契约本身。
         """
         self.assertEqual(LEGACY_PREFIXES["chat"], "telegram",
                          "chat 是 telegram 的旧别名")
         self.assertEqual(TelegramAdapter._conversation_id(CHAT), CHAT_CID)
         for chat in (55, "55", -1001234567890):
             with self.subTest(chat=chat):
-                self.assertEqual(TelegramAdapter._conversation_id(chat), f"chat:{chat}")
-        # 仍是旧格式：parse_id 拒绝它，只有 normalize 才知道怎么归一
-        self.assertFalse(is_valid(CHAT_CID))
-        with self.assertRaises(InvalidConversationId):
-            parse_id(CHAT_CID)
-        self.assertEqual(normalize(CHAT_CID, platform_hint="telegram"),
-                         "telegram:55")
+                self.assertEqual(TelegramAdapter._conversation_id(chat),
+                                 f"telegram:{chat}")
+                self.assertFalse(
+                    TelegramAdapter._conversation_id(chat).startswith("chat:"),
+                    "旧前缀不许复活：它已从 identity 的登记表里退出，"
+                    "新写的键会与迁移后的键对不上",
+                )
+        # 已是合法新格式：parse_id 收它，且往返无损
+        self.assertTrue(is_valid(CHAT_CID))
+        self.assertEqual(parse_id(CHAT_CID).platform, "telegram")
+        self.assertEqual(normalize(CHAT_CID), CHAT_CID, "新格式必须幂等")
+        # 旧 id 仍能归一（迁移期在途的旧 conversation_id）
+        self.assertEqual(normalize(LEGACY_CHAT_CID, platform_hint="telegram"),
+                         CHAT_CID)
         self.assertEqual(TelegramAdapter._chat_id(CHAT_CID), 55)
 
-    def test_inbound_and_callback_ids_keep_the_legacy_prefix(self):
-        """入站链路上的 id 也必须是 ``chat:``（不只是 ``_conversation_id`` 本身）。"""
+    def test_chat_id_still_accepts_the_legacy_prefix_and_bare_chat_id(self):
+        """反向解析**必须**继续认旧前缀，否则盘上未投递的消息会被永久丢弃。
+
+        写前收件箱把 ``conversation_id`` 持久化在 SQLite 里：切换前写入、切换后才
+        重放的那几行带着 ``chat:`` 前缀，认不出来就再也发不出去了。
+        """
+        for raw, expected in (
+            ("telegram:55", 55),
+            ("chat:55", 55),              # 切换前落盘的旧 conversation_id
+            ("55", 55),                   # 裸 chat_id
+            ("chat:-1001234567890", -1001234567890),
+        ):
+            with self.subTest(conversation_id=raw):
+                self.assertEqual(TelegramAdapter._chat_id(raw), expected)
+        for bad in ("telegram:", "chat:", "", "telegram:abc", None):
+            with self.subTest(conversation_id=bad):
+                self.assertIsNone(TelegramAdapter._chat_id(bad))
+
+    def test_inbound_and_callback_ids_carry_the_unified_prefix(self):
+        """入站链路上的 id 也必须是 ``telegram:``（不只是 ``_conversation_id`` 本身）。"""
         adapter, hooks = make_telegram()
         script_transport(
             adapter,
@@ -190,27 +218,42 @@ class TestTelegramMigrationInvariants(unittest.TestCase):
                          [CHAT_CID, CHAT_CID])
         self.assertEqual(hooks.callbacks, [(CHAT_CID, "act:ok", "QID1")])
 
-    def test_switching_prefix_now_would_orphan_stored_sessions(self):
-        """把"为什么现在不能切前缀"写成**可执行**的断言（只读地借用 StateStore）。
+    def test_legacy_chat_key_survives_the_prefix_cutover_through_state_migration(self):
+        """端到端：切换前落盘的 ``chat:55`` 键，升级后仍能取回同一个会话。
 
-        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**：切前缀等于把
-        历史键全部作废，而且不报错、只表现为"agent 突然记错上下文"。
-        真要切时必须先做键迁移 —— 那时这个用例会提醒你同步更新它。
+        ``conversation_id`` 是 :class:`StateStore` 的**不透明键**，所以切前缀必须与
+        :class:`StateStore` 的键迁移（``migrate_keys=True``）**同一个变更**上线 ——
+        否则已落盘的键全部作废，且不报错、只表现为"agent 突然记错上下文"。
+
+        这里真写一份**旧格式** ``state.json``（模拟升级前的用户磁盘），再用开启迁移
+        的 store 重开，断言新 id 取得到、且落盘键已改写成新格式。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "state.json")
-            cid = TelegramAdapter._conversation_id(CHAT)
-            store = StateStore(path)
-            store.set_session(cid, "sess-1")
-            reopened = StateStore(path)          # 模拟进程重启
-            self.assertEqual(reopened.get_session(cid), "sess-1",
-                             "旧键在重启后必须仍能读回（这就是'已落盘'）")
-            future = "telegram:55"
-            self.assertNotEqual(future, cid)
-            self.assertIsNone(
-                reopened.get_session(future),
-                "切前缀后同一个 chat 是另一个不透明键 → 会话映射直接丢失",
-            )
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": {LEGACY_CHAT_CID: "sess-telegram"},
+                           "meta": {}}, fh)
+
+            store = StateStore(path, migrate_keys=True)
+
+            report = store.last_migration
+            self.assertEqual(report.migrated, 1)
+            self.assertEqual(report.collisions, 0)
+            # ⚠️ 用**字面量**断言旧键已消失，而不是拿 LEGACY_PREFIXES 常量比。
+            self.assertEqual(store.all_sessions(), {CHAT_CID: "sess-telegram"})
+            self.assertNotIn("chat:", json.dumps(store.all_sessions()))
+            with open(path, "r", encoding="utf-8") as fh:
+                on_disk = json.load(fh)
+            self.assertEqual(on_disk["sessions"], {CHAT_CID: "sess-telegram"})
+
+            # 模拟进程重启：新 id 查得到，旧 id 也仍查得到（别名回退是活代码，
+            # slack/discord/mattermost 的 channel: 键还在盘上，它不能被删）
+            reopened = StateStore(path, migrate_keys=True)
+            self.assertEqual(reopened.get_session(TelegramAdapter._conversation_id(CHAT)),
+                             "sess-telegram")
+            self.assertEqual(reopened.get_session(LEGACY_CHAT_CID), "sess-telegram")
+            self.assertEqual(reopened.get_session(LEGACY_CHAT_CID),
+                             reopened.get_session(CHAT_CID))
 
     # ------------------------------------------------------------------
     # 退避接线：2s 恒定（不是指数）+ reset_after=0

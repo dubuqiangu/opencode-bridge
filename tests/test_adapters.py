@@ -118,7 +118,7 @@ class TestTelegramPolling(unittest.TestCase):
         inbound = hooks.inbounds[0]
         self.assertIsInstance(inbound, Inbound)
         self.assertEqual(inbound.kind, "text")
-        self.assertEqual(inbound.conversation_id, "chat:55")
+        self.assertEqual(inbound.conversation_id, "telegram:55")
         self.assertEqual(inbound.text, "你好 world")
         self.assertEqual(inbound.platform, "telegram")
         self.assertEqual(inbound.message_id, "9")
@@ -150,9 +150,9 @@ class TestTelegramPolling(unittest.TestCase):
         self.assertEqual(inbound.kind, "callback")
         self.assertEqual(inbound.callback_query_id, "QID1")
         self.assertEqual(inbound.text, "act:ok")
-        self.assertEqual(inbound.conversation_id, "chat:55")
+        self.assertEqual(inbound.conversation_id, "telegram:55")
         # hooks.on_callback got (conversation_id, data, query_id)
-        self.assertEqual(hooks.callbacks, [("chat:55", "act:ok", "QID1")])
+        self.assertEqual(hooks.callbacks, [("telegram:55", "act:ok", "QID1")])
         # ordering: inbound -> on_callback -> answerCallbackQuery
         kinds = [e[0] for e in events]
         self.assertEqual(kinds, ["inbound", "callback", "post"])
@@ -189,7 +189,7 @@ class TestTelegramPolling(unittest.TestCase):
         self.assertEqual(hooks.inbounds, [])  # rejected, no crash
         adapter._dispatch_update(message_update(chat_id=999))
         self.assertEqual(len(hooks.inbounds), 1)
-        self.assertEqual(hooks.inbounds[0].conversation_id, "chat:999")
+        self.assertEqual(hooks.inbounds[0].conversation_id, "telegram:999")
 
         # string ids in the config compare equal to int chat ids
         adapter2, hooks2 = make_telegram({"allowed_chat_ids": ["888"]})

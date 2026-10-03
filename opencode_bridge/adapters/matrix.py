@@ -7,21 +7,22 @@ A1：轮询循环 / 退避 / 线程 / ``stop()`` 语义已迁到
 :class:`~opencode_bridge.transport.PollingTransport`。本文件只留 Matrix 语义：
 增量同步游标、事件过滤、授权闸门、编辑的 MSC2676 近似、出站分片。
 
-⚠️ ``conversation_id`` 前缀**本轮刻意仍是 ``room:``**，不要"顺手改好"
-------------------------------------------------------------------------
-``identity.LEGACY_PREFIXES`` 里 ``room`` → ``matrix`` 是**指向别的平台的旧别名**
-（语法上 ``room`` 本身是合法平台名，所以光看字符串判不出来）。
+``conversation_id`` 前缀：已从 ``room:`` 切到 ``matrix:``
+-----------------------------------------------------
+:meth:`MatrixAdapter._conversation_id` 现在走
+``identity.format_id("matrix", ...)``，产出统一格式 ``platform:local_id``。
 
-把 ``_conversation_id`` 改成 ``matrix:...`` 会改变 ``conversation_id`` 的字符串
-格式，而 :class:`~opencode_bridge.state.StateStore` 拿它当**不透明键**存
-``conversation_id ↔ session_id`` 映射 —— 于是**已落盘 ``state.json`` 里的所有
-``room:`` 键会一次性变成孤儿**，用户会在迁移后一次性"忘记"所有历史会话映射。
-这种故障**不报错**，只表现为"agent 突然记错上下文"，比直接失败难查得多。
+切换的前置条件（旧前缀期间一直挂着的那条警告）已经满足：
+:class:`~opencode_bridge.state.StateStore` 的键迁移（旧键 → 新键的显式重写 +
+版本门控）已上线，且 ``__main__`` **打开了** ``migrate_keys=True``。这两件事
+**必须同一个变更**：只切前缀而不开迁移，已落盘 ``state.json`` 里的所有 ``room:``
+键会一次性变成孤儿，用户会在升级后一次性"忘记"所有历史会话映射 —— 不报错，
+只表现为"agent 突然记错上下文"，比直接失败难查得多。
 
-所以前缀切换必须是一个**单独的变更**，且必须与 ``state.py`` 的键迁移
-（旧键 → 新键的显式重写 + 版本门控）**一起**发。在那之前
-``_conversation_id`` 必须逐字节保持 ``room:`` 前缀 ——
-``tests/test_matrix.py`` 里有专门的用例把这一点钉死。
+⚠️ **反向解析仍认旧前缀**（见 :attr:`MatrixAdapter._CONVERSATION_PREFIXES`）：
+写前收件箱把 ``conversation_id`` **持久化**在 SQLite 里，升级前写入、升级后才
+重放的未投递消息带着 ``room:`` 前缀。认不出来就等于把那些回复永久丢弃。
+``state.py`` 的"精确键 → 无歧义别名"回退是同一类问题的另一半。
 
 两个平台特有的点：
 
@@ -52,6 +53,7 @@ import uuid
 from typing import Any, List, Optional, Tuple
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
+from ..identity import format_id
 from ..split import split_text
 from ..transport import NOTHING, PollingTransport
 from .base import Adapter, classify_http, register
@@ -122,9 +124,8 @@ class MatrixAdapter(Adapter):
     线程与退避归 :class:`~opencode_bridge.transport.PollingTransport`；
     :attr:`running` / :meth:`stop` 是它的代理。
 
-    ⚠️ ``_conversation_id`` 刻意仍产出 ``room:`` 前缀 —— 见模块 docstring
-    「``conversation_id`` 前缀本轮刻意仍是 ``room:``」一节（切换的前置条件是
-    ``state.py`` 的键迁移，本轮不做）。
+    ``_conversation_id`` 产出统一格式 ``matrix:<room_id>``（已从 ``room:`` 切过来），
+    ``_room_id`` 仍认旧前缀 —— 见模块 docstring「``conversation_id`` 前缀」一节。
     """
 
     name = "matrix"
@@ -144,6 +145,13 @@ class MatrixAdapter(Adapter):
     message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
     backoff_interval = BACKOFF_INTERVAL
+
+    #: ``conversation_id`` 的合法前缀：当前格式 + 切换前的旧别名（``room:``）。
+    #: :meth:`_room_id` 按这个列表剥前缀，所以**旧前缀必须继续认** ——
+    #: 写前收件箱把 ``conversation_id`` 持久化在盘上，切换前写入、切换后才重放的
+    #: 未投递消息带着 ``room:``，认不出来就等于把那些回复永久丢弃。
+    #: 与 :data:`identity.LEGACY_PREFIXES` 同源（``room`` → ``matrix``）。
+    _CONVERSATION_PREFIXES = ("matrix:", "room:")
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
@@ -427,19 +435,22 @@ class MatrixAdapter(Adapter):
     # ------------------------------------------------------------------
     @staticmethod
     def _conversation_id(room_id: Any) -> str:
-        """``room_id`` → ``room:...``。
-
-        ⚠️ **不要**改成 ``identity.format_id("matrix", room_id)``。``room`` 在
-        :data:`identity.LEGACY_PREFIXES` 里是旧别名，切换会让已落盘 ``state.json``
-        的会话映射键全部失效 —— 前置条件是 ``state.py`` 的键迁移。见模块 docstring。
-        """
-        return f"room:{room_id}"
+        """``room_id`` → ``matrix:...``（统一 ``platform:local_id`` 格式）。"""
+        return format_id("matrix", room_id)
 
     @staticmethod
     def _room_id(conversation_id: Any) -> Optional[str]:
+        """``conversation_id`` → 房间 id；空的一律返回 ``None``。
+
+        裸房间 id（``"!abc:example.org"``）也认，切换前后的两种前缀都认 ——
+        理由见 :attr:`MatrixAdapter._CONVERSATION_PREFIXES`。注意房间 id 本身
+        **含冒号**，所以这里只剥**已知前缀**、不做按冒号切分。
+        """
         raw = str(conversation_id or "")
-        if raw.startswith("room:"):
-            raw = raw[len("room:"):]
+        for prefix in MatrixAdapter._CONVERSATION_PREFIXES:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
         return raw or None
 
     def _send_path(self, room_id: str, txn_id: str) -> str:

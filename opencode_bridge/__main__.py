@@ -461,7 +461,13 @@ def _run_bridge_locked(cfg: Config) -> int:
 
     endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
     client = OpenCodeClient(endpoint)
-    state = StateStore(cfg.state_path)
+    # ⚠️ ``migrate_keys=True`` 是**必须**的，不是可选项：telegram / matrix 已改用
+    # ``platform:local_id``，而 StateStore 拿 conversation_id 当不透明键存
+    # ``conversation_id ↔ session_id``。不开这个开关，已落盘 ``state.json`` 里的
+    # ``chat:`` / ``room:`` 键会一次性变成孤儿 —— 用户升级后一次性"忘记"所有历史
+    # 会话，不报错，只表现为"agent 突然记错上下文"。歧义的 ``channel:`` 键
+    # （slack / discord / mattermost 共用）原样保留、继续可用。
+    state = StateStore(cfg.state_path, migrate_keys=True)
     # 写前收件箱必须在 state 旁边，且**开/关都要说出来**：它是可选注入的
     # （None = 关闭），静默关闭正好让这次要修的丢消息 bug 重新变得看不见 ——
     # 所以启动日志里必须能一眼看出当前是开是关。

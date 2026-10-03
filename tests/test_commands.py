@@ -489,8 +489,12 @@ class ModelCommandForwardingTests(HandlerTestCase):
 
 
 # ----------------------------------------------------------------------
-# 9-10: /approve 与 /deny（会改动下游 agent 的授权状态，语义不许漂）
+# 9-10: /approve 与 /deny（会改动下游 agent 的授权状态）
 # ----------------------------------------------------------------------
+# 不变式：**只有** ``/approve`` 能发 ``always``。``/deny`` 的决策恒为 ``reject``，
+# 而且多一个 token 就当用错命令处理 —— 回用法、一个决策都不发。曾经共用一个带
+# ``default_decision`` 的函数，于是 ``/deny per_5 always`` 静默发出了永久放行
+# （AGENTS.md §8：那种"用户会静默地遇到错的东西"绝不能作为代价）。
 class PermissionCommandTests(HandlerTestCase):
     def test_approve_defaults_to_once_and_always_is_opt_in(self):
         session_id = self.attach_session()
@@ -507,28 +511,106 @@ class PermissionCommandTests(HandlerTestCase):
         self.assertEqual(self.last_reply.text, "已回复权限请求 per_3: once")
         self.assertEqual(self.last_reply.session_id, session_id)
 
-    def test_deny_defaults_to_reject(self):
+    def test_approve_can_still_widen_a_single_reply_to_always(self):
+        """配对的那一半：修的是 ``/deny``，不是把 ``/approve`` 也一起阉掉。
+
+        ``always`` 依然是 ``/approve`` 的正当选项，大小写不敏感 —— 否则就成了
+        "什么都拒、什么都批不了"。
+        """
+        session_id = self.attach_session()
+
+        for argument in ("per_20 always", "per_21 ALWAYS", "per_22 Always"):
+            with self.subTest(argument=argument):
+                self.run_command("/approve " + argument)
+
+                request_id = argument.split()[0]
+                self.assertEqual(self.client.permission_replies[-1],
+                                 (session_id, request_id, "always"))
+                self.assertEqual(self.last_reply.kind, "text")
+
+        self.assertEqual(len(self.client.permission_replies), 3)
+
+    def test_deny_answers_reject_and_nothing_else(self):
         session_id = self.attach_session()
 
         self.run_command("/deny per_4")
-        self.run_command("/deny per_5 always")
 
-        self.assertEqual(self.client.permission_replies, [
-            (session_id, "per_4", "reject"),
-            (session_id, "per_5", "always"),
-        ])
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_4", "reject")])
+        self.assertEqual(self.last_reply.text, "已回复权限请求 per_4: reject")
+        self.assertEqual(self.last_reply.kind, "text")
 
-    def test_malformed_permission_arguments_never_reach_the_server(self):
+    def test_deny_with_an_extra_token_is_a_usage_error_and_sends_nothing(self):
+        """``/deny per_5 always`` 曾经发出**永久放行**。
+
+        修法不是"忽略多余的 token"（那会把用户的笔误藏起来，让请求一直挂着而
+        人以为已经拒了），而是当用错命令处理：回用法，并且**一个决策都不发** ——
+        用户看得见自己写错了，也就知道要重新回一次。
+        """
+        session_id = self.attach_session()
+
+        for argument in ("per_5 always", "per_5 once", "per_5 ONCE",
+                         "per_5 Always", "per_5 ALWAYS", "per_5 reject",
+                         "per_5 bogus", "per_5 always extra"):
+            with self.subTest(argument=argument):
+                self.run_command("/deny " + argument)
+
+                self.assertEqual(self.last_reply.kind, "error")
+                self.assertEqual(
+                    self.last_reply.text,
+                    "用法: /approve <请求ID> [always]  或  /deny <请求ID>",
+                )
+                # 关键：这一串跑完，服务端那边必须什么都没有
+                self.assertEqual(self.client.permission_replies, [])
+
+        # 只允许留下下面这一条 reject —— 前面那些一次都不许发出去
+        self.run_command("/deny per_6")
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_6", "reject")])
+
+    def test_deny_without_a_request_id_never_reaches_the_server(self):
         self.attach_session()
 
-        for argument in ("", "a b c", "per_6 bogus", "per_6 ALWAYS extra"):
+        for argument in ("", "   ", "a b c"):
             with self.subTest(argument=argument):
-                self.run_command("/approve " + argument)
+                self.run_command("/deny " + argument)
 
                 self.assertEqual(self.last_reply.kind, "error")
                 self.assertIn("用法: /approve", self.last_reply.text)
 
         self.assertEqual(self.client.permission_replies, [])
+
+    def test_malformed_permission_arguments_never_reach_the_server(self):
+        """两条命令共用同一份用法文案，所以畸形参数的行为必须一致。"""
+        self.attach_session()
+
+        for command in ("/approve ", "/deny "):
+            for argument in ("", "a b c", "per_6 bogus", "per_6 ALWAYS extra"):
+                with self.subTest(command=command, argument=argument):
+                    self.run_command(command + argument)
+
+                    self.assertEqual(self.last_reply.kind, "error")
+                    self.assertIn("用法: /approve", self.last_reply.text)
+
+        self.assertEqual(self.client.permission_replies, [])
+
+    def test_the_shared_permission_helper_takes_a_final_decision(self):
+        """守住"守住它的那个东西"。
+
+        共享回信函数只该接受**终值**决策。一旦它又有了一个"默认/可覆盖"的参数，
+        ``/deny`` 就重新有了发 ``always`` 的路 —— 所以这里把参数表钉死。
+        """
+        parameters = list(
+            inspect.signature(
+                CommandHandler._apply_permission_decision
+            ).parameters
+        )
+
+        self.assertEqual(parameters[1:],
+                         ["conversation_id", "adapter", "request_id", "decision"])
+        for name in parameters:
+            self.assertNotIn("default", name, "%s 不能是「默认决策」" % name)
+            self.assertNotIn("override", name, "%s 不能被覆盖" % name)
 
     def test_replying_without_a_session_says_so_and_sends_nothing(self):
         self.run_command("/approve per_1")

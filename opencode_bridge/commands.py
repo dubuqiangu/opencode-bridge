@@ -195,6 +195,17 @@ def setup_platforms() -> tuple[tuple[str, str], ...]:
 
 
 # ----------------------------------------------------------------------
+# 权限回信：决策词与用法文案（两条命令共用，所以放在模块级）
+# ----------------------------------------------------------------------
+#: ``/approve`` 第二个 token 的取值。**只有** ``/approve`` 有这个位置；
+#: ``/deny`` 的决策恒为 ``reject``，多一个 token 就是用错命令了。
+_APPROVE_CHOICES = ("once", "always")
+
+#: 参数写错时回的那一句（``/approve`` 与 ``/deny`` 共用同一份，省得两边说法不一）。
+_PERMISSION_USAGE = "用法: /approve <请求ID> [always]  或  /deny <请求ID>"
+
+
+# ----------------------------------------------------------------------
 # 注入的协作者：签名写在这里，core 那边的实现是什么它们不关心
 # ----------------------------------------------------------------------
 #: 发一条出站文本。关键字参数与返回值都照着 core 的发信入口：
@@ -450,35 +461,69 @@ class CommandHandler:
     def _cmd_approve(
         self, conversation_id: str, adapter: Adapter, args: str
     ) -> None:
-        self._reply_permission(conversation_id, adapter, args, "once")
+        """``/approve <请求ID> [once|always]`` —— **只有**这条命令能选 ``always``。
+
+        决策在这里定完，再连同请求 id 一起交给共享的回信函数；那个函数只负责把
+        **已经定好的**决策送出去。``/deny`` 因此结构上够不着 ``always`` 这条路 ——
+        之前共用一个带 ``default_decision`` 的函数，而"默认"意味着任何调用方都能
+        悄悄覆盖它，``/deny per_5 always`` 于是发出了永久放行（AGENTS.md §8：
+        权限路径上的 ``default_*`` 参数本身就是缺陷）。
+        """
+        tokens = args.split()
+        if not tokens or len(tokens) > 2:
+            self._send_text(
+                conversation_id, _PERMISSION_USAGE, kind="error",
+                adapter=adapter,
+            )
+            return
+        request_id = tokens[0]
+        decision = "once"
+        if len(tokens) == 2:
+            choice = tokens[1].lower()
+            if choice not in _APPROVE_CHOICES:
+                self._send_text(
+                    conversation_id, _PERMISSION_USAGE, kind="error",
+                    adapter=adapter,
+                )
+                return
+            decision = choice
+        self._apply_permission_decision(
+            conversation_id, adapter, request_id, decision
+        )
 
     def _cmd_deny(
         self, conversation_id: str, adapter: Adapter, args: str
     ) -> None:
-        self._reply_permission(conversation_id, adapter, args, "reject")
+        """``/deny <请求ID>`` —— 决策**只有** ``reject``，而且只接一个 token。
 
-    def _reply_permission(
+        多写一个 token 一律当用错命令处理（回用法、**不发任何决策**）：
+        默默忽略那个多余的 token 会把用户的笔误藏起来，而"看起来拒绝了、其实没
+        拒绝"比报错糟糕得多。
+        """
+        tokens = args.split()
+        if len(tokens) != 1:
+            self._send_text(
+                conversation_id, _PERMISSION_USAGE, kind="error",
+                adapter=adapter,
+            )
+            return
+        self._apply_permission_decision(
+            conversation_id, adapter, tokens[0], "reject"
+        )
+
+    def _apply_permission_decision(
         self,
         conversation_id: str,
         adapter: Adapter,
-        args: str,
-        default_decision: str,
+        request_id: str,
+        decision: str,
     ) -> None:
-        tokens = args.split()
-        usage = "用法: /approve <请求ID> [always]  或  /deny <请求ID>"
-        if not tokens or len(tokens) > 2:
-            self._send_text(conversation_id, usage, kind="error", adapter=adapter)
-            return
-        request_id = tokens[0]
-        decision = default_decision
-        if len(tokens) == 2:
-            choice = tokens[1].lower()
-            if choice not in ("once", "always"):
-                self._send_text(
-                    conversation_id, usage, kind="error", adapter=adapter
-                )
-                return
-            decision = choice
+        """把**终值**决策送到 opencode，并回一句确认。
+
+        ``decision`` 是调用方已经选定的最终结果：这里不做选择、不读第二个 token，
+        收到的每一个决策都原样发给服务端。这样"谁能发 ``always``"就只由
+        :meth:`_cmd_approve` 一处决定 —— 共享层没有可以被覆盖的入口。
+        """
         session_id = self._conversation_state.get_session(
             conversation_id, platform=adapter.name
         )

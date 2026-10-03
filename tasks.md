@@ -97,6 +97,83 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | G3 | 无法指定模型 | 中 | 只能吃 opencode 默认值；默认值不可用则整条链路瘫 | ☐ 未修 |
 | G4 | A1 迁移剩 2/8 | 中 | Mattermost / Twitch 仍走各自老实现 | ☐ 未修 |
 | G5 | A2 前缀切换剩 5 家 | 低 | telegram/matrix/slack/discord/mattermost 仍发旧前缀 | ☐ 未修 |
+| **G6** | **测试夹具硬编码本机 opencode 口令** | 中 | 口令已随origin/main 公开（仅指向 127.0.0.1:4097，实际可利用性低） | ⏸ **用户决定暂不修** |
+
+### G6 · 测试夹具硬编码本机opencode 口令（**用户决定暂不修，2026-10-03**）
+
+**位置**：`tests/test_opencode_client.py:35` 的 `SMOKE_PASSWORD`
+
+> ⚠️ 这里**刻意不抄口令原文** —— 抄进来等于在第二个文件里又存一份，
+> 将来清理时要改两个地方，且凭据出现次数翻倍。要看值请直接看那个文件。
+
+**用途**：`SMOKE = os.environ.get("OPENCODE_BRIDGE_SMOKE") == "1"`（`:33`）才启用，
+用来连 `http://127.0.0.1:4097`（`:34`），断言在 `:607`：`Endpoint(SMOKE_URL, SMOKE_PASSWORD)`。
+
+**定性**：形状像生成出来的真值，不像占位符（同文件其它夹具如
+`app-password-0123456789abcdef`、`SUPERSECRET-APP-SECRET-VALUE` 都是明显的假值）。
+全库仅此一处出现。**已在 `origin/main`**，最早来自初始提交 `5ce06e0`。
+
+**实际风险：低但非零**。目标端口绑在 `127.0.0.1`，拿到口令的人仍需先能在本机
+上访问该端口。所以这是"卫生问题"而非"正在被利用的漏洞"。
+
+**改法（随时可做，很小）**：换成 `os.environ.get("OPENCODE_BRIDGE_SMOKE_PASSWORD")`，
+**不给默认值**，取不到就 `skipTest`。这样既不泄露也不再硬编码。
+（`SMOKE_URL` 同理，但 URL 只是端口号，本身无害。）
+
+**为什么暂不修 —— 用户明确决定**：
+
+1. 它**已经泄漏**了，现在改代码并不能撤销已推送的事实；
+2. 要真正清除必须**重写历史**，而重写会改掉所有 commit SHA，
+   代价远大于这条卫生问题的收益；
+3. 实际可利用性低（见上）。
+
+**所以记在这里，避免以后忘了它还在。** 若将来决定处理，按上面「改法」做；
+若要彻底清除，需要重写历史 + 假定该口令已泄漏并轮换。
+
+---
+
+## 类体量债务（2026-10-03 普查，用户立规则时量出来的）
+
+用户新立规则「类里代码多就拆类」（见 `AGENTS.md` 5.1）时，顺手用 `ast`
+普查了全库，**当前债务不小**：
+
+**18/65 个类超阈值**（方法数 ≥15 或自有代码行 ≥250）：
+
+| 类 | 文件 | 方法数 | 自有代码行 |
+|---|---|---|---|
+| `BridgeCore` | `core.py` | **49** | **1120** |
+| `HomeAssistantAdapter` | `adapters/homeassistant.py` | 49 | 829 |
+| `DiscordAdapter` | `adapters/discord.py` | 43 | 678 |
+| `QQBotAdapter` | `adapters/qqbot.py` | 42 | 828 |
+| `NextcloudAdapter` | `adapters/nextcloud.py` | 38 | 669 |
+| `MattermostAdapter` | `adapters/mattermost.py` | 36 | 639 |
+| `TwitchAdapter` | `adapters/twitch.py` | 36 | 532 |
+| `IRCAdapter` | `adapters/irc.py` | 35 | 417 |
+| `A2aAdapter` | `adapters/a2a.py` | 34 | 747 |
+| `EmailAdapter` | `adapters/email.py` | 32 | 570 |
+| `TelegramAdapter` | `adapters/telegram.py` | 24 | 515 |
+| `Transport` | `transport/base.py` | 24 | 363 |
+| `MatrixAdapter` | `adapters/matrix.py` | 23 | 401 |
+| `WebSocketClient` | `ws.py` | 21 | 275 |
+| `OpenCodeClient` | `opencode_client.py` | 21 | 266 |
+| `SlackAdapter` | `adapters/slack.py` | 20 | 333 |
+| `HttpServer` | `httpsrv.py` | 19 | 342 |
+| `NtfyAdapter` | `adapters/ntfy.py` | 16 | 249 |
+
+单文件超 400 行阈值的有 8 个（`core.py` 1619 行最大）。
+
+**为什么现在记下来而不是立刻拆**：
+
+1. **正在做G2**。G2 的修复点正好在 `BridgeCore`（`_drain` / `_dispatch_prompt`），
+   也就是最大的那个类。规则要求"新功能要么进新模块，要么先拆"——
+   所以 **G2 的重试队列必须做成独立模块，不许塞进 `BridgeCore`**。
+   这是规则的第一个实际约束。
+2. **大范围重構风险高**。18 个类同时拆，改动面极大，且与 G1/G2 的修复叠在一起
+   会让"这次改动到底改了什么"变得不可审。**先把功能修对，再还债**，比反过来更安全。
+3. 规则是**向前生效**的：新代码不得继续加厚这些大类；存量债务择机偿还。
+
+**待办（未排期）**：给 `BridgeCore` 排一次拆分。候选切分线已可见——
+会话/事件流、状态持久化、outbound 发送、平台路由。拆之前先有测试兜住行为。
 
 > **实现方案（2026-10-03 定稿）** —— 先查了参考项目再定，结论见下方逐条。
 

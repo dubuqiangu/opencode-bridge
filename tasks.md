@@ -94,7 +94,7 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 |---|---|---|---|---|
 | **G1** | **桥每 5~7 分钟退出一次** | 高 | 退出期间消息进不来 | ◐ **症状已消失，根因未证实** |
 | **G2** | **at-most-once：崩溃窗口内静默丢消息** | 高 | 崩溃窗口**主体已修**（写前收件箱+ 启动重放）；**残留**：「游标已落盘 → on_inbound」段未覆盖 | ◐ **主体已修，残留窗口未闭合** |
-| G3 | 无法指定模型 | 中 | 只能吃 opencode 默认值；默认值不可用则整条链路瘫 | ☐ 未修 |
+| G3 | 无法指定模型 | 中 | **前提已证伪**：服务端**有**专用端点可换模型且实测生效，只是 prompt 端点不收 | ◐ **能力已证实，待定交互形态** |
 | G4 | A1 迁移剩 2/8 | 中 | Mattermost / Twitch 仍走各自老实现 | ☐ 未修 |
 | G5 | A2 前缀切换剩 5 家 | 低 | telegram/matrix/slack/discord/mattermost 仍发旧前缀 | ☐ 未修 |
 | **G6** | **测试夹具硬编码本机 opencode 口令** | 中 | 口令已随origin/main 公开（仅指向 127.0.0.1:4097，实际可利用性低） | ⏸ **用户决定暂不修** |
@@ -360,6 +360,69 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 `assert len(阶梯) == MAX_ATTEMPTS - 1`（2 级）。
 **注意：两个测试把这个缺陷钉住了** —— 只改实现反而会让测试失败。
 这是"测试全绿不等于测试正确"的实例：测试忠实锁住了**我给错的规格**。
+
+#### G3 实测：能力存在，只是走错了端点（2026-10-03）
+
+台账原判断是「无法指定模型，只能吃 opencode 默认值；默认值不可用则整条链路瘫」。
+**实测证明这个前提是错的** —— 能力存在，只是我们一直在找错的地方。
+
+**契约取证**（运行时 `GET /openapi.json`，权威；OpenAPI 3.1.0，116 路径，
+255 个 component schema）：
+
+| 端点 | 请求体有无 `model` |
+|---|---|
+| `POST /api/session/{sessionID}/prompt` | ❌ **没有** |
+| `POST /api/session/{sessionID}/model` | ✅ 有 |
+| `POST /api/session`（建会话） | ✅ 有（`Model.Ref \| null`） |
+| `POST /api/experimental/generate` | ✅ 有（与本桥无关） |
+
+`prompt` 请求体的**全部**字段（这就是为什么之前找不到）：
+`['agents', 'delivery', 'files', 'id', 'metadata', 'resume', 'skills', 'text']`
+
+**字段形状**：`model` 是 **`Model.Ref` 对象**，不是字符串——
+
+    { "id": "...", "providerID": "...", "variant": "..." }    # variant 似乎可选
+
+实测传 `{"model": {"providerID": "opencode", "id": "space-bunny-free"}}`
+被接受，服务端自行补出 `variant: "default"`。
+
+**闭环实测（真的换了并读回）**：
+
+| 步骤 | 结果 |
+|---|---|
+| `POST /api/session/{id}/model` | **HTTP 204**（接受） |
+| `GET /api/session/{id}` | `model: {"id": "space-bunny-free", "providerID": "opencode", "variant": "default"}` |
+| `POST /api/session/{id}/prompt` | HTTP 200，消息创建成功 |
+
+即**模型确实生效，且 `GET /api/session/{id}` 会把当前模型读回来**——
+这意味着桥既能给会话指定模型，也能把当前模型显示给用户。
+
+**可用模型**：`GET /api/model` 返回 **819 个**，
+每项带 `providerID` / `id` / `name`（例如 `opencode/space-bunny-free`、
+`openai/gpt-6.1-sol`）。所以可以做 `/model` 补全或校验。
+
+**持久性**：模型存在**服务端会话**里，而桥把 `session_id` 持久化在
+`state.json`（`core._ensure_session`）—— 所以模型**跨桥重启天然保持**，
+不需要桥额外存。
+
+#### G3 尚未实施：待定的是交互形态，不是能力
+
+能力已证实，剩下的只是「怎么让用户指定」。这是个 UX 选择，需要单独决策，
+本轮**未动手**。待决问题（留给下一轮）：
+
+1. **入口形态**：IM 里发 `/model <provider>/<id>` 命令？还是在 `config.json`
+   里按平台/会话配？还是两者都要？
+2. **是否要给未知会话预置**：新会话建好时要不要按配置先设一个默认模型，
+   还是只在用户显式 `/model` 时才动？
+3. **切换的可见性**：换成功后要不要回一句确认（含旧模型 -> 新模型）？
+   当前模型可以从 `GET /api/session/{id}` 读到，所以做得到。
+4. **越权防护**：`/model` 应当走既有的 `admits()` 授权闸门——
+   任何人都能换掉 agent 用的模型是很强的能力，不该对所有人生效。
+   **这一条我倾向「必须」，但要不要按会话再收紧（例如只允许私聊）需要你定。**
+
+⚠️ 另：实测在 opencode 上留下了两个探测会话（标题 `g3-model-probe` 与
+`g3-model-probe-2`），`/delete` 与 `/abort` 都返回 404，没找到删除端点。
+无害但没清掉，如在意可手动在 opencode 里删。
 
 #### ⚠️ 残留：仍未闭合的窗口
 

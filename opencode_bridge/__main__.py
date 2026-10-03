@@ -31,6 +31,7 @@ from .config import Config, DEFAULT_CONFIG_NAME
 from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
 from .instance_lock import InstanceLock, pid_is_alive
+from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
 from .state import StateStore
 
@@ -252,6 +253,21 @@ def _pid_alive(pid: int) -> bool:
     return pid_is_alive(pid)
 
 
+def _inbox_path(cfg: Config) -> str:
+    """写前收件箱的落盘位置：与 ``state.json`` **同一个目录**，文件名 ``inbox.db``。
+
+    跟着 ``cfg.state_path`` 走而不是死用 :func:`_bridge_dir`：用户把
+    ``state_path`` 指到别处时，待投递的行必须跟着走 —— 否则状态与"还没兑现的
+    处理义务"分居两处，备份与清理都得记两遍，而漏掉哪一处都不会有人发现。
+    ``state_path`` 是裸文件名（默认就是 ``state.json``，相对当前目录）时，
+    它的目录恰好就是 :func:`_bridge_dir`。
+    """
+    return os.path.join(
+        os.path.dirname(os.path.abspath(cfg.state_path)) or _bridge_dir(),
+        "inbox.db",
+    )
+
+
 class _NullHooks:
     """只为读取适配器能力快照而存在：不消费任何事件。"""
 
@@ -446,7 +462,22 @@ def _run_bridge_locked(cfg: Config) -> int:
     endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
     client = OpenCodeClient(endpoint)
     state = StateStore(cfg.state_path)
-    core = BridgeCore(cfg, client, state)
+    # 写前收件箱必须在 state 旁边，且**开/关都要说出来**：它是可选注入的
+    # （None = 关闭），静默关闭正好让这次要修的丢消息 bug 重新变得看不见 ——
+    # 所以启动日志里必须能一眼看出当前是开是关。
+    inbox_path = _inbox_path(cfg)
+    try:
+        inbox = InboundInbox(inbox_path)
+    except Exception:
+        logger.exception("写前收件箱打开失败（%s）", inbox_path)
+        inbox = None
+    if inbox is None:
+        logger.warning(
+            "写前收件箱：未启用 —— 投递窗口里崩溃仍会静默丢消息"
+        )
+    else:
+        logger.info("写前收件箱：已启用（%s）", inbox_path)
+    core = BridgeCore(cfg, client, state, inbox)
 
     usable = 0
     for name, entry in list((cfg.adapters or {}).items()):
@@ -468,6 +499,8 @@ def _run_bridge_locked(cfg: Config) -> int:
     if usable == 0:
         print(NO_ADAPTER_MESSAGE, file=sys.stderr)
         client.close()
+        if inbox is not None:
+            inbox.close()
         return 1
 
     core.start()
@@ -497,6 +530,8 @@ def _run_bridge_locked(cfg: Config) -> int:
         diagnostics.dump_stacks(exit_reason)
         diagnostics.close()
         core.stop()
+        if inbox is not None:
+            inbox.close()   # 生命周期清理：关掉 SQLite 连接（WAL 落盘）
     logger.info("已退出")
     return 0
 

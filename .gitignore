@@ -32,3 +32,9 @@ package-lock.json
 *.session
 *.session-journal
 .DS_Store
+
+# G2 写前收件箱（SQLite）。**含消息正文（text 列），属隐私数据，绝不提交。**
+# WAL 模式下还有两个副文件，一并忽略。
+inbox.db
+inbox.db-wal
+inbox.db-shm

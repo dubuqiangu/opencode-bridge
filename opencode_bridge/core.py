@@ -19,10 +19,15 @@ Robustness rules:
   removed, undecodable surrogates replaced)
 * ``adapter.edit`` is always wrapped: ``ValueError`` (text too long) falls
   back to ``adapter.send`` for finalisation
+* inbound **prompt** text is written to the durable inbox (when one is
+  injected) *before* it is dispatched, so a crash in the delivery window
+  loses nothing silently; the durable policy lives in
+  :mod:`opencode_bridge.inbox_recovery`, this module only wires it
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -34,6 +39,8 @@ from .adapters import Adapter
 from .config import DEFAULT_CONFIG_NAME, Config
 from .hooks import Button, Inbound, MsgHandle, Outbound  # BridgeCore implements Hooks
 from .identity import LEGACY_PREFIXES
+from .inbox import InboundInbox, QueuedPrompt
+from .inbox_recovery import recover_pending
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .state import StateStore
 
@@ -62,6 +69,11 @@ _PERM_DECISIONS = ("once", "always", "reject")
 #: ``StateStore`` 里存放"消息流位置"的 meta 键。轮询型适配器（email 的 IMAP
 #: UID 等）靠它跨重启续跑；见 :meth:`BridgeCore.load_stream_cursor`。
 _STREAM_CURSOR_META_KEY = "stream_cursor"
+
+#: 启动时等事件流确认连上的上限（秒），见 :meth:`BridgeCore._recover_inbox`。
+#: 取 2 秒是因为 opencode 通常就在本机；而真的不可达时这 2 秒只换来一行告警 ——
+#: 那种情况下恢复扫描本身也多半会失败，不该在这里死等。
+_EVENT_STREAM_CONFIRMED_TIMEOUT_SECONDS = 2.0
 
 HELP_TEXT = """\
 可用命令：
@@ -258,6 +270,80 @@ def _as_dict(value: Any) -> dict:
 
 
 # ----------------------------------------------------------------------
+# 写前收件箱：从一条入站消息到收件箱里的一行
+# ----------------------------------------------------------------------
+# 这一段刻意是**模块级函数**而不是 :class:`BridgeCore` 的方法：那个类已经
+# 51 个方法 / ~1160 行自有代码（AGENTS.md §5.1），纯逻辑的构造与记账不该再往里加。
+def _queued_prompt_for(inbound: Inbound, text: str) -> QueuedPrompt:
+    """Build the :class:`QueuedPrompt` row for one inbound message.
+
+    The body is carried through **verbatim** — never prefixed, never rewritten.
+    That text lands in the agent's context, so anything appended here (a
+    "replayed after crash" note, say) would be read by the agent as part of the
+    user's request. Alerts about a replay belong in the notification path, not
+    in the prompt.
+
+    Delivery id: the platform's own ``message_id`` when it has one, else
+    ``sha256(platform|conversation_id|text)``. The fallback is a real
+    trade-off — two byte-identical messages from a platform that reports no
+    ``message_id`` collapse into one delivery — so it is logged, never silent
+    (see :func:`_record_inbound`).
+    """
+    platform = str(inbound.platform or "")
+    conversation_id = str(inbound.conversation_id or "")
+    message_id = str(inbound.message_id) if inbound.message_id else None
+    if message_id:
+        delivery_id = "%s:%s:%s" % (platform, conversation_id, message_id)
+    else:
+        delivery_id = hashlib.sha256(
+            ("%s|%s|%s" % (platform, conversation_id, text)).encode("utf-8")
+        ).hexdigest()
+    return QueuedPrompt(
+        delivery_id=delivery_id,
+        conversation_id=conversation_id,
+        platform=platform,
+        message_id=message_id,
+        text=text,
+    )
+
+
+def _record_inbound(
+    inbox: InboundInbox | None, inbound: Inbound, text: str,
+) -> QueuedPrompt | None:
+    """Write-ahead one inbound prompt. Returns the row to deliver, or ``None``
+    to deliver nothing.
+
+    ``None`` means **dedup hit**: the same ``delivery_id`` is already in the
+    inbox, so the platform re-delivered something we have a receipt for. Running
+    the agent again on it is exactly what at-most-once is for.
+
+    ``inbox is None`` means the inbox is switched off; delivery proceeds
+    unchanged, just without a receipt.
+    """
+    queued = _queued_prompt_for(inbound, text)
+    if inbox is None:
+        return queued
+    if inbox.record(queued):
+        return queued
+    if queued.message_id is None:
+        # The hash-fallback collapse is the one dedup the user cannot predict
+        # from the platform side, so it gets spelled out rather than left as a
+        # mysterious "message ignored".
+        logger.info(
+            "inbox %s: duplicate ignored; this platform reports no message_id, "
+            "so the dedup key fell back to a content hash — two byte-identical "
+            "messages collapse into one delivery",
+            queued.delivery_id,
+        )
+    else:
+        logger.info(
+            "inbox %s: duplicate ignored (platform re-delivered a known message)",
+            queued.delivery_id,
+        )
+    return None
+
+
+# ----------------------------------------------------------------------
 # turn state
 # ----------------------------------------------------------------------
 @dataclass
@@ -288,11 +374,23 @@ class BridgeCore:
     """Routes IM messages to OpenCode sessions and streams events back."""
 
     def __init__(
-        self, config: Config, client: OpenCodeClient, state: StateStore
+        self,
+        config: Config,
+        client: OpenCodeClient,
+        state: StateStore,
+        inbox: InboundInbox | None = None,
     ) -> None:
+        """``inbox`` enables the write-ahead inbox; ``None`` switches it off.
+
+        Optional and last so that every existing construction site keeps working
+        untouched — which also means a wiring bug would be invisible (nothing
+        fails when the inbox is simply absent), so ``__main__`` logs which mode
+        it started in and ``tests/test_inbox_wiring.py`` guards the wiring.
+        """
         self.config = config
         self.client = client
         self.state = state
+        self._inbox = inbox
 
         self._lock = threading.RLock()
         self._adapters: list[Adapter] = []
@@ -302,13 +400,17 @@ class BridgeCore:
         #: session_id -> conversation_id (rebuilt from state per event)
         self._sid_conv: dict[str, str] = {}
         self._turns: dict[str, Turn] = {}
-        self._queues: dict[str, list[str]] = {}
+        self._queues: dict[str, list[QueuedPrompt]] = {}
         self._draining: set[str] = set()
         #: (session_id, tool call id) -> tool name (from tool.input.started)
         self._tool_names: dict[tuple[str, str], str] = {}
 
         self._thread: threading.Thread | None = None
         self._started = False
+        #: Set once the event stream has delivered its first frame, i.e. the
+        #: subscription is live. Startup recovery waits for it (bounded) before
+        #: replaying anything — see :meth:`_recover_inbox` for why.
+        self._event_stream_confirmed = threading.Event()
 
         bridge_cfg = getattr(config, "bridge", None) or {}
         self.edit_interval = self._positive_float(
@@ -378,7 +480,7 @@ class BridgeCore:
         logger.info("adapter attached: %s", adapter.name)
 
     def start(self) -> None:
-        """Start the SSE reader thread and every attached adapter."""
+        """Start the SSE reader thread, replay the inbox, then start adapters."""
         with self._lock:
             if self._started:
                 return
@@ -389,6 +491,8 @@ class BridgeCore:
             self._thread = thread
         thread.start()
         logger.info("event stream thread started")
+        # ⚠️ 位置有意义：SSE 线程**之后**、适配器**之前**（理由见 _recover_inbox）。
+        self._recover_inbox()
         for adapter in self.adapters:
             try:
                 adapter.start()
@@ -546,9 +650,16 @@ class BridgeCore:
                 )
                 return
             if text.startswith("/"):
+                # ⚠️ 命令**绝不**写前落盘。命令由 core 自己就地执行、从不经过
+                # prompt()，所以它永远不会走到 mark_delivered —— 那一行会永远留在
+                # 收件箱里，于是每次启动都被重放一遍：`/new` 每次重启都重建会话、
+                # `/setup` 每次都重发引导。那比要修的丢消息 bug 更糟。
+                # 落盘必须留在 else 分支里（tests/test_inbox_wiring.py 锁住这条）。
                 self._handle_command(conversation_id, adapter, text)
             else:
-                self._enqueue(conversation_id, text)
+                queued = _record_inbound(self._inbox, inbound, text)
+                if queued is not None:  # None = 去重命中，已投递过
+                    self._enqueue(queued)
         except Exception:
             logger.exception("on_inbound failed")
 
@@ -748,9 +859,10 @@ class BridgeCore:
     # ------------------------------------------------------------------
     # prompt queue (one conversation at a time, many in parallel)
     # ------------------------------------------------------------------
-    def _enqueue(self, conversation_id: str, text: str) -> None:
+    def _enqueue(self, queued: QueuedPrompt) -> None:
+        conversation_id = queued.conversation_id
         with self._lock:
-            self._queues.setdefault(conversation_id, []).append(text)
+            self._queues.setdefault(conversation_id, []).append(queued)
             if conversation_id in self._draining:
                 return  # current drainer will pick this up
             self._draining.add(conversation_id)
@@ -776,12 +888,16 @@ class BridgeCore:
                         # concurrent enqueue can never be lost
                         self._draining.discard(conversation_id)
                         return
-                    text = queue.pop(0)
-                outcome = self._dispatch_prompt(conversation_id, text)
+                    queued = queue.pop(0)
+                outcome = self._dispatch_prompt(queued)
                 if outcome == "busy":
+                    # 409 是"还没轮到"，不是失败：不写 failed，重试预算分文未花
+                    # （收件箱也没有"撤销 attempting"的转换，所以那一行停在
+                    # attempting —— 进程内重投成功后就转 delivered）。
+                    # 这一条退回内存队列，等 _flush_queue。
                     with self._lock:
                         queue = self._queues.setdefault(conversation_id, [])
-                        queue.insert(0, text)
+                        queue.insert(0, queued)
                         self._draining.discard(conversation_id)
                     return
         except Exception:
@@ -789,9 +905,23 @@ class BridgeCore:
             with self._lock:
                 self._draining.discard(conversation_id)
 
-    def _dispatch_prompt(self, conversation_id: str, text: str) -> str:
-        """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error``."""
+    def _dispatch_prompt(
+        self, queued: QueuedPrompt, *, recording_delivery: bool = True,
+    ) -> str:
+        """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error``.
+
+        The four inbox writes live here and nowhere else, because only this
+        method can tell *which* of the three outcomes happened — and the
+        ``attempting`` write has to sit immediately against ``client.prompt()``:
+        written earlier, a crash during ``create_session`` would leave a row
+        that looks "outcome unknown" when in fact the agent never ran.
+
+        ``recording_delivery=False`` skips the writes for the startup recovery
+        path, where :func:`~.inbox_recovery.recover_pending` is the sole bookkeeper.
+        """
+        conversation_id = queued.conversation_id
         adapter = self._adapter_for(conversation_id)
+        inbox = self._inbox if recording_delivery else None
         try:
             session_id = self._ensure_session(conversation_id)
         except Exception as exc:
@@ -802,10 +932,14 @@ class BridgeCore:
                 kind="error",
                 adapter=adapter,
             )
+            if inbox is not None:
+                inbox.mark_failed(queued.delivery_id, f"create_session failed: {exc}")
             return "error"
 
+        if inbox is not None:
+            inbox.mark_attempting(queued.delivery_id)
         try:
-            self.client.prompt(session_id, text)
+            self.client.prompt(session_id, queued.text)
         except OpenCodeError as exc:
             if exc.status == 409:
                 logger.info(
@@ -821,6 +955,8 @@ class BridgeCore:
                 kind="error",
                 adapter=adapter,
             )
+            if inbox is not None:
+                inbox.mark_failed(queued.delivery_id, f"prompt failed: {exc}")
             return "error"
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("prompt failed")
@@ -830,8 +966,12 @@ class BridgeCore:
                 kind="error",
                 adapter=adapter,
             )
+            if inbox is not None:
+                inbox.mark_failed(queued.delivery_id, f"prompt failed: {exc}")
             return "error"
 
+        if inbox is not None:
+            inbox.mark_delivered(queued.delivery_id)
         # success: create / reuse this turn's progress message
         with self._lock:
             turn = self._turns.get(session_id)
@@ -852,6 +992,91 @@ class BridgeCore:
                 if current is not None and current.progress_handle is None:
                     current.progress_handle = handle
         return "ok"
+
+    # ------------------------------------------------------------------
+    # inbox recovery (startup)
+    # ------------------------------------------------------------------
+    def _recover_inbox(self) -> None:
+        """Replay whatever the last crash left in the inbox.
+
+        **为什么夹在 SSE 线程与适配器之间**（两个邻居都不是随便选的）：
+
+        * **在 SSE 线程之后** —— 重放出去的 prompt 必须有人接它的回复。
+          ``session.execution.started`` 整条丢掉的话就没有 :class:`Turn`，
+          收尾时既不发布结果也不刷队列，用户对这条消息什么都看不到 ——
+          于是"修好丢消息"变成"重放出一条没有回复的消息"。
+          为此这里等事件流确认连上（有上限）：服务端握手后发的第一帧
+          （``server.connected``）到达即证明订阅已建立。
+        * **在适配器之前** —— 此刻还没有实况入站，重放不会和用户的新消息
+          并发打同一个会话（那种交错会把其中一条变成 409，甚至两次都成功）。
+        * **告警仍然送得出去** —— 这正是看上去的矛盾点：``notify`` 需要可用
+          的适配器，但扫描跑在 ``adapter.start()`` 之前。两者并不冲突：
+          ``Adapter.send`` 是纯出站（``start()`` 只负责入站轮询；见
+          ``adapters/telegram.py`` 的 ``send`` 与 ``start``），所以适配器
+          已 attach 就能发。真的发不出去时 :meth:`_send_text` 记警告，这里
+          再记一条 —— 这段告警只有这一条路，静默丢掉等于没告警。
+
+        ``uncertain`` / ``abandoned`` **已经**被 :func:`recover_pending`
+        告警过，这里只记日志，绝不重发。
+        """
+        inbox = self._inbox
+        if inbox is None:
+            logger.info(
+                "write-ahead inbox disabled (no inbox injected); "
+                "a crash during delivery loses that message silently"
+            )
+            return
+        if not self._event_stream_confirmed.wait(
+            timeout=_EVENT_STREAM_CONFIRMED_TIMEOUT_SECONDS
+        ):
+            logger.warning(
+                "event stream not confirmed within %.1fs; running inbox recovery "
+                "anyway (replays will most likely fail too — see the logs below)",
+                _EVENT_STREAM_CONFIRMED_TIMEOUT_SECONDS,
+            )
+
+        def dispatch_recovered(queued: QueuedPrompt) -> None:
+            """Hand one recovered prompt to opencode.
+
+            Goes through the very same :meth:`_dispatch_prompt` a live message
+            takes, which is also why the inbox bookkeeping is split the way it
+            is: :func:`~.inbox_recovery.recover_pending` owns the writes here
+            (it brackets this call with ``mark_attempting`` / ``mark_delivered``),
+            so a second ``mark_failed`` from inside the dispatch would burn two
+            retry-budget steps for one failure.
+
+            Anything other than ``ok`` raises so recovery records ``failed`` and
+            the next boot retries on the backoff ladder. ``busy`` included: at
+            startup there is no in-memory queue to fall back into.
+            """
+            outcome = self._dispatch_prompt(queued, recording_delivery=False)
+            if outcome != "ok":
+                raise OpenCodeError(
+                    f"replay of {queued.delivery_id} returned {outcome!r}"
+                )
+
+        def notify_recovered(conversation_id: str, alert_text: str) -> None:
+            """Send one user-visible recovery alert; never let it vanish."""
+            if self._send_text(conversation_id, alert_text, kind="text") is None:
+                logger.warning(
+                    "inbox recovery: could not deliver the alert for %s; "
+                    "the user may never learn about it",
+                    conversation_id,
+                )
+
+        logger.info("write-ahead inbox enabled; scanning for rows left by a crash")
+        outcome = recover_pending(
+            inbox,
+            dispatch=dispatch_recovered,
+            notify=notify_recovered,
+        )
+        logger.info(
+            "inbox recovery done: %d replayed, %d uncertain (alerted, NOT replayed),"
+            " %d abandoned (alerted)",
+            len(outcome.replayed),
+            len(outcome.uncertain),
+            len(outcome.abandoned),
+        )
 
     # ------------------------------------------------------------------
     # session lifecycle
@@ -1148,6 +1373,9 @@ class BridgeCore:
     def _event_loop(self) -> None:
         try:
             for event in self.client.subscribe():
+                # A first frame means the subscription is live. Startup recovery
+                # blocks on this before replaying (see :meth:`_recover_inbox`).
+                self._event_stream_confirmed.set()
                 try:
                     if not isinstance(event, dict):
                         continue

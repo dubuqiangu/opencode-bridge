@@ -883,3 +883,54 @@
     `plugin/README.md` 连 a2a/qqbot/homeassistant 三家都缺）—— 这次一并补齐，
     并在 install.md 里点明"入站就绪 ≠ 会收到消息"。
   验证：**homeassistant 42 OK**、compileall 0、**十三个平台**。
+
+- **2026-10-03** **A2b `state.json` 键迁移完成**（`state.py` 136 → 488 行 + 33 个用例）：
+  - lane **没有替我静默决定一个冲突**，而是把两个需求冲突原样报上来，这个态度比
+    "全绿"有价值得多（裁决见下）。
+  - **歧义 `channel:` 的策略：原样保留，一个字节都不改。** 分类只调
+    `identity.normalize(key)`、**永不传 `platform_hint`** —— 传了就等于编造一个
+    store 并不掌握的线索。测试用**三种形状刻意可区分**的 local id
+    （`channel:C123` / `channel:123456789012345678` / `channel:abcdefghijklmnopqrstuvwxyz`）
+    钉住这条：即使形状可区分也**不区分**。理由：形状启发式（Slack `C`/`D`、
+    Discord 全数字、Mattermost 26 位 base32）**正是 `identity.py` 明文禁止的那一套**，
+    而猜错的后果是把用户映射到**别人的会话**上 —— 不报错、难复现、已被污染。
+    保留的代价几乎为零：这些键继续走适配器现有的旧路径工作，只是没有"统一格式"这个属性。
+  - **碰撞策略同源**：目标键已被占用时**两份都留**，绝不覆盖、绝不合并。
+  - **原子性**：先纯内存重写（`migrate_document` 不碰磁盘）→ `shutil.copy2` 备份
+    → 走既有的 `mkstemp` + `flush` + `fsync` + **`os.replace`**（Windows 与 POSIX 上
+    都是原子的，文件要么全旧要么全新，**没有第三种状态**）。
+    **备份失败就整趟放弃**（没有备份 = 没有回滚路径 = 不动用户的文件）。
+  - **幂等靠两套机制，且正确性不依赖标记**：(a) **基于内容** —— 重写后不再有可无歧义
+    迁移的键，于是报告 `changed=False`，不写盘也不备份；(b) 版本闸门 ——
+    `schema_version >= 2` 直接跳过扫描。标记**故意不声称"所有键都是新格式"**
+    （保留的 `channel:` 是有意为之）。
+  - **损坏文件**（JSON 解析失败）打 ERROR 且**既不迁移也不重写**，留给用户手工抢救。
+    ⚠️ 这里有个与既有契约的张力：既有 `StateStore(path)` 遇到损坏文件会得到空 store，
+    而后续 `set_session` **会**覆盖它（`tests/test_opencode_client.py:536` 有断言）。
+    lane 把"不覆盖"的范围限定在**迁移路径**，显式写入保持旧行为——这个边界划得对，
+    但若意图是"损坏文件一律永不覆盖"，那是 `set_session` 的行为变更，需要单独决策。
+  - **超出字面要求的一处**：因为适配器目前还在发 `chat:`/`room:`，若只迁文件，
+    迁移期每次查找都会落空 —— 正是 A2b 要防的症状，只是换了个位置。
+    于是 `_lookup` 加了"精确键 → 无歧义别名"的一次回退（**歧义前缀没有别名，
+    所以它不会猜**），前缀切换后这段自动变成死代码。lane 核实了这不影响路由。
+  - ✅ **裁决（我确认 lane 的判断正确）**：它把 `migrate_keys` **默认设为关**，
+    因为**四个既有用例**（`test_telegram:193` / `test_matrix:596` / `test_slack:325` /
+    `test_discord_gateway:851`）断言的正是"切前缀会让会话映射丢失"，自动迁移会让那四条
+    断言变假，而其中两个文件属于当时在跑的 lane。默认关闭 ⇒ **零行为变化**、
+    文件逐字节不变（已实测），且符合仓库自己的规矩"切换必须与键迁移一起发"。
+    **后续动作**：翻转前缀的那一个变更里，必须同时（a）传 `migrate_keys=True`、
+    (b) 改写那 4 条用例、(c) 删掉 `_lookup` 的别名回退。三件事**同一个 commit**，
+    否则仓库停在半迁移态 —— 那正是"agent 突然忘事"的成因。
+  - 复核（我独立实测）：默认路径**文件逐字节不变、无备份、无临时文件**；
+    opt-in 后三种形状的 `channel:` **全部原样保留**、`chat:`→`telegram:`、
+    `room:`→`matrix:`、`meta` 与 `sessions` **同键映射不漂移**；
+    **幂等**（再加载两次文件逐字节不变、只产生 1 个备份）、`schema_version=2`；
+    **损坏文件原样保留且未被覆盖**并打 ERROR。
+  - lane 报的一条全量偶发失败（在我那条 homeassistant 用例上）我**独立排查了**：
+    连跑 15 次 + 全套 5 次**均 0 失败** —— 那次是它的全量跑撞上了另一条 lane 正在
+    写 `homeassistant.py` 的窗口，不是真flake。它没去追一个不属于它的根因，判断正确。
+  验证：**test_state 33 OK**、identity+core+routing+cli **133 OK**、
+  legacy 前缀适配器组（telegram/matrix/slack/discord/opencode_client）**215 OK**、
+  全量 **1404 OK (skipped=1)**、compileall 0。
+  文档：修正 `docs/architecture.md` 里过时的"`state.py` 136 行"（现 488 行），
+  并把不变量 9 从"提醒"升级为指向具体机制（含半迁移态为何危险）。

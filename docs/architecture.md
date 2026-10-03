@@ -91,7 +91,7 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 | `hooks.py` | 122 | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
 | `identity.py` | 241 | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
 | `split.py` | 294 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
-| `state.py` | 136 | `conversation_id ↔ session_id` 映射、落盘 | 平台知识 |
+| `state.py` | 488 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`migrate_keys=True` 才启用）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
 | `status.py` | 436 | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
 | `transport/base.py` | 395 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
 | `transport/polling.py` | 94 | HTTP 短轮询/长轮询 | — |
@@ -138,6 +138,16 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 9. **前缀切换必须与 `state.json` 键迁移一起发** —— 切前缀会让已落盘的键全部变孤儿，
    用户一次性丢失会话映射。已完成的迁移（irc/twitch/nextcloud）**字节级不变**，
    因为它们的前缀本就映射到自身；`chat:`/`room:`/`channel:` 尚待此步。
+
+   键迁移已实现为 `StateStore(path, migrate_keys=True)`，**默认关闭** —— 这是刻意的：
+   迁移若先于前缀切换单独上线，仓库会停在"文件已是新格式、适配器还在发旧前缀"的
+   **半迁移态**，那正是"agent 突然忘事"的成因。开启它必须与切换前缀、改写那 4 条
+   "切前缀会丢映射"的用例**在同一个变更里**完成。
+
+   歧义前缀 `channel:`（slack/discord/mattermost 共用）**原样保留**：
+   `state.py` 拿到的只是不透明字符串，它没有依据判断是哪一家，
+   而**猜错会把用户映射到别人的会话**。`get_session` 额外做一次"精确键 → 无歧义别名"
+   的回退查找，让迁移期不会出现"文件迁了但查找全落空"。
 
 ### 传输层
 

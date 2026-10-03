@@ -504,7 +504,11 @@ class SetupCommandTests(unittest.TestCase):
                 else:
                     body = out.text
                 self.assertNotIn("D:\\workSpace", body)
-                self.assertNotIn("C:\\Users\\33204", body)
+                # 用**通用占位符**而不是本机真实用户名 —— 这条断言要防的是
+                # "冻结文案硬编码了机器路径"，而把真实用户名写进公开仓库等于
+                # 自己泄漏它，且与被测行为无关。
+                self.assertNotIn("C:\\Users\\example-user", body)
+                self.assertNotIn("C:\\Users\\%s" % os.environ.get("USERNAME", ""), body)
 
     def test_setup_config_path_is_derived_at_runtime(self):
         with tempfile.TemporaryDirectory() as td:

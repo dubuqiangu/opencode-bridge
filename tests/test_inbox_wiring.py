@@ -132,7 +132,7 @@ class InboxWiringTestCase(unittest.TestCase):
         """走真实的 ``start()``，并让事件流立刻确认连上。
 
         那条 ``server.connected`` 是服务端握手后发的第一帧（见
-        ``test_opencode_client``），正是 :meth:`BridgeCore._recover_inbox` 等的信号 ——
+        ``test_opencode_client``），正是 :meth:`InboundGateway.recover_inbox` 等的信号 ——
         不推它的话每个用例会白等 2 秒上限。
         """
         client.push({"type": "server.connected", "data": {}})
@@ -248,8 +248,10 @@ class CrashBeforeDispatchReplaysThePendingRow(InboxWiringTestCase):
     def test_pending_row_is_replayed_by_the_next_boot(self):
         core, client, _adapter, _inbox = self.make_core()
         # Die between the write-ahead and the enqueue: _enqueue never runs at all.
+        # （入队搬进了 ``InboundGateway``，所以打的是那边的 ``_enqueue``；同一个窗口。）
         with mock.patch.object(
-            core, "_enqueue", side_effect=SimulatedCrash("died right after record")
+            core.inbound_gateway, "_enqueue",
+            side_effect=SimulatedCrash("died right after record"),
         ):
             with self.assertRaises(SimulatedCrash):
                 core.on_inbound(inbound_message("把 README 翻译成英文", message_id="3"))
@@ -332,7 +334,7 @@ class RedeliveryIsDeduplicated(InboxWiringTestCase):
         core, client, _adapter, _inbox = self.make_core()
         core.on_inbound(inbound_message("跑一下测试", message_id=None))
 
-        with self.assertLogs("opencode_bridge.core", level="INFO") as captured:
+        with self.assertLogs("opencode_bridge.inbound_gateway", level="INFO") as captured:
             core.on_inbound(inbound_message("跑一下测试", message_id=None))
 
         self.assertEqual(texts_of(client.prompts), ["跑一下测试"])

@@ -298,7 +298,6 @@ class IRCAdapter(Adapter):
     outbound_tokens = ("host", "nick")
 
     # 类级旋钮（测试可在实例上覆盖）。
-    message_limit = MESSAGE_LIMIT
     line_limit = LINE_LIMIT
     min_interval = 1.0          # 防 flood：两次 PRIVMSG 的最小间隔（秒）
     ping_interval = PING_INTERVAL
@@ -712,7 +711,7 @@ class IRCAdapter(Adapter):
         """出站分片：先按字符上限切（与其它适配器同用 split_text），再按字节兜底。"""
         budget = self._body_budget(target)
         pieces: List[str] = []
-        for chunk in split_text(text, self.message_limit, prefix_fmt=""):
+        for chunk in split_text(text, self.effective_max_length, prefix_fmt=""):
             pieces.extend(_byte_safe_split(chunk, budget))
         return pieces
 

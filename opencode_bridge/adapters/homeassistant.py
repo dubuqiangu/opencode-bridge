@@ -392,8 +392,6 @@ class HomeAssistantAdapter(Adapter):
     outbound_tokens = ("url", "token")
 
     # -- 类级旋钮（测试可在实例上覆盖）----------------------------------
-    #: 运行时分片阈值（初值 = 静态保守值）。
-    message_limit = MESSAGE_LIMIT
     min_interval = 0.0                    # HA 没有文档化的出站频率限制
     ping_interval = PING_INTERVAL
     command_timeout = COMMAND_TIMEOUT
@@ -1289,14 +1287,6 @@ class HomeAssistantAdapter(Adapter):
             {"code": slot["code"], "message": slot["message"]},
         )
 
-    def _effective_limit(self) -> int:
-        limit = getattr(self, "message_limit", 0)
-        try:
-            value = int(limit)
-        except (TypeError, ValueError):
-            value = 0
-        return value if value > 0 else int(self.max_message_length)
-
     def send(self, out: Outbound) -> MsgHandle | None:
         """调一次 service（默认 ``persistent_notification.create``），超长自动分片。
 
@@ -1317,11 +1307,11 @@ class HomeAssistantAdapter(Adapter):
             self._note_send_failure(SendError.BAD_FORMAT, "token missing")
             return None
 
-        chunks = split_text(out.text, self._effective_limit(), prefix_fmt="")
+        chunks = split_text(out.text, self.effective_max_length, prefix_fmt="")
         if len(chunks) > 1:
             logger.info(
                 "homeassistant: splitting outbound message into %d chunks (limit=%d，"
-                "⚠️ 上限是自选保守值，官方未公布)", len(chunks), self._effective_limit(),
+                "⚠️ 上限是自选保守值，官方未公布)", len(chunks), self.effective_max_length,
             )
         handle: Optional[MsgHandle] = None
         for chunk in chunks:

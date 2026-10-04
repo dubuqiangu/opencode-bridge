@@ -211,7 +211,7 @@ class MattermostAdapter(Adapter):
     能力声明（T1.1）里的 ``max_message_length`` 是**静态下限**，不是精确上限 ——
     真实上限随部署而异（服务端运行时从 DB 列宽算出），启动后由
     :meth:`_apply_max_post_size` 用 ``GET /config/client`` 的 ``MaxPostSize`` 细化，
-    出站分片按**运行时的有效值**切（见 :attr:`message_limit`）。
+    出站分片按**运行时的有效值**切（见 :attr:`effective_max_length`）。
 
     ``_conversation_id`` 产出统一格式 ``mattermost:<channel_id>``（已从 ``channel:``
     切过来），``_channel_id`` 仍认旧前缀；读取时的归属划分见
@@ -236,8 +236,8 @@ class MattermostAdapter(Adapter):
     outbound_tokens = ("site_url", "token")
 
     # -- 类级旋钮（测试可在实例上覆盖）----------------------------------
-    #: 分片阈值（**运行时的有效上限**）：初值 = 静态下限，``start()`` 后被 MaxPostSize 细化。
-    message_limit = MESSAGE_LIMIT
+    # 分片阈值不在这里声明：基类的 ``message_limit`` 槽默认 ``0``（= 静态下限），
+    # ``start()`` 后由 :meth:`_apply_max_post_size` 写入服务端 ``MaxPostSize``。
     min_interval = MIN_SEND_INTERVAL
     #: 迁移前 Mattermost 用的 ``conversation_id`` 前缀（**歧义**：三家共用）。
     #: 值刻意写**字面量**，不用任何常量拼 —— 拼了就跟"防走偏断言"一样会恒真。
@@ -502,24 +502,22 @@ class MattermostAdapter(Adapter):
         return value
 
     def _apply_max_post_size(self, value: Optional[int]) -> int:
-        """用运行时 ``MaxPostSize`` 细化分片阈值，返回生效值（取不到则保持静态下限）。"""
+        """用运行时 ``MaxPostSize`` 细化分片阈值，返回生效值（取不到则保持静态下限）。
+
+        比较对象是 :attr:`effective_max_length` 而不是裸槽：槽的初值是 ``0``（"未细化"），
+        拿它比会在"服务端恰好等于静态下限"时多打一条没发生过的细化日志。
+        """
         if value is None or value <= 0:
             self.message_limit = int(self.max_message_length)
-            return self.message_limit
-        if value != self.message_limit:
+            return self.effective_max_length
+        if value != self.effective_max_length:
             logger.info(
                 "mattermost: 消息上限由静态下限 %d 细化为服务端 MaxPostSize=%d",
                 self.max_message_length,
                 value,
             )
         self.message_limit = value
-        return self.message_limit
-
-    @property
-    def effective_max_length(self) -> int:
-        """**运行时生效**的出站分片阈值（= ``MaxPostSize``，或取不到时的静态下限）。"""
-        limit = _as_int(getattr(self, "message_limit", 0), int(self.max_message_length))
-        return limit if limit > 0 else int(self.max_message_length)
+        return self.effective_max_length
 
     def _refresh_runtime_limits(self) -> None:
         """启动时补齐两样运行期事实。**任何失败都只降级，不抛**（``start()`` 不许抛）。"""

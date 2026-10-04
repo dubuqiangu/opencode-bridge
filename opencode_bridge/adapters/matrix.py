@@ -146,7 +146,6 @@ class MatrixAdapter(Adapter):
     outbound_tokens = ("homeserver", "access_token")
 
     # 类级旋钮（测试可在实例上覆盖）。
-    message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
     backoff_interval = BACKOFF_INTERVAL
 
@@ -526,7 +525,7 @@ class MatrixAdapter(Adapter):
             return None
         # prefix_fmt="" 与 telegram/slack/discord 保持一致：分段不额外加「（i/n）」，
         # 且 "".join(chunks) == 原文。
-        chunks: List[str] = split_text(out.text, self.message_limit, prefix_fmt="")
+        chunks: List[str] = split_text(out.text, self.effective_max_length, prefix_fmt="")
         if len(chunks) > 1:
             logger.info("matrix: splitting outbound message into %d chunks", len(chunks))
         handle: MsgHandle | None = None
@@ -559,7 +558,7 @@ class MatrixAdapter(Adapter):
         已知局限：
         * 并非所有客户端都支持 MSC2676 回落写法；不支持的只会当成一条普通消息 ——
           内容不丢，但会多出一条。**调用方不应把它当成"原地改写"来做幂等判断。**
-        * 新正文超过 :attr:`message_limit` 时**退化为发一条新消息**（普通
+        * 新正文超过 :attr:`effective_max_length` 时**退化为发一条新消息**（普通
           ``send``，会自行分片），不再带编辑语义。
         * 因为带 ``m.relates_to``，本条消息会被自己的入站过滤跳过
           （见 :meth:`_handle_event`），不会形成回声。
@@ -578,11 +577,11 @@ class MatrixAdapter(Adapter):
             logger.warning("matrix: refusing to edit with empty text")
             self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return False
-        if len(out.text) > self.message_limit:
+        if len(out.text) > self.effective_max_length:
             logger.info(
                 "matrix: edit body too long (%d > %d); degrading to plain send",
                 len(out.text),
-                self.message_limit,
+                self.effective_max_length,
             )
             return self.send(
                 Outbound(

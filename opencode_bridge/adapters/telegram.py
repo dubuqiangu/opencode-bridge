@@ -128,7 +128,6 @@ class TelegramAdapter(Adapter):
     supports_message_edit = True
 
     # Class-level knobs (tests may override them on the instance).
-    message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
     backoff_interval = BACKOFF_INTERVAL
 
@@ -632,7 +631,7 @@ class TelegramAdapter(Adapter):
         # prefix_fmt="" 保持既有出站行为（分段不加「（i/n）」前缀，且
         # "".join(chunks) == text）。前缀编号是 split.py 的可选能力，
         # 是否默认开启见 tasks.md T1.4 的后续决策。
-        chunks = split_text(out.text, self.message_limit, prefix_fmt="")
+        chunks = split_text(out.text, self.effective_max_length, prefix_fmt="")
         if len(chunks) > 1:
             logger.info(
                 "telegram: splitting outbound message into %d chunks", len(chunks)
@@ -685,9 +684,9 @@ class TelegramAdapter(Adapter):
         Raises ``ValueError`` when the text exceeds 4096 characters — per
         CONTRACT.md §2.2 the caller is responsible for truncating.
         """
-        if len(out.text) > self.message_limit:
+        if len(out.text) > self.effective_max_length:
             raise ValueError(
-                f"telegram edit text too long: {len(out.text)} > {self.message_limit}"
+                f"telegram edit text too long: {len(out.text)} > {self.effective_max_length}"
             )
         if not out.text:
             logger.warning("telegram: refusing to edit with empty text")

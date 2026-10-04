@@ -92,7 +92,6 @@ class NtfyAdapter(Adapter):
     outbound_tokens = ("topic",)
 
     # 类级旋钮（测试可在实例上覆盖）
-    message_limit = MESSAGE_LIMIT
     poll_interval = DEFAULT_POLL_INTERVAL
     min_interval = MIN_SEND_INTERVAL
 
@@ -340,7 +339,7 @@ class NtfyAdapter(Adapter):
         # ntfy 不支持"一条消息拆多段"的语义，但单条有 4096 字节硬上限，
         # 所以按**字节**预算切；split_text 是按字符切的（其它平台用），
         # 这里先用它做粗切，再用 _fit_bytes 兜住字节上限。
-        for chunk in split_text(out.text, int(self.message_limit), prefix_fmt=""):
+        for chunk in split_text(out.text, self.effective_max_length, prefix_fmt=""):
             piece = self._fit_bytes(chunk)
             if not piece:
                 continue

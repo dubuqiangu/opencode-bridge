@@ -141,7 +141,6 @@ class SlackAdapter(Adapter):
     # 让 --status / --setup --json 不会把这种情况报成"已配置"。
     required_tokens = ("bot_token", "app_token")
 
-    message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
 
     #: 迁移前 Slack 用的 ``conversation_id`` 前缀（**歧义**：三家共用）。
@@ -478,7 +477,7 @@ class SlackAdapter(Adapter):
             logger.warning("slack: refusing to send empty text")
             self._note_send_failure(SendError.BAD_FORMAT, "empty text")
             return None
-        chunks: List[str] = split_text(out.text, self.message_limit, prefix_fmt="")
+        chunks: List[str] = split_text(out.text, self.effective_max_length, prefix_fmt="")
         if len(chunks) > 1:
             logger.info("slack: splitting outbound message into %d chunks", len(chunks))
         handle: MsgHandle | None = None

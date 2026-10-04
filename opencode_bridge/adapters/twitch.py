@@ -260,7 +260,6 @@ class TwitchAdapter(Adapter):
     outbound_tokens = ("token", "channel")
 
     # 类级旋钮（测试可在实例上覆盖）。
-    message_limit = MESSAGE_LIMIT
     line_budget = LINE_BUDGET
     inbound_line_limit = INBOUND_LINE_LIMIT
     min_interval = MIN_SEND_INTERVAL
@@ -856,7 +855,7 @@ class TwitchAdapter(Adapter):
         """先按字符上限切（与其余平台一致），再按字节兜底（不切出乱码）。"""
         budget = self._body_budget(target)
         pieces: List[str] = []
-        for chunk in split_text(text, self.message_limit, prefix_fmt=""):
+        for chunk in split_text(text, self.effective_max_length, prefix_fmt=""):
             pieces.extend(_byte_safe_split(chunk, budget))
         return pieces
 

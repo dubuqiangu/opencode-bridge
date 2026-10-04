@@ -437,7 +437,6 @@ class EmailAdapter(Adapter):
     outbound_tokens = ("address", "password", "smtp_host")
 
     # -- 类级旋钮（测试可在实例上覆盖）---------------------------------
-    message_limit = MESSAGE_LIMIT
     poll_interval = DEFAULT_POLL_INTERVAL
     min_interval = MIN_SEND_INTERVAL
     dedupe_capacity = DEDUPE_CAPACITY

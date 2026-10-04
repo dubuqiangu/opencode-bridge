@@ -306,8 +306,6 @@ class QQBotAdapter(Adapter):
     outbound_tokens = ("app_id", "app_secret")
 
     # -- 类级旋钮（测试可在实例上覆盖）----------------------------------
-    #: 运行时分片阈值（初值 = 静态保守值）。
-    message_limit = MESSAGE_LIMIT
     min_interval = MIN_SEND_INTERVAL
     #: 读超时兜底；测试可以调小以验证"半开连接会被发现并重连"。
     ws_recv_timeout = WS_RECV_TIMEOUT
@@ -1144,14 +1142,6 @@ class QQBotAdapter(Adapter):
             if self._stop_event.wait(wait):
                 return
 
-    def _effective_limit(self) -> int:
-        limit = getattr(self, "message_limit", 0)
-        try:
-            value = int(limit)
-        except (TypeError, ValueError):
-            value = 0
-        return value if value > 0 else int(self.max_message_length)
-
     def _passive_reply_fields(self, scope: str, cid: str) -> dict:
         """被动回复字段（``msg_id`` + ``msg_seq``）；不适用时返回 ``{}``。
 
@@ -1203,7 +1193,7 @@ class QQBotAdapter(Adapter):
             self._note_send_failure(SendError.TRANSIENT, f"access_token: {exc}")
             return None
 
-        limit = self._effective_limit()
+        limit = self.effective_max_length
         chunks = split_text(out.text, limit, prefix_fmt="")
         if len(chunks) > 1:
             logger.info(

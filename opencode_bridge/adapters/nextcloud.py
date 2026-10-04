@@ -268,8 +268,8 @@ class NextcloudAdapter(Adapter):
     outbound_tokens = ("base_url", "username", "password")
 
     # -- 类级旋钮（测试可在实例上覆盖）----------------------------------
-    #: 分片阈值（运行时的有效上限）：初值 = 源码常量，``start()`` 后可能被 capabilities 细化。
-    message_limit = MESSAGE_LIMIT
+    # 分片阈值不在这里声明：基类的 ``message_limit`` 槽默认 ``0``（= 静态下限），
+    # ``start()`` 后由 :meth:`_apply_max_chat_length` 写入部署侧的 ``max-length``。
     min_interval = 0.0                         # Talk 没有 Matrix/Slack 那种会话级节流
 
     def __init__(self, config: dict, hooks: Hooks) -> None:
@@ -539,20 +539,14 @@ class NextcloudAdapter(Adapter):
         """用部署侧的 ``max-length`` 细化分片阈值；取不到就沿用源码常量。"""
         if value is None or value <= 0:
             self.message_limit = int(self.max_message_length)
-            return self.message_limit
-        if value != self.message_limit:
+            return self.effective_max_length
+        if value != self.effective_max_length:
             logger.info(
                 "nextcloud: 消息上限由源码常量 %d 细化为部署值 %d",
                 self.max_message_length, value,
             )
         self.message_limit = value
-        return self.message_limit
-
-    @property
-    def effective_max_length(self) -> int:
-        """**运行时生效**的出站分片阈值。"""
-        limit = _as_int(getattr(self, "message_limit", 0), int(self.max_message_length))
-        return limit if limit > 0 else int(self.max_message_length)
+        return self.effective_max_length
 
     def _refresh_runtime_facts(self) -> None:
         """启动时补齐运行期事实。**任何失败都只降级，不抛**（``start()`` 不许抛）。"""

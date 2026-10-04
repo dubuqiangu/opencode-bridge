@@ -90,6 +90,19 @@ class Adapter(abc.ABC):
     label: str = ""
     #: 单条消息的字符上限；出站分片（T1.4）以此为阈值。
     max_message_length: int = 4000
+    #: **运行期细化槽**：服务端告诉我们的、比 :attr:`max_message_length` **更严**的
+    #: 单条出站上限；``0`` = 服务端没说（就按 :attr:`max_message_length` 切）。
+    #:
+    #: 只有拿得到服务端上限的平台才写它：Mattermost 用 ``MaxPostSize``、Nextcloud 用
+    #: ``spreed.config.chat.max-length``（见两家的 ``_apply_*``）。
+    #:
+    #: ⚠️ 默认**必须**是 ``0``，不能是 :attr:`max_message_length`。这个槽一旦自带初值，
+    #: 它就和 :attr:`max_message_length` 变成两个同义不同名的数，每个新消费者都得重新
+    #: 猜一遍该读哪个、每个适配器还得各自抄一份解析 —— 那正是此前**十二个**适配器
+    #: 重复声明它的原因，而漏掉声明的那个会在**投递时**才 ``AttributeError``。
+    #: 声明平台上限只需写 :attr:`max_message_length`（能力声明，:meth:`capabilities`
+    #: 对外报的就是它）；要读"实际按多少切"一律读 :attr:`effective_max_length`。
+    message_limit: int = 0
     #: 是否具备入站（接收）能力。False = 只能主动发送。
     supports_inbound: bool = False
     #: 是否支持 inline 按钮 / 卡片式交互。
@@ -177,22 +190,32 @@ class Adapter(abc.ABC):
     def effective_max_length(self) -> int:
         """**运行期真正生效**的单条出站上限，即 :meth:`send` 实际切分的那个数。
 
-        与类属性 :attr:`max_message_length` 分开是有原因的：Mattermost /
-        Nextcloud 启动后会拿服务端的 ``MaxPostSize`` / ``max-length`` 把它细化
-        （见 ``adapters/mattermost.py`` 的 ``_apply_max_post_size``），所以
+        这是**唯一**该读"我按多少切"的地方。答案 = :attr:`message_limit`（运行期细化
+        槽，非 0 时胜出），否则 :attr:`max_message_length`（声明的静态下限）。
+
+        与 :attr:`max_message_length` 分开是有原因的：Mattermost / Nextcloud 启动后
+        会拿服务端的 ``MaxPostSize`` / ``max-length`` 把它细化（见
+        ``adapters/mattermost.py`` 的 ``_apply_max_post_size``），所以
         **类属性是静态下限，不是真值**。
 
-        收在基类上是因为这个问题此前有四个名字：``message_limit``（类属性）、
-        ``effective_max_length``（mattermost / nextcloud 的 property）、
-        ``_effective_limit``（homeassistant / qqbot 的私有方法），
-        而**基类自己一个答案都没有** —— 于是每个新消费者都得重新猜一遍该读哪个。
-        声明方（mattermost / nextcloud）的同名 property 会覆盖本实现，行为不变。
+        收在基类上、且只有这一份解析，是因为这个问题此前有**四个名字**：
+        ``message_limit``（类属性）、``effective_max_length``（mattermost /
+        nextcloud 各自的 property）、``_effective_limit``（homeassistant /
+        qqbot 各自的私有方法），而**基类自己一个答案都没有** —— 于是每个新消费者都
+        得重新猜一遍该读哪个，每个适配器还得各自抄一份等价的解析。现在：槽声明在
+        基类、解析在基类、读取只有本属性一处，子类不再需要覆写本属性。
         """
-        try:
-            limit = int(getattr(self, "message_limit", 0))
-        except (TypeError, ValueError):
+        declared = int(self.max_message_length)
+        raw = self.message_limit
+        if raw is None or isinstance(raw, bool):
+            # ``bool`` 不当长度用（``True`` 不是"1 字符"）：按"没细化"处理。
             limit = 0
-        return limit if limit > 0 else int(self.max_message_length)
+        else:
+            try:
+                limit = int(raw)
+            except (TypeError, ValueError):
+                limit = 0
+        return limit if limit > 0 else declared
 
     def owns_local_id(self, local_id: str) -> bool:
         """``local_id`` 是不是落在**本平台**的 id 命名空间里。

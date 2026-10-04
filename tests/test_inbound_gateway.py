@@ -506,6 +506,187 @@ class OnInboundTests(InboundGatewayTestCase):
         self.assertEqual(self.inbox.recorded, [])
         self.assertEqual(self.client.prompts, [])
 
+
+# ----------------------------------------------------------------------
+# 3c: 入站正文的缩进 —— 逐字节保留（去空白 ≠ 去缩进）
+# ----------------------------------------------------------------------
+# 这一类盯的是**agent 实际收到的正文**（``prompt_bodies`` 剥掉渠道说明后的那段），
+# 不是被清洗前的入参。⚠️ 每一条的第一行都**带缩进** —— 一个首行无缩进的样本会让
+# 断言恒真，那正是本项目已经踩过一次（先写了一个首行没缩进的样本，"验证"通过，
+# 然后样本被扔掉、断言什么也没证明）。
+class InboundIndentationTests(InboundGatewayTestCase):
+    """把"空白是噪声、缩进有意义"这条不变量钉在真实路径上。"""
+
+    #: 只调保险丝，不动长输入回执的门槛（这一类与那条无关）。
+    bridge_config = {"merge_continue_timeout_seconds": 0.05}
+
+    def delivered(self) -> list[str]:
+        """每条 prompt 里的**用户正文**（渠道说明已剥掉）。"""
+        return [user_text_of(text) for _, text in self.client.prompts]
+
+    # --- 决定性的一条 -----------------------------------------------------
+    def test_a_pasted_python_block_reaches_the_agent_byte_for_byte(self):
+        pasted = "    def f():\n        return 1"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual(self.delivered(), [pasted])
+
+    def test_the_indentation_error_is_not_manufactured_any_more(self):
+        """⚠️ 改之前：第一行 dedent、第二行不 dedent → ``def f():`` 后面跟着一个
+        8 空格函数体 = ``IndentationError``。这条断言的是**不存在**这种形状。"""
+        self.gateway.on_inbound(
+            message("    def f():\n        return 1", message_id="m1")
+        )
+
+        first, second = self.delivered()[0].split("\n")
+        self.assertTrue(first.startswith("    "), "首行缩进被吃掉了：%r" % first)
+        self.assertGreater(len(second) - len(second.lstrip()), len(first) - len(
+            first.lstrip()), "函数体必须比 def 更深")
+
+    def test_a_nested_yaml_block_reaches_the_agent_byte_for_byte(self):
+        pasted = "build:\n  steps:\n    - name: test\n      run: pytest"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual(self.delivered(), [pasted])
+
+    def test_a_deeply_nested_block_keeps_every_level(self):
+        pasted = "  a:\n    b:\n      c:\n        - 1\n        - 2"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual(self.delivered(), [pasted])
+
+    # --- 开头的空行仍然要丢 -----------------------------------------------
+    def test_leading_blank_lines_are_dropped_and_indentation_kept(self):
+        self.gateway.on_inbound(
+            message("\n\n    def g():\n        return 2\n\n", message_id="m1")
+        )
+
+        self.assertEqual(self.delivered(), ["    def g():\n        return 2"])
+
+    def test_interior_blank_lines_are_kept(self):
+        """内部空行是代码结构的一部分，不是排版噪声。"""
+        pasted = "def a():\n    pass\n\n\ndef b():\n    pass"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual(self.delivered(), [pasted])
+
+    # --- 全空白 / 无空白 --------------------------------------------------
+    def test_an_all_whitespace_message_is_dropped_not_turned_into_something(self):
+        """全空白 → 空串 → 守卫丢掉。**不是**变成一串空格发给 agent。"""
+        for blank in ("", "   ", "\n\n", "  \n\t\n  "):
+            with self.subTest(blank=blank):
+                self.client.prompts.clear()
+                self.gateway.on_inbound(message(blank, message_id="m1"))
+
+                self.assertEqual(self.client.prompts, [])
+                self.assertEqual(self.inbox.recorded, [])
+
+    def test_a_single_line_without_whitespace_is_untouched(self):
+        self.gateway.on_inbound(message("hi", message_id="m1"))
+
+        self.assertEqual(self.delivered(), ["hi"])
+
+    def test_a_single_indented_line_keeps_its_indentation(self):
+        self.gateway.on_inbound(message("    indented", message_id="m1"))
+
+        self.assertEqual(self.delivered(), ["    indented"])
+
+    # --- 尾巴 --------------------------------------------------------------
+    def test_trailing_newlines_are_dropped(self):
+        self.gateway.on_inbound(
+            message("    x = 1\n\n\n", message_id="m1")
+        )
+
+        self.assertEqual(self.delivered(), ["    x = 1"])
+
+    def test_trailing_spaces_on_the_last_line_are_dropped(self):
+        self.gateway.on_inbound(message("    x = 1   ", message_id="m1"))
+
+        self.assertEqual(self.delivered(), ["    x = 1"])
+
+    def test_interior_trailing_spaces_are_not_rewritten(self):
+        """⚠️ 只动**结尾**。行尾那圈空格在正文里，删它同样是改写用户写的代码。"""
+        pasted = "def m():\n    return 1   \n\ndef n():\n    pass"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual(self.delivered(), [pasted])
+
+    # --- 收件箱里存的也必须是缩进完好的那份 --------------------------------
+    def test_the_inbox_row_keeps_the_indentation_too(self):
+        """⚠️ 去重键与重放读的都是收件箱那一行。它若存的是 dedent 过的版本，
+        那么崩溃重放出来的 prompt 仍然是坏的 —— 而那条路没有真人看着。"""
+        pasted = "    def f():\n        return 1"
+
+        self.gateway.on_inbound(message(pasted, message_id="m1"))
+
+        self.assertEqual([row.text for row in self.inbox.recorded], [pasted])
+
+    # --- 与 C3 合并的交界 -------------------------------------------------
+    def test_a_held_line_keeps_its_indentation_all_the_way_through(self):
+        """⚠️ **C3 与这条的交界**：strip 在**合并之前**逐行跑，所以合并前被缓冲的
+        那一行的缩进也会被吃掉 —— 不只第一条消息的第一行。"""
+        self.gateway.on_inbound(message("    def f():..", message_id="m1"))
+        self.gateway.on_inbound(message("        return 1", message_id="m2"))
+
+        self.assertEqual(self.delivered(), ["    def f():\n        return 1"])
+
+    def test_a_merged_burst_keeps_the_indentation_of_every_line(self):
+        self.gateway.on_inbound(message("  a:..", message_id="m1"))
+        self.gateway.on_inbound(message("    b:..", message_id="m2"))
+        self.gateway.on_inbound(message("      c: 1", message_id="m3"))
+
+        self.assertEqual(self.delivered(), ["  a:\n    b:\n      c: 1"])
+
+    def test_the_expired_hold_also_keeps_the_indentation(self):
+        """保险丝那条路**不**重新走清洗（它直接调 :meth:`_persist_and_enqueue`），
+        所以缓冲里攒下的缩进原样送达。"""
+        self.gateway.on_inbound(message("    def f():..", message_id="m1"))
+
+        self.assertTrue(self.hold_expired.wait(timeout=5),
+                        "保险丝没有把缓冲交出来")
+        self.assertEqual(self.delivered(), ["    def f():"])
+
+    # --- 命令不受影响 ------------------------------------------------------
+    def test_a_command_with_a_leading_space_is_still_a_command(self):
+        """⚠️ **刻意保留的旧行为**：修缩进时若连带把 lstrip 去掉，
+        ``"  /help"`` 就会从一条命令变成一条发给 agent 的消息。命令那一支显式
+        lstrip，所以这里与改动前逐字节一致。"""
+        self.gateway.on_inbound(message("  /help", message_id="m1"))
+
+        self.assertEqual(self.commands,
+                         [(CONVERSATION, self.adapter_result, "/help")])
+
+    def test_a_command_with_a_trailing_space_is_still_a_command(self):
+        self.gateway.on_inbound(message("/help  ", message_id="m1"))
+
+        self.assertEqual(self.commands,
+                         [(CONVERSATION, self.adapter_result, "/help")])
+
+    def test_a_command_surrounded_by_blank_lines_is_still_a_command(self):
+        """旧代码是 ``.strip()``，所以前导空行也一样容得下。"""
+        self.gateway.on_inbound(message("\n\n  /help\n", message_id="m1"))
+
+        self.assertEqual(self.commands,
+                         [(CONVERSATION, self.adapter_result, "/help")])
+
+    def test_an_indented_line_starting_with_a_slash_is_still_routed_as_a_command(self):
+        """⚠️ **已知残留，本次刻意不改**：``"    /usr/bin/env"`` 这种缩进的
+        ``/`` 开头行仍然进命令表（于是回一句"未知命令"）。
+
+        旧代码是 ``.strip()``，**行为完全一样** —— 所以这不是本次引入的回归，
+        改它就属于"缩进之外的改动"了。真正的分界（缩进的 ``/`` 开头应当当正文）
+        要动的是命令路由，那是另一次取舍。
+        """
+        self.gateway.on_inbound(message("    /usr/bin/env", message_id="m1"))
+
+        self.assertEqual(self.commands,
+                         [(CONVERSATION, self.adapter_result, "/usr/bin/env")])
+
     def test_a_failing_inbound_is_logged_and_never_escapes(self):
         """一条坏消息不许打断适配器的轮询循环。"""
         self.remember_platform_error = RuntimeError("platform lookup blew up")

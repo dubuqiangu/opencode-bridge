@@ -764,6 +764,114 @@ class InboundBurstTests(unittest.TestCase):
                 [out.text for out in adapter.sent if "已收到" in out.text], []
             )
 
+
+# ----------------------------------------------------------------------
+# 入站缩进：粘贴的代码块必须**逐字节**到达 agent
+# ----------------------------------------------------------------------
+# 这一类只认一件事：**agent 实际收到的那段正文**（``prompt_bodies`` 已经把渠道说明
+# 剥掉，剩下的那段仍须逐字节等于用户敲的）。⚠️ 每个样本的**第一行都带缩进** ——
+# 首行无缩进的样本会让断言恒真，那正是本项目已经踩过一次的坑。
+class InboundIndentationTests(unittest.TestCase):
+    CONVERSATION = "chat:55"
+
+    def send(self, core, text: str) -> None:
+        core.on_inbound(Inbound(
+            conversation_id=self.CONVERSATION,
+            text=text,
+            kind="text",
+            platform="telegram",
+            message_id="m1",
+        ))
+
+    def delivered(self, core, client) -> list[str]:
+        return [body for _, body in prompt_bodies(client.prompts)]
+
+    # --- 缺陷报告里的那两张表，逐字重建 -----------------------------------
+    def test_the_reported_python_block_arrives_byte_identical(self):
+        sent = "    def f():\n        return 1"
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, sent)
+
+            self.assertEqual(self.delivered(core, client), [sent])
+
+    def test_the_reported_block_after_blank_lines_keeps_its_indentation(self):
+        """⚠️ 改之前这里丢的是**前导空行 + 首行缩进**两样，而首行缩进才是损坏。"""
+        sent = "\n\n    def g():\n        return 2\n\n"
+        expected = "    def g():\n        return 2"
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, sent)
+
+            self.assertEqual(self.delivered(core, client), [expected])
+
+    def test_a_yaml_block_arrives_byte_identical(self):
+        sent = "version: 2\njobs:\n  build:\n    steps:\n      - run: make\n"
+        expected = sent.rstrip()
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, sent)
+
+            self.assertEqual(self.delivered(core, client), [expected])
+
+    def test_a_nested_list_block_arrives_byte_identical(self):
+        sent = "items:\n  - name: a\n    tags: [1, 2]\n  - name: b\n    tags: []"
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, sent)
+
+            self.assertEqual(self.delivered(core, client), [sent])
+
+    # --- 损坏的形状本身 ---------------------------------------------------
+    def test_no_indentation_error_is_manufactured(self):
+        """⚠️ 核心断言：改之前首行被 dedent 而次行没有，于是
+        ``def f():`` 后面跟着一个更深的函数体 = ``IndentationError``。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, "    def f():\n        return 1")
+
+            first, second = self.delivered(core, client)[0].split("\n")
+            self.assertTrue(first.startswith("    "),
+                            "首行缩进被吃掉：%r" % first)
+            self.assertEqual(len(first) - len(first.lstrip()), 4)
+            self.assertEqual(len(second) - len(second.lstrip()), 8)
+
+    def test_the_indent_stack_never_decreases_on_an_indented_first_line(self):
+        """逐行检查缩进阶梯：首行有缩进时，函数体必须更深而不是更浅。"""
+        sent = "  def outer():\n      def inner():\n          return 1\n\n  return outer"
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, sent)
+
+            body = self.delivered(core, client)[0]
+            indents = [
+                len(line) - len(line.lstrip())
+                for line in body.split("\n")
+                if line.strip()
+            ]
+            self.assertEqual(indents, [2, 6, 10, 2])
+
+    # --- 与 C3 合并的交界 -------------------------------------------------
+    def test_a_merged_burst_keeps_every_lines_indentation(self):
+        """⚠️ strip 在**合并之前**逐行跑，所以合并前每一行的缩进都会被吃掉 ——
+        损坏面比单条消息更大（不止第一条消息的第一行）。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            for index, line in enumerate(
+                ("  def f():..", "      x = 1..", "      return x"), start=1
+            ):
+                core.on_inbound(Inbound(
+                    conversation_id=self.CONVERSATION, text=line, kind="text",
+                    platform="telegram", message_id="m%d" % index,
+                ))
+
+            self.assertEqual(len(client.prompts), 1,
+                             "并集只该跑一次 agent")
+            self.assertEqual(
+                self.delivered(core, client),
+                ["  def f():\n      x = 1\n      return x"],
+            )
+
     def test_failed_command_replies_with_error(self):
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)

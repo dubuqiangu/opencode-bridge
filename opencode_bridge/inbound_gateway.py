@@ -43,7 +43,7 @@ from .inbound_merge import (
 )
 from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import recover_pending
-from .normalize import _clean
+from .normalize import _clean, trim_outer_whitespace
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .permission_ledger import (
     REPEATED_ANSWER_ACK,
@@ -280,8 +280,15 @@ class InboundGateway:
                 # Lane B fires on_inbound(kind="callback") *before*
                 # on_callback(); handling it here as well would double-send.
                 return
-            text = _clean(inbound.text).strip()
-            if not conversation_id or not text:
+            text = _clean(inbound.text)
+            if not conversation_id:
+                return
+            # ⚠️ 这里**不能**写 ``.strip()``：无参 strip 会去掉前导空白，于是粘贴
+            # 的第一行被 dedent、后面几行没有 —— agent 拿到的是 IndentationError。
+            # 全空白消息交给下面那个 ``not text`` 守卫去丢（那才是 strip 当初的
+            # 作用），排版交给 :func:`~opencode_bridge.normalize.trim_outer_whitespace`。
+            text = trim_outer_whitespace(text)
+            if not text:
                 return
             adapter = self._adapter_for(conversation_id)
             if adapter is None:
@@ -290,7 +297,14 @@ class InboundGateway:
                     conversation_id,
                 )
                 return
-            if text.startswith("/"):
+            if text.startswith("/") or text.lstrip().startswith("/"):
+                # ⚠️ 这里**判两次**：正文不再 lstrip（缩进要留着），但命令必须
+                # 仍然容得下一个前导空格 —— 那是 C3 之前 ``.strip()`` 顺带给出的
+                # 行为，而"只改缩进、别的都不动"要求把它原样留下。
+                # ``text.lstrip()`` 与旧代码的 ``.strip()`` 在命令这一支上等价：
+                # 命令一定是一行，而 :meth:`~opencode_bridge.commands.CommandHandler.
+                # handle_command` 本来就按空白切词，两侧空白它都吃。
+                #
                 # ⚠️ 命令**绝不**写前落盘。命令就地执行、从不经过 prompt()，
                 # 所以它永远不会走到 mark_delivered —— 那一行会永远留在
                 # 收件箱里，于是每次启动都被重放一遍：`/new` 每次重启都重建会话、
@@ -300,7 +314,7 @@ class InboundGateway:
                 # ⚠️ 命令也**绝不**进合并窗口（与 dsh 的 gateway.ts:395-428 同一条
                 # 纪律）：`/approve` 这类命令必须立刻执行，缓存它等于把 C4 刚堵上的
                 # 权限路径重新打开一条延迟通道。用户给命令敲 `..` 本来就没有意义。
-                self._handle_command(conversation_id, adapter, text)
+                self._handle_command(conversation_id, adapter, text.lstrip())
                 return
             self._deliver_plain_text(conversation_id, adapter, inbound, text)
         except Exception:

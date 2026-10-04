@@ -171,9 +171,16 @@ class FakeClient:
 
 
 class FakeAdapter(Adapter):
-    """Offline stand-in for a messaging adapter."""
+    """Offline stand-in for a messaging adapter.
+
+    ⚠️ 声明 ``supports_message_edit = True``：它**就是**一个能改写已发消息的
+    平台（:meth:`edit` 默认返回 ``True``，与 Telegram / Slack 同形）。出站那道
+    「平台清不掉就不发占位消息」的闸门读的是**这个声明**，不读 ``edit()`` 的返回值，
+    所以这里必须声明 —— 否则整套流式/收尾用例会误以为在测一个 IRC。
+    """
 
     name = "fake"
+    supports_message_edit = True
 
     def __init__(self) -> None:
         super().__init__({}, hooks=None)  # type: ignore[arg-type]

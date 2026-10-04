@@ -17,6 +17,10 @@ IRC 上发一屏表格，或者在 Slack 上把三段话并成一行。
 * :attr:`~opencode_bridge.adapters.base.Adapter.splits_long_messages`
   —— 那个数**能不能当长度说**。邮件的 998 是 RFC 5322 的**单行**上限、A2A 的是
   **请求体字节**上限，两家都从不切片，当成"消息容量"报出去就是假话；
+* :attr:`~opencode_bridge.adapters.base.Adapter.supports_message_edit`
+  —— 读者在等待期间**看得见什么**。平台能把已发消息原地改写时，那条占位消息会被
+  顶掉；不能改写的平台上桥**根本不发**它，于是等待期间读者什么也看不见 ——
+  这两句不能共用一句，见 :meth:`ChannelProfile._progress_visibility`；
 * :attr:`~opencode_bridge.adapters.base.Adapter.supports_inline_buttons`。
 
 ⚠️ **刻意没有"平台 → 上限"的对照表。** 那样一张表对第 14 个平台一定是错的，
@@ -101,6 +105,7 @@ class ChannelProfile:
     max_message_chars: int
     splits_long_messages: bool
     supports_inline_buttons: bool
+    supports_message_edit: bool
 
     @classmethod
     def from_adapter(cls, adapter: Adapter) -> "ChannelProfile":
@@ -116,12 +121,19 @@ class ChannelProfile:
         RFC 5322 的单行上限、A2A 的是请求体字节上限，两家都从不切片，
         把它们当"消息容量"报出去就是在对模型说假话（见
         :attr:`~opencode_bridge.adapters.base.Adapter.splits_long_messages`）。
+
+        ``supports_message_edit`` 决定等待期间读者**看得见什么**。平台不能原地
+        改写已发消息时，出站那道闸门**根本不发**占位消息（见
+        :meth:`~opencode_bridge.outbound.OutboundSender.send_text`），所以
+        "读者会先看到一条占位消息"这句话在那些平台上**是假的** —— 而一条骗人的
+        渠道说明比没有渠道说明更糟（§8）。
         """
         return cls(
             label=_safe_display_label(adapter.label, adapter.name),
             max_message_chars=int(adapter.effective_max_length),
             splits_long_messages=bool(adapter.splits_long_messages),
             supports_inline_buttons=bool(adapter.supports_inline_buttons),
+            supports_message_edit=bool(adapter.supports_message_edit),
         )
 
     def render(self) -> str:
@@ -143,10 +155,7 @@ class ChannelProfile:
             "and links reach the reader exactly as typed, so write plain "
             "sentences and put the answer first.",
             "",
-            "The reply is not instant. The reader first sees a short "
-            "placeholder while you work, the platform's own delivery may add "
-            "more delay, and where a message cannot be replaced in place your "
-            "finished answer is posted as a new message below the placeholder.",
+            self._progress_visibility(),
             "",
             self._reply_expectation(),
             "",
@@ -165,8 +174,41 @@ class ChannelProfile:
         return "%s\n\n%s\n%s" % (self.render(), _HINT_SEPARATOR, user_text)
 
     # ------------------------------------------------------------------
-    # 两条随上限 / 按钮能力变化的句子
+    # 三条随能力变化的句子
     # ------------------------------------------------------------------
+    def _progress_visibility(self) -> str:
+        """等待期间读者**看得见什么**。
+
+        这一支是本模块里**最容易被写假**的一句，所以它必须跟着
+        :attr:`~opencode_bridge.adapters.base.Adapter.supports_message_edit` 走：
+
+        * **能改写** —— 占位消息会被最终答复顶掉，读者全程有"正在动"的迹象。
+          ⚠️ 第三个分句（"顶不掉就补发一条"）**仍然要留着**，因为能改写的平台上
+          也会顶不掉：答复超过 :attr:`OutboundSender` 的改写预算时会改发新消息，
+          Matrix / Nextcloud 的个别部署与客户端也会让改写失败。那是有条件的
+          说法（"where … cannot"），不是假话。
+        * **不能改写** —— 桥**根本不发**那条占位消息（见
+          :meth:`~opencode_bridge.outbound.OutboundSender.send_text`），所以
+          "你会先看到一条占位消息"在这里**是假的**。真话是：等待期间读者什么都
+          看不见。这条对模型有用：它因此不会假设"用户在等我"，也不会写出
+          "我继续看看"这种只有配一条后续更新才成立的话。
+        """
+        if not self.supports_message_edit:
+            return (
+                "The reply is not instant, and nothing at all appears while "
+                "you work: until your finished answer is ready the reader has "
+                "no sign that anything is happening. Do not assume they know "
+                "you are still working, and do not write anything that only "
+                "makes sense as an interim update. Delivery itself may add "
+                "more delay on top of that."
+            )
+        return (
+            "The reply is not instant. The reader first sees a short "
+            "placeholder while you work, the platform's own delivery may add "
+            "more delay, and where a message cannot be replaced in place your "
+            "finished answer is posted as a new message below the placeholder."
+        )
+
     def _length_advice(self) -> str:
         if not self.splits_long_messages:
             # 这一支**不给数字**：适配器自己声明了「那个数不是消息容量」

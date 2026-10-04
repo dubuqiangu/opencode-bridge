@@ -132,6 +132,11 @@ class StandInAdapter(Adapter):
     name = "fake"
     label = "Fake Chat"
     max_message_length = 640
+    #: 本替身**能**改写已发消息（与 :meth:`edit` 的返回值一致），所以本文件那些
+    #: 断言"这一轮建/复用了一条进度占位消息"的用例仍然测的是**占位消息那条路**。
+    #: ⚠️ 出站闸门读的是**这个声明**而不是 ``edit()`` 的返回值 ——
+    #: 见 :class:`opencode_bridge.adapters.base.Adapter` 的 ``supports_message_edit``。
+    supports_message_edit = True
 
     def start(self) -> None:
         return None
@@ -144,7 +149,7 @@ class StandInAdapter(Adapter):
         )
 
     def edit(self, handle: MsgHandle, out: Outbound) -> bool:
-        return False
+        return True
 
 
 class RecordingStreamConfirmed:

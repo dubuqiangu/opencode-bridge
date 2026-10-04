@@ -258,6 +258,11 @@ class NextcloudAdapter(Adapter):
     supports_inbound = True                     # lookIntoFuture=1 长轮询
     supports_inline_buttons = False             # v1 不发 reactions / 卡片
     supports_media = False                      # v1 只发纯文本
+    #: ``PUT chat/{token}/{messageId}`` 真能改写已发消息（见 :meth:`edit`），
+    #: 所以占位气泡发得。⚠️ 部署侧关掉 ``edit-messages`` 时 :meth:`edit` 会返回
+    #: ``False``；那属于**部署配置**，启动时读不到（见 :meth:`_fetch_max_chat_length`
+    #: 只取 ``max-length``），所以留作已知缺口，不在这里猜。
+    supports_message_edit = True
     typed_command_prefix = "/"
     required_tokens = ("base_url", "username", "password")
     outbound_tokens = ("base_url", "username", "password")

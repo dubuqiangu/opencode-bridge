@@ -131,6 +131,21 @@ class Adapter(abc.ABC):
     #: 回答），更不要据此改盘上的键。
     legacy_conversation_prefix: Optional[str] = None
 
+    #: :attr:`max_message_length` 的**语义**：``True`` = "一条出站消息装得下这么多
+    #: **字符**，超了会被拆成多条"（默认，绝大多数平台如此）；``False`` = **这个数
+    #: 根本不是消息容量**，拿它当"消息能装多少"说出来就是假话。
+    #:
+    #: ⚠️ 必须显式声明，因为仓库里就有两个反例，而它们的数**长得像**容量：
+    #:
+    #: * ``email`` —— :data:`~opencode_bridge.adapters.email.MESSAGE_LIMIT` 是
+    #:   RFC 5322 的**单行**上限（998），出站**硬折行**；RFC 5322 对正文总长
+    #:   没有任何上限，拆信还会毁掉线程（见该常量的注释）。
+    #: * ``a2a`` —— :data:`~opencode_bridge.adapters.a2a.MESSAGE_LIMIT` 是
+    #:   **请求体字节**上限，出站把整段文本放进一个 artifact，从不切片。
+    #:
+    #: 谁把它当"消息容量"报给 agent，谁就在对模型说假话。
+    splits_long_messages: bool = True
+
     #: 本平台 **local id** 的合法形状。描述的是该平台 API 发出来的 id，所以由
     #: **拥有那个平台的适配器**自己声明，而不是集中登记在一张表里
     #: （Slack 的 id 规则变了只该碰 Slack 那一个文件）。
@@ -139,6 +154,27 @@ class Adapter(abc.ABC):
     #: :meth:`owns_local_id`。``None`` = 本平台不参与划分（telegram / matrix 等
     #: 本来就没有歧义旧前缀）。
     local_id_pattern: Optional[re.Pattern[str]] = None
+
+    @property
+    def effective_max_length(self) -> int:
+        """**运行期真正生效**的单条出站上限，即 :meth:`send` 实际切分的那个数。
+
+        与类属性 :attr:`max_message_length` 分开是有原因的：Mattermost /
+        Nextcloud 启动后会拿服务端的 ``MaxPostSize`` / ``max-length`` 把它细化
+        （见 ``adapters/mattermost.py`` 的 ``_apply_max_post_size``），所以
+        **类属性是静态下限，不是真值**。
+
+        收在基类上是因为这个问题此前有四个名字：``message_limit``（类属性）、
+        ``effective_max_length``（mattermost / nextcloud 的 property）、
+        ``_effective_limit``（homeassistant / qqbot 的私有方法），
+        而**基类自己一个答案都没有** —— 于是每个新消费者都得重新猜一遍该读哪个。
+        声明方（mattermost / nextcloud）的同名 property 会覆盖本实现，行为不变。
+        """
+        try:
+            limit = int(getattr(self, "message_limit", 0))
+        except (TypeError, ValueError):
+            limit = 0
+        return limit if limit > 0 else int(self.max_message_length)
 
     def owns_local_id(self, local_id: str) -> bool:
         """``local_id`` 是不是落在**本平台**的 id 命名空间里。

@@ -51,6 +51,7 @@ from opencode_bridge.adapters.discord import DiscordAdapter
 from opencode_bridge.adapters.mattermost import MattermostAdapter
 from opencode_bridge.adapters.slack import SlackAdapter
 from opencode_bridge.adapters.telegram import TelegramAdapter
+from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.core import BridgeCore
@@ -546,6 +547,19 @@ class NothingIsRewrittenOnDisk(ConversationStateTestCase):
                          {"matrix:!abc:example.org": {"directory": "docs"}})
 
 
+def user_text_of(prompt: str) -> str:
+    """``prompt`` 里的**用户正文** —— 剥掉 C1 拼在前面的渠道说明。
+
+    本文件断言的是**旧键归属**（谁该接到哪条会话），不是渠道说明；说明由
+    ``tests/test_channel_profile.py`` 单独断言。剩下的那段仍须逐字节等于用户原文。
+    """
+    return prompt.split(_HINT_SEPARATOR + "\n", 1)[-1]
+
+
+def prompt_bodies(prompts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(session_id, user_text_of(text)) for session_id, text in prompts]
+
+
 class BridgeCoreReusesTheRightLegacySession(ConversationStateTestCase):
     """端到端走真 :class:`~opencode_bridge.core.BridgeCore`。"""
 
@@ -573,7 +587,7 @@ class BridgeCoreReusesTheRightLegacySession(ConversationStateTestCase):
         self.assertEqual(client.create_attempts, [],
                          "旧会话接回来了就不许再新建（否则用户会看到两份会话）")
         self.assertEqual(
-            client.prompts,
+            prompt_bodies(client.prompts),
             [("ses-slack", "接着说"), ("ses-discord", "接着说"),
              ("ses-mattermost", "接着说")],
             "每条消息必须回到**自己**的会话",
@@ -588,7 +602,9 @@ class BridgeCoreReusesTheRightLegacySession(ConversationStateTestCase):
         self.assertEqual(len(client.create_attempts), 1,
                          "形状不属于 slack ⇒ 读不到旧键 ⇒ 必须新建一个会话")
         self.assertNotEqual(client.created_ids[0], "ses-discord")
-        self.assertEqual(client.prompts, [(client.created_ids[0], "接着说")])
+        self.assertEqual(
+            prompt_bodies(client.prompts), [(client.created_ids[0], "接着说")]
+        )
 
     def test_slack_alone_still_recovers_its_own_legacy_session(self):
         core, client = self.core_with(("slack",))
@@ -596,7 +612,7 @@ class BridgeCoreReusesTheRightLegacySession(ConversationStateTestCase):
         self.send(core, "slack", SLACK_CHANNEL_ID)
 
         self.assertEqual(client.create_attempts, [])
-        self.assertEqual(client.prompts, [("ses-slack", "接着说")])
+        self.assertEqual(prompt_bodies(client.prompts), [("ses-slack", "接着说")])
 
     def test_new_command_drops_the_legacy_key_and_starts_over(self):
         """``/new``：删掉本平台的旧键 + 新建会话；别人的旧键一个字都不动。"""

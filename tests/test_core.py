@@ -18,6 +18,7 @@ from unittest import mock
 
 from opencode_bridge.adapters.base import Adapter
 from opencode_bridge import __main__ as cli
+from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.core import (
     HELP_TEXT,
@@ -229,6 +230,20 @@ def make_env(td: str, *, mode: str = "ask", bridge: dict | None = None):
     return core, client, adapter, state, path, cfg
 
 
+def prompt_bodies(prompts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """``(session_id, 用户正文)`` —— 剥掉 C1 拼在正文前面的渠道说明。
+
+    本文件断言的是**路由与会话生命周期**，不是渠道说明；说明由
+    ``tests/test_channel_profile.py`` 单独断言。剥掉之后剩下的那段仍然必须
+    **逐字节**等于用户敲的字，所以"用户原文没有被改写"这条不变量照样被守住。
+    """
+    separator = _HINT_SEPARATOR + "\n"
+    return [
+        (session_id, text.split(separator, 1)[-1])
+        for session_id, text in prompts
+    ]
+
+
 def inbound(cid: str, text: str, kind: str = "text") -> Inbound:
     return Inbound(conversation_id=cid, text=text, kind=kind, platform="telegram")
 
@@ -260,7 +275,7 @@ class SessionLifecycleTests(unittest.TestCase):
             self.assertIsNone(attempt["permissions"])  # permissions_mode=ask
             sid = client.created_ids[0]
             self.assertEqual(state.get_session("chat:55"), sid)
-            self.assertEqual(client.prompts, [(sid, "hello")])
+            self.assertEqual(prompt_bodies(client.prompts), [(sid, "hello")])
 
             # "restart": fresh state/client must reuse the stored session
             state2 = StateStore(path)
@@ -271,7 +286,7 @@ class SessionLifecycleTests(unittest.TestCase):
             core2.on_inbound(inbound("chat:55", "again"))
 
             self.assertEqual(client2.create_attempts, [])
-            self.assertEqual(client2.prompts, [(sid, "again")])
+            self.assertEqual(prompt_bodies(client2.prompts), [(sid, "again")])
 
     def test_new_command_deletes_and_recreates_session(self):
         with tempfile.TemporaryDirectory() as td:
@@ -421,7 +436,7 @@ class CommandTests(unittest.TestCase):
             )
             core.on_inbound(inbound("chat:55", "/approve"))
             self.assertIn("用法: /approve", adapter.sent[-1].text)
-            self.assertEqual(client.prompts, [(sid, "hello")])
+            self.assertEqual(prompt_bodies(client.prompts), [(sid, "hello")])
 
     def test_failed_command_replies_with_error(self):
         with tempfile.TemporaryDirectory() as td:
@@ -599,7 +614,7 @@ class PromptRoutingTests(unittest.TestCase):
             core.on_inbound(inbound("chat:55", "hello world"))
             self.assertEqual(len(client.prompts), 1)
             self.assertEqual(
-                client.prompts[0][1], "hello world"
+                prompt_bodies(client.prompts)[0][1], "hello world"
             )
             kinds = [out.kind for out in adapter.sent]
             self.assertEqual(kinds, ["progress"])
@@ -611,12 +626,12 @@ class PromptRoutingTests(unittest.TestCase):
 
             core.on_inbound(inbound("chat:55", "queued text"))
             sid = client.created_ids[0]
-            self.assertEqual(client.prompts, [(sid, "queued text")])
+            self.assertEqual(prompt_bodies(client.prompts), [(sid, "queued text")])
             self.assertEqual(adapter.sent, [])  # nothing sent while busy
 
             core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
             self.assertEqual(
-                client.prompts,
+                prompt_bodies(client.prompts),
                 [(sid, "queued text"), (sid, "queued text")],
             )
             # queue drained: a second idle must not prompt again

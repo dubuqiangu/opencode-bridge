@@ -419,6 +419,9 @@ class A2aAdapter(Adapter):
     #: 见 :data:`MESSAGE_LIMIT` 的长注释：**规范没有规定**，这里取我们自己的 1 MiB
     #: 请求体上限，不是编出来的"权威数字"。
     max_message_length = MESSAGE_LIMIT
+    #: 出站把整段文本放进**一个** artifact（:meth:`A2aAdapter.send` 从不切片），
+    #: 所以上面那个数是请求体**字节**上限，不是"一条消息能装多少字"。
+    splits_long_messages = False
     supports_inbound = True
     #: A2A 没有"按钮"这个概念（Part 只有 text/raw/url/data，§4.1.6）。
     supports_inline_buttons = False

@@ -419,6 +419,10 @@ class EmailAdapter(Adapter):
     label = "Email"
     #: 见 :data:`MESSAGE_LIMIT` 的详细说明 —— 这是**行长**预算，不是正文总量预算。
     max_message_length = MESSAGE_LIMIT
+    #: 邮件**从不**把一个答案拆成多封（拆信会毁掉线程，见 :data:`MESSAGE_LIMIT`）。
+    #: 所以 :attr:`~opencode_bridge.adapters.base.Adapter.max_message_length`
+    #: **不是**"一封邮件能装多少字"，对外也绝不能这么说。
+    splits_long_messages = False
     supports_inbound = True                     # IMAP 轮询
     supports_inline_buttons = False             # 邮件没有 inline 按钮
     supports_media = False                      # v1 只发 text/plain

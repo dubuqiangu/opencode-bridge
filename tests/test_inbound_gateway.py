@@ -23,6 +23,8 @@ import threading
 import unittest
 from unittest import mock
 
+from opencode_bridge.adapters import Adapter
+from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.commands import _setup_guide
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import Turn
@@ -116,6 +118,33 @@ class RecordingSendText:
     @property
     def last(self) -> Outbound:
         return self.outgoing[-1]
+
+
+class StandInAdapter(Adapter):
+    """``adapter_for`` 返回的那个"已挂载适配器"。
+
+    ⚠️ 它**必须是真的 :class:`Adapter` 子类**，不能是裸 ``object()``：
+    :meth:`InboundGateway._dispatch_prompt` 会按 C1 的要求问适配器要渠道能力
+    （见 :mod:`opencode_bridge.channel_profile`），裸对象会在那里抛
+    ``AttributeError``，于是每个投递用例都会莫名走进"发送失败"分支。
+    """
+
+    name = "fake"
+    label = "Fake Chat"
+    max_message_length = 640
+
+    def start(self) -> None:
+        return None
+
+    def send(self, out: Outbound) -> MsgHandle | None:
+        return MsgHandle(
+            conversation_id=out.conversation_id,
+            message_id="m-stand-in",
+            platform=self.name,
+        )
+
+    def edit(self, handle: MsgHandle, out: Outbound) -> bool:
+        return False
 
 
 class RecordingStreamConfirmed:
@@ -214,6 +243,16 @@ def message(text: str, *, conversation_id: str = CONVERSATION,
     )
 
 
+def user_text_of(prompt: str) -> str:
+    """``prompt`` 里的**用户正文** —— 剥掉 C1 拼在前面的渠道说明。
+
+    本文件断言的是**协作契约**（写前落盘、去重、排队、409 退回、恢复不写账），
+    不是渠道说明本身；说明由 ``tests/test_channel_profile.py`` 单独断言。
+    所以这里只取分隔标记之后的那一段，而那一段仍然必须**逐字节**等于用户敲的字。
+    """
+    return prompt.split(_HINT_SEPARATOR + "\n", 1)[-1]
+
+
 def queued(delivery_id: str, text: str,
            conversation_id: str = CONVERSATION) -> QueuedPrompt:
     return QueuedPrompt(
@@ -243,8 +282,10 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.send_text = RecordingSendText()
         self.answer = RecordingAnswer()
         self.gateway = self.build_gateway()
-        #: ``_adapter_for`` 返回什么（``None`` = 没有挂适配器）
-        self.adapter_result: object | None = object()
+        #: ``_adapter_for`` 返回什么（``None`` = 没有挂适配器）。
+        #: ⚠️ 默认值是**真的适配器**而不是裸 ``object()`` —— C1 让投递路径去问
+        #: 适配器要渠道能力，裸对象会在那里炸（理由见 :class:`StandInAdapter`）。
+        self.adapter_result: object | None = StandInAdapter({}, hooks=None)  # type: ignore[arg-type]
         self.adapter_for_error: Exception | None = None
         self.remember_platform_error: Exception | None = None
         self.adapter_for_calls: list[str] = []
@@ -294,6 +335,14 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.remembered_platforms.append((conversation_id, platform))
 
     # --- 断言用的小帮手 -------------------------------------------------
+    @property
+    def prompt_bodies(self) -> list[tuple[str, str]]:
+        """``(session_id, 用户正文)``，渠道说明已剥掉（理由见 :func:`user_text_of`）。"""
+        return [
+            (session_id, user_text_of(text))
+            for session_id, text in self.client.prompts
+        ]
+
     def texts_of(self) -> list[tuple[str, str]]:
         return [(out.conversation_id, out.text) for out in self.send_text.outgoing]
 
@@ -376,7 +425,7 @@ class OnInboundTests(InboundGatewayTestCase):
 
         self.assertEqual([queued.text for queued in self.inbox.recorded],
                          ["把 README 翻译成英文"])
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "把 README 翻译成英文")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "把 README 翻译成英文")])
         self.assertEqual(self.states_of(),
                          {"fake:chat:55:1": DeliveryState.DELIVERED})
 
@@ -502,7 +551,7 @@ class QueueTests(InboundGatewayTestCase):
     def test_the_first_message_is_delivered_right_away(self):
         self.deliver()
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "看一下 README")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "看一下 README")])
         self.assertEqual(self.queued_texts(), [])
         self.assertEqual(self.gateway._draining, set())
 
@@ -518,7 +567,7 @@ class QueueTests(InboundGatewayTestCase):
         self.gateway._draining.clear()
         self.gateway.flush_queue(CONVERSATION)
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "第二条")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "第二条")])
 
     def test_flushing_an_empty_queue_does_nothing(self):
         self.gateway.flush_queue(CONVERSATION)
@@ -539,7 +588,7 @@ class QueueTests(InboundGatewayTestCase):
         self.client.prompt_errors.append(OpenCodeError("busy", status=409))
         self.deliver("第一条", delivery_id="d1")
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "第一条")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "第一条")])
         self.assertEqual([queued.text for queued in
                           self.gateway._queues[CONVERSATION]], ["第一条"])
         self.assertEqual(self.gateway._draining, set())
@@ -561,12 +610,12 @@ class QueueTests(InboundGatewayTestCase):
 
         self.gateway.flush_queue(CONVERSATION)          # 第一条 409，退回队首
 
-        self.assertEqual([text for _, text in self.client.prompts], ["第一条"])
+        self.assertEqual([text for _, text in self.prompt_bodies], ["第一条"])
         self.assertEqual(self.queued_texts(), ["第一条", "第二条"])
 
         self.gateway.flush_queue(CONVERSATION)          # 这次轮到它成功
 
-        self.assertEqual([text for _, text in self.client.prompts],
+        self.assertEqual([text for _, text in self.prompt_bodies],
                          ["第一条", "第一条", "第二条"])
 
     def test_a_failed_drain_is_logged_and_releases_the_conversation(self):
@@ -584,7 +633,7 @@ class QueueTests(InboundGatewayTestCase):
         self.deliver("甲", delivery_id="a1")
         self.gateway._enqueue(queued("b1", "乙", conversation_id=OTHER_CONVERSATION))
 
-        self.assertEqual([text for _, text in self.client.prompts], ["甲", "乙"])
+        self.assertEqual([text for _, text in self.prompt_bodies], ["甲", "乙"])
         self.assertEqual(self.gateway._draining, set())
 
 
@@ -653,7 +702,7 @@ class DispatchPromptTests(InboundGatewayTestCase):
         """恢复时 ``inbox_recovery`` 才是账本 —— 这里再写一次会烧掉两级预算。"""
         self.gateway._dispatch_prompt(queued("d1", "重放"), recording_delivery=False)
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "重放")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "重放")])
         self.assertEqual(self.inbox.rows, {})
         self.assertEqual(self.inbox.failures, {})
 
@@ -681,14 +730,14 @@ class RecoverInboxTests(InboundGatewayTestCase):
 
         self.assertEqual(len(self.stream_confirmed.waits), 1)
         self.assertGreater(self.stream_confirmed.waits[0], 0.0)
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "上次没发出去的")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "上次没发出去的")])
 
     def test_a_pending_row_is_replayed_and_marked_delivered(self):
         self.inbox.record(queued("d1", "上次没发出去的"))
 
         self.gateway.recover_inbox()
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "上次没发出去的")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "上次没发出去的")])
         self.assertEqual(self.states_of(), {"d1": DeliveryState.DELIVERED})
 
     def test_an_uncertain_row_is_alerted_and_never_replayed(self):
@@ -746,7 +795,7 @@ class RecoverInboxTests(InboundGatewayTestCase):
         self.inbox.make_failure_due("d1")
         self.gateway.recover_inbox()
 
-        self.assertEqual(self.client.prompts, [(SESSION_ID, "上次明确失败")])
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "上次明确失败")])
         self.assertEqual(self.states_of(), {"d1": DeliveryState.DELIVERED})
 
     def test_an_alert_that_cannot_be_delivered_is_logged_not_swallowed(self):

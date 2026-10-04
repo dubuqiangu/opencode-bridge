@@ -173,7 +173,7 @@ opencode 引用。按权威度查：
 
 | 用途 | 去哪查 |
 |---|---|
-| **权威定义** | `anomalyco/opencode` 的 `packages/schema/src/event-manifest.ts`、`session-event.ts`、`permission.ts` |
+| **权威定义** | `anomalyco/opencode` 的 `packages/schema/src/event-manifest.ts`、`session-event.ts`、`session-status-event.ts`、`permission.ts`（后两个文件名 `gh` 核实过确实存在）|
 | **机器可读** | 运行时 `GET /openapi.json`（含 `V2Event` 完整 `oneOf`；文档站 `/doc` 在 2.0.22 已不存在） |
 | **架构语义** | `specs/v2/event-stream-architecture.md`（队列/编码/溢出） |
 | **怎么消费** | `grinev/opencode-telegram-bot` → `src/opencode/v2/events.ts` |
@@ -189,12 +189,32 @@ opencode 引用。按权威度查：
 1. **等待必须由终止事件驱动，不能靠超时猜。** `session.text.delta` 迟迟不来是正常的
    （模型在思考），超时后当"没内容"就会误判。终止事件只有
    `session.execution.succeeded`/`.failed`/`.interrupted`，且 `interrupted` 的
-   `reason == "shutdown"` **不算结束**（重启会续跑这一轮）。`session.idle` 已废弃、
-   `session.status` 从不发布 —— 把它们当"一轮结束"就是**永远等不到**。
+   `reason == "shutdown"` **不算结束**（重启会续跑这一轮）。
+
+   ⚠️ `session.idle` / `session.status` 的准确说法（`gh` 核实，**别再写成「从不发布」**）：
+   两者在 `packages/schema/src/session-status-event.ts` 里**都有定义**，`session.status`
+   还**真被消费**（`packages/opencode/src/acp/event.ts` 有 `case "session.status":`）。
+   但它们被 `V1_API_MIGRATION.md` 列为 **transitional dependency、计划移除**，而
+   **2.0.22 运行时我们从未观测到它们**。结论不变：**别拿它们当「一轮结束」的信号**，
+   否则**永远等不到** —— 依据是「运行时没观测到 + 上游计划移除」，不是「协议里没有」。
 2. **正文要合并后再发。** delta 极度碎片化（实测 5.7 KB 回答 = 3402 个 delta，每个
    1.7 字符），IM 场景必须做时间窗/大小窗合并，否则一条消息变几千帧。
-3. **权威全文用 `session.text.ended.data.text`**，不要自己拼 delta —— delta 是
-   ephemeral，断连即丢。
+3. **⚠️ 上游有「权威全文」事件，但本仓库刻意不用 —— 这条不是对现有代码的描述。**
+   `gh search code '"session.text.ended"' --repo anomalyco/opencode` **确实命中**
+   （`packages/app/src/context/server-session-v2-reducer.ts` 里有 `case "session.text.ended":`），
+   上游 schema 的注释正是本条的理由：
+   `// Stream fragments are live-only; Text.Ended is the replayable full-value boundary.`
+   ——**delta 是 live-only，`Text.Ended` 是可重放的全量边界。实质成立。**
+
+   但要分清三件事：① `dev` 分支已改名 **`session.next.text.ended`**（见上方铁律区的
+   「别抄 dev」）；② 本项目运行时是 **2.0.22**，该版本到底发哪个名字**未核实**；
+   ③ **本仓库零实现** —— `grep -rn 'text\.ended' .`（含 tests）**零命中**，
+   正文由 `event_stream.py` 的 `Turn.assemble` 从 delta 组装，并有跨 13 个平台的
+   逐字节重组测试。
+
+   ⛔ **所以：不要为了"符合这条铁律"去改成读那个事件。** 那会删掉或绕过一份
+   正在通过的、有意的契约，去对齐一个**在本仓库从未出现过、且版本名未核实**的事件。
+   真要改，先用 `gh` 核到 2.0.22 的确切事件名与载荷形状，再动。
 4. **未知事件不许静默丢弃。** `if handler is None: return` 会让"事件名写错"这类错误
    在生产里表现为**完全无迹可循**。至少打一行日志。
 

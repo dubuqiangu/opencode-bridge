@@ -95,7 +95,72 @@ __all__ = [
 
 logger = logging.getLogger("opencode_bridge.core")
 
+#: Minimum seconds between two rewrites of the same progress message while an
+#: answer streams in — the throttle in
+#: :meth:`~opencode_bridge.event_stream.EventStream._on_text_delta`
+#: (``if (now - turn.last_edit_ts) < self._edit_interval: return``). Lower = the
+#: reader watches the answer grow more smoothly; higher = fewer API calls and less
+#: risk of a platform rate limit.
+#:
+#: **What kind of number: 出处不明 — no derivation found.** It arrived in the
+#: initial commit ``5ce06e0`` (2026-10-01) with no comment and no commit-message
+#: rationale, and has never been touched since (``git log -S`` finds that single
+#: commit). It matches no reference project's value either: hermes uses
+#: ``DEFAULT_STREAMING_EDIT_INTERVAL = 0.8`` *plus* an adaptive backoff and
+#: flood-strike escalation, and dsh has no edit-interval constant at all. No
+#: measurement of real IM edit cadence is recorded anywhere in this repo — so
+#: **do not read 1.5 as a measured result.** It is an unexamined starting value.
+#:
+#: ⚠️ It is **not** the body-coalescing window §6.3 rule 2 asks for. Coalescing
+#: happens by ordinal in :meth:`~opencode_bridge.event_stream.Turn.assemble`
+#: (deltas are bucketed per ``(assistantMessageID, ordinal)`` and merged); there
+#: is no time-window coalescing in this codebase. This constant only bounds how
+#: often an already-assembled body gets rewritten.
 DEFAULT_EDIT_INTERVAL = 1.5
+
+#: The **bridge's own** budget for one message the bridge itself writes or edits
+#: (the progress placeholder, and the finalising edit that completes it). It is
+#: **not** a platform limit and not a safe send size.
+#:
+#: **What kind of number: 出处不明 — no derivation found**, same provenance as
+#: :data:`DEFAULT_EDIT_INTERVAL` (initial commit ``5ce06e0``, no comment, never
+#: changed). It happens to equal ``maxMessageLength: 4000``, the constant
+#: ``zhuiyueya/dsh-im-gateway`` uses for the same concept across its channels —
+#: and this repo's own design reference flags exactly that as dsh's anti-pattern
+#: ("4000 是猜的默认值而非各平台真实上限"). A transcription is plausible and
+#: **unproven**: ``5ce06e0`` shows no sign of consulting the reference projects,
+#: and AGENTS.md §6's "check the reference projects first" rule was added two
+#: days later.
+#:
+#: **Per-platform truth lives on the adapter, never here.** Read
+#: :attr:`~opencode_bridge.adapters.base.Adapter.max_message_length` (the
+#: declared static floor), refined at runtime through the
+#: :attr:`~opencode_bridge.adapters.base.Adapter.message_limit` slot (declared
+#: ``0`` = "not refined"; Mattermost / Nextcloud fill it from the server), and
+#: always take the resolved value from
+#: :attr:`~opencode_bridge.adapters.base.Adapter.effective_max_length` — that
+#: property is the single resolver (``adapters/base.py:190``).
+#:
+#: ⚠️ **This default exceeds the real limit on 6 of the 13 platforms** (measured
+#: 2026-10-05): ``discord`` 2000, ``email`` 998, ``irc`` 400, ``qqbot`` 2000,
+#: ``twitch`` 400 sit below it, and ``mattermost``'s static floor merely
+#: coincides at 4000 (it is refined from ``config/client`` ``MaxPostSize``).
+#: It is therefore narrowed by ``min()`` against ``effective_max_length`` at
+#: :meth:`~opencode_bridge.outbound.OutboundSender.finalize`
+#: (``outbound.py:188``) — **that is the only place it is narrowed.**
+#:
+#: ⚠️ Known residual, left alone on purpose: the streaming gate
+#: (``event_stream.py:510``) compares against this value **un-narrowed**, so on a
+#: platform below 4000 a body between the platform limit and 4000 passes it. If
+#: the first successful streaming *send* is such a body, the adapter splits it
+#: and hands back the last chunk's handle while ``Turn.shown_progress_text``
+#: records the whole body; ``finalize``'s lower bound
+#: ``max(len(head), len(shown_progress_text))`` then restores the full length, so
+#: the edit is attempted over the platform limit and the placeholder keeps a
+#: fragment. The reader still gets the complete answer exactly once
+#: (``finalize`` then sends only the missing suffix), so this is cosmetic rather
+#: than data loss. Closing it means narrowing that gate — a behaviour change,
+#: deliberately not done here.
 DEFAULT_MAX_MESSAGE_CHARS = 4000
 
 

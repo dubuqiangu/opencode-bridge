@@ -536,6 +536,58 @@ class TurnLifecycleTests(EventStreamTestCase):
 # ----------------------------------------------------------------------
 # 9-11: 文本合并、节流与长度上限
 # ----------------------------------------------------------------------
+class ProgressGateTests(EventStreamTestCase):
+    """闸门本身：它是**桥的**预算，**不按平台收窄**（`core.py` 里记着这条）。
+
+    ⚠️ 为什么值得单独钉住：上面那条「收窄只发生在 finalize」是
+    ``DEFAULT_MAX_MESSAGE_CHARS`` 文档字符串里的**主张**，而如果它写错了、
+    有人照着它去改代码，损失是"以为 4000 是安全发送长度"。所以这里**驱动真实闸门**
+    而不是复述那个常数的算术 —— 复述常数的测试对"闸门有没有被收窄"完全瞎。
+    """
+
+    def test_a_body_between_the_platform_limit_and_the_default_still_gets_through(self):
+        """Discord 上限 2000、桥的预算 4000：2500 字**能过闸**。
+
+        这就是文档字符串记的残留：闸门拿未收窄的 4000 比。
+        若哪天有人收窄了它，这条会红 —— 那正是该回来改注释、并单独决策的时机。
+        """
+        self.rebuild(max_message_chars=2500)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "字" * 2500))
+
+        self.assertEqual(
+            [len(out.text) for out in self.send_text.outgoing], [2500],
+            "闸门把 2500 字挡住了 —— 它已被收窄，core.py 的注释要改",
+        )
+
+    def test_the_gate_still_drops_anything_past_the_budget(self):
+        """闸门**必须仍在工作**：超过预算的一帧不发不改写，也不烧节流窗口。
+
+        与上一条成对 —— 上一条证明"没有被收窄"，这一条证明"没有被绕开"。
+        """
+        self.rebuild(max_message_chars=5)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "字" * 6))
+
+        self.assertEqual(self.send_text.outgoing, [])
+        self.assertEqual(self.edit_progress_calls, [])
+        self.assertEqual(self.turns[SESSION_ID].last_edit_ts, 0.0)
+
+    def test_the_boundary_is_inclusive(self):
+        """恰好等于预算的正文过得去（判据是 ``>``），多一个字符过不去。"""
+        self.rebuild(max_message_chars=5)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "01234"))
+        self.assertEqual([len(o.text) for o in self.send_text.outgoing], [5])
+
+        self.feed(text_delta(SESSION_ID, "5", ordinal=1))
+        self.assertEqual([len(o.text) for o in self.send_text.outgoing], [5],
+                         "超出预算的那一帧本该被丢")
+
+
 class TextDeltaTests(EventStreamTestCase):
     def test_deltas_are_merged_into_one_streaming_message(self):
         self.start_turn()

@@ -20,7 +20,10 @@ from opencode_bridge.adapters.base import Adapter
 from opencode_bridge import __main__ as cli
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
+from opencode_bridge.adapters.base import build, registered_names
 from opencode_bridge.core import (
+    DEFAULT_EDIT_INTERVAL,
+    DEFAULT_MAX_MESSAGE_CHARS,
     HELP_TEXT,
     NO_OUTPUT_TEXT,
     BridgeCore,
@@ -28,7 +31,9 @@ from opencode_bridge.core import (
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
+from opencode_bridge.outbound import OutboundSender
 from opencode_bridge.state import StateStore
+from tests.test_outbound import CONVERSATION, ScriptedAdapter
 
 #: ``config.bridge`` 的完整默认值。**逐个键列出**，而不是从生产代码 import ——
 #: 那道断言的全部意义就是"新增一个键必须有人在这里看见并决定它的默认值"。
@@ -1795,6 +1800,134 @@ class CoreLifecycleTests(unittest.TestCase):
 # ----------------------------------------------------------------------
 # config / ruleset helpers
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# 两个默认常量的**文档字符串是真的** —— 一次审计把它们标成「无出处的圆整数」
+# ----------------------------------------------------------------------
+# ⚠️ 这一类的价值全在**非空洞**上：一条注释如果只是"存在"而没人核，那它就是装饰；
+# 而一条**写错**的注释比没有注释更糟，因为下一个人会信它。所以下面每一条断言都
+# 在核**注释里的具体主张**，而不是核常量还在不在。
+# 顺带把两件容易被下一个读代码的人搞错的事钉住：
+# ① 4000 **超过** 6/13 个平台的真实上限，所以它不是"安全发送长度"；
+# ② 它**只在** ``OutboundSender.finalize`` 那一个地方被 min() 收窄。
+class DocumentedDefaultConstantTests(unittest.TestCase):
+    def test_the_two_constants_still_hold_their_documented_values(self):
+        """``1.5`` 与 ``4000`` 必须原样 —— 这次改动是纯注释。"""
+        self.assertEqual(DEFAULT_EDIT_INTERVAL, 1.5)
+        self.assertEqual(DEFAULT_MAX_MESSAGE_CHARS, 4000)
+
+    def test_the_config_defaults_agree_with_the_module_constants(self):
+        """``config.bridge`` 的默认值与这两个常量是同一组数，两边不许漂移。"""
+        self.assertEqual(DEFAULT_BRIDGE["edit_interval_seconds"],
+                         DEFAULT_EDIT_INTERVAL)
+        self.assertEqual(DEFAULT_BRIDGE["max_message_chars"],
+                         DEFAULT_MAX_MESSAGE_CHARS)
+
+    def test_the_max_chars_default_exceeds_six_of_the_platform_limits(self):
+        """钉住注释里那句「**超过** 6/13 个平台的真实上限」。
+
+        反向价值更大：哪天有人**调小** ``DEFAULT_MAX_MESSAGE_CHARS`` 让这句话不再
+        成立，或者某个平台的上限变了，这条会红 —— 那正是该回来改注释的时候。
+        """
+        below, coinciding = self._platforms_relative_to_the_default()
+
+        self.assertEqual(
+            sorted(below),
+            ["discord", "email", "irc", "qqbot", "twitch"],
+            "低于 4000 的平台清单变了，core.py 里的注释要跟着改",
+        )
+        self.assertEqual(
+            sorted(coinciding), ["mattermost"],
+            "与 4000 相等的平台清单变了，core.py 里的注释要跟着改",
+        )
+        self.assertEqual(len(below) + len(coinciding), 6)
+
+    def test_the_finalize_budget_is_narrowed_to_the_platform_limit(self):
+        """钉住「收尾那条路被 min() 收窄」—— 4000 **不是**编辑预算的真值。
+
+        走真实 :class:`OutboundSender`，而不是只读那一行代码。
+        """
+        for platform_limit in (2000, 400, 998):
+            with self.subTest(platform_limit=platform_limit):
+                adapter = ScriptedAdapter()
+                adapter.max_message_length = platform_limit
+                sender = OutboundSender(
+                    adapter_for=lambda conversation_id, a=adapter: a,
+                    max_message_chars=DEFAULT_MAX_MESSAGE_CHARS,
+                )
+                answer = "字" * (platform_limit + 800)
+
+                sender.finalize(
+                    CONVERSATION, _handle_for(adapter), answer, "ses_probe",
+                    shown_progress_text="",
+                )
+
+                self.assertTrue(adapter.edited, "收尾必须尝试改写占位消息")
+                self.assertLessEqual(
+                    len(adapter.edited[-1][1].text), platform_limit,
+                    "改写正文超过了平台上限 —— min() 那一步不见了",
+                )
+
+    def test_a_body_over_the_platform_limit_reaches_the_edit_via_shown_progress(self):
+        """钉住注释里描述的那条残留路径本身。
+
+        这是最容易"注释说了但其实没那回事"的一处，所以必须跑出来：``finalize``
+        的下界是 ``max(len(head), len(shown_progress_text))``，所以当流式记录过
+        一段比**收窄后**预算更长的正文时，编辑会按记录的长度发出去。读者仍拿到
+        完整答复（``finalize`` 只补发缺失的后缀），所以这是观感问题不是丢数据。
+        """
+        platform_limit = 2000
+        adapter = ScriptedAdapter()
+        adapter.max_message_length = platform_limit
+        sender = OutboundSender(
+            adapter_for=lambda conversation_id, a=adapter: a,
+            max_message_chars=DEFAULT_MAX_MESSAGE_CHARS,
+        )
+        answer = "字" * 6000
+        shown_beyond_budget = "字" * 2500
+
+        sender.finalize(
+            CONVERSATION, _handle_for(adapter), answer, "ses_probe",
+            shown_progress_text=shown_beyond_budget,
+        )
+
+        self.assertGreater(
+            len(adapter.edited[-1][1].text), platform_limit,
+            "这条路径不存在了 —— core.py 里关于残留的那段注释要改",
+        )
+
+    @staticmethod
+    def _platforms_relative_to_the_default() -> tuple[list[str], list[str]]:
+        """Names of adapters whose effective limit is below / equal to the default.
+
+        真适配器（``build`` 真类），不是替身 —— 断言的是**各平台自己声明的上限**，
+        而那正是注释让读者去看的地方。
+        """
+        below, coinciding = [], []
+        for name in registered_names():
+            adapter = build(name, {}, hooks=_NoOpHooks())
+            effective = int(adapter.effective_max_length)
+            if effective < DEFAULT_MAX_MESSAGE_CHARS:
+                below.append(name)
+            elif effective == DEFAULT_MAX_MESSAGE_CHARS:
+                coinciding.append(name)
+        return below, coinciding
+
+
+class _NoOpHooks:
+    """``Adapter`` 只要一个 ``hooks`` 对象；这些用例不发消息也不收消息。"""
+
+    def on_inbound(self, inbound: Inbound) -> None:
+        return None
+
+    def on_callback(self, conversation_id: str, data: str, query_id: str) -> None:
+        return None
+
+
+def _handle_for(adapter: ScriptedAdapter) -> MsgHandle:
+    """A placeholder message handle, produced by the adapter's own ``send``."""
+    return adapter.send(Outbound(conversation_id=CONVERSATION, text=""))
+
+
 class ConfigBridgeTests(unittest.TestCase):
     def test_default_bridge_section(self):
         self.assertEqual(Config().bridge, DEFAULT_BRIDGE)

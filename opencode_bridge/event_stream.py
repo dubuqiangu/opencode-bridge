@@ -50,6 +50,17 @@ class Turn:
 
     conversation_id: str
     progress_handle: MsgHandle | None = None
+    #: 进度消息**当前实际显示**的内容 —— 只在写入**成功**之后才更新。
+    #:
+    #: 为什么非记不可：收尾时那条消息有可能**改不动**（平台能力 / 部署配置 /
+    #: 个别客户端 / 网络）。改不动就意味着它的内容被**冻结**在这里这一刻，
+    #: 而桥必须知道冻结的是哪一段，才能只补发"读者还没看到的那截"，而不是
+    #: 把整条答复再发一遍（重复）或从错误的偏移补发（丢失）。
+    #:
+    #: ⚠️ 记录的是**写成功**的那一份，不是"打算写的那一份" —— ``edit_progress``
+    #: 返回 ``False`` 时平台可能根本没换成功，那一刻显示的还是上一次的内容。
+    #: 空串 = 还没有任何一次写入成功过（占位消息压根没发出去，或改写从未成功）。
+    shown_progress_text: str = ""
     #: assistantMessageID -> {ordinal: delta} (deltas may arrive out of order)
     parts: dict[str, dict[int, str]] = field(default_factory=dict)
     last_edit_ts: float = 0.0
@@ -514,8 +525,15 @@ class EventStream:
                 current = self._turns.get(session_id)
                 if current is not None and current.progress_handle is None:
                     current.progress_handle = new_handle
+                    # 发成功才记：失败时那条消息并不存在（见 shown_progress_text）
+                    if new_handle is not None:
+                        current.shown_progress_text = text
             return
-        self._edit_progress(conversation_id, handle, text, session_id)
+        if self._edit_progress(conversation_id, handle, text, session_id):
+            with self._lock:
+                current = self._turns.get(session_id)
+                if current is not None:
+                    current.shown_progress_text = text
 
     def _on_tool_input_started(self, data: dict) -> None:
         session_id = _session_id(data)
@@ -649,6 +667,10 @@ class EventStream:
             f"任务失败 [{error_type}]: {error_message}",
             session_id,
             kind="error",
+            # ⚠️ 失败文案与本轮正文**毫无关系**，所以它几乎永远不是
+            # ``shown_progress_text`` 的延伸。``finalize`` 会自己校验这一点，
+            # 校验不过就整段发出去 —— 绝不拿正文的前缀去给一条报错算偏移。
+            shown_progress_text=turn.shown_progress_text if turn else "",
         )
         # a failed execution leaves the session idle -> release queued messages
         self._flush_queue(conversation_id)
@@ -710,7 +732,8 @@ class EventStream:
         if turn is not None:
             final = _clean(turn.assemble())
             self._finalize(
-                conversation_id, turn.progress_handle, final, session_id
+                conversation_id, turn.progress_handle, final, session_id,
+                shown_progress_text=turn.shown_progress_text,
             )
         self._flush_queue(conversation_id)
 

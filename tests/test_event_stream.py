@@ -173,13 +173,14 @@ class EventStreamTestCase(unittest.TestCase):
         return True
 
     def _record_finalize(self, conversation_id, handle, text, session_id,
-                         *, kind="final") -> None:
+                         *, kind="final", shown_progress_text="") -> None:
         self.finalize_calls.append((
             conversation_id,
             handle.message_id if handle else None,
             text,
             session_id,
             kind,
+            shown_progress_text,
         ))
 
     def _flush_queue(self, conversation_id: str) -> None:
@@ -818,12 +819,15 @@ class FinalizeTests(EventStreamTestCase):
 
         # publish 走 _finalize，带着这一轮那条进度消息的句柄
         self.assertEqual(len(self.finalize_calls), 1)
-        conversation, handle, text, session_id, kind = self.finalize_calls[-1]
+        conversation, handle, text, session_id, kind, shown = self.finalize_calls[-1]
         self.assertEqual(conversation, CONVERSATION)
         self.assertEqual(handle, "m1", "必须是那条已经发出去的进度消息")
         self.assertEqual(text, "任务失败 [ProviderError]: boom")
         self.assertEqual(session_id, SESSION_ID)
         self.assertEqual(kind, "error")
+        # 占位消息当前显示的那一截也要传下去：失败文案与正文毫无关系，
+        # ``finalize`` 会自己校验它不是前缀从而整段重发（见 outbound 的说明）。
+        self.assertEqual(shown, "half an answer")
         # 关键：没有第二条消息被发出去
         self.assertEqual(len(self.send_text.outgoing), 1)
         self.assertEqual(self.send_text.outgoing[0].kind, "progress")

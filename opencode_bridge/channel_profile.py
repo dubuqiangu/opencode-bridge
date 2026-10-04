@@ -183,10 +183,9 @@ class ChannelProfile:
         :attr:`~opencode_bridge.adapters.base.Adapter.supports_message_edit` 走：
 
         * **能改写** —— 占位消息会被最终答复顶掉，读者全程有"正在动"的迹象。
-          ⚠️ 第三个分句（"顶不掉就补发一条"）**仍然要留着**，因为能改写的平台上
-          也会顶不掉：答复超过 :attr:`OutboundSender` 的改写预算时会改发新消息，
-          Matrix / Nextcloud 的个别部署与客户端也会让改写失败。那是有条件的
-          说法（"where … cannot"），不是假话。
+          ⚠️ 答复装不下一条消息时，那个位置装的是答复的**开头一段**、其余作为
+          后续消息接在下面（见 :meth:`~opencode_bridge.outbound.OutboundSender.finalize`），
+          所以这一支说的是"开头落在原处、其余在下面"，**不是**"整条答复被顶上去"。
         * **不能改写** —— 桥**根本不发**那条占位消息（见
           :meth:`~opencode_bridge.outbound.OutboundSender.send_text`），所以
           "你会先看到一条占位消息"在这里**是假的**。真话是：等待期间读者什么都
@@ -204,9 +203,10 @@ class ChannelProfile:
             )
         return (
             "The reply is not instant. The reader first sees a short "
-            "placeholder while you work, the platform's own delivery may add "
-            "more delay, and where a message cannot be replaced in place your "
-            "finished answer is posted as a new message below the placeholder."
+            "placeholder while you work, and the platform's own delivery may "
+            "add more delay. When the answer is longer than one message, its "
+            "beginning lands in that same message and the rest follows in "
+            "further messages below."
         )
 
     def _length_advice(self) -> str:

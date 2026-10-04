@@ -44,6 +44,7 @@ from opencode_bridge.config import Config
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.inbound_gateway import PROGRESS_TEXT
+from opencode_bridge.outbound import OutboundSender
 from opencode_bridge.state import StateStore
 
 #: 短答复：远低于**每一个**平台的分片阈值，所以"线上文本"就是答复本身，
@@ -53,6 +54,15 @@ ANSWER = "构建失败是因为 config.py 里少了 default 分支。"
 #: 长答复：5000 个 ASCII 字符 —— 超过 IRC / Twitch 的 400，超过 Discord / QQ 的 2000，
 #: 超过 email 的 998 行长预算，但远小于 Nextcloud / Slack。
 LONG_ANSWER = "0123456789" * 500
+
+#: ``run_one_turn`` 给 ``bridge.max_message_chars`` 配的值；与
+#: :func:`one_message_budget` 共用同一份，免得两处漂移。
+BRIDGE_MAX_MESSAGE_CHARS = 4000
+
+#: 「按顺序一小片一小片投递」时每片多长。比任何一个平台的单条上限都小得多，
+#: 所以**每一种长度**下流式改写都真的发生过 —— 否则超长答复一次都不会被改写，
+#: "收尾那一步改不动"的前提根本无从复现。
+STREAMING_CHUNK = 137
 
 #: 仓库内的临时目录：即便 TEMP/TMP 指向机器别处，测试也不可能写到仓库之外。
 _REPOSITORY_TEMP = os.path.join(
@@ -94,6 +104,11 @@ class PlatformUnderTest:
     #: 线路文本在比对前要做的归一化。默认原样；只有邮件需要（见 :func:`_email`）——
     #: MIME 的 quoted-printable 会按 76 字符硬折行，那是传输层的事，不是内容变了。
     normalise_wire: Callable[[str], str] = lambda text: text
+    #: 第几次 ``edit()`` 起开始**假装失败**（``None`` = 不装）。用来复现
+    #: "改写这一步真的失败"—— 平台能力 / 部署配置 / 个别客户端 / 网络都可能。
+    fail_edits_from: int | None = None
+    #: 这一轮一共发生过几次 ``edit()``（含失败的那些）。
+    edit_calls: int = 0
 
     # -- 派生视图 ------------------------------------------------------
     def identities(self) -> dict[str, list[str]]:
@@ -177,6 +192,19 @@ def _instrument_adapter_boundary(under_test: PlatformUnderTest) -> None:
         return handle
 
     def recording_edit(handle: MsgHandle, out: Outbound) -> bool:
+        under_test.edit_calls += 1
+        should_fail = (
+            under_test.fail_edits_from is not None
+            and under_test.edit_calls >= under_test.fail_edits_from
+        )
+        if should_fail:
+            # 平台真的改不动那条消息（部署关掉了能力 / 客户端不支持 / 网络抖动）。
+            # 底下**不**调真实现：真实现会成功，那样就复现不了"改不动"。
+            under_test.deliveries.append(Delivery(
+                identity=handle.message_id, text=out.text, via="edit",
+                kind=out.kind, edited=False,
+            ))
+            return False
         edited = real_edit(handle, out)
         under_test.deliveries.append(Delivery(
             identity=handle.message_id, text=out.text, via="edit",
@@ -530,17 +558,118 @@ def event(name: str, **data) -> dict:
     return {"type": name, "data": data}
 
 
-def run_one_turn(under_test: PlatformUnderTest, answer: str) -> None:
+def one_message_budget(adapter) -> int:
+    """这个平台"一条消息"到底装得下多少 —— 与
+    :meth:`OutboundSender.finalize` 算的是同一个数（取两条上限的小者）。
+
+    测试从**实现同一处**取这个预算，而不是把 4000 抄一遍：抄的那份迟早会与
+    实现漂移，而漂移的方向恰好是"测试还以为装得下"。
+    """
+    return min(BRIDGE_MAX_MESSAGE_CHARS, int(adapter.effective_max_length))
+
+
+def answer_of_length(total: int) -> str:
+    """一条**恰好** ``total`` 个字符的 ASCII 答复，每 60 字符一个换行。
+
+    纯 ASCII 是有意的：ntfy 的上限是**字节**、IRC 的兜底也按字节再切一遍，
+    中文会让"多少字符算一条消息"在测试里变得不可预测。换行是为了给
+    :func:`~opencode_bridge.split.split_text` 一个自然断点，分段才可复现。
+    """
+    filler = "answer text that must arrive whole, in order, exactly once."
+    characters: list[str] = []
+    index = 0
+    while len(characters) < total:
+        if characters and len(characters) % 60 == 0:
+            characters.append("\n")
+        characters.append(filler[index % len(filler)])
+        index += 1
+    return "".join(characters)[:total]
+
+
+def length_boundaries(budget: int) -> tuple[tuple[str, str], ...]:
+    """四个边界，每个都返回 ``(名字, 恰好那个长度的答复)``。"""
+    return (
+        ("short", answer_of_length(max(1, budget // 2))),
+        ("exactly_at_budget", answer_of_length(budget)),
+        ("just_over", answer_of_length(budget + 51)),
+        ("far_over", answer_of_length(budget * 3 + 137)),
+    )
+
+
+def reader_view(under_test: "PlatformUnderTest") -> str:
+    """读者**最终**看到的东西：每条消息最后写入的文本，按消息出现顺序拼起来。
+
+    只取"最后一次写入"是因为同一条消息会被改写很多次（流式 + 收尾），而读者
+    看到的是最后那一版；只取"每条消息一次"是因为那正是"一条消息 = 一段内容"
+    这个模型。两者合起来，拼接结果与原文不等，就一定是丢了 / 重复了 / 乱序了 /
+    留了半截。
+    """
+    order: list[str] = []
+    for delivery in under_test.deliveries:
+        if delivery.identity not in order:
+            order.append(delivery.identity)
+    written = under_test.identities()
+    return "".join(written[identity][-1] for identity in order)
+
+
+def normalise(text: str) -> str:
+    """占位消息文案的归一化版本（与 :attr:`PlatformUnderTest.normalise_wire`
+    同一套规则，邮件那边折行、其余原样）。"""
+    return "".join(text.splitlines())
+
+
+def uncontinued_fragments(
+    under_test: "PlatformUnderTest", answer: str,
+) -> list[tuple[str, str]]:
+    """那些"最终停在答复真前缀上、而续段没跟上"的残留。
+
+    这就是旧契约留下的东西：占位消息永远显示半截正文，读者先读到半句、再在
+    别的消息里读到全文 —— 同一段话出现两次，而且那半句看上去像完整的一句话。
+    """
+    order: list[str] = []
+    for delivery in under_test.deliveries:
+        if delivery.identity not in order:
+            order.append(delivery.identity)
+    written = under_test.identities()
+    leftovers: list[tuple[str, str]] = []
+    for index, identity in enumerate(order):
+        final_text = written[identity][-1]
+        is_partial = 0 < len(final_text) < len(answer) and answer.startswith(final_text)
+        if not is_partial:
+            continue
+        # 续段必须出现在**它之后**：把它之后所有消息的最终文本拼起来看
+        # 是否真的包含剩下的那一截。顺序错了也算残留 —— 读者读到的是乱的。
+        after = "".join(written[later][-1] for later in order[index + 1:])
+        if not after.startswith(answer[len(final_text):]):
+            leftovers.append((identity, final_text))
+    return leftovers
+
+
+def run_one_turn(
+    under_test: PlatformUnderTest, answer: str, *, stream_progress: bool = True,
+    chunk_size: int | None = None,
+) -> None:
     """在**真桥**上跑完整的一轮：入站 → prompt → 流式 delta → 收尾。
 
     桥那一侧全部是真的（``BridgeCore`` / ``EventStream`` / ``InboundGateway`` /
     ``OutboundSender``），只有最底下的线路是记录器 —— 所以走的就是生产路径。
-    ``edit_interval_seconds=0`` 是为了让流式改写不被节流挡掉，那与本用例无关。
+
+    ``edit_interval_seconds=0`` 让流式改写不被节流挡掉（那与本用例无关）；
+    ``stream_progress=False`` 把节流窗口设成极大，让流式改写一次都不发生 ——
+    线路记录于是恰好等于「占位消息 + 最终答复」，逐字节比对不含歧义。
+
+    ``chunk_size=None`` 时按"两半、**先到后半**"投递，那是**乱序**投递，
+    用来钉住 :meth:`Turn.assemble` 会按 ordinal 排序。给了 ``chunk_size`` 就按顺序
+    一小片一小片投递 —— 更贴近真实模型输出，也让**每一种长度**下占位消息都真的被
+    流式写过（否则超长答复一次流式改写都不会发生，"改不动"那条路就无从复现）。
     """
     os.makedirs(_REPOSITORY_TEMP, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=_REPOSITORY_TEMP) as tempdir:
         config = Config()
-        config.bridge = {"edit_interval_seconds": 0, "max_message_chars": 4000}
+        config.bridge = {
+            "edit_interval_seconds": 0 if stream_progress else 10 ** 9,
+            "max_message_chars": BRIDGE_MAX_MESSAGE_CHARS,
+        }
         core = BridgeCore(
             config, _RecordingOpenCodeClient(), StateStore(
                 os.path.join(tempdir, "state.json")
@@ -556,15 +685,22 @@ def run_one_turn(under_test: PlatformUnderTest, answer: str) -> None:
             session_id = core.client.created_ids[0]
             stream = core.event_stream
             stream.dispatch(event("session.execution.started", sessionID=session_id))
-            # 故意**乱序**投递两片：顺便证明收尾时拼回的是原文，不是到达顺序。
-            stream.dispatch(event(
-                "session.text.delta", sessionID=session_id,
-                assistantMessageID="msg_a", ordinal=1, delta=answer[len(answer) // 2:],
-            ))
-            stream.dispatch(event(
-                "session.text.delta", sessionID=session_id,
-                assistantMessageID="msg_a", ordinal=0, delta=answer[:len(answer) // 2],
-            ))
+            if chunk_size is None:
+                # 两半、故意先投后半：证明收尾时拼回的是按 ordinal 排的原文。
+                halves = [
+                    (1, answer[len(answer) // 2:]),
+                    (0, answer[:len(answer) // 2]),
+                ]
+            else:
+                halves = [
+                    (index, answer[start:start + chunk_size])
+                    for index, start in enumerate(range(0, len(answer), chunk_size))
+                ]
+            for ordinal, delta in halves:
+                stream.dispatch(event(
+                    "session.text.delta", sessionID=session_id,
+                    assistantMessageID="msg_a", ordinal=ordinal, delta=delta,
+                ))
             stream.dispatch(event(
                 "session.execution.succeeded", sessionID=session_id,
             ))
@@ -708,13 +844,12 @@ class TheAnswerArrivesExactlyOnceTests(TurnTestCase):
                 )
 
     def test_a_long_answer_is_not_truncated_and_not_duplicated(self):
-        """长答复会被切分；**原样**到达，且只落在一条消息上。
+        """长答复：**按顺序**读下来逐字节等于原文，且没有一条消息停在半截上。
 
-        ⚠️ 能改写的六个平台上，超过 ``bridge.max_message_chars`` 的答复会让
-        :meth:`~opencode_bridge.outbound.OutboundSender.finalize` 放弃改写、
-        改发新消息（那是既有行为，见该方法的注释）。所以本例只断言
-        「不丢、不截断、不重复」，**不**断言"只有一条消息"—— 那是上面短答复那几条
-        已经钉住的不变量。
+        ⚠️ 这条断言**改过**：它原来要求"整条长答复落在**一条**消息上"，那是
+        旧契约（超长就放弃占位消息、整段另发）。新契约下超长答复会**跨**多条消息
+        —— 占位消息承载开头那一段、其余作为后续消息 —— 所以判据必须是**拼接**，
+        而不是"某一条消息等于全文"。
         """
         for name in registered_names():
             with self.subTest(platform=name):
@@ -726,12 +861,170 @@ class TheAnswerArrivesExactlyOnceTests(TurnTestCase):
                     under_test.left_showing_the_placeholder(), [],
                     "%s 长答复这一轮留下了僵尸占位气泡" % name,
                 )
-                carrying = under_test.identities_whose_last_text_is(LONG_ANSWER)
                 self.assertEqual(
-                    len(carrying), 1,
-                    "%s 的长答复落在了 %d 条消息上（丢了或重复了）"
-                    % (name, len(carrying)),
+                    reader_view(under_test), LONG_ANSWER,
+                    "%s 的长答复按顺序读下来不等于原文" % name,
                 )
+
+    # ------------------------------------------------------------------
+    # 整条长度轴：四个边界 × 十三个平台
+    # ------------------------------------------------------------------
+    def test_every_length_boundary_delivers_the_whole_answer_in_order(self):
+        """短 / 正好装满 / 刚超 / 远超 —— 四个边界，十三个平台，逐字节。
+
+        判据是**读者最终看到的东西**：每条消息**最后**写入的文本，按消息出现的
+        顺序拼起来。这一条同时否掉四种坏结果：
+
+        * **丢** —— 拼接短于原文；
+        * **重复** —— 拼接长于原文；
+        * **乱序** —— 拼接不等于原文；
+        * **留下半截** —— 拼接里混进了 ``⏳ 处理中…`` 或任何没被续上的片段。
+        """
+        for name in registered_names():
+            budget = one_message_budget(build_platform(name).adapter)
+            for boundary, answer in length_boundaries(budget):
+                with self.subTest(platform=name, boundary=boundary):
+                    under_test = build_platform(name)
+
+                    run_one_turn(under_test, answer)
+
+                    self.assertEqual(
+                        reader_view(under_test), answer,
+                        "%s 在 %s 边界上：读者读到的不是完整原文"
+                        % (name, boundary),
+                    )
+                    self.assertEqual(
+                        under_test.left_showing_the_placeholder(), [],
+                        "%s 在 %s 边界上留下了僵尸占位气泡" % (name, boundary),
+                    )
+
+    def test_a_runtime_edit_failure_still_delivers_the_whole_answer(self):
+        """**收尾那一步改不动**时（部署关掉能力 / 客户端不支持 / 网络抖动），
+        读者仍然拿到完整答复，而且没有半截没人接。
+
+        复现方式：先跑一遍量出这一轮共有几次 ``edit()``，再跑一遍让**最后一次**
+        （也就是收尾那一次）失败 —— 流式那些改写照常成功，所以占位消息在那一刻
+        显示着一段正文，而桥改不动它。
+
+        ⚠️ 这一条是补上的**漏洞**，不是锦上添花：没有它的时候，
+        ``Turn.shown_progress_text`` 到底记没记上**没有任何断言**，
+        所以把记录条件反过来（记失败的那次）整个测试集照样全绿。
+        """
+        for name in PLATFORMS_WITH_MESSAGE_EDIT:
+            boundaries = dict(length_boundaries(
+                one_message_budget(build_platform(name).adapter)
+            ))
+            for boundary in ("short", "just_over", "far_over"):
+                answer = boundaries[boundary]
+                with self.subTest(platform=name, boundary=boundary):
+                    probe = build_platform(name)
+                    run_one_turn(probe, answer, chunk_size=STREAMING_CHUNK)
+                    finalize_edit_is_the_last = probe.edit_calls
+                    self.assertGreater(
+                        finalize_edit_is_the_last, 1,
+                        "%s 在 %s 边界上流式改写一次都没成功过 —— "
+                        "那这条用例就测不到'占位消息已经显示着一段正文'这个前提"
+                        % (name, boundary),
+                    )
+
+                    under_test = build_platform(name)
+                    under_test.fail_edits_from = finalize_edit_is_the_last
+                    run_one_turn(under_test, answer, chunk_size=STREAMING_CHUNK)
+
+                    self.assertEqual(
+                        reader_view(under_test), answer,
+                        "%s 在 %s 边界上收尾改写失败：读者读到的不是完整原文"
+                        % (name, boundary),
+                    )
+                    self.assertEqual(
+                        under_test.left_showing_the_placeholder(), [],
+                        "%s 在 %s 边界上收尾改写失败后留下了僵尸占位气泡"
+                        % (name, boundary),
+                    )
+                    self.assertEqual(
+                        uncontinued_fragments(under_test, answer), [],
+                        "%s 在 %s 边界上收尾改写失败后留下了没人接下去的半截"
+                        % (name, boundary),
+                    )
+
+    def test_the_wire_carries_the_whole_answer_exactly_once_at_every_boundary(self):
+        """同一条判据，这次落在**线路**上（适配器分片之后）。
+
+        与 :func:`reader_view` 分工：那条量的是"桥交给适配器的东西 + 每条消息的
+        最终版本"，这条量的是**真正发出去的每一段** —— 所以它连"适配器把答复切错 /
+        切重 / 切漏"也能抓到。
+
+        这里把流式改写关掉，于是线路记录恰好等于「占位消息（若平台支持）+ 最终
+        答复」，比对不含任何歧义；流式那一路由 :func:`reader_view` 那条覆盖。
+        """
+        for name in registered_names():
+            budget = one_message_budget(build_platform(name).adapter)
+            for boundary, answer in length_boundaries(budget):
+                with self.subTest(platform=name, boundary=boundary):
+                    under_test = build_platform(name)
+
+                    run_one_turn(under_test, answer, stream_progress=False)
+
+                    transcript = "".join(under_test.wire_text())
+                    expected = under_test.normalise_wire(answer)
+                    if under_test.progress_sends():
+                        self.assertTrue(
+                            transcript.startswith(normalise(PROGRESS_TEXT)),
+                            "%s 的线路第一段应当是占位消息" % name,
+                        )
+                        transcript = transcript[len(normalise(PROGRESS_TEXT)):]
+                    self.assertEqual(
+                        transcript, expected,
+                        "%s 在 %s 边界上：线路上的文本拼不回原文"
+                        % (name, boundary),
+                    )
+
+    def test_no_message_is_left_holding_a_fragment(self):
+        """**显式**断言：没有哪条消息最后停在一段"没人接下去"的正文上。
+
+        与 :meth:`reader_view` 是同一件事的正面说法：这里把"半截"定义出来 ——
+        一条消息的最终文本是答复的**真前缀**（不是全部），而它的续段**没有**在它
+        之后出现。那正是旧契约留下的残留（占位消息永远停在半截正文上）。
+        """
+        for name in registered_names():
+            budget = one_message_budget(build_platform(name).adapter)
+            for boundary, answer in length_boundaries(budget):
+                if boundary == "short":
+                    continue  # 装得下 ⇒ 不会有前缀型残留
+                with self.subTest(platform=name, boundary=boundary):
+                    under_test = build_platform(name)
+
+                    run_one_turn(under_test, answer)
+
+                    fragments = uncontinued_fragments(under_test, answer)
+                    self.assertEqual(
+                        fragments, [],
+                        "%s 在 %s 边界上留下了没人接下去的半截：%r"
+                        % (name, boundary, fragments),
+                    )
+
+    def test_a_prefix_holding_message_really_does_occur_at_the_long_boundaries(self):
+        """上一条不能是空断言：得先证明「占位消息承载开头那一段」确实发生。"""
+        holders = 0
+        for name in PLATFORMS_WITH_MESSAGE_EDIT:
+            under_test = build_platform(name)
+            boundaries = dict(length_boundaries(
+                one_message_budget(under_test.adapter)
+            ))
+            answer = boundaries["far_over"]
+
+            run_one_turn(under_test, answer)
+
+            placeholder_identity = under_test.progress_sends()[0].identity
+            final_text = under_test.identities()[placeholder_identity][-1]
+            if 0 < len(final_text) < len(answer) and answer.startswith(final_text):
+                holders += 1
+        self.assertEqual(
+            holders, len(PLATFORMS_WITH_MESSAGE_EDIT),
+            "有能改写的平台并没有让占位消息承载开头那一段 —— "
+            "说明这条路径根本没被走到，后面的断言就是空的",
+        )
+
 
 
 # ----------------------------------------------------------------------
@@ -772,7 +1065,6 @@ class TheDeclarationMatchesTheAdapterTests(TurnTestCase):
         """闸门在出站咽喉上，所以调用方一个 if 都不用加 —— 用源码守住这一点。"""
         import inspect
 
-        from opencode_bridge.outbound import OutboundSender
 
         source = inspect.getsource(OutboundSender.send_text)
         self.assertIn("supports_message_edit", source)
@@ -780,7 +1072,6 @@ class TheDeclarationMatchesTheAdapterTests(TurnTestCase):
 
     def test_a_missing_adapter_never_sends_a_placeholder(self):
         """路由已经坏了的场合：不发，也不多报一个故障。"""
-        from opencode_bridge.outbound import OutboundSender
 
         sender = OutboundSender(adapter_for=lambda conversation_id: None,
                                 max_message_chars=4000)

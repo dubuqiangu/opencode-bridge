@@ -607,7 +607,12 @@ class TheProgressVisibilityClauseIsConditionalTests(unittest.TestCase):
                 paragraph = progress_paragraph(adapter)
 
                 self.assertIn(_PLACEHOLDER_MARKER, paragraph)
-                self.assertIn("cannot be replaced in place", paragraph)
+                self.assertIn("further messages below", paragraph)
+                self.assertNotIn(
+                    "below the placeholder", paragraph,
+                    "%s 的占位消息现在被**补完**成答复的开头一段，"
+                    "整条答复不再被顶上去、更不再被整条另发" % adapter.name,
+                )
                 self.assertNotIn(
                     _SILENCE_MARKER, paragraph,
                     "%s 能改写，却说了'等待期间什么都不会出现'" % adapter.name,

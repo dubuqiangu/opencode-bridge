@@ -852,7 +852,13 @@ class StreamingTests(unittest.TestCase):
             finals = [out for _, out in adapter.edited if out.kind == "final"]
             self.assertEqual([f.text for f in finals], ["ok"])
 
-    def test_overlong_final_is_sent_instead_of_edited(self):
+    def test_overlong_final_completes_the_placeholder_and_sends_the_rest(self):
+        """答复超过一条消息时，占位消息被**补完**成装得下的那一段，剩下的另发。
+
+        ⚠️ 这条断言**改过**：它原来叫 ``test_overlong_final_is_sent_instead_of_edited``，
+        钉的是"装不下就压根不改写、整段另发一条" —— 而那正是本任务要消灭的行为：
+        占位消息会永远停在半截正文上，读者先读到半句、再读到全文，同一段话出现两次。
+        """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(
                 td, bridge={"max_message_chars": 20}
@@ -869,14 +875,20 @@ class StreamingTests(unittest.TestCase):
                     delta="x" * 30,
                 )
             )
-            self.assertEqual(adapter.edited, [])  # long delta never edited
+            self.assertEqual(adapter.edited, [])  # long delta never streamed
             core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
-            self.assertEqual(adapter.edited, [])  # still no edit call
+            # 占位消息被补成 20 字符（= 一条消息的预算），不再是半截正文
+            self.assertEqual(adapter.edited[-1][1].text, "x" * 20)
             self.assertEqual(adapter.sent[-1].kind, "final")
-            self.assertEqual(adapter.sent[-1].text, "x" * 30)
+            self.assertEqual(adapter.sent[-1].text, "x" * 10)
 
     def test_final_edit_valueerror_falls_back_to_send(self):
+        """改写抛 ValueError，而占位消息**已经显示着全文** ⇒ 一个字都不用补。
+
+        读者手上已经是完整答复；再发一遍才是重复。这条断言以前写的是"另发一条
+        完整正文"，那正好是本任务要消灭的重复。
+        """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
             core.on_inbound(inbound("chat:55", "go"))
@@ -894,8 +906,10 @@ class StreamingTests(unittest.TestCase):
             adapter.edit_results.append(ValueError("edit text too long"))
             core.event_stream.dispatch(ev("session.execution.succeeded", sessionID=sid))
 
-            self.assertEqual(adapter.sent[-1].kind, "final")
-            self.assertEqual(adapter.sent[-1].text, "最终结果")
+            self.assertEqual(
+                [out.kind for out in adapter.sent], ["progress"],
+                "占位消息已经显示全文，不该再发第二条",
+            )
 
     def test_retry_scheduled_edits_progress_message(self):
         """重试提示改挂到 `session.retry.scheduled`——v2.0.22 里真实存在的那个事件。

@@ -209,9 +209,11 @@ class EditProgressTests(OutboundSenderTestCase):
 # 5: 收尾 —— 改不动才退化成新发一条
 # ----------------------------------------------------------------------
 class FinalizeTests(OutboundSenderTestCase):
-    def finalize(self, *, handle=..., text="最终答复", kind="final") -> None:
+    def finalize(self, *, handle=..., text="最终答复", kind="final",
+                 shown_progress_text="") -> None:
         target = self.handle if handle is ... else handle
-        self.sender.finalize(CONVERSATION, target, text, "ses_1", kind=kind)
+        self.sender.finalize(CONVERSATION, target, text, "ses_1", kind=kind,
+                             shown_progress_text=shown_progress_text)
 
     def test_an_editable_progress_message_is_rewritten_in_place(self):
         self.finalize()
@@ -256,14 +258,82 @@ class FinalizeTests(OutboundSenderTestCase):
         self.assertEqual(self.texts_of(), ["最终答复"])
         self.assertEqual(self.adapter.edited, [])
 
-    def test_text_over_the_cap_is_sent_rather_than_edited(self):
-        """装不下就别改 —— 适配器自己会切分。"""
+    def test_text_over_the_cap_completes_the_placeholder_instead_of_abandoning_it(self):
+        """装不下就**补完**那条消息，而不是留着半截正文再整段重发。
+
+        ⚠️ 这条断言**改过**：它原来钉的是"装不下就压根不改写、整段另发一条"，
+        而那正是本任务要消灭的行为 —— 那样占位消息会永远停在半截正文上，
+        读者先读到半句、再读到全文，等于同一段话出现两次。
+        """
         sender = OutboundSender(adapter_for=self._adapter_for,
                                 max_message_chars=10)
         sender.finalize(CONVERSATION, self.handle, "很长很长很长的一段答复", "ses_1")
 
-        self.assertEqual(self.adapter.edited, [])
-        self.assertEqual(self.texts_of(), ["很长很长很长的一段答复"])
+        head = self.adapter.edited[0][1].text
+        self.assertEqual(len(head), 10, "占位消息该被补成一条装得下的消息")
+        self.assertEqual(self.texts_of(), ["很长很长很长的一段答复"[len(head):]])
+
+    def test_a_refused_edit_sends_only_what_the_placeholder_does_not_show(self):
+        """改不动 ⇒ 那条消息冻结在最后一次写入成功的内容上。
+
+        所以只能补发读者**还没看到**的那截；整段重发会让读者读到两遍。
+        """
+        self.adapter.edit_result = "false"
+        self.finalize(text="很长很长很长的一段答复", shown_progress_text="很长很长")
+
+        self.assertEqual(self.texts_of(), ["很长的一段答复"])
+
+    def test_a_refused_edit_with_nothing_known_to_be_shown_sends_everything(self):
+        """占位消息发出去过、但一次写入都没成功过 ⇒ 我们不知道它显示了什么，
+        宁可多发也绝不丢。"""
+        for outcome in ("false", "too_long", "boom"):
+            with self.subTest(outcome=outcome):
+                self.adapter = ScriptedAdapter()
+                self.adapter.edit_result = outcome
+                sender = OutboundSender(
+                    adapter_for=lambda conversation_id: self.adapter,
+                    max_message_chars=10)
+
+                sender.finalize(CONVERSATION, self.handle, "很长很长很长的一段答复",
+                                "ses_1")
+
+                self.assertEqual(self.texts_of(), ["很长很长很长的一段答复"])
+
+    def test_a_shown_text_that_is_not_a_prefix_is_never_used_as_an_offset(self):
+        """失败文案与本轮正文毫无关系，拿它算偏移会把答复**切掉一截**。"""
+        self.adapter.edit_result = "false"
+
+        self.finalize(text="任务失败 [ProviderError]: boom",
+                      shown_progress_text="很长很长很长的一段答复的前半截")
+
+        self.assertEqual(self.texts_of(), ["任务失败 [ProviderError]: boom"])
+
+    def test_the_placeholder_is_never_shortened_below_what_it_already_shows(self):
+        """已经显示的那截**不许**被收回去 —— 那是数据丢失。"""
+        sender = OutboundSender(adapter_for=self._adapter_for,
+                                max_message_chars=10)
+        answer = "0123456789ABCDEFGHIJ"  # 切点会落在 10，但已显示 16
+
+        sender.finalize(CONVERSATION, self.handle, answer, "ses_1",
+                        shown_progress_text=answer[:16])
+
+        self.assertEqual(self.adapter.edited[0][1].text, answer[:16])
+        self.assertEqual(self.texts_of(), [answer[16:]])
+
+    def test_the_budget_never_exceeds_what_the_platform_accepts(self):
+        """``bridge.max_message_chars`` 可能比平台上限大（Discord 2000 vs 默认 4000）。
+
+        只看配置就会拿一条平台必然拒收的文本去改写，于是改写失败、整段重发、
+        占位消息留下半截 —— 正是本任务要消灭的残留。所以取两条上限的**小者**。
+        """
+        self.adapter.max_message_length = 6
+        sender = OutboundSender(adapter_for=self._adapter_for,
+                                max_message_chars=4000)
+
+        sender.finalize(CONVERSATION, self.handle, "0123456789", "ses_1")
+
+        self.assertEqual(len(self.adapter.edited[0][1].text), 6)
+        self.assertEqual(self.texts_of(), ["6789"])
 
     def test_blank_text_falls_back_to_the_placeholder(self):
         self.finalize(text="\x00\x07")

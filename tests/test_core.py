@@ -30,7 +30,16 @@ from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
 from opencode_bridge.state import StateStore
 
-DEFAULT_BRIDGE = {"edit_interval_seconds": 1.5, "max_message_chars": 4000}
+#: ``config.bridge`` 的完整默认值。**逐个键列出**，而不是从生产代码 import ——
+#: 那道断言的全部意义就是"新增一个键必须有人在这里看见并决定它的默认值"。
+DEFAULT_BRIDGE = {
+    "edit_interval_seconds": 1.5,
+    "max_message_chars": 4000,
+    # C3：长输入回执门槛（180，抄自 dsh 的 longInputAckChars）
+    "long_input_ack_chars": 180,
+    # C3：续行保险丝秒数（15）—— 不是合并窗口，普通消息不碰它
+    "merge_continue_timeout_seconds": 15.0,
+}
 
 
 # ----------------------------------------------------------------------
@@ -612,6 +621,148 @@ class PermissionSafetyTests(unittest.TestCase):
                 (session_id, "per_b", "always"),
                 (session_id, "per_c", "reject"),
             ])
+
+
+# ----------------------------------------------------------------------
+# C3: 一次并集 = 一次 agent 运行（真装配、真适配器、真分发）
+# ----------------------------------------------------------------------
+# ``tests/test_inbound_merge.py`` 测合并器自己，``tests/test_inbound_gateway.py``
+# 测接线；这里测的是**三段合起来**之后 agent 到底被驱动了几次 —— 而那才是 C3 要
+# 解决的问题本身（一次 4 行的粘贴原本会变成 4 次 ``prompt()``）。
+class InboundBurstTests(unittest.TestCase):
+    CONVERSATION = "irc:libera:#dev"
+
+    def send(self, core, text: str, message_id: str) -> None:
+        core.on_inbound(Inbound(
+            conversation_id=self.CONVERSATION,
+            text=text,
+            kind="text",
+            platform="fake",
+            message_id=message_id,
+        ))
+
+    def test_a_four_line_paste_is_one_agent_run_not_four(self):
+        """**决定性的一条**：4 行一次到达 → agent 只跑一次。
+
+        改动之前这里实测是 4 次 ``prompt()``（同一个 opencode session），也就是
+        LLM 轮次 ×4、上下文碎裂 —— 那正是 C3 要治的代价。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            lines = ("第一段..", "第二段..", "第三段..", "第四段")
+            for index, line in enumerate(lines, start=1):
+                self.send(core, line, "m%d" % index)
+
+            self.assertEqual(len(client.prompts), 1)
+            self.assertEqual(len(client.create_attempts), 1,
+                             "并集只该建一次会话")
+            self.assertEqual(prompt_bodies(client.prompts),
+                             [(client.created_ids[0],
+                               "第一段\n第二段\n第三段\n第四段")])
+
+    def test_an_ordinary_single_message_still_runs_immediately_and_alone(self):
+        """**延迟那条**：一条普通消息的额外延迟必须是 0。
+
+        这里是"可证明的 0"而不是"权衡后接受"：没有标记就不会有任何缓冲，也就不
+        会有任何计时器 —— 而计时器是唯一能给一条消息加等待的东西。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, "看一下 README", "m1")
+
+            self.assertEqual(len(client.prompts), 1)
+            self.assertEqual(
+                core.inbound_gateway._merger.held_conversation_ids(), (),
+                "一条没有标记的消息绝不该被缓冲 —— 那就是延迟的来源",
+            )
+            self.assertEqual(core.inbound_gateway._merger._fuses, {})
+
+    def test_two_ordinary_messages_stay_two_runs(self):
+        """不合并：合并只能由用户自己的标记开启，不能由"看起来像一段话"推断。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, "第一句", "m1")
+            self.send(core, "第二句", "m2")
+
+            self.assertEqual(prompt_bodies(client.prompts), [
+                (client.created_ids[0], "第一句"),
+                (client.created_ids[0], "第二句"),
+            ])
+
+    def test_the_reconstructed_text_carries_no_marker(self):
+        """**无标记泄漏**：送进 agent 的正文里不许出现 ``..`` 或 ``!!``。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            self.send(core, "先看这个..", "m1")
+            self.send(core, "再看那个!!", "m2")
+
+            delivered = prompt_bodies(client.prompts)[0][1]
+            self.assertEqual(delivered, "先看这个\n再看那个")
+            self.assertNotIn("..", delivered)
+            self.assertNotIn("!!", delivered)
+
+    def test_a_slash_command_is_never_held_for_a_continuation(self):
+        """⚠️ 命令不进合并窗口（dsh 同一条纪律，``gateway.ts:395-428``）。
+
+        缓存命令等于给 C4 刚堵上的权限路径重新开一条延迟通道。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            self.send(core, "hello", "m1")
+            session_id = client.created_ids[0]
+
+            self.send(core, "/approve per_9", "m2")
+
+            self.assertEqual(client.permission_replies,
+                             [(session_id, "per_9", "once")])
+            self.assertEqual(
+                core.inbound_gateway._merger.held_conversation_ids(), (),
+                "命令绝不能留在缓冲里",
+            )
+
+    def test_a_held_line_is_acknowledged_so_it_is_never_silently_swallowed(self):
+        """⚠️ 一句正好以 ``..`` 结尾的散文会被判成续行标记。这条断言的是
+        它**不是静默的** —— 用户立刻看到一句提示。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            self.send(core, "等等..", "m1")
+
+            self.assertEqual(client.prompts, [])
+            self.assertIn("..", adapter.sent[-1].text)
+            self.assertIn("!!", adapter.sent[-1].text)
+
+    def test_a_long_input_gets_a_receipt_where_nothing_else_would_show(self):
+        """不能改写已发消息的平台（IRC / Twitch / ntfy / email / a2a / QQ / HA）
+        **根本不发** ``⏳ 处理中…``，所以长输入必须自己回一句。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td, bridge={
+                "long_input_ack_chars": 10,
+                "merge_continue_timeout_seconds": 15.0,
+            })
+            adapter.supports_message_edit = False
+
+            self.send(core, "改一下 README 的安装步骤并重新跑一遍测试", "m1")
+
+            self.assertEqual(len(client.prompts), 1)
+            receipts = [out.text for out in adapter.sent if "已收到" in out.text]
+            self.assertEqual(len(receipts), 1)
+            self.assertIn("24", receipts[0])
+
+    def test_a_long_input_gets_no_extra_receipt_where_the_placeholder_shows(self):
+        """能改写的那些本来就有占位消息 —— 再加一句只是让一次提问变成三条消息。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td, bridge={
+                "long_input_ack_chars": 10,
+                "merge_continue_timeout_seconds": 15.0,
+            })
+            adapter.supports_message_edit = True
+
+            self.send(core, "改一下 README 的安装步骤并重新跑一遍测试", "m1")
+
+            self.assertEqual(len(client.prompts), 1)
+            self.assertEqual(
+                [out.text for out in adapter.sent if "已收到" in out.text], []
+            )
 
     def test_failed_command_replies_with_error(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1548,7 +1699,7 @@ class ConfigBridgeTests(unittest.TestCase):
             cfg = Config.load(path)
         self.assertEqual(
             cfg.bridge,
-            {"edit_interval_seconds": 0.2, "max_message_chars": 4000},
+            dict(DEFAULT_BRIDGE, edit_interval_seconds=0.2),
         )
 
     def test_invalid_bridge_values_fall_back_to_defaults(self):

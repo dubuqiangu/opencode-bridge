@@ -467,6 +467,7 @@ class InjectionIsWiredIntoTheSinglePromptCallTests(unittest.TestCase):
                          kind=kwargs.get("kind", "text"))
             ) or MsgHandle(conversation_id, "m1", "quibblechat"),
             permission_ledger=PermissionLedger(),
+            bridge_config={},
         )
         return gateway, client, rows
 

@@ -47,7 +47,25 @@ _KNOWN_KEYS = frozenset(
 _BRIDGE_DEFAULTS: dict[str, Any] = {
     "edit_interval_seconds": 1.5,
     "max_message_chars": 4000,
+    # C3 ①：入站**长输入回执**的字数门槛。0 = 不回执。
+    # 180 抄自 dsh 的 ``longInputAckChars``（快照
+    # ``zhuiyueya-dsh-im-gateway-8a5edab282632443.txt`` 的 ``src/core/config.ts``），
+    # 但只用于**不能改写已发消息**的平台 —— 能改写的那些本来就有 ``⏳ 处理中…``，
+    # 再回一句只是多一条消息（见 ``channel_profile.ChannelProfile._progress_visibility``）。
+    "long_input_ack_chars": 180,
+    # C3 ②：敲了 ``..`` 之后等下一行的**保险丝**上限（秒）。
+    # ⚠️ 它**不是**合并窗口：没有 ``..`` 的消息根本不会起计时器，所以普通消息的
+    # 额外延迟可证明是 0。它只是"敲了 ``..`` 然后走开"那条消息不至于永远卡住。
+    # 给到 15s（而不是 dsh 的 5s）是因为人打完一行再发出来要好几秒，而这条保险丝
+    # 只对少数人有用，多等一会儿对谁都无感。0 = 关掉保险丝（不推荐：那条消息会丢）。
+    "merge_continue_timeout_seconds": 15.0,
 }
+
+#: ``bridge`` 段里要取整的键。``0`` 对这两个键都是**合法值**（= 关掉该功能），
+#: 所以取整后只挡负数，不像 ``max_message_chars`` 那样要求至少 1。
+_BRIDGE_INTEGER_KEYS = frozenset(
+    {"max_message_chars", "long_input_ack_chars"}
+)
 
 _ENV_OVERRIDES: dict[str, str] = {
     "OPENCODE_URL": "opencode_url",
@@ -80,7 +98,8 @@ class Config:
     state_path: str = "state.json"
     bridge: dict = field(
         default_factory=lambda: dict(_BRIDGE_DEFAULTS)
-    )  # {"edit_interval_seconds": 1.5, "max_message_chars": 4000}
+    )  # {"edit_interval_seconds": 1.5, "max_message_chars": 4000,
+        #     "long_input_ack_chars": 180, "merge_continue_timeout_seconds": 15.0}
 
     # ------------------------------------------------------------------
     # loading
@@ -175,6 +194,9 @@ class Config:
                         value,
                     )
                     continue
+            elif key in _BRIDGE_INTEGER_KEYS:
+                # 取整即可：0 对这两个键是"关掉"，所以不能套用上面那个 ``>= 1``。
+                number = int(round(number))
             merged[key] = number
         return merged
 

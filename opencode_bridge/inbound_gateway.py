@@ -20,7 +20,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .adapters import Adapter
 # C1：发给 agent 的 prompt 前面拼一段"这条回复发出去是什么样"的说明。
@@ -33,6 +34,13 @@ from .commands import _SETUP_ALIASES, _setup_guide
 # 建 turn 用 :class:`Turn`，类型归事件流所有；这里只 import，不复制。
 from .event_stream import Turn
 from .hooks import Inbound, MsgHandle
+from .inbound_merge import (
+    BUFFERED_NOTICE,
+    HELD,
+    HELD_EXPIRED_NOTICE,
+    IGNORED,
+    ConversationMerger,
+)
 from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import recover_pending
 from .normalize import _clean
@@ -51,6 +59,34 @@ PROGRESS_TEXT = "⏳ 处理中…"
 
 #: Values accepted in ``perm:<sessionID>:<reqID>:<decision>`` callbacks.
 _PERM_DECISIONS = ("once", "always", "reject")
+
+#: 长输入回执的字数门槛（配置缺失或非法时用这个）。180 抄自 dsh 的
+#: ``longInputAckChars``；含义与理由见 :meth:`InboundGateway._acknowledge_long_input`。
+DEFAULT_LONG_INPUT_ACK_CHARS = 180
+
+#: 续行缓冲的保险丝秒数（配置缺失或非法时用这个）。**不是**合并窗口 ——
+#: 没有 ``..`` 的消息不会起任何计时器，所以普通消息的额外延迟可证明是 0。
+DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS = 15.0
+
+
+def _positive_float(value: Any, default: float) -> float:
+    """A finite, non-negative float, else ``default`` (NaN and negatives rejected)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number if number > 0 else default
+
+
+def _positive_int(value: Any, default: int) -> int:
+    """A non-negative int, else ``default``. ``0`` is legal (= 该功能关掉)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
 
 #: 启动时等事件流确认连上的上限（秒），见 :meth:`InboundGateway.recover_inbox`。
 #: 取 2 秒是因为 opencode 通常就在本机；而真的不可达时这 2 秒只换来一行告警 ——
@@ -176,6 +212,7 @@ class InboundGateway:
         remember_platform: RememberPlatform,
         send_text: SendText,
         permission_ledger: PermissionLedger,
+        bridge_config: Mapping[str, Any],
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -192,6 +229,12 @@ class InboundGateway:
         ``perm:`` 按钮那一条路和 ``/approve`` 会对"这个请求答过了没有"得出
         同一个答案 —— 否则同一个请求从两条路各能答一次，去重就成了半拉子
         （见 :mod:`opencode_bridge.permission_ledger`）。
+
+        ``bridge_config`` 是 ``config.bridge`` 那一段（构造时读一次，运行时不会
+        被改写）。C3 只从里面取两个数：长输入回执的字数门槛、续行保险丝的秒数。
+        刻意**不**注入整个 :class:`~opencode_bridge.config.Config` —— 本类用不到
+        别的配置，而那两个数读不到就各自退回模块默认值（见
+        :mod:`opencode_bridge.inbound_merge`）。
         """
         self._client = client
         self._lock = lock
@@ -205,6 +248,18 @@ class InboundGateway:
         self._remember_platform = remember_platform
         self._send_text = send_text
         self._permission_ledger = permission_ledger
+        self._long_input_ack_chars = _positive_int(
+            bridge_config.get("long_input_ack_chars"), DEFAULT_LONG_INPUT_ACK_CHARS
+        )
+        #: C3 的续行缓冲。**本类自己建**（只有入站这一侧读它），所以不注入。
+        #: 保险丝到点的回调是本类的方法 —— 缓冲因此不需要知道任何出站的东西。
+        self._merger = ConversationMerger(
+            hold_timeout_seconds=_positive_float(
+                bridge_config.get("merge_continue_timeout_seconds"),
+                DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
+            ),
+            on_hold_expired=self._deliver_expired_hold,
+        )
 
         #: conversation_id -> 该会话排队等发的消息。**只有本类读写**。
         self._queues: dict[str, list[QueuedPrompt]] = {}
@@ -241,13 +296,122 @@ class InboundGateway:
                 # 收件箱里，于是每次启动都被重放一遍：`/new` 每次重启都重建会话、
                 # `/setup` 每次都重发引导。那比要修的丢消息 bug 更糟。
                 # 落盘必须留在 else 分支里（tests/test_inbox_wiring.py 锁住这条）。
+                #
+                # ⚠️ 命令也**绝不**进合并窗口（与 dsh 的 gateway.ts:395-428 同一条
+                # 纪律）：`/approve` 这类命令必须立刻执行，缓存它等于把 C4 刚堵上的
+                # 权限路径重新打开一条延迟通道。用户给命令敲 `..` 本来就没有意义。
                 self._handle_command(conversation_id, adapter, text)
-            else:
-                queued = _record_inbound(self._inbox, inbound, text)
-                if queued is not None:  # None = 去重命中，已投递过
-                    self._enqueue(queued)
+                return
+            self._deliver_plain_text(conversation_id, adapter, inbound, text)
         except Exception:
             logger.exception("on_inbound failed")
+
+    def _deliver_plain_text(
+        self,
+        conversation_id: str,
+        adapter: Adapter,
+        inbound: Inbound,
+        text: str,
+    ) -> None:
+        """One non-command line: merge-gate it, then persist and deliver.
+
+        拆成独立方法是因为 :meth:`on_inbound` 里已经有一条命令分支，再往那个
+        ``else`` 里塞合并、回执、去重三件事会让它读不下去（AGENTS.md §5.1 的
+        "只能往大方法里塞 if 分支"就是该拆的信号）。
+
+        **顺序是有意的**：合并 → 回执 → 写前落盘 → 投递。合并必须在最前（那是
+        "这几行是一件事"的判断），而落盘必须在投递前（那是"别丢这条"）。两件事
+        刻意由两个模块各管各的：缓冲**不**写进收件箱（见
+        :mod:`opencode_bridge.inbound_merge` 的模块 docstring）。
+        """
+        merged = self._merger.ingest(conversation_id, text)
+        if merged.kind == IGNORED:
+            return
+        if merged.kind == HELD:
+            # 回执是**必须**的：一行以 `..` 结尾的散文会被判成续行标记，没有这句
+            # 它就是静默消失（AGENTS.md §8 点名最糟的那种代价）。
+            self._send_text(
+                conversation_id, BUFFERED_NOTICE, kind="text", adapter=adapter
+            )
+            return
+        self._persist_and_enqueue(conversation_id, adapter, inbound, merged.text)
+
+    def _persist_and_enqueue(
+        self,
+        conversation_id: str,
+        adapter: Adapter,
+        inbound: Inbound,
+        text: str,
+    ) -> None:
+        """Acknowledge if long, write the inbox receipt, then queue for delivery.
+
+        合并**已经**做完，这里只处理"怎么把它变成一次投递"。拆成独立方法是
+        因为保险丝那条路要走同样的三步，而它拿到的是**并集**而不是一行 ——
+        若让它去调 :meth:`_deliver_plain_text`，那份并集会被再过一次合并，
+        末尾的 ``..`` 会让它重新进缓冲，形成自己喂自己的循环。
+        """
+        self._acknowledge_long_input(conversation_id, adapter, text)
+        queued = _record_inbound(self._inbox, inbound, text)
+        if queued is not None:  # None = 去重命中，已投递过
+            self._enqueue(queued)
+
+    def _acknowledge_long_input(
+        self, conversation_id: str, adapter: Adapter, text: str,
+    ) -> None:
+        """Tell the reader a long input arrived — **only where nothing else will**.
+
+        判据是 :attr:`~opencode_bridge.adapters.base.Adapter.supports_message_edit`
+        而不是"平台名单"：不能改写已发消息时出站那道闸门**根本不发**
+        ``⏳ 处理中…``（见 :mod:`opencode_bridge.channel_profile`），于是用户粘一大段
+        之后**什么迹象都没有**。能改写的那些本来就有那个占位消息，再加一句只是让
+        一次提问变成三条消息。
+        """
+        threshold = self._long_input_ack_chars
+        if threshold <= 0 or len(text) < threshold:
+            return
+        if getattr(adapter, "supports_message_edit", False):
+            return
+        self._send_text(
+            conversation_id,
+            "已收到 %d 字，处理中…" % len(text),
+            kind="text",
+            adapter=adapter,
+        )
+
+    def _deliver_expired_hold(self, conversation_id: str, held_text: str) -> None:
+        """Fuse fired: deliver what was held, and say that we did.
+
+        这一条保证缓冲的内容**任何路径都不会无声消失**：用户敲了 ``..`` 然后
+        再没下文，保险丝到点替他发出去，并告诉他发出去的是什么。
+
+        ⚠️ 合成的那条 :class:`Inbound` **没有** ``message_id`` —— 它不是平台
+        交付的一条消息。给了 ``None`` 就会走 :func:`_queued_prompt_for` 的
+        ``sha256(platform|conversation_id|text)`` 兜底，于是同一次超时重放两次会
+        被收件箱去重挡掉（那是**要**的：同一条并集不该被 agent 跑两遍）。
+        ``platform`` 取适配器自己的 ``name``，与各适配器构造 ``Inbound`` 时写的
+        ``platform=self.name`` 是同一个值（见 :meth:`AdapterRouter.asking_platform`
+        的说明：提问平台就是适配器自己报上来的名字）。
+        """
+        adapter = self._adapter_for(conversation_id)
+        inbound = Inbound(
+            conversation_id=conversation_id,
+            text=held_text,
+            kind="text",
+            platform=str(getattr(adapter, "name", "") or ""),
+        )
+        if adapter is None:
+            logger.warning(
+                "inbound merge: no adapter for %s; the held text is delivered "
+                "anyway but nothing will be sent to the reader",
+                conversation_id,
+            )
+        self._send_text(
+            conversation_id,
+            HELD_EXPIRED_NOTICE % held_text,
+            kind="text",
+            adapter=adapter,
+        )
+        self._persist_and_enqueue(conversation_id, adapter, inbound, held_text)
 
     def on_callback(
         self, conversation_id: str, data: str, query_id: str

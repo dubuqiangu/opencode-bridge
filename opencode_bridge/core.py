@@ -247,6 +247,7 @@ class BridgeCore:
             remember_platform=self.routing.remember_platform,
             send_text=self.outbound.send_text,
             permission_ledger=self.permission_ledger,
+            bridge_config=getattr(config, "bridge", None) or {},
         )
 
         # 事件名以 **anomalyco/opencode v2.0.22 源码** 为准，不是文档

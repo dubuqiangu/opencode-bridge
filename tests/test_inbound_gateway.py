@@ -35,6 +35,8 @@ from opencode_bridge.inbound_gateway import (
     _queued_prompt_for,
     _record_inbound,
 )
+from opencode_bridge.channel_profile import with_channel_hint
+from opencode_bridge.inbound_merge import BUFFERED_NOTICE
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.permission_ledger import REPEATED_ANSWER_ACK, PermissionLedger
@@ -274,7 +276,11 @@ def queued(delivery_id: str, text: str,
 # 基类：造一套 InboundGateway（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class InboundGatewayTestCase(unittest.TestCase):
-    """每个用例一套全新的十二个协作者。"""
+    """每个用例一套全新的十三个协作者。"""
+
+    #: C3 的两个配置项在这里要显式给 0 / 极短，否则那些用例会去抢真实的计时器
+    #: 与真实的门槛值（测试不该依赖默认值）。需要它们的用例自己覆盖。
+    bridge_config: dict = {}
 
     def setUp(self) -> None:
         os.makedirs(_REPOSITORY_TEMP, exist_ok=True)
@@ -302,6 +308,12 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.ensure_session_calls: list[tuple[str, str]] = []
         self.ensure_session_errors: list[Exception] = []
         self.session_id = SESSION_ID
+        #: conversation_id -> session id 的**覆盖**表。默认空，于是绝大多数用例
+        #: 仍然一律拿到 :data:`SESSION_ID`；只有"两个会话不许互相合并"那类用例
+        #: 需要两个不同 session 才能看出串了。
+        self.session_id_by_conversation: dict[str, str] = {}
+        #: 保险丝到点的信号（见 :meth:`build_gateway` 里的包装）。
+        self.hold_expired = threading.Event()
 
     def build_gateway(self, **overrides) -> InboundGateway:
         kwargs = {
@@ -317,10 +329,27 @@ class InboundGatewayTestCase(unittest.TestCase):
             "remember_platform": self._remember_platform,
             "send_text": self.send_text,
             "permission_ledger": self.permission_ledger,
+            "bridge_config": self.bridge_config,
         }
         kwargs.update(overrides)
         self.gateway = InboundGateway(**kwargs)
+        self._watch_the_hold_fuse()
         return self.gateway
+
+    def _watch_the_hold_fuse(self) -> None:
+        """把保险丝的回调包一层，好让用例能等它**而不必等时长**。
+
+        生产代码里这个回调是 :meth:`InboundGateway._deliver_expired_hold`，由本类
+        自己构造合并器时绑上；这里只在它外面套一个置信号的壳，投递行为一个字没改。
+        """
+        merger = self.gateway._merger
+        deliver_then_signal = merger._on_hold_expired
+
+        def signal_then_deliver(conversation_id: str, held_text: str) -> None:
+            self.hold_expired.set()
+            deliver_then_signal(conversation_id, held_text)
+
+        merger._on_hold_expired = signal_then_deliver
 
     # --- 四个可调用替身 -------------------------------------------------
     def _adapter_for(self, conversation_id: str):
@@ -333,7 +362,7 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.ensure_session_calls.append((conversation_id, platform))
         if self.ensure_session_errors:
             raise self.ensure_session_errors.pop(0)
-        return self.session_id
+        return self.session_id_by_conversation.get(conversation_id, self.session_id)
 
     def _handle_command(self, conversation_id, adapter, text) -> None:
         self.commands.append((conversation_id, adapter, text))
@@ -371,14 +400,14 @@ class InboundGatewayTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(InboundGatewayTestCase):
-    def test_the_constructor_takes_the_twelve_injected_dependencies(self):
+    def test_the_constructor_takes_the_thirteen_injected_dependencies(self):
         parameters = inspect.signature(InboundGateway.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "lock", "turns", "inbox", "stream_confirmed",
              "adapter_for", "answer_callback", "ensure_session",
              "handle_command", "remember_platform", "send_text",
-             "permission_ledger"],
+             "permission_ledger", "bridge_config"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -618,6 +647,209 @@ class OnCallbackTests(InboundGatewayTestCase):
             self.gateway.on_callback(CONVERSATION, "setup:telegram", "Q1")
 
         self.assertEqual(self.answer.acks, [(None, "Q1", "失败")])
+
+
+# ----------------------------------------------------------------------
+# 3b: C3 —— 续行合并与长输入回执的**接线**（真 ``on_inbound``，不打桩）
+# ----------------------------------------------------------------------
+# ``tests/test_inbound_merge.py`` 锁的是合并器自己；这里锁的是"它有没有被接上"
+# 以及"回执发到了哪里"。两处分开是因为合并器全绿而接线漏掉是可能的 ——
+# 而漏掉的症状恰好是 C3 整个功能不存在。
+class InboundMergeWiringTests(InboundGatewayTestCase):
+    # 门槛给 1 字，于是任何非空消息都会触发回执；保险丝给 0.05 秒，
+    # 那些要等它到点的用例等的是**回调**而不是时长。
+    bridge_config = {
+        "long_input_ack_chars": 1,
+        "merge_continue_timeout_seconds": 0.05,
+    }
+
+    # --- 决定性的那条：一次并集 = 一次投递 ---------------------------------
+    def test_a_marker_burst_becomes_exactly_one_prompt_in_order(self):
+        self.gateway.on_inbound(message("帮我看下这个函数..", message_id="m1"))
+        self.gateway.on_inbound(message("def f(x):..", message_id="m2"))
+        self.gateway.on_inbound(message("return x +", message_id="m3"))
+
+        self.assertEqual(self.client.prompts, [
+            (SESSION_ID, with_channel_hint(
+                "帮我看下这个函数\ndef f(x):\nreturn x +",
+                self.adapter_result,
+            )),
+        ])
+
+    def test_a_marker_burst_lands_in_the_inbox_as_one_receipt(self):
+        self.gateway.on_inbound(message("甲..", message_id="m1"))
+        self.gateway.on_inbound(message("乙..", message_id="m2"))
+
+        self.assertEqual(self.client.prompts, [])
+        self.assertEqual(self.inbox.recorded, [])
+
+        self.gateway.on_inbound(message("丙", message_id="m3"))
+
+        # 3 条并成 1 行 —— 收件箱里是**一**行，不是三行。
+        self.assertEqual(len(self.inbox.recorded), 1)
+        self.assertEqual(self.inbox.recorded[0].text, "甲\n乙\n丙")
+
+    def test_no_marker_text_reaches_the_agent(self):
+        """**无标记泄漏**：送进 agent 的正文里不许残留 ``..`` / ``!!``。"""
+        self.gateway.on_inbound(message("第一段..", message_id="m1"))
+        self.gateway.on_inbound(message("第二段!!", message_id="m2"))
+
+        self.assertEqual(
+            user_text_of(self.client.prompts[0][1]), "第一段\n第二段"
+        )
+
+    # --- 零延迟 -----------------------------------------------------------
+    def test_an_ordinary_message_is_prompted_immediately_with_nothing_buffered(self):
+        self.gateway.on_inbound(message("看一下 README", message_id="m1"))
+
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "看一下 README")])
+        self.assertEqual(self.gateway._merger.held_conversation_ids(), ())
+
+    def test_an_ordinary_message_starts_no_hold_fuse(self):
+        """证明"额外延迟 = 0"：没有缓冲就没有计时器可等。"""
+        self.gateway.on_inbound(message("看一下 README", message_id="m1"))
+
+        self.assertEqual(self.gateway._merger._fuses, {})
+
+    def test_two_ordinary_messages_stay_two_separate_prompts(self):
+        self.gateway.on_inbound(message("第一句", message_id="m1"))
+        self.gateway.on_inbound(message("第二句", message_id="m2"))
+
+        self.assertEqual(self.prompt_bodies,
+                         [(SESSION_ID, "第一句"), (SESSION_ID, "第二句")])
+
+    # --- 回执 -------------------------------------------------------------
+    def test_a_held_line_is_acknowledged_immediately(self):
+        self.gateway.on_inbound(message("第一段..", message_id="m1"))
+
+        self.assertEqual(self.client.prompts, [])
+        self.assertIn("..", self.send_text.last.text)
+        self.assertIn("!!", self.send_text.last.text)
+
+    def test_the_held_acknowledgement_is_never_left_silent(self):
+        """⚠️ 一句正好以 ``..`` 结尾的散文会被判成续行标记。没有这句回执，
+        它就是静默消失 —— AGENTS.md §8 点名最糟的代价。"""
+        self.gateway.on_inbound(message("等等..", message_id="m1"))
+
+        self.assertEqual(self.client.prompts, [])
+        self.assertEqual(self.send_text.outgoing[-1].text,
+                         BUFFERED_NOTICE)
+
+    def test_the_expired_hold_is_delivered_and_reported(self):
+        self.gateway.on_inbound(message("敲完就走了..", message_id="m1"))
+
+        self.assertTrue(self.hold_expired.wait(timeout=5),
+                        "保险丝没有把缓冲交出来")
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "敲完就走了")])
+        self.assertIn(
+            "敲完就走了",
+            "".join(out.text for out in self.send_text.outgoing),
+        )
+
+    def test_the_expired_hold_is_delivered_exactly_once(self):
+        """竞态：保险丝到点的那一下不能和"下一行到了"各发一次。"""
+        self.gateway.on_inbound(message("第一段..", message_id="m1"))
+        self.gateway.on_inbound(message("第二段", message_id="m2"))
+
+        threading.Event().wait(timeout=0.4)   # 让保险丝有机会（不该）再醒一次
+
+        self.assertEqual(self.prompt_bodies,
+                         [(SESSION_ID, "第一段\n第二段")])
+
+    # --- 命令必须绕开 -----------------------------------------------------
+    def test_a_command_never_waits_for_the_next_line(self):
+        """⚠️ 命令**不进**合并窗口 —— 缓存它等于给 C4 刚堵上的权限路径
+        重新开一条延迟通道（dsh 也在 ``gateway.ts:395-428`` 做了同一个排除）。"""
+        self.gateway.on_inbound(message("/approve per_9", message_id="m1"))
+
+        self.assertEqual(self.commands,
+                         [(CONVERSATION, self.adapter_result, "/approve per_9")])
+        self.assertEqual(self.gateway._merger.held_conversation_ids(), ())
+
+    def test_a_command_after_a_held_line_does_not_swallow_the_held_line(self):
+        """敲了 ``..`` 之后敲命令：命令立刻执行，而缓冲**不动**。
+
+        刻意不为它加"命令顺手把缓冲冲掉"的行为 —— 那样一条命令会静默改掉
+        agent 接下来看到的上下文。缓冲由自己的保险丝负责交出去。
+        """
+        self.gateway.on_inbound(message("第一段..", message_id="m1"))
+        self.gateway.on_inbound(message("/help", message_id="m2"))
+
+        self.assertEqual(self.commands, [(CONVERSATION, self.adapter_result, "/help")])
+        self.assertEqual(self.gateway._merger.held_text(CONVERSATION), "第一段")
+
+    # --- 两个会话不许互相合并 ---------------------------------------------
+    def test_two_conversations_never_merge_into_one_prompt(self):
+        self.session_id_by_conversation[CONVERSATION] = SESSION_ID
+        self.other_session_id = "ses_fake0002"
+        self.session_id_by_conversation[OTHER_CONVERSATION] = self.other_session_id
+        self.gateway.on_inbound(message("给 dev 的..", conversation_id=CONVERSATION,
+                                        message_id="d1"))
+        self.gateway.on_inbound(message("给 ops 的..", conversation_id=OTHER_CONVERSATION,
+                                        message_id="o1"))
+        self.gateway.on_inbound(message("dev 第二行", conversation_id=CONVERSATION,
+                                        message_id="d2"))
+        self.gateway.on_inbound(message("ops 第二行", conversation_id=OTHER_CONVERSATION,
+                                        message_id="o2"))
+
+        self.assertEqual(self.prompt_bodies, [
+            (SESSION_ID, "给 dev 的\ndev 第二行"),
+            (self.other_session_id, "给 ops 的\nops 第二行"),
+        ])
+
+    # --- 长输入回执 --------------------------------------------------------
+    def test_a_long_input_is_acknowledged_on_a_platform_that_cannot_edit(self):
+        self.adapter_result = StandInAdapter({}, hooks=None)
+        self.adapter_result.supports_message_edit = False
+        long_text = "改一下 README 的安装步骤" * 20
+
+        self.gateway.on_inbound(message(long_text, message_id="m1"))
+
+        self.assertIn("已收到", self.send_text.outgoing[0].text)
+        self.assertIn(str(len(long_text)), self.send_text.outgoing[0].text)
+        # 回执**不能**取代占位消息，也不能多发一条：正文仍然只投递一次。
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, long_text)])
+
+    def test_a_long_input_is_not_acknowledged_where_the_placeholder_already_shows(self):
+        """能改写已发消息的平台本来就有 ``⏳ 处理中…``，再加一句只是让一次提问
+        变成三条消息。判据读的是能力声明，不是平台名单。"""
+        self.adapter_result = StandInAdapter({}, hooks=None)
+        self.adapter_result.supports_message_edit = True
+
+        self.gateway.on_inbound(message("长输入" * 60, message_id="m1"))
+
+        self.assertNotIn("已收到", "".join(
+            out.text for out in self.send_text.outgoing
+        ))
+
+    def test_a_short_input_is_not_acknowledged_even_where_nothing_else_shows(self):
+        """门槛之上的那一句之外的输入不该收到回执 —— 这里把门槛调高再验一次。"""
+        gateway = self.build_gateway(
+            bridge_config={"long_input_ack_chars": 500,
+                           "merge_continue_timeout_seconds": 0.05},
+        )
+        self.adapter_result = StandInAdapter({}, hooks=None)
+        self.adapter_result.supports_message_edit = False
+
+        gateway.on_inbound(message("hi", message_id="m1"))
+
+        self.assertNotIn("已收到", "".join(
+            out.text for out in self.send_text.outgoing
+        ))
+
+    def test_the_acknowledgement_threshold_is_configurable(self):
+        gateway = self.build_gateway(
+            bridge_config={"long_input_ack_chars": 500,
+                           "merge_continue_timeout_seconds": 0.05},
+        )
+        self.adapter_result = StandInAdapter({}, hooks=None)
+        self.adapter_result.supports_message_edit = False
+
+        gateway.on_inbound(message("短于门槛的输入", message_id="m1"))
+
+        self.assertNotIn("已收到", "".join(
+            out.text for out in self.send_text.outgoing
+        ))
 
 
 # ----------------------------------------------------------------------

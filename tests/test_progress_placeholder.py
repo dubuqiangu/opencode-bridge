@@ -174,8 +174,46 @@ def build_platform(name: str) -> PlatformUnderTest:
     所以走的确实是它自己的解析 / 分片 / 发信代码。
     """
     under_test = _PLATFORM_SETUP[name]()
+    _disable_flood_throttle(under_test)
     _instrument_adapter_boundary(under_test)
     return under_test
+
+
+def _disable_flood_throttle(under_test: PlatformUnderTest) -> None:
+    """把防 flood 的**真实等待**关掉（``min_interval = 0``）。
+
+    ## 为什么必须关
+
+    每个平台适配器都有一个**按会话**的防 flood 节流，而它等的是**真时钟**：
+    discord / matrix / slack / telegram 是 1.2 秒、irc 1.0、twitch 1.5、
+    qqbot 3.0、ntfy / email 1.0、mattermost 0.15，阻塞方式是
+    ``_stop_event.wait(...)`` 或 ``time.sleep(...)``（见各家的 ``_throttle``）。
+
+    本文件比别的平台测试**贵一个数量级**，因为它成轮地跑桥：一轮长答复
+    会有几十次流式改写，每一次都过一次节流。于是
+    ``test_a_runtime_edit_failure_still_delivers_the_whole_answer``
+    一个用例的节流等待就把整个测试集拖到十几分钟（实测 604 秒里占 347 秒）。
+    节流是**阻塞等待**而不是"跳过这一次"，所以它乘的是轮数而不是误差。
+
+    ## 关掉它不丢任何覆盖
+
+    * 本文件判据是**消息身份**与**最终文本**（有没有僵尸占位气泡、答复是否
+      恰好一次逐字节到达），与"两次发信之间隔多久"**毫无关系**。
+    * 节流本身在别处有**专门的用例**：
+      ``tests/test_email.py::test_throttle_enforces_min_interval``、
+      ``tests/test_qqbot.py::test_throttle_enforces_min_interval``、
+      ``tests/test_twitch.py::test_throttle_enforces_min_interval``，
+      以及 qqbot 的 ``test_throttle_is_per_conversation``。
+    * 仓库里**其余每一个平台测试**都是这么关的（``tests/test_adapters.py``
+      的 ``adapter.min_interval = 0  # no artificial sleeps in tests``，
+      telegram / slack / matrix / irc / ntfy / twitch / discord / qqbot /
+      mattermost / nextcloud / email 各家都有）。本文件原先是**唯一漏掉**的一个。
+
+    ⚠️ 只在适配器**真的声明了**这个属性时才设 —— ``a2a`` 没有防 flood 节流，
+    给它凭空加一个属性等于让读代码的人以为那里有节流。
+    """
+    if hasattr(under_test.adapter, "min_interval"):
+        under_test.adapter.min_interval = 0
 
 
 def _instrument_adapter_boundary(under_test: PlatformUnderTest) -> None:

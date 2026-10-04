@@ -257,8 +257,16 @@ opencode 引用。按权威度查：
    但它们被 `V1_API_MIGRATION.md` 列为 **transitional dependency、计划移除**，而
    **2.0.22 运行时我们从未观测到它们**。结论不变：**别拿它们当「一轮结束」的信号**，
    否则**永远等不到** —— 依据是「运行时没观测到 + 上游计划移除」，不是「协议里没有」。
-2. **正文要合并后再发。** delta 极度碎片化（实测 5.7 KB 回答 = 3402 个 delta，每个
-   1.7 字符），IM 场景必须做时间窗/大小窗合并，否则一条消息变几千帧。
+2. **正文要合并后再发 —— 但本仓库的合并机制与这句话字面不同，别照字面去「修」。**
+   delta 极度碎片化（实测 5.7 KB 回答 = 3402 个 delta，每个 1.7 字符），不合并就会让
+   一条消息变几千帧。
+   ⚠️ **但本仓库既没有时间窗合并、也没有大小窗合并**：`Turn.assemble` 是**按 ordinal
+   分桶**（键为 `(assistantMessageID, ordinal)`）；而 `DEFAULT_EDIT_INTERVAL`
+   **只约束已组装好的正文被改写的频率**，它**不是**这条的旋钮。
+   长度阈值那一路也不是「窗口」：`event_stream.py` 的门是**超限就不发不改**这一轮，
+   留给收尾整段发出（由适配器自己切分）。
+   ⛔ **所以靠调 `1.5` 去「实现」这条铁律是找错了地方** —— 我自己派单时正是这么写的，
+   被实现者驳回。
 3. **⚠️ 上游有「权威全文」事件，但本仓库刻意不用 —— 这条不是对现有代码的描述。**
    `gh search code '"session.text.ended"' --repo anomalyco/opencode` **确实命中**
    （`packages/app/src/context/server-session-v2-reducer.ts` 里有 `case "session.text.ended":`），

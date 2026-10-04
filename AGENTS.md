@@ -272,12 +272,19 @@ opencode 引用。按权威度查：
 
 ```powershell
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -match 'unittest|pytest' } |   # ⛔ 必须过滤，见下
   ForEach-Object { [pscustomobject]@{
       pid=$_.ProcessId
       分钟=[math]::Round(((Get-Date) - $_.CreationDate).TotalMinutes,1)
       CPU秒=[math]::Round($_.UserModeTime/10000000.0,1) } } |
   Where-Object { $_.CPU秒 -lt 5 -and $_.分钟 -gt 5 }   # 分钟在涨而 CPU 不涨 = 停滞
 ```
+
+⛔ **那个 `CommandLine` 过滤是必需的，漏掉它这条判据就废了。** 只比 CPU 与墙钟
+**不区分「卡住的任务」和「空闲的服务」**：本机常驻着桥实例、argo-search 的 MCP server
+等好几个长期空闲的 python（实测 CPU 0 秒 / 墙钟 700~1700 分钟），**全都会被报成「停滞」** ——
+一次就出了 5 个假阳性。**判据必须说清「在干什么」，否则它只是把空闲当卡住。**
+同理，**只读任务（explorer）本就不该有落盘**，所以落盘判据对它无效，别拿「无落盘」判它停滞。
 
 **「还在落盘」是比任何状态查询都硬的活性证据** —— 文件持续被写入就说明它在产出。
 

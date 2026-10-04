@@ -123,6 +123,51 @@ SLACK_TOKEN = "xox" + "b-" + "<数字段>" + "-" + "<密钥段>"   # 示例用�
 **判定**（满足任一即须拆）：方法数 **~15+**、类自身代码行 **~250+**、或出现多个
 互不相关的职责块。
 
+⚠️ **「类自身代码行」必须按下面这个口径数，否则判定等于掷硬币。**
+本仓库实例：`BridgeCore` 的类跨度是 **281 行**，其中 **80 行纯注释 + 38 行 docstring
++ 22 空行**。于是——
+
+| 口径 | 结果 | 对 250 阈值 |
+|---|---|---|
+| 跨度 − 空行 | **259** | 超标 → `core.py` 自称「远低于阈值」是假的 |
+| 跨度 − 空行 − 纯注释 | 179 | 达标 |
+| **语句行（去空行/纯注释/docstring）** | **147** | 达标 |
+
+**两个都不算 cheating 的口径，恰好骑在阈值两侧。** 本规则采用**最后一个**
+（SLOC，标准口径）：阈值要衡量的是**职责体量，不是文字体量**——80 行解释性注释
+不是「胖」。
+
+可复现的数法（别手数，手数会把这三种口径数成同一个数）：
+
+```python
+import ast, io
+src = io.open(path, encoding="utf-8").read(); lines = src.split("\n")
+cls = next(n for n in ast.parse(src).body
+           if isinstance(n, ast.ClassDef) and n.name == CLASS_NAME)
+def spanned(node):
+    start = getattr(node, "lineno", None)
+    return set() if start is None else set(range(start, (node.end_lineno or start) + 1))
+docs = set()
+for n in ast.walk(cls):                       # docstring 不算代码
+    if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) \
+            and isinstance(n.value.value, str):
+        docs |= spanned(n)
+code = {l for n in ast.walk(cls) if isinstance(n, ast.stmt) for l in spanned(n)} - docs
+sloc = sum(1 for l in code
+           if lines[l - 1].strip() and not lines[l - 1].strip().startswith("#"))
+```
+
+这段数法**已实测**（`BridgeCore` → **147 / 11**，达标；`CommandHandler` 262/13、
+`InboundGateway` 349/12、`EventStream` 449/19、`DiscordAdapter` 536/43，均超标）——
+**跨类给出一致且合理的判定**，不是只对一个类调通。
+
+⚠️ 别把 `{...}` 写成**节点**集合再去减行号集合 —— 那样**不报错地算错**，
+一路错到 `lines[n - 1]` 才炸。**规则里的代码必须真跑过** —— 这段的第一版就是这么错的。
+
+**数出来的结果要连口径一起写进 `tasks.md`** —— 只写数字的话，下一个人会换口径重数，
+然后得出相反的结论（这条已踩过：旧记录「449 行」在 `core.py` 还是 1315 行时是真的，
+后来文件缩小了它就过期了 —— **「错」与「过期」不是一回事**）。
+
 **两种形态，优先第一种**：
 1. **抽出去** —— 一整块职责连同其私有状态搬进新类，原类只留调用
    （首选：新类能独立测试，不依赖原类内部状态）

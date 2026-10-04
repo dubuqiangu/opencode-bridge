@@ -37,6 +37,7 @@ from unittest import mock
 
 from opencode_bridge import __main__ as cli
 from opencode_bridge import inbox as inbox_module
+from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import Inbound
@@ -90,8 +91,17 @@ def inbound_message(
 
 
 def texts_of(prompts: list[tuple[str, str]]) -> list[str]:
-    """``FakeClient.prompts`` 里的正文，顺序不变。"""
-    return [text for _session_id, text in prompts]
+    """``FakeClient.prompts`` 里的**用户正文**，顺序不变。
+
+    ⚠️ 剥掉的是 C1 拼在正文前面的渠道说明（见
+    :mod:`opencode_bridge.channel_profile`）。本文件断言的是**写前收件箱**的语义
+    ——落盘时机、去重、重放、失败预算——而不是渠道说明；说明由
+    ``tests/test_channel_profile.py`` 单独断言。剥掉之后剩下的那段仍然必须
+    **逐字节**等于用户敲的字，所以"用户原文没有被改写"这条不变量照样被守住。
+    """
+    return [
+        text.split(_HINT_SEPARATOR + "\n", 1)[-1] for _session_id, text in prompts
+    ]
 
 
 def turn_finished(session_id: str) -> dict:

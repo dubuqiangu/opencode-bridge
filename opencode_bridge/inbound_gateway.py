@@ -23,6 +23,10 @@ import threading
 from collections.abc import Callable
 
 from .adapters import Adapter
+# C1：发给 agent 的 prompt 前面拼一段"这条回复发出去是什么样"的说明。
+# 纯函数、无状态，所以直接 import —— 本文件注入的是**有状态的协作者**
+# （路由 / 收件箱 / 出站），而这一段只需要适配器的能力声明。
+from .channel_profile import with_channel_hint
 # ``setup:`` 按钮回调要回的那份**冻结文案**就在命令那边，所以这里 import 它，
 # 而不是复制第二份 —— 改一处只碰一个地方（AGENTS.md §5.1）。
 from .commands import _SETUP_ALIASES, _setup_guide
@@ -372,7 +376,13 @@ class InboundGateway:
         if inbox is not None:
             inbox.mark_attempting(queued.delivery_id)
         try:
-            self._client.prompt(session_id, queued.text)
+            # ⚠️ 渠道说明（C1）只在**发给 opencode 的这一刻**拼上去，而且是
+            # 由 ``adapter`` 自己的能力算出来的（见 :mod:`opencode_bridge.channel_profile`
+            # ——刻意没有"平台 → 上限"的对照表）。收件箱里存的、哈希算的、
+            # 重放重发的都还是用户原文，那条不变量一个字没动。
+            self._client.prompt(
+                session_id, with_channel_hint(queued.text, adapter)
+            )
         except OpenCodeError as exc:
             if exc.status == 409:
                 logger.info(

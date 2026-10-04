@@ -8,6 +8,30 @@
 > 设计依据见 [`docs/platform-design-reference.md`](docs/platform-design-reference.md)（Hermes / dsh-im-gateway 三方对比）。
 > 扩展前稳定点：tag `backup/pre-platform-expansion-20261002`（`06a7d2f`）。
 
+## ⚠️ 本台账的进度标记**本身**曾不可信（2026-10-05 全面对账）
+
+> **一次只读审计发现：好几格 `☐` 其实早已做完，还有一处 `✅` 旁的说明已经作废。**
+> 于是"接下来做什么"是在过期信息上排的。已按代码逐条核对并订正，涉及：
+> C1（`☐` → 已完成，且台账点名的机制**根本不存在**）、C4 残留、C3.1、
+> email `_uid`、A2（`◐`/`☐` → 8/8）、A2b（「从未启用」→ 已启用并有测试）、
+> 多实例并存（"待决策" → 已修）、`BridgeCore` 拆分待办（**作废，不要重排**）、
+> G2 退避阶梯（**三级 vs 两级，文本自相矛盾**）、`EventStream`/`CommandHandler`
+> 的方法数与行数、单文件超阈值数、以及两个互相矛盾的类体量普查数字。
+>
+> **两条读法**：
+>
+> 1. **凡是标「⚠️ 2026-10-05」的段落都写了"原文明说什么 / 代码现在是什么"** ——
+>    按 §8，翻推翻结论必须把**当初为什么那么定**和**现在为什么改**一起写下，
+>    否则下一个人会把同一个坑再踩一遍。**只翻标记不留理由，等于没改。**
+> 2. **标「不可核实」的格子不要猜。** G1 要的是**运行观测**（取证装置已就位，
+>    没有代码可写）；G3 那两个 `g3-model-probe*` 会话是 **opencode 服务端状态**，
+>    本仓库既不创建也不删除它们；B3/B4 与阶段 E 的平台能力主张需要**本仓库之外的
+>    证据**。这四类都保持原状，只把"能不能核实"标出来。
+>
+> **台账里 `file:line` 指针会随重构失效** —— 本轮就有三处（`core.py:1278-1286`、
+> `email.py:814/913/958`、`telegram.py:492`）指向了不存在的行或已漂移的行。
+> 引用本文件的行号前**先确认它还成立**；本轮实测的行号都在订正段里标了实测日期。
+
 ## 实现铁律：先查参考项目，不要靠推测（用户定，2026-10-03）
 
 > **能抄就抄，能借鉴就直接复刻，不要重复造轮子、从头踩坑。**
@@ -113,6 +137,12 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 `app-password-0123456789abcdef`、`SUPERSECRET-APP-SECRET-VALUE` 都是明显的假值）。
 全库仅此一处出现。**已在 `origin/main`**，最早来自初始提交 `5ce06e0`。
 
+> **2026-10-05 复核：未变，延后仍然是"用户决定"。** 行号全部仍然对得上 ——
+> `tests/test_opencode_client.py:35` 是 `SMOKE_PASSWORD`，`:33` 是启用闸门
+> `SMOKE = os.environ.get("OPENCODE_BRIDGE_SMOKE") == "1"`，`:34` 是 `SMOKE_URL`。
+> 本次**没有动它**，也**不建议**顺手改：按 §2 的推送保护，改凭据形状相关的 fixture
+> 要连带复核有没有别处依赖它，而那是另一件事。此条维持"用户决定暂不修"。
+
 **实际风险：低但非零**。目标端口绑在 `127.0.0.1`，拿到口令的人仍需先能在本机
 上访问该端口。所以这是"卫生问题"而非"正在被利用的漏洞"。
 
@@ -132,39 +162,59 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 
 ---
 
-## 类体量债务（2026-10-03 普查，用户立规则时量出来的）
+## 类体量债务（2026-10-05 普查；前一版 2026-10-03 / 2026-10-04 的数字已作废）
 
-用户新立规则「类里代码多就拆类」（见 `AGENTS.md` 5.1）时，顺手用 `ast`
-普查了全库，**当前债务不小**：
+**这一节在 2026-10-05 被整体重测过。旧版写着「18/65 个类超阈值」，紧跟着又补
+一句「2026-10-04 复测得 19/54」——两个数字**互相矛盾**，而且都复现不出来。
+根因是口径从没写下来：「自有代码行」既可以按物理行算，也可以扣掉空行与文档
+字符串，两把尺子差好几十行。**
 
-**18/65 个类超阈值**（方法数 ≥15 或自有代码行 ≥250）。
-> ⚠️ 基线是 2026-10-03 普查。2026-10-04 复测得**19/54**（口径不同：排除测试目录、且只计有方法的类）——**不是数字变大了，是两把尺子不一样**，别误读为债务恶化。同期 `BridgeCore` 已由 49/1120 降到 43/1113。⚠️ 其中 `MattermostAdapter` / `TwitchAdapter` 的数字是 **G4 迁移后**重新实测的（迁移把缝合层搬进了适配器，两者都更胖了）：
+**现在的口径（照此可复现）**：用 `ast` 遍历 `opencode_bridge/**/*.py`，类内
+`def` / `async def` 的个数记作**方法数**；**自有代码行** = 该类从
+**类文档字符串结束之后**到最后一行之间的**非空行**数（不含模块 import 段，
+嵌套函数的函数体算这个类的）。阈值仍是方法数 ≥15 或自有代码行 ≥250。
+本节所有数字都是这把尺子量出来的。
+
+**23/88 个类超阈值**：
 
 | 类 | 文件 | 方法数 | 自有代码行 |
 |---|---|---|---|
-| `BridgeCore` | `core.py` | **22** | **449** |（原 49/1120 -> 峰值 54/1315 -> 26/681 -> **22/449**）|
-| `InboundGateway` | `inbound_gateway.py` | 8 | 304 |（`c59095b` 新增；见「已知偏离」）|
-| `EventStream` | `event_stream.py` | 18 | 491 |（`67cb720` 新增；见下方「已知偏离」）|
-| `CommandHandler` | `commands.py` | 13 | 289 |（`f8461d0` 新增；含冻结文案约 129 行）|
-| `HomeAssistantAdapter` | `adapters/homeassistant.py` | 49 | 829 |
-| `DiscordAdapter` | `adapters/discord.py` | 43 | 678 |
-| `QQBotAdapter` | `adapters/qqbot.py` | 42 | 828 |
-| `NextcloudAdapter` | `adapters/nextcloud.py` | 38 | 669 |
-| `MattermostAdapter` | `adapters/mattermost.py` | 41 | 677 |
-| `TwitchAdapter` | `adapters/twitch.py` | 42 | 586 |
-| `IRCAdapter` | `adapters/irc.py` | 35 | 417 |
-| `A2aAdapter` | `adapters/a2a.py` | 34 | 747 |
-| `EmailAdapter` | `adapters/email.py` | 32 | 570 |
-| `TelegramAdapter` | `adapters/telegram.py` | 24 | 515 |
-| `Transport` | `transport/base.py` | 24 | 363 |
-| `MatrixAdapter` | `adapters/matrix.py` | 23 | 401 |
-| `WebSocketClient` | `ws.py` | 21 | 275 |
-| `OpenCodeClient` | `opencode_client.py` | 21 | 266 |
-| `SlackAdapter` | `adapters/slack.py` | 20 | 333 |
-| `HttpServer` | `httpsrv.py` | 19 | 342 |
-| `NtfyAdapter` | `adapters/ntfy.py` | 16 | 249 |
+| `HomeAssistantAdapter` | `adapters/homeassistant.py` | 48 | 906 |
+| `QQBotAdapter` | `adapters/qqbot.py` | 41 | 885 |
+| `A2aAdapter` | `adapters/a2a.py` | 34 | 838 |
+| `MattermostAdapter` | `adapters/mattermost.py` | 40 | 769 |
+| `NextcloudAdapter` | `adapters/nextcloud.py` | 37 | 748 |
+| `DiscordAdapter` | `adapters/discord.py` | 43 | 744 |
+| `EmailAdapter` | `adapters/email.py` | 34 | 667 |
+| `EventStream` | `event_stream.py` | 19 | 626 |
+| `TelegramAdapter` | `adapters/telegram.py` | 24 | 566 |
+| `InboundGateway` | `inbound_gateway.py` | 12 | 502 |
+| `IRCAdapter` | `adapters/irc.py` | 35 | 470 |
+| `MatrixAdapter` | `adapters/matrix.py` | 23 | 444 |
+| `Transport` | `transport/base.py` | 24 | 362 |
+| `SlackAdapter` | `adapters/slack.py` | 20 | 369 |
+| `HttpServer` | `httpsrv.py` | 19 | 341 |
+| `CommandHandler` | `commands.py` | 13 | 318 |
+| `WebSocketClient` | `ws.py` | 21 | 294 |
+| `OpenCodeClient` | `opencode_client.py` | 23 | 303 |
+| `Adapter`（基类） | `adapters/base.py` | 16 | 278 |
+| `InboundInbox` | `inbox.py` | 19 | 266 |
+| **`BridgeCore`** | `core.py` | **11** | **258** |
+| `NtfyAdapter` | `adapters/ntfy.py` | 16 | 272 |
 
-单文件超 400 行阈值的有 8 个（`core.py` 1619 行最大）。
+**`BridgeCore` 这一行旧版写的是「22 方法 / 449 自有代码行」，与事实不符**：
+`core.py` 现在整个文件只有 **385 行**（`core.py:385` 是最后一行），449 行**装不进
+这个文件**。四块职责拆走（`219c954`）之后它确实是 11 个方法（`core.py:108,266,
+279,285,289,311,342,350,360,368,379`）。**但它并非"完全达标"**：按上面的口径
+自有代码行 258，**仍然越过 250 那条线 8 行**——而 `core.py:21-23` 的模块文档
+字符串写着「this class is now well inside both」。那句话在方法数上成立，在行数上
+不成立。**这句自我评价要改**，但差 8 行不构成拆分的理由，故**不重排拆分**。
+
+单文件超 400 行阈值的**生产**模块有 **25 个**（`a2a.py` 1510 行最大）。
+`core.py` **已不在其中**——旧版这里写的是「8 个（`core.py` 1619 行最大）」，
+那是 `219c954` 拆分之前的状态。⚠️ 25 这个数**含 `adapters/**` 的 13 个**；
+只数 `opencode_bridge/*.py` 顶层则是 12 个。测试目录另有 31 个超阈值的文件，
+按 §5 的口径**不算**进这条债务。
 
 **为什么现在记下来而不是立刻拆**：
 
@@ -176,8 +226,20 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
    会让"这次改动到底改了什么"变得不可审。**先把功能修对，再还债**，比反过来更安全。
 3. 规则是**向前生效**的：新代码不得继续加厚这些大类；存量债务择机偿还。
 
-**待办（未排期）**：给 `BridgeCore` 排一次拆分。候选切分线已可见——
-会话/事件流、状态持久化、outbound 发送、平台路由。拆之前先有测试兜住行为。
+**待办（已作废，2026-10-05）**：~~给 `BridgeCore` 排一次拆分。候选切分线已可见——
+会话/事件流、状态持久化、outbound 发送、平台路由。~~ **不要重排。**
+**当初为什么那么定**：`core.py` 当时 1619 行、`BridgeCore` 49 方法 / 1120 行，
+候选切分线（会话/事件流、状态持久化、outbound、平台路由）就是照着那四个职责块
+画的，规则要求「新功能要么进新模块，要么先拆」。
+**现在为什么改**：那四条线**已经全部拆走了**（`219c954`）——分别落在
+`session_model.py` / `session_registry.py`、`event_stream.py`、`outbound.py`、
+`adapter_router.py`。`core.py` 现在 **385 行**、`BridgeCore` **11 个方法**，
+`core.py:9-19` 的模块文档字符串逐条列出了那七个已抽出的簇。按 §5.1 的阈值
+（方法数 15 / 自有代码行 250）它**方法数达标、行数差 8 行**（见上表）。
+再拆一次的**候选切分线已经不存在**——剩下的只是生命周期、`Hooks` 协议本身，
+和把七个模块装配起来的代码，拆它们等于拆"接线"。
+⚠️ 这条作废**不表示账已还清**：`EventStream` / `InboundGateway` / 各适配器仍在
+阈值之上（见上表），它们的偿还需要**单独立项**，不是这条。
 
 > **实现方案（2026-10-03 定稿）** —— 先查了参考项目再定，结论见下方逐条。
 
@@ -302,8 +364,18 @@ dashboard WebSocket，它提到 OpenCode 的地方是**把 OpenCode Zen 当模�
 | `attempting` | 结果不可知 | **只告警，绝不重放**；告知该会话有N 条状态未知，请自行检查 |
 | `abandoned` | 重试次数耗尽 | 终态，启动时告警一次 |
 
-退避用**固定阶梯**（30s / 120s / 600s），不用指数——与 hermes 一致。
+退避用**固定阶梯**，不用指数——与 hermes 一致。
 并遵守它那条**永不花掉最后一次预算重试**（`:836909`）的约束。
+
+> ⚠️ **本行原先写的是「30s / 120s / 600s」三级，与代码不符，已订正为两级**
+> （2026-10-05）。实际是 `BACKOFF_LADDER_SECONDS = (30.0, 120.0)`
+> （`inbox.py:89`）配 `MAX_ATTEMPTS = 3`（`inbox.py:93`），并有
+> `assert len(BACKOFF_LADDER_SECONDS) == MAX_ATTEMPTS - 1`
+> （`inbox.py:95-96`）把这个不变量钉死——**三级阶梯与 3 次预算在算术上不相容**，
+> 所以 600s 那一档是被同文件里记录的一次算术修复合掉的，不是被删掉的。
+> `inbox.py:84` 的注释还留着「之前本意是三级阶梯 30/120/600，配 `MAX_ATTEMPTS = 3`，
+> 但**多出来的那一级永远触发不到**」的旧描述——那是**设计意图与那次修正的记录**，
+> 不是现状，读的时候别当成当前行为。
 
 **告警文字一律发给用户，绝不塞进 `prompt.text`**：那段文字会进入 agent 的上下文，
 污染它可能改变 agent 在重复任务上的行为。
@@ -666,19 +738,25 @@ gateway 仍然需要流上的 owner 方法（`begin_turn`/`attach_progress`）�
 
 ##### 类体量仍未达标的地方（有意接受，非漏做）
 
-`EventStream` **18 方法 / 491 行，仍超阈值**（15 / 250）。但 §5.1 同时说
-「出现多个互不相关的职责块」才该拆 —— 这个类只有一个职责。唯一剩下的杠杆是
-散在 5 个 handler 里约 68 行的 `_turns` 记账；拆它属于 §5.1 的**第二种形态
-（拆基类）**，明确是不优先的那个，所以**留到第三步之后判** —— 因为第三步会把
-`_dispatch_prompt` 与 `_drop_session` 这两个簇外写入者搬走，届时事件流**可能
-可以完全拥有 turn 表**，那才是拆的前提成立。
+`EventStream` **19 方法 / 626 自有代码行，仍超阈值**（15 / 250）。
+> ⚠️ 数字订正（2026-10-05）：本行原先写「18 方法 / 491 行」。方法数实为 **19**
+> （`event_stream.py:217,297,319,370,411,430,438,462,483,547,558,576,595,627,
+> 650,687,720,748,782`），文件 **783 行**，「491」那个数按现在的口径复现不出来。
+> ⚠️ **但延后拆分的结论不变、不重开**：`event_stream.py` 里 `core.py:663-665`
+> 当初否决「拆 turn 表」的理由仍然成立——§5.1 说「若拆完还要同时改两个类，
+> 说明拆错了」，而 `_lock` 无论如何都得注入。§5.1 也说「出现多个互不相关的
+> 职责块」才该拆，这个类只有一个职责。
 
-`CommandHandler` 289 行超 ~250 线 39 行（同因：约 129 行是冻结文案，是数据）。
+`CommandHandler` **13 方法 / 318 自有代码行**，超 250 线 **68 行**（方法数达标）。
+> ⚠️ 数字订正（2026-10-05）：本行原先写「289 行超 39 行」。`289` 既不是物理行
+> 也不是自有代码行：类体跨 `commands.py:226-577`（352 物理行），13 个方法落在
+> `commands.py:240-520`，自有代码行 318。「289」这个数按任何一种口径都复现不出来。
+> 同因仍在：约 129 行是冻结文案（`HELP_TEXT` / `_SETUP_GUIDES`），是数据不是逻辑。
 
 **这轮债务不止 `BridgeCore`**：债务表里还有 10 个适配器超阈值
-（`HomeAssistantAdapter` 49、`DiscordAdapter` 43、`QQBotAdapter` 42、
-`TwitchAdapter` 42、`MattermostAdapter` 41、`NextcloudAdapter` 38、
-`IRCAdapter` 35、`A2aAdapter` 34、`EmailAdapter` 32、`TelegramAdapter` 24）。
+（`HomeAssistantAdapter` 48、`DiscordAdapter` 43、`TwitchAdapter` 42、
+`QQBotAdapter` 41、`MattermostAdapter` 40、`NextcloudAdapter` 37、`IRCAdapter` 35、
+`A2aAdapter` 34、`EmailAdapter` 34、`TelegramAdapter` 24）。
 **没有排期**，记在这里以免被当成已完成。§5.1 的**约束**（新功能不得加厚这些类）
 对新代码立即生效；**存量**的全面偿还需要单独立项。
 
@@ -829,13 +907,32 @@ homeassistant `:1089`。所以 `/model` 与其它命令走同一道闸，**没�
 任何能触达 bot 的人都能换掉 agent 干活用的模型。
 **当前本机配置 telegram 白名单有 1 项，风险不存在**（已实测确认，不是推测）。
 这是台账里已记的「默认全开」隐患，值得在放宽白名单时一并想起。
+> **2026-10-05 复核：仍然开放，且逐字可查** ——
+> `adapters/base.py:287-288` 就是 `if not self.allowed_chat_ids: return True`，
+> `adapters/base.py:281` 的 docstring 自己写着「空（v1 保持现状）= 全开」。
+> 这是**刻意写下来的现状**，改成默认拒是破坏性变更（已配好即用的用户升级后会
+> 突然收不到消息），需要迁移期 + 警告期，**由用户决定，不排期**。
+> ⚠️ 顺带记一句：`/model` 走的是 `admits()` 这同一道闸
+> （`adapters/base.py:283-285` 明确要求闸门在任何副作用**之前**，否则未授权者能
+> 用 `/approve` 这类命令字绕过它），所以上面说的"公开"风险是真实存在的，不是假设。
 
 ##### 一处已发现但刻意未动的重复
 
-`core.py:1278-1286` 的 `_cmd_status` 里还有一段 ~8 行的 `providerID`/`id`
-格式化，与 `session_model.current_model_label()` 重复。实现者**没有**顺手改，
+`_cmd_status` 里还有一段 ~9 行的 `providerID`/`id` 格式化，与
+`session_model.current_model_label()` 重复。实现者**没有**顺手改，
 因为那会让 `/status` 的输出从 `?` 变成中文「未知」——那是既有命令的
 **行为变更**，不该混在这次refactor 里。留着当后续项。
+
+> ⚠️ **2026-10-05：指针已失效，位置也变了。** 原文写的 `core.py:1278-1286`
+> **不存在** —— `core.py` 现在只有 385 行，`_cmd_status` 早已随命令块搬走。
+> 重复段现在在 **`commands.py:414-422`**（`model = session.get("model")` 起，
+> `for key in ("providerID", "id")` 在 `commands.py:418`），
+> 被复用的那份是 **`session_model.py:113` `current_model_label(session)`**。
+> ⚠️ **不动的理由仍然成立且未被推翻**：改它会改 `/status` 的输出文案
+> （`?` → 中文「未知」）。所以这一格按原样保留，**只修指针** ——
+> 否则下一个人会去 `core.py:1278` 找一个不存在的行。
+> ⚠️ 那次漂移本身也是一条教训：台账里的 `file:line` 指针**会随重构失效**，
+> 而"删掉重复"这件事又因此一直没人做。
 
 #### G3 曾待决的四个问题（**已定，见上节**）
 
@@ -854,26 +951,57 @@ homeassistant `:1089`。所以 `/model` 与其它命令走同一道闸，**没�
 ⚠️ 另：实测在 opencode 上留下了两个探测会话（标题 `g3-model-probe` 与
 `g3-model-probe-2`），`/delete` 与 `/abort` 都返回 404，没找到删除端点。
 无害但没清掉，如在意可手动在 opencode 里删。
+> **2026-10-05：改标签 —— 这是「服务端状态 / 手动操作」，不是本仓库的待办。**
+> 这两个会话存在于 opencode 服务端，本仓库的代码里没有任何东西创建、持有或删除它们
+> —— 它们是 2026-09 那次 `/model` 探测的副产品。所以它既不是 `☐` 工单，也不是
+> 本仓库能修的缺陷；留在台账里只应作为"记得去服务端删一下"的备忘。
+> ⚠️ 删不掉的**原因未知**：本仓库没有会话删除端点的封装（`opencode_client.py` 只有
+> `create_session` / `delete_session`，后者是删自己建的会话），而上面那次 404 是
+> 在 opencode 侧调的 —— 要判断是"端点不存在"还是"权限/路径不对"，**需要仓库外的
+> 证据**，本次不下结论。
 
-#### ⚠️ 残留：仍未闭合的窗口
+#### ✅ 多实例并存 → **已修**（原 A4 记的"待决策架构问题"）
+
+**当初为什么那么定**：A4 实测时只观察到"两个桥进程会互抢同一个 opencode token"，
+没有定位机制，于是记成"待决策架构问题"。**现在为什么改**：根因是**没有锁**，
+所以修法是加一个跨进程的原子锁，而不是给 token 加逻辑。
+`__main__.py:453-455` 现在先 `InstanceLock(_bridge_dir())` 再
+`acquired, holder_pid = instance_lock.acquire()`，拿不到就直接拒启动并报出
+持锁者的 pid（`__main__.py:33` 引入 `InstanceLock, pid_is_alive`）。
+机制是 `instance_lock.py` 的硬链接原子创建 + pid+token 双匹配释放。
+⚠️ 这**不是**"只影响 A4 那次实测"的问题：多开一个桥就会发生，
+所以这一格原先的 `◐` 低估了它。
+
+#### ⚠️ 残留：仍未闭合的窗口（**这是架构决策，不是一张工单**）
 
 收件箱写入点是 `on_inbound`。它**不覆盖「游标已落盘 → on_inbound」**这段：
 
 ```
-email.py:814  save(fetched_through)      <- 游标已落盘
+adapters/email.py:817  save(fetched_through)      <- 游标已落盘
+adapters/email.py:818  push_many(items)
    ...（transport 队列等待，窗口 = 队列排空时间）...
-email.py:913  _on_raw
-email.py:958  hooks.on_inbound            <- 收件箱写入点
+adapters/email.py:916  _on_raw
+adapters/email.py:961  hooks.on_inbound            <- 收件箱写入点
 ```
+
+> ⚠️ 2026-10-05 订正：本节原引的是 `email.py:814/913/958`，三行都已漂移
+> （文件在那之后长过），现改为上面这四个实测行号。结论未变。
 
 **email 这段含队列等待，不是窄窗口**；崩溃在这里，那批邮件仍会永久丢失。
 telegram / matrix 等无队列的适配器这段很窄（微秒级），实际风险低。
 
 - 这**不是本次引入的**（改前同样丢，因为改前每次启动都跳到最新）；
-- 本次也没关闭它。要关闭得让写前落盘发生在**适配器推进游标之前**，
-  那是另一套设计（且会与"适配器不改动"的前提冲突），未排期。
+- 本次也没关闭它。
 
-#### 另一处有意接受的偏离
+**⚠️ 这一格改标签：它是「架构决策」，不是待办工单**（2026-10-05）。
+理由：关掉它要求写前落盘发生在**适配器推进游标之前**，也就是要把 `inbox.record()`
+挪到 `adapters/email.py:817` 之前 —— 那要求**改动适配器**，直接违反本仓库的
+「适配器不改动」前提。这个前提不是风格偏好：它正是 A2b 键迁移、G1 修复、
+`session_keys` 归属判定这一整串决定能保持可审的原因。所以它**不是"忘了做"**，
+是"按当前架构做不到"。要改就得先推翻那条前提，那是一次独立的、以
+"为什么适配器不可改"为主题的决策 —— 不该藏在一条残留里等着被某个人顺手实现掉。
+
+#### 另一处有意接受的偏离（**2026-10-05 升为「可动工」，一条转移**）
 
 **409 时该行留在 `attempting`，不是 `pending`。** 409 只有在
 `client.prompt()` **之后**才认得，而 `mark_attempting` 必须紧贴那个调用之前写
@@ -883,9 +1011,18 @@ telegram / matrix 等无队列的适配器这段很窄（微秒级），实际�
 实际保证（都有测试）：不产生 `failed`/`abandoned`、`attempts == 0`
 （不烧重试预算）、写前义务仍在盘上、进程内在该轮结束后重试并落成 `delivered`。
 残留代价窄且偏保守：**若恰在 409 与其重试之间崩溃**，下次启动走
-"只告警不重放"分支。若日后想严格符合规格，给 `inbox.py` 加一个
-`mark_pending` 即可（一行转移），本次刻意不加 ——
-不想在最后一段扩大 API 面。
+"只告警不重放"分支。
+
+**2026-10-05：由「刻意不加」改为「可动工」，工作量就是一条转移。**
+上一版写的是"若日后想严格符合规格，给 `inbox.py` 加一个 `mark_pending`
+即可（一行转移），本次刻意不加 —— 不想在最后一段扩大 API 面"。
+**那个理由已经过时**：`InboundInbox` 现有五个转移是
+`record`（`inbox.py:220`）/ `mark_attempting`（`:253`）/ `mark_delivered`（`:267`）/
+`mark_failed`（`:276`）/ `mark_abandoned`（`:316`），**没有** `mark_pending`；
+调用点在 `inbound_gateway.py:600-606`（`exc.status == 409` 分支只 `return "busy"`）。
+「收尾那一段别扩大 API 面」是一次性的工期顾虑，如今 G2 已结项、
+409 路径的行为也已被测试钉住，**那条顾虑不再约束任何人**。
+所以现在按**可动工**记，而不是按"已决定不做"记 —— 后者会让下一个人以为它被否决过。
 
 #### 对两条既有结论的修正（oracle 裁决时查出）
 
@@ -910,6 +1047,18 @@ telegram / matrix 等无队列的适配器这段很窄（微秒级），实际�
 "新装机器不要吞掉几个月历史邮件"这个**意图是对的**，bug 在于没有限定在首次运行。
 修法：游标经`StateStore` 持久化，首次运行保留跳过、之后重启从已存游标续跑。
 注意保持 email 既有的"先推进游标再处理"顺序不变（`tests/test_email.py` 有测试锁定）。
+
+> ✅ **2026-10-05：已修。原文明写「从不由磁盘恢复」，现已不成立。**
+> 游标走 `Hooks.load_stream_cursor` / `save_stream_cursor` 那一对持久化：
+> `adapters/email.py:757` `_restore_cursor_once()`，**在第一次 fetch 之前**只跑一次
+> （`:763-765` 的 `_cursor_restored` 闸门），`:766` `load()`、`:769` 写回 `self._uid`、
+> `:770-772` 记一行"已从存储恢复游标"的日志。
+> 首次连接的"跳过全部未读"水位线**立刻**落盘：`:800-801`
+> `self._uid = uids[-1]` 紧跟 `self._cursor_persistence.save(uids[-1])`。
+> 因此"每重启一次静默吞掉整个未读邮箱"**已关闭**，且首次运行的意图保留。
+> ⚠️ 上面 `adapters/email.py:400` 与 `:669-676` 两个行号是**漂移的**
+> （`:400` 那句 `self._uid = None` 现在在 `__init__` 里但行号已变）——
+> 当年的判断仍然成立，位置要重新查。
 
 **与收件箱的关系**：收件箱覆盖"游标已推进 → 消息交给 opencode"之间的崩溃窗口，
 所以email 侧**只需持久化游标**，不必自己实现至少一次语义。
@@ -939,6 +1088,18 @@ telegram / matrix 等无队列的适配器这段很窄（微秒级），实际�
 > 结果真实服务端一个都对不上，而 1400 多条测试全是绿的。
 
 ### G1 · 桥反复退出（**不要靠猜去改**）
+
+> **⚠️ 2026-10-05：本条没有代码可写，处于「等观测」状态。**
+> 取证装置**已全部就位**，缺的只有运行数据：`__main__.py:526-527`
+> `diagnostics = ProcessDiagnostics(_bridge_dir())` + `diagnostics.install()`；
+> `diagnostics.py:117` `dump_stacks(reason)` 写全线程栈；
+> `diagnostics.py:131` `record(reason, exit_code=None, detail="")` 往账本写
+> `pid / startedAt / endedAt / durationSeconds / reason / exitCode / threadCount /
+> registeredSignals`（`:139-148`）。
+> **所以不要把本条排成"实现某功能"** —— 没有功能可实现。要做的是让带诊断的
+> 版本**长期运行**，然后按 `reason` / 栈转储是否落盘 / `registeredSignals` 三样
+> 读账本。⚠️ 代码**不做**三种情形的分类，判据是事后读这两样产物（见下方那条
+> 「只退出、无 kill 记录」的订正）。在此之前**根因未证实**，只能写成症状。
 
 **已掌握的事实**（实测，非推断）：
 
@@ -996,6 +1157,16 @@ telegram / matrix 等无队列的适配器这段很窄（微秒级），实际�
   那是 opencode 进程关闭时的**清理**（`cleanup: 已终止本实例 spawn 的 bridge`），
   **不是**死亡原因。方向作废。
 - 还有约 15 个 pid 是"只退出、无 kill 记录"，属于自行退出，原因仍不明。
+  > **2026-10-05：这批数据现在**可分类**了，但**代码不做分类** ——
+  > `ProcessDiagnostics` 只提供两样原始材料：`dump_stacks(reason)`
+  > （`diagnostics.py:117`）把全线程栈写进 `_stack_file`，`record(...)`
+  > （`diagnostics.py:131`）往账本写一行带 `reason` / `exitCode` /
+  > `registeredSignals` 的 JSON（`diagnostics.py:144-147`）。三种情形的判据是
+  > **事后读这两样东西**：栈转储在 → 软退出；栈在 + 信号已注册 → 被信号带走；
+  > 两者皆空 → 硬杀（连 `record` 都没跑到）。
+  > ⚠️ 原以为 `diagnostics.py:169` 是那个分类器，**不是** —— `:169` 是私有的
+  > `_append_ledger`（账本文件写入器）。所以本条**仍然是数据收集**，不是待实现功能；
+  > 判读脚本/结论要另立。
 - 结论只能写成**症状消失**，不能写成**已定位根因**。
 
 **接下来怎么做**（比继续猜更有价值）：
@@ -1281,10 +1452,31 @@ adapters/telegram.py:327     self._pending.clear()
 | # | 任务 | 难度 | 验收 | 状态 |
 |---|---|---|---|---|
 | A1 | **传输层抽象**：`opencode_bridge/transport/` —— `HttpPollTransport`（长轮询）/ `IntervalTransport`（短轮询）/ `WebSocketTransport`（包 `ws.py`）/ `TcpLineTransport`（行协议）。基类统一线程、指数退避、**先关连接再 join 的 stop 语义** | L | 四个 transport 各自有测试；迁移 2~3 个现有适配器后行为**不变**（现有 703 用例全绿） | ☑ 包已建成（67 用例，含**平台无关的周期钩子**）；**迁移进度 5/8：IRC ✓ Matrix ✓ Telegram ✓ Slack ✓ Discord ✓**。剩余：**Mattermost → Twitch**（IRC-over-WS；可切到新周期钩子的循环驱动模式）。⚠️ **Nextcloud 不迁**：它是 5 worker 轮转池（在飞长轮询恒 ≤ worker 数），映射不到单`fetch` 回调模型，硬迁会破坏结构 |
-| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ◐ 包已建成（27 用例）。**分两类**：<br>· **映射到自身、切换零风险**（`conversation_id` 字节级不变）：**irc ✓ twitch ✓ nextcloud ✓ 已全部完成**<br>· **切换会改键格式**（须先有 A2b）：telegram(`chat:`) / matrix(`room:`) / slack / discord / mattermost(`channel:`，歧义还需知道是哪一家) ☐ |
-| A2b | **`state.json` 键迁移**：加载时按 `identity.normalize(..., platform_hint=)` 重写旧键并原子落盘 | M | 用旧 `state.json` 起一次，`chat:`/`room:`/`channel:` 键全部变新格式；**中途中断不丢数据**；旧文件保留备份 | ☑ **代码已完成**（`StateStore(path, migrate_keys=True)`，`state.py` 136→488 行 + 33 用例）。⚠️ **但从未在任何平台启用** —— 它必须与 A2 的前缀切换在**同一个 commit** 上线，否则会造出「已迁移但前缀未切」的**半迁移态**。此处 ☑ 指代码就绪，不代表功能已对用户生效；未生效的部分记在 A2 行|
+| A2 | **会话标识统一**：`opencode_bridge/identity.py` —— `platform:local_id`，提供 `format` / `parse` / `platform_of` / 校验；**向后兼容**已落盘的 `chat:` `channel:` `room:` 旧格式 | S | 各适配器不再自造前缀；旧 `state.json` 仍能读；跨平台同名 chat id 不再混淆 | ✅ **8/8 全部完成**（2026-10-05 订正，见下） |
+| A2 细分 | **映射到自身、切换零风险**（`conversation_id` 字节级不变） | | | ✅ **3/3**：irc ✓ twitch ✓ nextcloud ✓ |
+| A2 细分 | **切换会改键格式**（须先有 A2b） | | | ✅ **5/5**：telegram(`chat:`) ✓ matrix(`room:`) ✓ slack ✓ discord ✓ mattermost(`channel:`，歧义靠 `platform_hint`) ✓ |
+
+> ⚠️ **本行原先是 `◐` 且把后五个平台标成 `☐`，并与 G5 那一行自相矛盾**
+> （G5 写的是"前缀已切换"，见下方 G5）。两处现在**同时**为真：代码确实全切了，
+> 且 A2b 也确实**同时**启用了。
+> **当初为什么那么定**：切前缀会改 `conversation_id` 的字符串格式，而 `StateStore`
+> 拿它当**不透明键**存会话映射 —— 已落盘 `state.json` 里的旧键会全部变成孤儿，
+> 用户**一次性丢会话映射**且**不报错**（只表现为"agent 突然记错上下文"，比直接失败
+> 难查得多）。所以它被列为"须先有 A2b"，而 A2b 那时**从未启用**。
+> **现在为什么改**：A2b 已在 `__main__.py:476` 以
+> `StateStore(cfg.state_path, migrate_keys=True)` **启用**（`__main__.py:470-475`
+> 解释了为什么必须同 commit 上线），于是前置条件已满足。
+> **证据（入站接受两种前缀 / 出站只发新前缀）**：
+> `adapters/telegram.py:139` `_CONVERSATION_PREFIXES = ("telegram:", "chat:")`、
+> `adapters/matrix.py:157` `("matrix:", "room:")`、
+> `adapters/slack.py:157` / `adapters/discord.py:263` / `adapters/mattermost.py:253`
+> 三家都是 `("<平台>:", legacy_conversation_prefix)`（歧义前缀交给 `platform_hint`）。
+> 出站构造：`adapters/telegram.py:597`、`matrix.py:442`、`slack.py:468`、
+> `discord.py:964`、`mattermost.py:919` —— 全部走 `format_id("<平台>", …)`。
+> 零风险那三家的字节级不变由 `identity.py` 的映射保证。 |
+| A2b | **`state.json` 键迁移**：加载时按 `identity.normalize(..., platform_hint=)` 重写旧键并原子落盘 | M | 用旧 `state.json` 起一次，`chat:`/`room:`/`channel:` 键全部变新格式；**中途中断不丢数据**；旧文件保留备份 | ✅ **代码已完成且已启用**（`StateStore(path, migrate_keys=True)`，`state.py` 136→488 行 + 33 用例）。**2026-10-05 订正：那句「但从未在任何平台启用」已不成立** —— 桥现在就是这么开的：`__main__.py:476` `state = StateStore(cfg.state_path, migrate_keys=True)`，理由写在 `__main__.py:470-475`。启用状态由 `tests/test_conversation_id_cutover.py:394` `test_bridge_opens_the_state_store_with_key_migration_enabled` 锁住，同文件 `:424` 还锁住"损坏文件保持逐字节不变并报错"。**A2 与 A2b 因此在同一个 commit 上线**，不存在那条警告担心的"半迁移态" |
 | A3 | **inbound-push 入口**：单端口 HTTP 服务 + 按路径路由到适配器（webhook 类平台的唯一可行入口） | M | 起一个本地 HTTP 服务，两个 webhook 适配器能各自收到 POST 并鉴权；停机干净 | ☐ `httpsrv.py` 已建成（a2a 首个使用方），A3 只需 `add_route()` |
-| A4 | **真实服务端到端验证**：至少让一个平台对着**真实服务器**跑通入站+ 出站 | M | 有一条真实会话的端到端记录（收发各一条），并把踩到的协议差异写回文档 | ☑ **2026-10-03 首次真实验证完成**（真实 Telegram bot + 真实 opencode 2.0.22）。已验证 5 项：出站送达、入站到达适配器、长轮询与游标、端点自动发现、错误可观测性。同时**定位并修掉 1 个确定性 bug**（默认配置让新会话必然 500），**另记录 1 个待决策架构问题**（多实例并存互抢 token）。可复现数据与修法见下方进度日志 2026-10-03 A4 条|
+| A4 | **真实服务端到端验证**：至少让一个平台对着**真实服务器**跑通入站+ 出站 | M | 有一条真实会话的端到端记录（收发各一条），并把踩到的协议差异写回文档 | ☑ **2026-10-03 首次真实验证完成**（真实 Telegram bot + 真实 opencode 2.0.22）。已验证 5 项：出站送达、入站到达适配器、长轮询与游标、端点自动发现、错误可观测性。同时**定位并修掉 1 个确定性 bug**（默认配置让新会话必然 500），**另记录 1 个架构问题**（多实例并存互抢 token —— **2026-10-05 订正：这条已不是"待决策"，而是已修**，见下方进度日志）。可复现数据与修法见下方进度日志 2026-10-03 A4 条|
 
 **A2b 为什么必须先做**：切前缀会改 `conversation_id` 的**字符串格式**，而 `StateStore`
 拿它当**不透明键**存会话映射 —— 于是已落盘 `state.json` 里的旧键全部变成孤儿，
@@ -1327,7 +1519,7 @@ adapters/telegram.py:327     self._pending.clear()
 
 | # | 任务 | 难度 | 收益 | 状态 |
 |---|---|---|---|---|
-| C1 | **prompt hint 注入**（借 `ctx.session.hook("context")`） | S | agent 知道自己在 400 字符的 IRC 上说话，还是 40000 的 Slack；无 markdown 渲染；回复非即时 | ☐ |
+| C1 | **prompt hint 注入** ~~（借 `ctx.session.hook("context")`）~~ —— **已用别的机制做完**（见下） | S | agent 知道自己在 400 字符的 IRC 上说话，还是 40000 的 Slack；无 markdown 渲染；回复非即时 | ✅ **已完成**（`b36dfcf`） |
 | C2 | **脱敏引擎** | M | **已完成**（`91da552`）：两个咽喉点（handler 级日志过滤器 + `StateStore` 序列化边界），**502 个日志调用点改了 0 个** | ✅ **已完成** |
 | C3 | ~~**入站合并窗口** 5s 超时 + 快照落盘~~ `..`/`!!` 标记门控 —— **前提一半是错的**（见下） | M | 4 行粘贴从 **4 次 `prompt()`** 变成 **1 次**，且普通消息**可证明地**零延迟 | ✅ **已完成**（`0187c95`）|
 | **C3.1** | **`on_inbound` 的 `.strip()` 吃掉首行缩进** —— 粘贴缩进代码块 → agent 收到坏代码 | S | 已完成（`c8a490f`）：**首行缩进逐字节保留**；且损害面比原判**更宽**（逐行、在合并之前，故每个被扣的行各自丢一次）| ✅ **已完成**（`c8a490f`）|
@@ -1368,6 +1560,14 @@ adapters/telegram.py:327     self._pending.clear()
 
 ##### §8 决策记录：**否决** `state.json` 的确定性键哈希（我只要评估、不许实现）
 
+> **2026-10-05 复核：这个否决仍然成立，而且现在**承重**。** 别把它当成一条可以
+> 重新评估的旧结论：实现它会让 `state.json` 的键**不再是平台原样的 id**，而
+> `conversation_keys.py:134-139` 现在明确把"只对该平台**自有的**历史前缀
+> 生效"钉成前置条件（`:134` 判 `legacy_conversation_prefix`、
+> `:137` `if not owner.owns_local_id(local_id): return ()`）。
+> A2/A2b 已经在生产路径上启用了（见上），所以归属判定是**活的**——
+> 任何把键改成哈希的想法都必须先答"歧义前缀 `channel:` 还怎么判归属"。
+
 结论**不做**。它发现一个改变判断的事实：`inbox.db` 的 `conversation_id` 是
 **载荷不是键**（无索引，`inbox.py:342,417` 只按 `state`/`not_before` 查），那侧只需
 改值、不需迁移 —— **只剩 `state.json` 本身**。
@@ -1388,11 +1588,20 @@ adapters/telegram.py:327     self._pending.clear()
 
 ##### 残留（明确记下，未修）
 
-- **裸 local id 仍在约 15 行日志里明文**（如 `telegram.py:492` 直接记
-  `chat.get("id")`）。**按形状不可修** —— discord snowflake **本身就是合法的纳秒
-  时间戳**，任何涵盖它的数字范围也涵盖时间戳/端口/行号。根治是让适配器改记带
-  前缀的 `conversation_id`，属于 `adapters/**`，不在 C2 范围内。
-- **装好之后再挂的 handler 不会被覆盖**（docstring 已明写）。生产代码的 handler
+> 2026-10-05 复核：**两条都仍然成立**，各补一个实测锚点。
+
+- **裸 local id 仍在日志里明文**。实测锚点：`adapters/telegram.py:493`
+  `logger.info("telegram: dropped message from non-whitelisted chat %s", chat.get("id"))`
+  （⚠️ 原写 `telegram.py:492`，该行已漂移；这是 chat id，不是 `identity.py`
+  意义上的 local id，两者都是平台侧 id）。
+  **按形状不可修** —— discord snowflake **本身就是合法的纳秒时间戳**，
+  任何涵盖它的数字范围也涵盖时间戳/端口/行号；`~15 行`这个数量本次**未重数**
+  （数法见下方 F4 那一节的口径问题），故不再引用它。
+  根治是让适配器改记带前缀的 `conversation_id`，属于 `adapters/**`，不在 C2 范围内。
+- **装好之后再挂的 handler 不会被覆盖** —— 原文照录于
+  `redaction.py:531-534`（`:531`「⚠️ 未知文本边界：**之后**再挂的 handler 不会被
+  覆盖到」，`:532-534` 给出理由：嵌入式只暴露 `logging.basicConfig`、生产路径经
+  `__main__._setup_logging` 只装一次、实际生产路径没有漏装）。生产代码的 handler
   只由 `basicConfig` 建一次，顺序正确。
 
 ##### 过程中抓到的两个真 bug
@@ -1448,6 +1657,35 @@ adapters/telegram.py:327     self._pending.clear()
 「同一请求可被连答三次」。改为每种决策各用自己的 id，可接受集合一条没少。
 
 **残留**：账本仅在内存中。持久化需要动 `state.json` schema，超出 C4 范围。
+> 2026-10-05 复核：**仍然成立**，且是有意的取舍而非疏漏 ——
+> `permission_ledger.py:24-26` 的模块文档字符串把这个决定写下来了：清空只会让判断
+> 退回服务端（`ANSWER_UNSEEN` fail open），而服务端才是"这个 id 存不存在"的权威。
+> 跨重启的持久化要在 `state.json` 里给 pending 请求建 schema，属独立立项。
+
+#### C1 已完成（`b36dfcf`）—— 台账点名的机制**一个都没用上**
+
+**这一格原先是 `☐`，且写着「借 `ctx.session.hook("context")`」。两处都要订正。**
+
+**实际用的机制**：`channel_profile.py` 的 `ChannelProfile.render()` 渲染一段英文
+说明，由 `with_channel_hint(queued.text, adapter)` 拼在用户正文**前面**，
+分隔标记 `_HINT_SEPARATOR = "---"`（`channel_profile.py:51,167-174`），
+唯一的调用点是 `inbound_gateway.py:597`（`_dispatch_prompt` 里调 `prompt()` 的那一行）。
+
+**为什么不走 hook**：⚠️ `ctx.session.hook` 在**代码里零出现** ——
+`opencode_bridge/**` 与 `plugin/*.ts` 全都没有。它只出现在**文档**里
+（`docs/platform-design-reference.md:232,233,290`）和本台账里。也就是说台账点名的
+那条路在本仓库**根本不存在**，标 `☐` 会让人以为"还没做"。
+
+**当初为什么那么定**：那行是照着 opencode 侧"宿主可以挂 hook"的设想抄的
+（`docs/platform-design-reference.md` 把它列在"可抄"里）。**现在为什么改**：
+那条 hook 我们**发不出来**（本仓库从不向宿主注册钩子）—— 这正是 AGENTS.md
+新增铁律 3「上游有此能力、本仓库刻意不用」记的那一类。改成在**调用 `prompt()` 的
+那一刻**自己拼前置说明，能力全部来自适配器**自己声明的**
+（`ChannelProfile.from_adapter`），所以新增第 14 个平台不用改这张表。
+
+**收益一栏的四个断言逐条仍然成立**：长度（`effective_max_length`）、无 markdown
+渲染、回复非即时、以及进度可见性（`supports_message_edit` 决定读者等待期间看不看得到
+东西）—— 后者还额外教会了模型"你假设用户在等"是错的。
 
 #### ⚠️⚠️ C3 与 C4 是**同一个根因**两次发作：台账项是照着 dsh 的配置 schema 转写的
 
@@ -1549,7 +1787,35 @@ C3 与 C4 **各自被点名的机制都不存在于本仓库**，而它们**在 
 | F1 | **`tests/test_transport.py`** 单字母 `t` | S | ☑ **248 处已改**（`0a28014`）。按实际含义分四类命名：`poll_transport` / `ws_transport` / `tcp_transport` / `fake_transport`，没有一律叫 `transport` |
 | F2 | **`opencode_client.py`** 局部 `data` | S | ☑ **26 处已改**（`0a28014`）。区分 wire 字段（保留）与自起局部（改名）：最坏写法 `data.get("data")` → `response.get("data")` |
 | F3 | **`tests/test_nextcloud.py`** 无意义 `junk` | S | ☑ 2 处已改（`0a28014`），改为 `non_numeric`（与同文件已有的 `bad` = 低于下限值并列，语义成对） |
-| F4 | **其余 ~460 处**自起局部 `data` | M | ☐ 按文件分批，**13 个适配器 + `core.py` + 6 个测试文件**。分布：`discord.py` 54、`telegram.py` 53、`qqbot.py` 48、`core.py` 46、`matrix.py` 41、`mattermost.py` 40、`opencode_client.py` 余 0、`nextcloud.py` 20、`slack.py` 16，其余零散 |
+| F4 | **其余**自起局部 `data` | M | ☐ 按文件分批。⚠️ **2026-10-05：本行原先的「~460 处」与它自己的分布表都复现不出来，已作废**，见下 |
+
+> **⚠️ 2026-10-05：F4 的计数无法复现，改用可重跑的口径。**
+> 原分布表写「`discord.py` 54、`telegram.py` 53、`qqbot.py` 48、`core.py` 46、
+> `matrix.py` 41、`mattermost.py` 40 …」并声称是用 `ast` / `tokenize` 普查的。
+> **实测复现不出这些数**：拿 `ast` 重新数，`core.py` 只有 **2** 处可执行的 `data`
+> （不是 46），而 `discord.py` 是 **55**（不是 54）、`telegram.py` **55**（不是 53）。
+> 结论不是"数字变了"，而是**这个任务从来没写下它的数法**，于是任何人重跑都得到
+> 另一组数。§3 明确把 `data` 划为**边界情形**：`data`/`type`/`id` 这些是协议
+> 自己的字段名，沿用是对的；只有**自起**的局部变量才算违规。
+>
+> **可重跑的口径**（照此可复现，与本节类体量普查同一套 `ast` 走法）：
+>
+> | 计法 | 含义 |
+> |---|---|
+> | `raw` | 整个文件文本里 `\bdata\b` 的出现次数（`grep` 给你的那个数） |
+> | `roles` | 上面里属于 `:data:` Sphinx 角色的次数（**在 docstring 里，不是变量**） |
+> | `raw-roles` | `raw` 减 `roles` —— 朴素 grep 的修正版 |
+> | `ast` | `ast` 看到的 `Name(id="data")` / `Attribute(attr="data")` / `arg(arg="data")` / `keyword(arg="data")` 之和 —— **只有这一列是"自起局部名"** |
+>
+> 2026-10-05 实测（`opencode_bridge/**`）：`raw-roles` 合计 **460**、
+> `ast` 合计 **406**，26 个文件有命中。
+> **差距 54 几乎全是协议字段**（`event["data"]`、`data.get(...)`）——
+> 也就是说 **`~460` 那个数把协议自己的字段名算成了违规**，
+> 而按 §3 那些**不算**。真正需要逐个看的量级是 `ast` 那一列，而它集中在：
+> `discord.py` 55、`telegram.py` 55、`event_stream.py` 54、`qqbot.py` 49、
+> `mattermost.py` 44、`matrix.py` 42、`nextcloud.py` 33、`slack.py` 17、
+> `email.py` 8、`homeassistant.py` 8。
+> ⚠️ **下一个人普查前先写下用的是哪一列**，否则这条会第三次对不上。
 
 ### F4 为什么单独立项而不是顺手改掉
 
@@ -1603,6 +1869,7 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 | 25 渠道全量 / 平台插件化 | 方向是"做深"不是"做多" |
 | 实例锁 | 纯插件进程，无共享 home 概念 |
 | 默认改显式 opt-in（`allowed_chat_ids` 空=全开 → 默认拒绝） | 会破坏"配好即用"现状；若要改需单独决策（迁移期 + 警告期）。⚠️ **但平台从 1 个变 8+ 个后风险面显著变大，这项应尽快决** |
+| ↑ 上面那条的 2026-10-05 复核 | **仍然开放，且仍然是"用户决策"而不是实现任务。** 现状逐字可查：`adapters/base.py:278` `def admits(...)`，`adapters/base.py:287-288` 就是 `if not self.allowed_chat_ids: return True`，`adapters/base.py:281` 的 docstring 自己写着「空（v1 保持现状）= 全开；非空 = 只放行列出的 chat」。所以**"默认全开"是刻意写下来的现状，不是疏漏**。改成默认拒是**破坏性变更**：已配好即用的用户升级后会突然收不到消息，且需要迁移期 + 警告期。⚠️ 这一格**不排期、不由实现者决定**，等用户定 |
 | **Signal** | 需 `signal-cli`（Java 二进制）+ **单独注册号**（不能复用主号，有封号风险）；Signal 官方无 bot API |
 | **imessage** | macOS 专有 + `imsg`/`osascript`，非 macOS 直接出局 |
 | **simplex** | WS 协议简单但必须跑 Haskell 守护进程 —— 只是把重型依赖换个地方装 |
@@ -1685,7 +1952,19 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
   旧 `split_text`——顺带修掉一处不当耦合：slack/discord 原先 `from .telegram import split_text`
   （跨平台依赖 telegram 模块）。**调用点显式传 `prefix_fmt=""`**，保持既有出站行为不变
   （分段不加前缀、`"".join(chunks) == text` 仍是断言的不变量）；前缀编号作为可选能力保留，
-  是否默认开启留待后续决策。旧 `TestSplitText` 的覆盖已被 `tests/test_split.py` 完全包含，删除以免
+  **是否默认开启留待后续决策 —— 2026-10-05 订正：这件事事实上已经"关"了，
+  从来没有人去做那个决策。**
+  `split.py:259` 的签名仍是 `prefix_fmt: str = DEFAULT_PREFIX_FMT`（默认**非空**），
+  但**全部 13 个生产调用点都显式传 `prefix_fmt=""`**：
+  `outbound.py:259`、`adapters/telegram.py:634`、`slack.py:480`、`discord.py:998`、
+  `matrix.py:528`、`mattermost.py:960` 与 `:975`、`irc.py:714`、`twitch.py:858`、
+  `ntfy.py:342`、`nextcloud.py:996`、`qqbot.py:1197`、`homeassistant.py:1310`。
+  即**前缀编号是 de-facto 关闭**，而那个非空默认值仍是个陷阱：下一个写新适配器的人
+  不传 `prefix_fmt` 就会**意外开启**一件所有现役适配器都没开的事。
+  **待办（可动工，二选一）**：把默认值翻成 `""`（一次性、行为不变，因为没人依赖它），
+  或把 `DEFAULT_PREFIX_FMT` 与编号分支**整个删掉**（§8：两处不统一也是代价）。
+  ⚠️ 别把它记成"已决定关闭"—— 从来没人决定过。旧 `TestSplitText` 的覆盖已被
+  `tests/test_split.py` 完全包含，删除以免
   两处维护同一行为。验证：200 tests OK、compileall 0、ZWJ 守恒（1800 个 ZWJ / 82 段无孤立
   ZWJ 开头）、国旗与键帽未拆。
 - **阶段 1 完成**（T1.1~T1.5 全部 ☑）。下一阶段：T2.1 Slack 入站。
@@ -2034,6 +2313,12 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
     事件到达率。**但若某个不合规的 homeserver 立刻返回空批次，就会变成对本机
     homeserver 的热循环** —— 迁移前那个 0.01 恰好是兜底。修它需要传输层加 pacing
     （属于 `transport/` 的事），本轮没做，已记为已知限制。
+    > **2026-10-05 复核：仍然未修，锚点更新。** 成功路径确实没有 pacing：
+    > `adapters/matrix.py:269-273` 构造 `PollingTransport(self._request_sync,
+    > idle_sleep=backoff, …)` —— `idle_sleep` 只在**没消息**时睡，
+    > `adapters/matrix.py:326` 的注释把这点写明了（"睡在 `idle_sleep` 里而不是白转"）。
+    > 上面那段文字里的 `matrix.py` 行号已漂移，`0.01s` 这个数来自当时的实现、
+    > 现行代码里查不到，所以按"曾经有、现在没有"记，别当成一个可配置项。
   - **代码量这次是变多的**（真实代码 +8 行）：删掉的样板只有 22 行（`_inbound_loop` 17 +
     建线程 5），新增接缝约 30 行 —— 因为"继承基类 1 行"变成"显式 10 行"，且轮询要拆
     `_request_sync`/`_on_sync` 两个接缝。诚实结论：**Matrix 这家迁移的收益是概念性的、

@@ -276,6 +276,21 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 
 **「还在落盘」是比任何状态查询都硬的活性证据** —— 文件持续被写入就说明它在产出。
 
+⚠️ **但「落盘」必须连 gitignore 的目录一起看。** 子代理按本规则把临时脚本放在
+`.tmp/`（gitignored），所以 `git status` 干净 **不等于** 它没在干活。
+踩过：据此判「没在产出」**错了两次**——而它正在 `.tmp/prof/` 里跑 `cProfile`，
+时间戳就在十几秒前。
+
+```powershell
+Get-ChildItem -Recurse -File -Path opencode_bridge, tests, .tmp |
+  Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-10) } |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 10
+```
+
+**这条判据与本规则给子代理的指令是配套的**：既然要求它们用 `.tmp/`，
+判断它们是否在动就**必须**看 `.tmp/`。用 `git status` 判断活性 =
+和自己的指令矛盾。
+
 ### ⛔ 顺序纪律：先取消并确认，再考虑动进程
 
 `task_cancel` 返回 `best-effort/uncertain … no tracked generation` 就是**没取消掉**。

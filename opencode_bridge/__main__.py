@@ -33,6 +33,7 @@ from .diagnostics import ProcessDiagnostics, describe_environment
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
+from .redaction import install_redaction_filter
 from .state import StateStore
 
 __all__ = ["main"]
@@ -67,6 +68,11 @@ def _setup_logging(level: str) -> None:
         level=numeric,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    # 脱敏过滤器必须挂在 **basicConfig 之后**：它装在 handler 上，而 handler 是
+    # basicConfig 建的。全仓库 34 个 logger 都是 ``opencode_bridge.*`` 的后代、
+    # 记录一律 propagate 到 root，所以这一行就覆盖了全部 13 个适配器以及将来
+    # 新增的任何一个 —— 而**没有任何一个调用点**需要改。
+    install_redaction_filter()
 
 
 def build_parser() -> argparse.ArgumentParser:

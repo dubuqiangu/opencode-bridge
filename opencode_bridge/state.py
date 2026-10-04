@@ -146,6 +146,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from . import identity
+from .redaction import redact_state_values
 
 __all__ = [
     "StateStore",
@@ -482,8 +483,16 @@ class StateStore:
             logger.warning("cannot create temp state file in %s: %s", directory, exc)
             raise
         try:
+            # ⚠️ **键不动，只脱敏值**（C2）。键是 conversation_id，也就是这份文档的
+            # **索引** —— 把它换成掩码文本会让每次查找落空、每条会话静默变成孤儿。
+            # 而值上只跑**凭据**一类：``meta`` 的值是要读回来用的（``directory`` /
+            # ``stream_cursor``），把手机号 / 邮箱规则套上去会让 ``/cd`` 静默去到
+            # 不存在的地方。理由见 :mod:`opencode_bridge.redaction` 模块 docstring。
+            # 脱敏结果是**新结构**，``self._data`` 本身不被改动，所以同进程内
+            # ``get_meta()`` 读到的仍是原值。
+            document = redact_state_values(self._data)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(self._data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dump(document, fh, ensure_ascii=False, indent=2, sort_keys=True)
                 fh.flush()
                 os.fsync(fh.fileno())
             # 原子替换：要么旧文件、要么新文件，**不存在**第三个状态。

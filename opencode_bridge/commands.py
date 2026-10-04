@@ -3,7 +3,7 @@
 
 这一整块原先是 :class:`~opencode_bridge.core.BridgeCore` 的十几个私有方法。搬出来
 是因为那个类已经远超 AGENTS.md §5.1 的阈值（方法数 ~15+ / 类自身代码行 ~250+），
-而命令处理恰好是其中**耦合最浅**的一块：它对 core 的依赖只有七个协作者
+而命令处理恰好是其中**耦合最浅**的一块：它对 core 的依赖只有八个协作者
 （见 :class:`CommandHandler`），搬出去之后既不用碰 core 的运行期状态
 （``_turns`` / ``_sid_conv`` / ``_lock`` 那一摊），又能脱离 core 单独测试。
 
@@ -32,6 +32,7 @@ from .conversation_keys import ConversationState
 from .hooks import Button, MsgHandle, Outbound
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient, OpenCodeError
+from .permission_ledger import PermissionLedger, repeated_answer_notice
 from .session_model import SessionModelCommand
 
 __all__ = [
@@ -225,7 +226,7 @@ DropSession = Callable[..., str | None]
 class CommandHandler:
     """斜杠命令的全部逻辑：认命令、分支、回话。
 
-    与 :class:`~opencode_bridge.core.BridgeCore` 之间只有 :meth:`__init__` 里那七个
+    与 :class:`~opencode_bridge.core.BridgeCore` 之间只有 :meth:`__init__` 里那八个
     注入的协作者 —— **没有** core 引用、也不读 core 的任何私有状态，所以这一整块
     能脱离 core 单独测（见 ``tests/test_commands.py``）。
 
@@ -246,11 +247,15 @@ class CommandHandler:
         ensure_session: EnsureSession,
         drop_session: DropSession,
         send_text: SendText,
+        permission_ledger: PermissionLedger,
     ) -> None:
-        """七个协作者全部由 core 注入，本类不自己去找。
+        """八个协作者全部由 core 注入，本类不自己去找。
 
         ``client`` 只用到 ``get_session`` / ``interrupt`` / ``reply_permission``；
         ``conversation_state`` 只用到 ``get_session`` / ``set_meta``；
+        ``permission_ledger`` 只读到 :meth:`PermissionLedger.status_of`、写到
+        :meth:`PermissionLedger.record_answered`（见
+        :mod:`opencode_bridge.permission_ledger`）；
         后三个是 core 那边的函数（建会话、删会话、发信），按**可调用对象**注入，
         所以本类拿不到 core 本身。
         """
@@ -261,6 +266,7 @@ class CommandHandler:
         self._ensure_session = ensure_session
         self._drop_session = drop_session
         self._send_text = send_text
+        self._permission_ledger = permission_ledger
 
     # ------------------------------------------------------------------
     # 入口
@@ -523,6 +529,18 @@ class CommandHandler:
         ``decision`` 是调用方已经选定的最终结果：这里不做选择、不读第二个 token，
         收到的每一个决策都原样发给服务端。这样"谁能发 ``always``"就只由
         :meth:`_cmd_approve` 一处决定 —— 共享层没有可以被覆盖的入口。
+
+        ⚠️ **迟到的第二次回答在这里被否掉**（C4）：本桥已经为这个请求发过决策，
+        或者服务端广播过 ``permission.replied``，那就**一个字节都不发**，
+        并且明确告诉用户这条被忽略了。少了这一步，
+        ``/approve per_7 once`` 之后再敲 ``/approve per_7 always`` 会发出两次
+        ``reply_permission``，第二次把一个已经答过的请求**放宽成永久放行** ——
+        与 ``d45440f`` 修掉的 ``/deny <id> always`` 同一类危害。
+
+        ⚠️ 反过来，**"本桥没见过这个 id"不作为拒绝理由**（状态
+        :data:`~opencode_bridge.permission_ledger.ANSWER_UNSEEN`）：
+        内存账本活不过重启，而服务端才是"这个 id 存不存在"的权威。在这里拒绝一个
+        还活着的请求会把 agent 永远卡住 —— 那个错方向是静默的，而这一边不是。
         """
         session_id = self._conversation_state.get_session(
             conversation_id, platform=adapter.name
@@ -533,7 +551,24 @@ class CommandHandler:
                 kind="error", adapter=adapter,
             )
             return
+        status = self._permission_ledger.status_of(session_id, request_id)
+        if status.already_closed:
+            logger.info(
+                "ignoring a second answer to permission request %s of session %s "
+                "(already %s); nothing is sent to the server",
+                request_id, session_id, status.state,
+            )
+            self._send_text(
+                conversation_id,
+                repeated_answer_notice(status),
+                kind="error",
+                adapter=adapter,
+            )
+            return
         self._client.reply_permission(session_id, request_id, decision)
+        # 只在**成功**之后记账：一次 5xx 若也记成"已答过"，这个还挂在服务端的请求
+        # 就再也批准不了（用户唯一能做的事被我们自己锁掉了）。
+        self._permission_ledger.record_answered(session_id, request_id, decision)
         self._send_text(
             conversation_id,
             f"已回复权限请求 {request_id}: {decision}",

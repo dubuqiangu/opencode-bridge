@@ -445,6 +445,174 @@ class CommandTests(unittest.TestCase):
             self.assertIn("用法: /approve", adapter.sent[-1].text)
             self.assertEqual(prompt_bodies(client.prompts), [(sid, "hello")])
 
+
+# ----------------------------------------------------------------------
+# C4: 审批路径的端到端不变量（真装配，真事件流，真命令分发）
+# ----------------------------------------------------------------------
+# 全部经 ``core.on_inbound`` / ``core.event_stream.dispatch`` /
+# ``core.on_callback`` —— 也就是适配器真正会走的那三条路，而不是直接调某个
+# 内部辅助函数。只测内部辅助函数的话，"这一块根本没接线"照样全绿。
+class PermissionSafetyTests(unittest.TestCase):
+    """C4 的断言：随口一句永远不是批准；一个请求只被回答一次。"""
+
+    def ask_permission(self, core, session_id, request_id, action="bash"):
+        """把一个 ``permission.asked`` 真事件推进事件流（渲染 + 记账）。"""
+        core.event_stream.dispatch(ev(
+            "permission.asked", sessionID=session_id, id=request_id,
+            action=action, resources=["/etc/shadow"],
+        ))
+
+    def test_an_ordinary_message_while_a_request_is_pending_is_never_an_approval(self):
+        """**决定性的反面用例**：请求挂着的时候随口一句，不许变成批准。
+
+        这一条是 C4 前提的正面回答。实测结论是：**今天已经成立** —— 一条普通消息
+        走的是 :meth:`~opencode_bridge.inbound_gateway.InboundGateway.on_inbound`
+        的 else 分支，被当成 prompt 发给 agent，压根到不了命令表。所以这里不是
+        "加了个保护"，而是把这条性质**钉住**：哪天有人加个"用户似乎同意了"之类的
+        启发式，这条会立刻红。
+
+        断言的是调用列表为空，而不只是"用户没报错" —— 恒真的断言比没有断言更危险。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "看一下 README"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_pending")
+
+            casual_replies = [
+                "是", "好", "行", "可以", "ok", "yes", "y", "sure",
+                "go ahead", "do it", "你看着办", "没问题",
+                "确认", "同意", "批准", "allow", "approve",
+                "per_pending", "once",
+            ]
+            for text in casual_replies:
+                with self.subTest(text=text):
+                    core.on_inbound(inbound("chat:55", text, ))
+                    self.assertEqual(
+                        client.permission_replies, [],
+                        "%r 被当成了批准" % text,
+                    )
+
+    def test_a_casual_reply_is_delivered_to_the_agent_instead_of_swallowed(self):
+        """与上面配对：随口一句**必须**到达 agent（当普通对话）。
+
+        只断言"没变成批准"不够 —— 万一实现是把它丢了，那也满足前一条而用户什么
+        都看不到。所以这里断言它进了 ``prompt()``。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "好"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_pending")
+
+            core.on_inbound(inbound("chat:55", "好"))
+
+            self.assertEqual(client.permission_replies, [])
+            self.assertEqual(prompt_bodies(client.prompts),
+                             [(session_id, "好"), (session_id, "好")])
+
+    def test_the_decision_word_without_the_slash_is_not_a_command(self):
+        """``approve per_1``（没有斜杠）不是命令 —— 斜杠是唯一入口。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "hello"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_1")
+
+            core.on_inbound(inbound("chat:55", "approve per_1"))
+
+            self.assertEqual(client.permission_replies, [])
+            self.assertEqual(prompt_bodies(client.prompts),
+                             [(session_id, "hello"),
+                              (session_id, "approve per_1")])
+
+    def test_a_second_answer_to_one_request_is_refused_end_to_end(self):
+        """真事件流 + 真命令：第二次一个字节都不发，且用户被告知。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "跑一下部署脚本"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_deploy")
+
+            core.on_inbound(inbound("chat:55", "/approve per_deploy"))
+            core.on_inbound(inbound("chat:55", "/approve per_deploy always"))
+
+            self.assertEqual(client.permission_replies,
+                             [(session_id, "per_deploy", "once")])
+            self.assertIn("忽略", adapter.sent[-1].text)
+
+    def test_a_late_answer_after_permission_replied_is_refused_end_to_end(self):
+        """服务端说结束了之后的那次回答不算数（这条事件以前被整个丢掉）。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "跑一下部署脚本"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_deploy")
+
+            core.event_stream.dispatch(ev(
+                "permission.replied", sessionID=session_id, id="per_deploy",
+            ))
+            core.on_inbound(inbound("chat:55", "/approve per_deploy always"))
+
+            self.assertEqual(client.permission_replies, [])
+            self.assertIn("已经结束", adapter.sent[-1].text)
+
+    def test_the_command_and_the_button_cannot_both_answer_one_request(self):
+        """两条回答路径共用**同一个账本** —— 否则去重是半拉子。
+
+        命令先答，按钮后按（或反过来）：第二次都必须被否掉。这条断的是"两边各有
+        一份记录"这种最省事也最没用的修法。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "跑一下部署脚本"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_deploy")
+
+            core.on_inbound(inbound("chat:55", "/approve per_deploy"))
+            core.on_callback("chat:55",
+                             "perm:%s:per_deploy:always" % session_id, "Q1")
+
+            self.assertEqual(client.permission_replies,
+                             [(session_id, "per_deploy", "once")])
+
+    def test_a_failed_answer_leaves_the_request_answerable_end_to_end(self):
+        """一次 5xx 不能把请求锁死 —— 用户重试必须还能发出去。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "跑一下部署脚本"))
+            session_id = client.created_ids[0]
+            self.ask_permission(core, session_id, "per_deploy")
+
+            client.permission_errors.append(OpenCodeError("down", status=500))
+            core.on_inbound(inbound("chat:55", "/approve per_deploy"))
+            core.on_inbound(inbound("chat:55", "/approve per_deploy"))
+
+            self.assertEqual(client.permission_replies,
+                             [(session_id, "per_deploy", "once")])
+
+    def test_the_paths_that_already_worked_are_untouched(self):
+        """C4 一条都不许改动的行为：三种决策仍然照发，且**每个请求**各一次。
+
+        这条是"没阉掉"的配对半边：去重要是"一个请求一次"，不是"一个会话一次"。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, _, _, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "hello"))
+            session_id = client.created_ids[0]
+            for request_id in ("per_a", "per_b", "per_c"):
+                self.ask_permission(core, session_id, request_id)
+
+            core.on_inbound(inbound("chat:55", "/approve per_a"))
+            core.on_inbound(inbound("chat:55", "/approve per_b always"))
+            core.on_inbound(inbound("chat:55", "/deny per_c"))
+
+            self.assertEqual(client.permission_replies, [
+                (session_id, "per_a", "once"),
+                (session_id, "per_b", "always"),
+                (session_id, "per_c", "reject"),
+            ])
+
     def test_failed_command_replies_with_error(self):
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
@@ -1228,8 +1396,15 @@ class EventFailureTests(unittest.TestCase):
             )
             self.assertEqual(adapter.answers, [("Q1", "已处理")])
 
+            # ⚠️ 这条断言的是**服务端报错**那条路，所以必须换一个请求 id：
+            # 同一个 ``per_9`` 已经被答过了，按 C4 现在会被账本先一步挡掉，
+            # 压根到不了服务端，也就走不到失败分支（那条由
+            # ``PermissionSafetyTests`` 里另外两个用例覆盖）。
+            core.event_stream.dispatch(
+                ev("permission.asked", sessionID=sid, id="per_10", action="edit")
+            )
             client.permission_errors.append(OpenCodeError("nope", status=400))
-            core.on_callback("chat:55", f"perm:{sid}:per_9:reject", "Q2")
+            core.on_callback("chat:55", f"perm:{sid}:per_10:reject", "Q2")
             self.assertEqual(adapter.answers[-1], ("Q2", "失败"))
             self.assertEqual(adapter.sent[-1].kind, "error")
 

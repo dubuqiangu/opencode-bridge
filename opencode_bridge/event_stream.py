@@ -29,6 +29,7 @@ from .adapters import Adapter
 from .hooks import MsgHandle
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient
+from .permission_ledger import PermissionLedger
 from .state import StateStore
 
 __all__ = ["EventStream", "Turn"]
@@ -206,7 +207,6 @@ class EventStream:
         "mcp.status.changed",
         "mcp.resources.changed",
         "location.shutdown",
-        "permission.replied",
     })
 
     #: 未知事件记账日志的最小间隔（秒）。多路事件交替出现时"同一个名字连续"
@@ -229,6 +229,7 @@ class EventStream:
         edit_progress: EditProgress,
         finalize: Finalize,
         flush_queue: FlushQueue,
+        permission_ledger: PermissionLedger,
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -238,6 +239,12 @@ class EventStream:
 
         ``clock`` / ``edit_interval`` / ``max_message_chars`` 是**构造时读一次**的
         配置值：它们来自 ``bridge`` 配置段，运行时不会被改写。
+
+        ``permission_ledger`` 与命令侧、入站按钮侧**共用同一个对象** —— 权限请求
+        的身份只有一份记录，否掉第二次回答才可能（见
+        :mod:`opencode_bridge.permission_ledger`）。本类只在两个时刻写它：
+        ``permission.asked``（这是唯一知道 request id 的时刻）与
+        ``permission.replied``。
         """
         self._client = client
         self._state = state
@@ -251,6 +258,7 @@ class EventStream:
         self._edit_progress = edit_progress
         self._finalize = finalize
         self._flush_queue = flush_queue
+        self._permission_ledger = permission_ledger
 
         #: Set once the event stream has delivered its first frame, i.e. the
         #: subscription is live. Startup recovery waits for it (bounded) before
@@ -275,6 +283,7 @@ class EventStream:
             "session.tool.failed": self._on_tool_event,
             "session.retry.scheduled": self._on_retry_scheduled,
             "permission.asked": self._on_permission_asked,
+            "permission.replied": self._on_permission_replied,
         }
         #: 事件名出现但没有 handler 时记进这里，便于 `dispatch` 打汇总日志，
         #: 免得刷屏（一个未知事件可能每秒来几百条）。有界，不无限增长。
@@ -691,6 +700,11 @@ class EventStream:
         else:
             resources_text = str(resources or "-")
         message = _clean(data.get("message") or "")
+        # ⚠️ 记账**必须在发信之前**：这是全流程里唯一同时握着 session id 与
+        # request id 的时刻，错过就再也补不回来（那正是 C4 的根因 ——
+        # 之前这里把 request_id 渲染成文字就扔了，之后只能靠用户手敲的字符串
+        # 去猜，见 :mod:`opencode_bridge.permission_ledger`）。
+        self._permission_ledger.record_asked(session_id, request_id)
         text = (
             "🔐 权限请求\n"
             f"动作: {action}\n"
@@ -702,6 +716,34 @@ class EventStream:
         self._send_text(
             conversation_id, text, kind="text", session_id=session_id
         )
+
+    def _on_permission_replied(self, data: dict) -> None:
+        """``permission.replied`` —— 服务端说这个权限请求**已经结束**。
+
+        这条事件以前在 :attr:`_KNOWN_BUT_IGNORED_EVENTS` 里被整个丢掉，也就是
+        唯一一个"这个请求不会再被回答"的**权威**信号被扔了。现在它只做一件事：
+        把账本记上，命令侧与按钮侧据此否掉迟到的第二次回答。
+
+        **刻意不发任何东西到 IM**：一次应答通常就是用户刚按过按钮（他那边已经收到
+        确认），或者 agent 自己走了另一条路 —— 这两种情况再发一条"某请求已结束"
+        对用户只是噪音。真要有话说，命令/按钮那条路上"已回复过"的那句才是用户
+        需要看到的，而它在**他真的又答了一次**的时候才出现。
+
+        别的会话的一律不记：`/api/event` 是全服务器广播，把同机其它 agent 会话的
+        ``permission.replied`` 记进来只会白占账本的槽位。
+        """
+        session_id = _session_id(data)
+        request_id = str(data.get("id") or "")
+        if not session_id or not request_id:
+            return
+        if not self._conversation_for(session_id):
+            logger.debug(
+                "permission.replied for a session this bridge does not serve "
+                "(session=%s); not recorded",
+                session_id,
+            )
+            return
+        self._permission_ledger.note_replied(session_id, request_id)
 
     def _finalize_session(self, session_id: str) -> None:
         """Publish the turn's final message, then flush the queue.

@@ -2,11 +2,12 @@
 
 这一整个文件存在的理由是 AGENTS.md §5.1 说的"抽出去"那种拆法：新类必须能脱离
 原类单独测。所以这里没有 ``make_env``、没有适配器挂载、没有 ``BridgeCore``；
-十二个协作者要么是真对象（``StateStore`` / ``Turn``），要么是本文件现造的替身。
+十三个协作者要么是真对象（``StateStore`` / ``Turn`` / 权限账本），要么是本文件现造
+的替身。
 
 因此这里能断言 core 层面**看不见**的东西：事件归属过滤的高频白名单、节流用的是
-哪个时钟、``turns`` 与锁是不是**共用同一个对象**、未知事件的记账与节流 —— 那些全
-是协作契约。
+哪个时钟、``turns`` 与锁是不是**共用同一个对象**、未知事件的记账与节流、
+``permission.replied`` 是不是不再被当"认识但忽略"丢掉 —— 那些全是协作契约。
 """
 
 from __future__ import annotations
@@ -21,6 +22,12 @@ from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import EventStream, Turn
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.opencode_client import OpenCodeError
+from opencode_bridge.permission_ledger import (
+    ANSWER_PENDING,
+    ANSWER_RESOLVED_UPSTREAM,
+    ANSWER_UNSEEN,
+    PermissionLedger,
+)
 from opencode_bridge.state import StateStore
 
 CONVERSATION = "chat:55"
@@ -124,7 +131,7 @@ def text_delta(session_id: str, text: str, ordinal: int = 0,
 # 基类：造一套 EventStream（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class EventStreamTestCase(unittest.TestCase):
-    """每个用例一套全新的十二个协作者。"""
+    """每个用例一套全新的十三个协作者。"""
 
     edit_interval = 1.5
     max_message_chars = 4000
@@ -144,6 +151,9 @@ class EventStreamTestCase(unittest.TestCase):
         self.finalize_calls: list[tuple] = []
         self.flush_queue_calls: list[str] = []
         self.adapter_for_calls: list[str] = []
+        #: 真对象：本文件要断言的正是"事件流有没有在 ``permission.asked`` 上记账、
+        #: 在 ``permission.replied`` 上销账"，所以不能拿替身把它糊过去。
+        self.permission_ledger = PermissionLedger()
         self.stream = EventStream(
             client=self.client,
             state=self.state,
@@ -157,6 +167,7 @@ class EventStreamTestCase(unittest.TestCase):
             edit_progress=self._record_edit_progress,
             finalize=self._record_finalize,
             flush_queue=self._flush_queue,
+            permission_ledger=self.permission_ledger,
         )
 
     # --- 五个协作者的可调用替身 -----------------------------------------
@@ -206,6 +217,7 @@ class EventStreamTestCase(unittest.TestCase):
             "edit_progress": self._record_edit_progress,
             "finalize": self._record_finalize,
             "flush_queue": self._flush_queue,
+            "permission_ledger": self.permission_ledger,
         }
         kwargs.update(overrides)
         self.stream = EventStream(**kwargs)
@@ -226,13 +238,13 @@ class EventStreamTestCase(unittest.TestCase):
 # 1-2: 依赖面与共享状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(EventStreamTestCase):
-    def test_the_constructor_takes_the_twelve_injected_dependencies(self):
+    def test_the_constructor_takes_the_thirteen_injected_dependencies(self):
         parameters = inspect.signature(EventStream.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "state", "lock", "turns", "clock", "edit_interval",
              "max_message_chars", "adapter_for", "send_text", "edit_progress",
-             "finalize", "flush_queue"],
+             "finalize", "flush_queue", "permission_ledger"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -892,6 +904,31 @@ class FinalizeTests(EventStreamTestCase):
 
         self.assertEqual(self.send_text.outgoing, [])
 
+    def test_a_rendered_permission_request_is_remembered_in_the_ledger(self):
+        """渲染那一刻是全流程里**唯一**同时握着 session id 与 request id 的时刻。
+
+        错过就再也补不回来：之后用户敲 ``/approve <id>`` 时，桥手里只有用户手敲的
+        那个字符串，分不清第一次还是第二次（C4 的根因）。
+        """
+        self.start_turn()
+
+        self.feed(ev("permission.asked", sessionID=SESSION_ID, id="per_remembered",
+                     action="bash"))
+
+        self.assertEqual(
+            self.permission_ledger.status_of(SESSION_ID, "per_remembered").state,
+            ANSWER_PENDING,
+        )
+
+    def test_an_unknown_sessions_permission_request_is_not_remembered(self):
+        """别桥会话的请求不进账本 —— 否则它会白占槽位，还可能被误当成已答过。"""
+        self.feed(ev("permission.asked", sessionID="ses_ghost", id="per_ghost"))
+
+        self.assertEqual(
+            self.permission_ledger.status_of("ses_ghost", "per_ghost").state,
+            ANSWER_UNSEEN,
+        )
+
     def test_a_send_failure_is_left_to_the_injected_callback(self):
         """事件流自己不吞异常：发不出去由 core 那边的发信路径记警告。"""
         self.start_turn()
@@ -899,6 +936,57 @@ class FinalizeTests(EventStreamTestCase):
 
         with self.assertRaises(RuntimeError):
             self.feed(ev("permission.asked", sessionID=SESSION_ID, id="per_4"))
+
+
+class PermissionRepliedTests(EventStreamTestCase):
+    """``permission.replied`` —— 事件流只**销账**，一个字节都不发到 IM。"""
+
+    def test_permission_replied_closes_the_request_in_the_ledger(self):
+        self.permission_ledger.record_asked(SESSION_ID, "per_1")
+
+        self.feed(ev("permission.replied", sessionID=SESSION_ID, id="per_1"))
+
+        self.assertEqual(
+            self.permission_ledger.status_of(SESSION_ID, "per_1").state,
+            ANSWER_RESOLVED_UPSTREAM,
+        )
+
+    def test_permission_replied_is_no_longer_accounted_as_an_unhandled_event(self):
+        """它以前在 ``_KNOWN_BUT_IGNORED_EVENTS`` 里被整个丢掉 —— 也就是唯一一个
+        "这个请求不会再被回答"的权威信号被扔了。现在它**有** handler，所以既不该
+        进未处理记账，也不该再出现在那个集合里（留着会让下一个人以为它被忽略）。"""
+        self.feed(ev("permission.replied", sessionID=SESSION_ID, id="per_1"))
+
+        self.assertEqual(self.stream._unhandled_event_names, {})
+        self.assertNotIn("permission.replied",
+                         EventStream._KNOWN_BUT_IGNORED_EVENTS)
+
+    def test_permission_replied_says_nothing_to_the_chat(self):
+        """用户刚按过按钮（那边已有确认）时再冒一句"某请求已结束"只是噪音。"""
+        self.feed(ev("permission.replied", sessionID=SESSION_ID, id="per_1"))
+
+        self.assertEqual(self.send_text.outgoing, [])
+
+    def test_permission_replied_for_another_session_is_not_recorded(self):
+        """``/api/event`` 是全服务器广播：同机别的 agent 会话的销账不能进账本。"""
+        self.permission_ledger.record_asked(SESSION_ID, "per_mine")
+
+        self.feed(ev("permission.replied", sessionID="ses_elsewhere",
+                     id="per_mine"))
+
+        self.assertEqual(
+            self.permission_ledger.status_of(SESSION_ID, "per_mine").state,
+            ANSWER_PENDING,
+            "别的会话的 permission.replied 不得销掉本会话的请求",
+        )
+
+    def test_a_permission_asked_frame_without_an_id_is_still_rendered(self):
+        """没有 id 的那一帧**照发** —— 服务端真给了这个形状时用户至少看得到。"""
+        self.start_turn()
+
+        self.feed(ev("permission.asked", sessionID=SESSION_ID, action="bash"))
+
+        self.assertIn("🔐 权限请求", self.last_text())
 
 
 # ----------------------------------------------------------------------

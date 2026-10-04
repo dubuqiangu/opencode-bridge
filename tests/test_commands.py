@@ -2,8 +2,8 @@
 
 这一整个文件存在的理由是 AGENTS.md §5.1 说的"抽出去"那种拆法：新类必须能脱离
 原类单独测。所以这里没有 ``make_env``、没有适配器挂载、没有 ``BridgeCore``；
-七个协作者要么是真实的小对象（``Config`` / ``ConversationState`` / ``StateStore``），
-要么是本文件里现造的替身。
+八个协作者要么是真实的小对象（``Config`` / ``ConversationState`` / ``StateStore`` /
+权限账本），要么是本文件里现造的替身。
 
 因此这里能断言 core 层面**看不见**的东西：``platform`` 透传、``drop`` 与
 ``ensure`` 的先后、缺会话时**不许**去碰服务端 —— 那些全是协作契约。
@@ -28,6 +28,7 @@ from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.opencode_client import OpenCodeError
+from opencode_bridge.permission_ledger import PermissionLedger
 from opencode_bridge.session_model import CommandReply
 from opencode_bridge.state import StateStore
 
@@ -41,7 +42,7 @@ NULL_BYTE = "\x00"
 
 
 # ----------------------------------------------------------------------
-# 替身：七个协作者里只有 client / 发信 / 建会话 / 删会话需要替身
+# 替身：八个协作者里只有 client / 发信 / 建会话 / 删会话需要替身
 # ----------------------------------------------------------------------
 class RecordingOpenCodeClient:
     """``CommandHandler`` 会用到的三个接口（就这三个：interrupt / get_session /
@@ -197,7 +198,7 @@ class StubModelCommand:
 # 基类：造一套 CommandHandler（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class HandlerTestCase(unittest.TestCase):
-    """每个用例一套全新的七件协作者。"""
+    """每个用例一套全新的八件协作者。"""
 
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -214,6 +215,8 @@ class HandlerTestCase(unittest.TestCase):
             CommandReply("当前模型: prov/model-x", kind="text",
                          session_id=SESSION_ID)
         )
+        #: 真对象（不是替身）：本文件要测的正是"命令侧与账本之间有没有接线"。
+        self.permission_ledger = PermissionLedger()
         self.handler = CommandHandler(
             client=self.client,
             config=self.config,
@@ -222,6 +225,7 @@ class HandlerTestCase(unittest.TestCase):
             ensure_session=self.ensure_session,
             drop_session=self.drop_session,
             send_text=self.send_text,
+            permission_ledger=self.permission_ledger,
         )
 
     # --- 驱动与断言的小帮手 ---------------------------------------------
@@ -242,12 +246,12 @@ class HandlerTestCase(unittest.TestCase):
 # 1-2: 依赖面（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(HandlerTestCase):
-    def test_the_constructor_takes_exactly_the_seven_collaborators(self):
+    def test_the_constructor_takes_exactly_the_eight_collaborators(self):
         parameters = inspect.signature(CommandHandler.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "config", "conversation_state", "model_command",
-             "ensure_session", "drop_session", "send_text"],
+             "ensure_session", "drop_session", "send_text", "permission_ledger"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -628,6 +632,160 @@ class PermissionCommandTests(HandlerTestCase):
 
         self.assertEqual(self.client.permission_replies,
                          [(session_id, "per7", "once")])
+
+
+# ----------------------------------------------------------------------
+# 10b: 迟到的第二次回答（C4）—— 一个请求只允许被回答一次
+# ----------------------------------------------------------------------
+# 这一节的每一条都在**同一个请求**上连发两次，断言第二次一个字节都不发。
+# 与上面 9-10 节合起来才是完整不变式：三种决策都还能发出去（没阉掉），
+# 而同一个请求**只能**发出去一次（没漏掉）。
+class RepeatedPermissionAnswerTests(HandlerTestCase):
+    def test_a_second_answer_to_one_request_is_never_sent(self):
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_twice")
+
+        self.run_command("/approve per_twice")
+        self.run_command("/approve per_twice")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_twice", "once")])
+
+    def test_a_late_answer_cannot_widen_once_into_always(self):
+        """``/approve <id> once`` 之后再敲 ``/approve <id> always``。
+
+        这是 :meth:`_apply_permission_decision` 存在的理由，也是 ``d45440f`` 那次
+        ``/deny <id> always`` 的同一个危害的另一半：**第二个更宽的决定覆盖掉一个
+        已经关闭的决定**。用户看到的是"always 被拒了"，而 agent 那边那条请求早已
+        结束 —— 若服务端照单全收，agent 会带着一条它从没被批准过的永久授权继续跑
+        （真实副作用：改文件、跑 git、长构建）。
+        """
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_widen")
+
+        self.run_command("/approve per_widen once")
+        self.run_command("/approve per_widen always")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_widen", "once")])
+
+    def test_a_deny_after_an_approve_is_refused_and_not_treated_as_a_flip(self):
+        """已经批准过之后再 ``/deny``：也不是"改主意"，而是第二次回答。
+
+        反过来同样成立 —— 见 :meth:`test_a_deny_cannot_be_flipped_into_approve`。
+        """
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_flip")
+
+        self.run_command("/approve per_flip")
+        self.run_command("/deny per_flip")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_flip", "once")])
+
+    def test_a_deny_cannot_be_flipped_into_approve(self):
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_reflip")
+
+        self.run_command("/deny per_reflip")
+        self.run_command("/approve per_reflip always")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_reflip", "reject")])
+
+    def test_a_refused_repeat_tells_the_user_instead_of_going_quiet(self):
+        """静默丢弃在这里是**最糟**的失败模式：用户以为自己拒了，而其实那条
+        早就答过了。所以必须回一句，并且说清上次答的是什么。"""
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_noisy")
+        self.run_command("/approve per_noisy")
+
+        self.run_command("/deny per_noisy")
+
+        self.assertEqual(self.last_reply.kind, "error")
+        self.assertIn("per_noisy", self.last_reply.text)
+        self.assertIn("once", self.last_reply.text)
+        self.assertIn("忽略", self.last_reply.text)
+
+    def test_a_request_the_server_already_closed_is_not_answerable(self):
+        """``permission.replied`` 到达之后的那次回答同样不算数。"""
+        session_id = self.attach_session()
+        self.permission_ledger.note_replied(session_id, "per_closed_upstream")
+
+        self.run_command("/approve per_closed_upstream always")
+
+        self.assertEqual(self.client.permission_replies, [])
+        self.assertEqual(self.last_reply.kind, "error")
+        self.assertIn("已经结束", self.last_reply.text)
+
+    def test_a_failed_reply_leaves_the_request_answerable(self):
+        """⚠️ 一次 5xx **不能**把请求锁死成"已回复过"。
+
+        那个请求在服务端还挂着，用户唯一能做的事就是再答一次。把它记成已答过，
+        用户看到的就会是"已经回复过"——一个**假的**说法，而请求还挂在那里。
+        """
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_flaky")
+        self.client.permission_error = OpenCodeError("nope", status=500)
+
+        self.run_command("/approve per_flaky")
+
+        self.client.permission_error = None
+        self.run_command("/approve per_flaky")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_flaky", "once")])
+
+    def test_a_request_this_process_never_saw_is_still_sent_to_the_server(self):
+        """⚠️ "本桥没见过这个 id"**不**作为拒绝理由。
+
+        内存账本活不过重启，而服务端才是"这个 id 存不存在"的权威。在这里拒绝一个
+        还活着的请求会把 agent 永远卡住，而用户只会看到一句莫名其妙的"已回复过"。
+        这个方向（未知 = 照旧转发，由服务端判）是有意的取舍，见
+        :mod:`opencode_bridge.permission_ledger`。
+        """
+        session_id = self.attach_session()
+
+        self.run_command("/approve per_from_a_previous_process")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_from_a_previous_process", "once")])
+
+    def test_repeated_answers_are_refused_per_request_not_per_session(self):
+        """去重按**请求**，不是按会话 —— 否则一个会话只能批准一件事。"""
+        session_id = self.attach_session()
+        self.permission_ledger.record_asked(session_id, "per_first")
+        self.permission_ledger.record_asked(session_id, "per_second")
+
+        self.run_command("/approve per_first")
+        self.run_command("/approve per_second")
+
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_first", "once"),
+                          (session_id, "per_second", "once")])
+
+    def test_a_second_answer_to_an_unknown_request_is_still_forwarded_twice(self):
+        """本桥完全没见过的请求：账本闭嘴，**服务端**自己去判（并可能 404）。
+
+        这条把上面那条取舍钉死，免得下一个读代码的人以为"去重"意味着"只准一次"。
+        ⚠️ 替身 :meth:`RecordingOpenCodeClient.reply_permission` 是"先记账再抛"，
+        所以一次失败也留在列表里 —— 列表**只数尝试次数**，而这正是要断言的：
+        账本没有拦下第二次。
+        """
+        session_id = self.attach_session()
+        self.client.permission_error = OpenCodeError("nope", status=404)
+        self.run_command("/approve per_never_answered_by_this_bridge")
+
+        self.client.permission_error = None
+        self.run_command("/approve per_never_answered_by_this_bridge")
+        self.run_command("/approve per_never_answered_by_this_bridge")
+
+        # 替身是"**先抛后记**"，所以只有成功那次进了列表：失败那次根本没发出去，
+        # 而第三次被账本否掉 —— 到那时账本**确实**知道它答过了（成功那次记下了）。
+        # 关键是头两次都没有被本地拦下：一个本桥没见过的 id 永远交给服务端判。
+        self.assertEqual(self.client.permission_replies,
+                         [(session_id, "per_never_answered_by_this_bridge", "once")])
+        self.assertIn("忽略", self.last_reply.text)
 
 
 # ----------------------------------------------------------------------

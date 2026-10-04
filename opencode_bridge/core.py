@@ -77,6 +77,7 @@ from .inbox import InboundInbox
 # 都按 ``core`` 的路径 import —— 所以这里**再导出**，导入路径不能因为搬动而变。
 from .outbound import NO_OUTPUT_TEXT, OutboundSender
 from .opencode_client import OpenCodeClient
+from .permission_ledger import PermissionLedger
 from .session_model import SessionModelCommand
 from .session_registry import SessionRegistry, ruleset_for
 from .state import StateStore
@@ -130,6 +131,12 @@ class BridgeCore:
         self._turns: dict[str, Turn] = {}
         self._thread: threading.Thread | None = None
         self._started = False
+        #: 权限请求的本地账本（C4）。**必须早于** ``commands`` /
+        #: ``event_stream`` / ``inbound_gateway`` 三处构造 —— 三个都要用到**同一个**
+        #: 对象，否掉迟到回答才可能（见
+        #: :mod:`opencode_bridge.permission_ledger`）。它是跨三块的**共有状态**，
+        #: 归属在本类，与 ``_lock`` / ``_turns`` 同一性质。
+        self.permission_ledger = PermissionLedger()
 
         bridge_cfg = getattr(config, "bridge", None) or {}
         self.edit_interval = self._positive_float(
@@ -179,7 +186,7 @@ class BridgeCore:
             client, ensure_session=self.sessions.ensure_session
         )
         #: 斜杠命令那一整块（``/help`` ``/setup`` ``/new`` ``/stop`` ``/status``
-        #: ``/cd`` ``/approve`` ``/deny`` 与 ``/model`` 的转发）。七个协作者
+        #: ``/cd`` ``/approve`` ``/deny`` 与 ``/model`` 的转发）。八个协作者
         #: **显式注入**（见 :class:`~opencode_bridge.commands.CommandHandler`）。
         #: ⚠️ 构造点必须在 ``sessions`` / ``outbound`` **之后**：它们是依赖之一。
         self.commands = CommandHandler(
@@ -190,9 +197,10 @@ class BridgeCore:
             ensure_session=self.sessions.ensure_session,
             drop_session=self.sessions.drop_session,
             send_text=self.outbound.send_text,
+            permission_ledger=self.permission_ledger,
         )
 
-        #: 订阅 SSE、把执行过程渲染回 IM 的那一整块。十二个依赖**显式注入**
+        #: 订阅 SSE、把执行过程渲染回 IM 的那一整块。十三个依赖**显式注入**
         #: （见 :class:`~opencode_bridge.event_stream.EventStream`）—— 其中
         #: ``lock`` / ``turns`` 是共用的状态（同上），其余是协作者。事件流不碰
         #: 收件箱、不碰入站、不碰生命周期，所以搬出去就能脱离 core 单独测
@@ -215,10 +223,11 @@ class BridgeCore:
             edit_progress=self.outbound.edit_progress,
             finalize=self.outbound.finalize,
             flush_queue=self._flush_queue,
+            permission_ledger=self.permission_ledger,
         )
 
         #: 适配器进来的两个 hook、每会话的 prompt 队列、写前收件箱与启动重放。
-        #: 十一个依赖**显式注入**（见
+        #: 十二个依赖**显式注入**（见
         #: :class:`~opencode_bridge.inbound_gateway.InboundGateway`）—— 其中
         #: ``lock`` / ``turns`` 是共用的状态（同上），``inbox`` 从构造参数透传。
         #: 入站这一侧不碰事件流的状态，只等它的 ``stream_confirmed``（AGENTS.md §5.1）。
@@ -237,6 +246,7 @@ class BridgeCore:
             handle_command=self.commands.handle_command,
             remember_platform=self.routing.remember_platform,
             send_text=self.outbound.send_text,
+            permission_ledger=self.permission_ledger,
         )
 
         # 事件名以 **anomalyco/opencode v2.0.22 源码** 为准，不是文档

@@ -37,6 +37,11 @@ from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import recover_pending
 from .normalize import _clean
 from .opencode_client import OpenCodeClient, OpenCodeError
+from .permission_ledger import (
+    REPEATED_ANSWER_ACK,
+    PermissionLedger,
+    repeated_answer_notice,
+)
 
 __all__ = ["InboundGateway"]
 
@@ -170,6 +175,7 @@ class InboundGateway:
         handle_command: HandleCommand,
         remember_platform: RememberPlatform,
         send_text: SendText,
+        permission_ledger: PermissionLedger,
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -181,6 +187,11 @@ class InboundGateway:
 
         ``stream_confirmed`` 是事件流那个"订阅已建立"的信号；恢复要等它（有上限），
         但**不归本类拥有**：设它的是事件流。
+
+        ``permission_ledger`` 与命令侧、事件流侧**共用同一个对象**，所以
+        ``perm:`` 按钮那一条路和 ``/approve`` 会对"这个请求答过了没有"得出
+        同一个答案 —— 否则同一个请求从两条路各能答一次，去重就成了半拉子
+        （见 :mod:`opencode_bridge.permission_ledger`）。
         """
         self._client = client
         self._lock = lock
@@ -193,6 +204,7 @@ class InboundGateway:
         self._handle_command = handle_command
         self._remember_platform = remember_platform
         self._send_text = send_text
+        self._permission_ledger = permission_ledger
 
         #: conversation_id -> 该会话排队等发的消息。**只有本类读写**。
         self._queues: dict[str, list[QueuedPrompt]] = {}
@@ -267,6 +279,25 @@ class InboundGateway:
                 logger.warning("unsupported callback payload: %r", data)
                 self._answer(adapter, query_id, "失败")
                 return
+            # ⚠️ 迟到的第二次回答在这里被否掉（C4）。按钮可以被连点、可以被
+            # Telegram 重投，于是同一个 ``perm:`` 载荷会走两遍；不否掉就会发出
+            # 两次 reply_permission，第二次还能把 once 放宽成 always。
+            # 与命令侧共用同一个账本，所以两条路合起来只答一次。
+            status = self._permission_ledger.status_of(session_id, request_id)
+            if status.already_closed:
+                logger.info(
+                    "ignoring a repeated permission button press for %s of "
+                    "session %s (already %s); nothing is sent to the server",
+                    request_id, session_id, status.state,
+                )
+                self._answer(adapter, query_id, REPEATED_ANSWER_ACK)
+                self._send_text(
+                    conversation_id,
+                    repeated_answer_notice(status),
+                    kind="error",
+                    adapter=adapter,
+                )
+                return
             try:
                 self._client.reply_permission(session_id, request_id, decision)
             except Exception as exc:
@@ -285,6 +316,10 @@ class InboundGateway:
                     adapter=adapter,
                 )
                 return
+            # 只在**成功**之后记账（理由见 commands._apply_permission_decision）。
+            self._permission_ledger.record_answered(
+                session_id, request_id, decision
+            )
             self._answer(adapter, query_id, "已处理")
         except Exception:
             logger.exception("on_callback failed")

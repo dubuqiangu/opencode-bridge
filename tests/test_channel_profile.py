@@ -33,6 +33,7 @@ from opencode_bridge.channel_profile import (
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.inbound_gateway import InboundGateway
 from opencode_bridge.inbox import QueuedPrompt
+from opencode_bridge.permission_ledger import PermissionLedger
 
 
 # ----------------------------------------------------------------------
@@ -465,6 +466,7 @@ class InjectionIsWiredIntoTheSinglePromptCallTests(unittest.TestCase):
                 Outbound(conversation_id=conversation_id, text=text,
                          kind=kwargs.get("kind", "text"))
             ) or MsgHandle(conversation_id, "m1", "quibblechat"),
+            permission_ledger=PermissionLedger(),
         )
         return gateway, client, rows
 

@@ -37,6 +37,7 @@ from opencode_bridge.inbound_gateway import (
 )
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.opencode_client import OpenCodeError
+from opencode_bridge.permission_ledger import REPEATED_ANSWER_ACK, PermissionLedger
 
 CONVERSATION = "chat:55"
 OTHER_CONVERSATION = "chat:66"
@@ -273,7 +274,7 @@ def queued(delivery_id: str, text: str,
 # 基类：造一套 InboundGateway（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class InboundGatewayTestCase(unittest.TestCase):
-    """每个用例一套全新的十一个协作者。"""
+    """每个用例一套全新的十二个协作者。"""
 
     def setUp(self) -> None:
         os.makedirs(_REPOSITORY_TEMP, exist_ok=True)
@@ -286,6 +287,8 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.stream_confirmed = RecordingStreamConfirmed()
         self.send_text = RecordingSendText()
         self.answer = RecordingAnswer()
+        #: 真对象：本文件要断言的正是按钮那条路上有没有接上账本。
+        self.permission_ledger = PermissionLedger()
         self.gateway = self.build_gateway()
         #: ``_adapter_for`` 返回什么（``None`` = 没有挂适配器）。
         #: ⚠️ 默认值是**真的适配器**而不是裸 ``object()`` —— C1 让投递路径去问
@@ -313,6 +316,7 @@ class InboundGatewayTestCase(unittest.TestCase):
             "handle_command": self._handle_command,
             "remember_platform": self._remember_platform,
             "send_text": self.send_text,
+            "permission_ledger": self.permission_ledger,
         }
         kwargs.update(overrides)
         self.gateway = InboundGateway(**kwargs)
@@ -367,13 +371,14 @@ class InboundGatewayTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(InboundGatewayTestCase):
-    def test_the_constructor_takes_the_eleven_injected_dependencies(self):
+    def test_the_constructor_takes_the_twelve_injected_dependencies(self):
         parameters = inspect.signature(InboundGateway.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "lock", "turns", "inbox", "stream_confirmed",
              "adapter_for", "answer_callback", "ensure_session",
-             "handle_command", "remember_platform", "send_text"],
+             "handle_command", "remember_platform", "send_text",
+             "permission_ledger"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -501,18 +506,87 @@ class OnCallbackTests(InboundGatewayTestCase):
         self.assertEqual(self.answer.acks, [(self.adapter_result, "Q3", "未知平台")])
 
     def test_each_accepted_permission_decision_is_forwarded(self):
+        """三种决策各自**换一个请求 id** —— 一个请求只允许被回答一次（C4）。
+
+        ⚠️ 原来这里三个 subTest 共用同一个 ``per_9``，也就是断言"同一个请求可以被
+        连答三次"。那正是 C4 要治的：连点按钮会走两遍，第二次还能把 once 放宽成
+        always。重复那条现在由 :meth:`test_a_repeated_button_press_is_refused` 单独
+        断言，所以三种决策的**可接受集合**一条没少。
+        """
         for decision in ("once", "always", "reject"):
             with self.subTest(decision=decision):
                 self.client.permission_replies.clear()
                 self.answer.acks.clear()
                 self.gateway.on_callback(
-                    CONVERSATION, "perm:ses_x:per_9:%s" % decision, "Q4"
+                    CONVERSATION, "perm:ses_x:per_for_%s:%s" % (decision, decision),
+                    "Q4",
                 )
 
-                self.assertEqual(self.client.permission_replies,
-                                 [("ses_x", "per_9", decision)])
+                self.assertEqual(
+                    self.client.permission_replies,
+                    [("ses_x", "per_for_%s" % decision, decision)],
+                )
                 self.assertEqual(self.answer.acks,
                                  [(self.adapter_result, "Q4", "已处理")])
+
+    def test_a_repeated_button_press_is_refused_and_says_so(self):
+        """连点 / 平台重投：第二次一个字节都不发，并且两处都告诉用户。
+
+        按钮那条路上"沉默"特别糟 —— Telegram 的转圈圈停了，用户只会以为已经答过，
+        而实际上第一次可能失败了他不知道。所以 ack 与正文都必须说话。
+        """
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_tap:once", "Q1")
+
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_tap:once", "Q2")
+
+        self.assertEqual(self.client.permission_replies,
+                         [("ses_x", "per_tap", "once")])
+        self.assertEqual(
+            self.answer.acks,
+            [(self.adapter_result, "Q1", "已处理"),
+             (self.adapter_result, "Q2", REPEATED_ANSWER_ACK)],
+        )
+        self.assertIn("per_tap", self.send_text.last.text)
+        self.assertIn("忽略", self.send_text.last.text)
+        self.assertEqual(self.send_text.last.kind, "error")
+
+    def test_a_second_button_press_cannot_widen_once_into_always(self):
+        """"once 之后再按 always" 是按钮版的 ``/deny <id> always``：必须被否掉。"""
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_widen:once", "Q1")
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_widen:always", "Q2")
+
+        self.assertEqual(self.client.permission_replies,
+                         [("ses_x", "per_widen", "once")])
+
+    def test_a_request_resolved_by_the_server_is_not_answerable_by_a_late_press(self):
+        """``permission.replied`` 之后的那一次按压同样不算数（账本由事件流写）。"""
+        self.permission_ledger.note_replied("ses_x", "per_late")
+
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_late:always", "Q1")
+
+        self.assertEqual(self.client.permission_replies, [])
+        self.assertEqual(self.answer.acks,
+                         [(self.adapter_result, "Q1", REPEATED_ANSWER_ACK)])
+
+    def test_a_failed_reply_leaves_the_request_answerable(self):
+        """⚠️ 一次 5xx **不能**把请求锁死成"已回复过"。
+
+        那个请求在服务端还挂着，用户唯一能做的事就是再答一次；把它记成已答过就等于
+        把那个请求永久卡死，且用户只会看到"已回复过"这种误导性的说法。
+        """
+        self.client.permission_errors.append(OpenCodeError("nope", status=500))
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_retry:once", "Q1")
+
+        self.gateway.on_callback(CONVERSATION, "perm:ses_x:per_retry:once", "Q2")
+
+        # ⚠️ 替身是"先记账再抛"，所以**两次**尝试都在列表里 —— 这正是要断言的：
+        # 第一次失败没有把请求锁死，第二次仍然到达了客户端。
+        self.assertEqual(self.client.permission_replies,
+                         [("ses_x", "per_retry", "once"),
+                          ("ses_x", "per_retry", "once")])
+        self.assertEqual(self.answer.acks,
+                         [(self.adapter_result, "Q1", "失败"),
+                          (self.adapter_result, "Q2", "已处理")])
 
     def test_an_unsupported_payload_acks_failure_and_never_touches_the_client(self):
         for payload in ("perm:ses_x:per_9", "perm:ses_x:per_9:bogus",

@@ -3,6 +3,32 @@
 本文是**对比报告**，不是使用手册。目的：把两个成熟参照系的平台层讲清楚，逐项标出
 opencode-bridge 该跟什么、跟到什么程度。
 
+## ⚠️ 修订记录（2026-10-05）
+
+本文的 `opencode-bridge` 列**整体过期过一次**：初稿写于 3 平台时代，此后项目扩到
+**13** 个平台，并补上了脱敏、身份、错误分类、授权闸门、入站合并、延迟回答拦截等能力。
+一份读起来像"当前现状"的过期对比**比没有对比更糟**（它会被当成现状引用），所以本次
+逐条更正；并且**每条更正都写出"旧文怎么说 / 现在是什么"**，不静默改写（AGENTS.md §8）。
+
+证据基线（两条，别混）：
+
+- **本仓库**：引用一律给 `文件:行号`。
+- **opencode 宿主**：读 **tag `v2.0.22`** 的源码，**不读文档站**（对 v2 已过时，
+  AGENTS.md §6.2）。⚠️ **`gh search code` 搜的是默认分支 `dev`，而 `dev` 的插件 SDK
+  目录结构已与 `v2.0.22` 不同**（`v2.0.22` 是 `packages/plugin/src/promise/`，
+  `dev` 上是 `packages/plugin/src/index.ts` + `src/v2/`）。**核实宿主能力必须用
+  `?ref=v2.0.22` 读文件，不能拿 dev 的搜索结果反推 v2.0.22。**
+
+本次**被推翻的关键结论**（正文已就地标注；Part 4 的 `opencode-bridge` 列与 Part 8 的
+宿主能力表另有**整表**更正）：
+
+1. 「IM 长按输入把一句话拆成 3~5 条」——Part 5 #2。
+2. 「4 个 chokepoint + 不可复用哨兵」——Part 9 A1。
+3. 「审批超时回落本地 + 迟到回答 30s 去重」——Part 9 C1c（超时是幻影，30s 是 dsh 的数）。
+4. 「`ctx.permission.list()`/`.reply()` 是我们现用的审批回传路径」——Part 8（走 REST）。
+5. 「3 个平台 / 3（2 无入站）/ 4 abstractmethod」——Part 1 / Part 4（13 个平台，
+   全部有入站，3 个 abstractmethod）。
+
 参照系：
 
 - **Hermes**（本机已安装）——"平台 + agent 一体"，自建 prompt/tools/cron/session。
@@ -21,7 +47,7 @@ opencode-bridge 该跟什么、跟到什么程度。
 |---|---|---|
 | **Hermes** | 富基类 + 注册表 + 插件化 | 4 个 abstractmethod 打底，约 4900 行基类承载重试/媒体/会话闸门/授权回调装配；能力用**类属性常量 + 方法查询 + 模板方法 + feature-detect** 四种机制混合表达 |
 | **dsh-im-gateway** | 极简契约 + 共享引擎 | 工厂函数返回 7 字段结构化对象；25 个渠道各约 100 行只做"协议 ↔ ImMessage"翻译，split/merge/路由/命令/审批全在网关侧 |
-| **opencode-bridge** | 桥（只做转换） | 3 个平台、Python 侧无外部依赖；把 IM 消息转成 opencode 的 session prompt。平台层最薄，但身份模型与授权层也最薄 |
+| **opencode-bridge** | 桥（只做转换） | 13 个平台、Python 侧无外部依赖；把 IM 消息转成 opencode 的 session prompt。**平台层最薄**这条仍成立；但「身份模型与授权层也最薄」**已被推翻**——`identity.py` 的 `platform:local_id` 与 `adapters/base.py` 的 `admits()` 闸门都已落地（见 Part 4 更正栏） |
 
 **关键认知**：Hermes 与 dsh 是**两种极端**，我们的问题不是"抄哪个"，而是
 **按需取用哪几块**——它们各自的强项恰好是我们的缺口，反之亦然。
@@ -137,23 +163,30 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 
 ## Part 4 · 三方并排对比
 
-| 维度 | Hermes | dsh-im-gateway | opencode-bridge |
+| 维度 | Hermes | dsh-im-gateway | opencode-bridge（**2026-10-05 逐行更正**） |
 |---|---|---|---|
-| 抽象风格 | 4900 行富基类 + 插件注册表（22 钩子） | 7 字段结构化对象 + 可选方法 | 4 abstractmethod + 3 适配器 |
-| 平台数 | 23 core + 插件 | 25（3 为 stub，真实可用 22） | 3（2 无入站） |
-| 能力表达 | 常量标志位 + 方法查询 + 模板方法 + feature-detect | 可选方法 duck typing | try/except 降级 + `Base.answer` 空 stub |
-| 会话身份 | `SessionSource` 20+ 字段 + 唯一真源 | `${channelId}:${chatId}` | 裸 `conversation_id: str` |
-| 多端共享会话 | 支持（profile route） | 支持（`bySession` 反向索引，跨渠道互见） | 无 |
-| 授权 | 三段闸门 + PairingStore + allowlist 并集 | 一层白名单（默认全开）+ UI 一键批准 | 仅 telegram 白名单 |
-| 出站错误 | `SendResult` + 7 类 `error_kind` | `send` 返回 void，失败全吞 | 无分类 |
-| 富交互 | 原生按钮 + 回调 id 硬约定 | 纯文本编号 + 关键词 | 纯文字提示 |
-| 主动发送 | cron/CLI/MCP（**明确非模型工具**） | `im_send_file` / `im_cron_*`（做成工具） | 无 |
-| 定时 | cron 表达式 + 双闸防 env 枚举 + 四 lane | 墙钟日历手写 + **绑 chat** | 无 |
-| 入站合并 | `EphemeralReply` 等 | `..`/`!!` + 5s 窗口 | 无 |
-| 渠道地址簿 | 有（仅已连接平台） | 无 | 无 |
-| 去重 | `MessageDeduplicator` | 核心无（只在渠道层） | telegram offset 游标 |
-| 限流 | 有 | 无 | telegram backoff |
-| 单实例 | 无此概念 | DSH_HOME 硬链接锁 | 单例锁（跨进程杀旧重启） |
+| 抽象风格 | 4900 行富基类 + 插件注册表（22 钩子） | 7 字段结构化对象 + 可选方法 | `adapters/base.py` **3** 个 abstractmethod（`start`/`send`/`edit`，`:292,311,315`）+ **13** 个适配器，各带一处入站闸门调用点。**「4 abstractmethod + 3 适配器」两个数都错** |
+| 平台数 | 23 core + 插件 | 25（3 为 stub，真实可用 22） | **13，全部有入站**（`supports_inbound = True` × 13）。**「3（2 无入站）」已不成立** |
+| 能力表达 | 常量标志位 + 方法查询 + 模板方法 + feature-detect | 可选方法 duck typing | **显式能力枚举**：`adapters/base.py:107-129` 的 4 个 flag（`supports_inbound` / `supports_inline_buttons` / `supports_media` / `supports_message_edit`）+ `Base.answer` 空 stub（`:319`）。**「try/except 降级」是 3 平台时代的做法**，现已换成 Hermes 式的显式枚举 |
+| 会话身份 | `SessionSource` 20+ 字段 + 唯一真源 | `${channelId}:${chatId}` | `identity.py` 统一 **`platform:local_id`**；歧义前缀（`channel:` 被 slack/discord/mattermost 三家共用）**拒绝猜测**，抛 `AmbiguousConversationId`。**「裸 `conversation_id: str`」已不成立** |
+| 多端共享会话 | 支持（profile route） | 支持（`bySession` 反向索引，跨渠道互见） | 无（全仓无反向索引）—— **仍为真** |
+| 授权 | 三段闸门 + PairingStore + allowlist 并集 | 一层白名单（默认全开）+ UI 一键批准 | `adapters/base.py:278` 的 `admits()` + **13 处调用点**（每适配器一处）。⚠️ 白名单为空 = 全开，**仍是 opt-out**（Part 9 A3 未做）。**「仅 telegram 白名单」已不成立** |
+| 出站错误 | `SendResult` + 7 类 `error_kind` | `send` 返回 void，失败全吞 | **7 类 `SendError`（`hooks.py:74`）+ `SendResult`（`hooks.py:91`，含 `partial` / `retry_after` / `error_detail`）**。**「无分类」已不成立** |
+| 富交互 | 原生按钮 + 回调 id 硬约定 | 纯文本编号 + 关键词 | 实测 **inline 按钮 1/13**：只有 telegram 声明 `supports_inline_buttons = True`（`adapters/telegram.py:125`），其余 12 家显式 `False`。**「纯文字提示」低估、「覆盖三平台」高估，两个都不对** |
+| 主动发送 | cron/CLI/MCP（**明确非模型工具**） | `im_send_file` / `im_cron_*`（做成工具） | 无（唯一注册的工具是只读的 `bridge_setup`）—— **仍为真** |
+| 定时 | cron 表达式 + 双闸防 env 枚举 + 四 lane | 墙钟日历手写 + **绑 chat** | 无（全仓无 scheduler 实现）—— **仍为真** |
+| 入站合并 | `EphemeralReply` 等 | `..`/`!!` + 5s 窗口 | **有**：`inbound_merge.py` 的 `ConversationMerger`（`:151`）。但**不是** dsh 那种窗口：**只有用户自己敲 `..` 才合并**，裸文本零延迟直发；超时是 **15s 保险丝**且**只在缓冲存在时存在**（`inbound_gateway.py:69`）。**「无」已不成立** |
+| 渠道地址簿 | 有（仅已连接平台） | 无 | 无 —— **仍为真** |
+| 去重 | `MessageDeduplicator` | 核心无（只在渠道层） | **消息级 at-most-once**：`inbound_gateway.py:134-155` 优先用平台 `message_id`，缺失时退回 `sha256(platform\|conversation_id\|text)`；`:158-180` 命中即**不再投递**。**「telegram offset 游标」只覆盖 telegram** |
+| 限流 | 有 | 无 | telegram 429 `retry_after` + `getUpdates` 退避（`adapters/telegram.py:80,90,93`）—— **仍为真** |
+| 单实例 | 无此概念 | DSH_HOME 硬链接锁 | 单例锁（跨进程杀旧重启，`instance_lock.py`）—— **仍为真** |
+
+**⚠️ 一条纪律原来就写对了，而且已落地**：dsh 的反面教训是「审批应答在白名单**之前**」，
+未授权用户能打"批准"（Part 3.7）。我们把这条写进了 `admits()` 的 docstring
+（`adapters/base.py:283-285`），13 个调用点都必须遵守。
+
+**仍为真的那几条不要当成"没进展"**：定时、渠道地址簿、主动发送、多端共享会话、单实例
+五项确实**还没做**，它们仍是 Part 6/9 里的未完成项。
 
 ---
 
@@ -164,10 +197,27 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 | # | 借鉴项 | 来源 | 解决什么问题 | 代价 |
 |---|---|---|---|---|
 | 1 | **`splitText` 码点切分 + 断点优先级 + 前缀两遍法重编号** | `split.ts:31-103` | 我们目前是简单截断，会切坏 emoji、会在断点不佳处硬切、可能出现"第 3/2 段" | 极低。纯函数 + 9 个现成测试可读 |
-| 2 | **入站 `..`/`!!` 合并窗口 + 长输入回执** | `merge.ts:45-75`、`gateway.ts:566-569` | IM 长按输入把一句话拆成 3~5 条，逐条注入 → LLM 轮次 ×N、上下文碎裂、成本暴涨 | 低。纯函数。**但必须同时实现快照落盘**，否则就是 dsh 那个半成品 |
+| 2 | **入站 `..`/`!!` 合并 + 长输入回执** | `merge.ts:45-75`、`gateway.ts:566-569` | ⚠️ **初稿写的理由已被推翻**：原文「IM 长按输入把一句话拆成 3~5 条」**对 13 个平台全为假**（逐个核实见 `inbound_merge.py:11-24`：每条协议消息产出**恰好一个** `Inbound`，正文逐字取自协议的单个字段；`..`/`!!` 是 irssi/weechat 那种**终端客户端**的多行粘贴约定，由用户自己敲，这些 IM 客户端没有）。真正装不下长输入的只有 IRC（512 B/行）与 Twitch（400 字符）两家 | ✅ **已实现**，但**刻意不抄窗口**：裸文本零延迟直发、15s 保险丝、拼接用换行、缓冲不落盘（理由见 `inbound_merge.py:26-46`） |
 | 3 | **状态四态归一纯函数** | `manager.ts:29-44` | 让 `--status` / `/status` / 日志三处对"算不算连上"用同一 verdict（对齐 Hermes 纪律） | 极低。一个纯函数 + 一个测试文件 |
 | 4 | **迟到回答去重 + 显式回复门** | `questions.ts:86,144-158` | 权限/提问窗口关闭后，随口一句话被误当答案；并发回答重复处理 | 低。30s 窗 + 一个判定函数 |
 | 5 | **"首答生效 + 同 key 不排队"** | `approval.ts:31`、`questions.ts:35` | 多端并发时的竞态：重复回答、错答串到别的会话 | 低。干净的小取舍 |
+
+### ✅ 落地对照（2026-10-05）
+
+下面的借鉴清单写于 **3 平台时代**，正文条目**保持原样**以便看出当初的判断依据；
+本表只记「哪一条被推翻 / 哪一条已落地」。
+
+| # | 初稿的说法 | 现状 |
+|---|---|---|
+| 1 | 「我们目前是简单截断」 | ✅ 已落地 `split.py`（比 dsh 多做了**字素簇原子**与前缀预估，见该模块 docstring） |
+| 2 | 理由「长按输入拆成 3~5 条」 | ❌ **理由被推翻**（见正文 #2）；✅ 功能已落地，但形态不是 dsh 的窗口 |
+| 3 | 「让三处用同一 verdict」 | ✅ 已落地 `status.py`（`ChannelState` / `normalize_platform_status` / `summarize` / `render_table`） |
+| 4 | 「低。30s 窗 + 一个判定函数」 | ⚠️ **30s 是 dsh 的数字，不是我们的**。我们**没抄这个窗**：改用 `permission_ledger.py` 的 `PermissionLedger`，**无超时**（见 Part 9 C1c） |
+| 5 | 「首答生效 + 同 key 不排队」 | ✅ 已落地，形态不同：`PermissionLedger` 在**两条回传路径上同时拒绝第二次回答** |
+| 6 | 「引入 `SendResult` + `classify_send_error`」 | ✅ 已落地 `hooks.py:74,91` |
+| 7 | cron 绑 chat | ⏳ 仍未做（全仓无 scheduler），决策本身依然成立 |
+| 8 | 「我们只有 3 平台」 | ❌ **平台数错**（13）；✅ 取法正确并已落地：`adapters/base.py:107-129` 的显式 flag |
+| 9 | 活跃渠道目录 | ⏳ 仍未做 |
 
 ### ⚠️ 需改造（决策可抄，实现要重做）
 
@@ -175,7 +225,7 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 |---|---|---|---|
 | 6 | **出站错误分类** | Hermes `error_kind` | 引入 `SendResult` 类结构 + 统一 `classify_send_error`，否则失败不可观测 |
 | 7 | **cron 绑 chat 不绑 session** | `cron.ts:1-3` | 这是"提醒不消失"的正解。但 opencode 侧是否有等价 scheduler 未确认；调度实现另选，只抄"绑定维度"这个决定 |
-| 8 | **能力表达** | 两者都不适合直接抄 | 我们只有 3 平台且要向用户报"不支持"，应采用 **Hermes 式显式能力枚举**，而非 dsh 的 duck typing（无法枚举能力） |
+| 8 | **能力表达** | 两者都不适合直接抄 | ~~我们只有 3 平台~~ 且要向用户报"不支持"，应采用 **Hermes 式显式能力枚举**，而非 dsh 的 duck typing（无法枚举能力） |
 | 9 | **活跃渠道目录** | Hermes `channel_directory.py` | "我在哪些群"是主动发送与 channel 绑 cron 的前置 |
 
 ### ❌ 不建议抄
@@ -194,16 +244,18 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 
 上一版（仅基于 Hermes）需两处修正，并新增一项：
 
-| 优先 | 项 | 变化原因 |
-|---|---|---|
-| **P0** | 授权层下沉到 `base.py`，三平台共用闸门 | Hermes 三段闸门 + dsh 都有白名单层，我们只有 telegram 一家。**且 dsh 证明了"审批在白名单之前"的危险** |
-| **P0** | 脱敏（`redact.py` + 不可复用哨兵） | 两家都有，我们 0。且我们的 `/status` 会把 session_id 回显到 IM |
-| **P0** | **默认开放改为显式 opt-in** | 我们 `allowed_chat_ids: []` = 全部允许，与 dsh 的 `allowAllUsers: true` 同为 opt-out；Hermes 是"没配 allowlist → pair/ignore，且 `_ALLOW_ALL_USERS` 要显式开" |
-| **P1** | 分片算法（码点 + 断点 + 两遍法） | 直接可抄，成本极低 |
-| **P1** | 权限/提问应答的去重与超时 | dsh 的 30s 窗 + 显式回复门，比我们现有实现更完整 |
-| **P2** | `SessionSource` 化身份模型 | **破坏性**（会话映射变了 = IM 会话失忆），需迁移。三方都做了，维度上 dsh 最弱、Hermes 最强 |
-| **P2** | 出站错误分类 / 能力枚举 / `--status` 汇总 | 中等成本，用户可感知 |
-| **P3** | 入站合并窗口 / cron 绑 chat / 渠道目录 / 主动发送 | 功能增量；cron 依赖 opencode 侧 scheduler 能力（未确认） |
+⚠️ **这张表写于 3 平台时代，「变化原因」列里的"我们只有…"多数已经不成立。** 逐条现状：
+
+| 优先 | 项 | 变化原因（初稿原文） | 现状 |
+|---|---|---|---|
+| **P0** | 授权层下沉到 `base.py`，三平台共用闸门 | Hermes 三段闸门 + dsh 都有白名单层，我们只有 telegram 一家。**且 dsh 证明了"审批在白名单之前"的危险** | ✅ 已落地并扩到 **13 平台**：`adapters/base.py:278` 的 `admits()` + 13 处调用点；dsh 那条教训写进了 docstring（`:283-285`） |
+| **P0** | 脱敏（`redact.py` + 不可复用哨兵） | 两家都有，我们 0。且我们的 `/status` 会把 session_id 回显到 IM | ✅ 已落地 `redaction.py`，但**形态与初稿设想不同**：**2 个**卡口（不是 4 个），且**没有做 Hermes 那种"不可复用哨兵"**——凭据改成**只遮蔽不摘要**的 `[REDACTED:<类别>]`，靠不可逆达成同等目的（理由见 `redaction.py:40-51`） |
+| **P0** | **默认开放改为显式 opt-in** | 我们 `allowed_chat_ids: []` = 全部允许，与 dsh 的 `allowAllUsers: true` 同为 opt-out；Hermes 是"没配 allowlist → pair/ignore，且 `_ALLOW_ALL_USERS` 要显式开" | ⏳ **仍未做**（`admits()` 里白名单为空仍直接放行）。这是本表**唯一还完整成立的 P0** |
+| **P1** | 分片算法（码点 + 断点 + 两遍法） | 直接可抄，成本极低 | ✅ 已落地 `split.py` |
+| **P1** | 权限/提问应答的去重与超时 | dsh 的 30s 窗 + 显式回复门，比我们现有实现更完整 | ⚠️ **"超时"是幻影**：本仓库从来没有审批超时，那是账本里一条被推翻的设想。真实落地的是 `permission_ledger.py` 的 `PermissionLedger`——**拒绝第二次回答**，无超时。**30s 是 dsh 的数字** |
+| **P2** | `SessionSource` 化身份模型 | **破坏性**（会话映射变了 = IM 会话失忆），需迁移。三方都做了，维度上 dsh 最弱、Hermes 最强 | ✅ 取了下面「关键路径与风险」里那条 **80% 方案**（`platform:` 前缀），`identity.py` 已落地；完整 `SessionSource` 仍未做 |
+| **P2** | 出站错误分类 / 能力枚举 / `--status` 汇总 | 中等成本，用户可感知 | ✅ 三项全部落地：`hooks.py:74,91` / `adapters/base.py:107-129` / `status.py` |
+| **P3** | 入站合并窗口 / cron 绑 chat / 渠道目录 / 主动发送 | 功能增量；cron 依赖 opencode 侧 scheduler 能力（未确认） | 入站合并 ✅ 已落地（`inbound_merge.py`）；cron 绑 chat / 渠道目录 / 主动发送 ⏳ 仍未做。cron 侧已核实：**v2.0.22 确实没有 scheduler**（见 Part 8） |
 
 ---
 
@@ -211,38 +263,73 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 
 1. **Hermes/dsh 都是"自带 agent 的宿主内插件"**（Hermes 自建 prompt/tools/cron；
    dsh 依赖 cordis 注入的 9 个 host service）。opencode-bridge 是**跨宿主桥**——
-   它只能通过 opencode 的 hook（`session.hook("context")`、`ctx.tool.transform`、
-   `ctx.command.transform`）参与，无法自己装配 prompt/toolset。
+   ⚠️ 初稿说它「只能通过 opencode 的 hook（`session.hook("context")`、
+   `ctx.tool.transform`、`ctx.command.transform`）参与」，**这句不准确**：
+   ① 它同时走 **REST**（`opencode_client.py`，prompt / interrupt / 权限回传），
+   ② `session.hook("context")` **我们从未调用**（见 Part 8），
+   ③ 平台 hint 是**在 Python 侧拼字符串**注入的（`channel_profile.py:251` 的
+   `with_channel_hint`，调用点 `inbound_gateway.py:597`），不经过任何 ctx。
+   真正用到的 ctx 成员只有 `ctx.options` / `ctx.tool.transform` /
+   `ctx.command.transform` / `ctx.session.prompt`（`plugin/index.ts`）。
 2. **主动发送的立场相反**：Hermes 明确"不做成模型工具"（防 agent 乱发），
    dsh 做成了 `im_send_file` 工具。要做 `bridge_send` 必须自行裁决：
-   opt-in + 目标白名单，还是不暴露给模型。
-3. **平台数与扩展方向相反**：两家都做了"加平台很容易"（注册表/开关/4 步），
-   而我们的扩展方向是"在已有 3 个平台上做深"（token 引导、审批、提问、定时）。
-   借鉴时应偏向**做深**那侧的能力，而非**做多**那侧的抽象。
+   opt-in + 目标白名单，还是不暴露给模型。**这一条仍然开放**（唯一注册的工具
+   `bridge_setup` 是只读的）。
+3. **扩展方向**：初稿写「我们的扩展方向是在已有 **3** 个平台上做深」——
+   ⚠️ **这个前提已经不成立**：现在是 13 个平台，"做多"已经发生了。
+   借鉴时该偏向**做深**那侧的能力（授权、错误分类、交互桥），这一点仍然成立；
+   但别再把"平台少"当成本论证的前提——13 个平台 × 13 个适配器意味着
+   **每加一个平台，上面那些机制都要再落一次地**。
 
 ---
 
 ## Part 8 · opencode 宿主能力边界（决定难度上限）
 
-实测 `opencode --help` + V2 插件契约（`/build/plugins`）：
+核实基线：**tag `v2.0.22`** 的源码（AGENTS.md §6.2「读实现，不读文档」）。
+ctx 的完整形状在 `packages/plugin/src/promise/plugin.ts:26-54`（`Context` interface），
+各域定义在同目录 `promise/<域>.ts`。
 
-| 宿主能力 | 有无 | 对我们的意义 |
-|---|---|---|
-| **cron / scheduler** | ❌ **完全没有**（顶层子命令无 cron/schedule/job） | 定时任务必须**自己实现 tick + 日历解析**（dsh 手写 156 行零库）→ 这是"提醒"功能的成本主因 |
-| `ctx.session.hook("context")` → `event.system.push(...)` | ✅ | **平台 prompt hint 可直接注入**（Hermes ④ 层的一半由宿主提供） |
-| `ctx.session.hook("prompt")` | ✅ | 可拦截/改写入站 prompt |
-| `ctx.permission.list()` / `.reply()` | ✅ | 我们现用的审批回传路径 |
-| `ctx.permission.hook("evaluate")` | ✅ | 可改判定的 effect（allow/ask/deny）——比"推送+等回复"更适合做白名单自动放行 |
-| `ctx.tool.hook("execute.before"/"after")` | ✅ | 可拦截任意工具输入/结果 → **agent 向 IM 提问**可由此实现 |
-| `ctx.tool.transform` | ✅ | 已用（`bridge_setup`）→ `bridge_send` 走同路 |
-| `ctx.command.transform` | ✅ | 已用（`/bridge-setup`） |
-| `ctx.storage`（scan/set/get，per-plugin 持久 JSON） | ✅ | 地址簿 / cron 状态 / 合并缓冲快照的落盘去处 |
-| `ctx.session.synthetic()` | ✅ | 可把"提醒"作为合成消息注入会话 |
-| TUI 插件（slots / panel / keymap） | ✅（独立技能域） | 状态面板可行，但属新技能域 |
-| 多端共享一个 session | ⚠️ 由我们自己的键设计决定（宿主不干预） | 与 Hermes/dsh 同构，可做 |
+⚠️ **`gh search code` 搜的是默认分支 `dev`，而 `dev` 的插件 SDK 布局已与 `v2.0.22` 不同**
+（`v2.0.22` 是 `src/promise/<域>.ts`；`dev` 上是 `src/index.ts` + `src/v2/`）。
+**别拿 dev 的搜索结果反推 v2.0.22**——本表所有"上游存在"一列都读的是
+`?ref=v2.0.22` 的文件正文。
 
-**结论**：宿主缺 cron（要自建），但**注入面比 Hermes 预想的更强**——
-prompt hint、工具拦截、持久存储都现成。这让"复刻两方优点"的实际成本比报告 Part 6 估的低。
+⚠️ **初稿最大的问题是把「上游存在」和「我们在用」挤在一列里**，于是 7 行我们**从未
+调用**的 `ctx.*` 看起来像现成能力。下面分成两列。
+
+| 宿主能力 | 上游是否存在（v2.0.22） | 本仓库是否在用 | 证据 |
+|---|---|---|---|
+| **cron / scheduler** | ❌ **无** | ❌ 无 | v2.0.22 顶层子命令目录 `packages/cli/src/commands/handlers/` 全清单里没有 `cron` / `schedule` / `job`。定时必须**自己实现 tick + 日历解析**（dsh 手写 156 行零库）→ 这是"提醒"功能的成本主因。**这一行仍为真**（初稿靠 `opencode --help` 实证，现在换成源码清单） |
+| `ctx.session.hook("context")` | ✅ 有 | ❌ **未用** | 上游 `promise/session.ts:140`（`SessionHooks.context`）、`:171`（`hook: ModelHooks<SessionHooks>`）。初稿说它能「直接注入平台 prompt hint」——**能力存在，但我们没走这条路** |
+| `ctx.session.hook("prompt")` | ✅ 有 | ❌ **未用** | 上游 `promise/session.ts:139`（`SessionHooks.prompt`） |
+| `ctx.session.prompt()` | ✅ 有 | ✅ **已用** | 上游 `promise/session.ts:160`（`Pick<SessionApi, … "prompt" …>`）；我们 `plugin/index.ts:482`（存在性检查）、`:494`（实际调用） |
+| `ctx.session.synthetic()` | ✅ 有 | ❌ **未用** | 上游 `promise/session.ts:164`（`Pick<SessionApi, … "synthetic" …>`） |
+| `ctx.permission.list()` / `.reply()` | ✅ 有 | ❌ **未用** | 上游 `promise/permission.ts:22`（`Pick<PermissionApi, "list" \| "get" \| "reply">`）。⚠️ **初稿说这是"我们现用的审批回传路径"——假**（见下） |
+| `ctx.permission.hook("evaluate")` | ✅ 有 | ❌ **未用** | 上游 `promise/permission.ts:18-20,23`（`PermissionHooks.evaluate`，`effect` 可改）。可用于白名单自动放行 |
+| `ctx.tool.hook("execute.before"/"execute.after")` | ✅ 有 | ❌ **未用** | 上游 `promise/tool.ts:38-64`（`ToolHooks`）、`:71`。→ **agent 向 IM 提问**可由此实现（Part 9 C1d） |
+| `ctx.tool.transform` | ✅ 有 | ✅ **已用** | 上游 `promise/tool.ts:67`；我们 `plugin/index.ts:440,442`（注册 `bridge_setup`）→ `bridge_send` 确实走同路 |
+| `ctx.command.transform` | ✅ 有 | ✅ **已用** | 上游 `README.md:69`；我们 `plugin/index.ts:482,484`（注册 `/bridge-setup`） |
+| `ctx.storage`（`get`/`set`/`remove`/`scan`） | ✅ 有 | ❌ **未用** | 上游 `promise/storage.ts:4-8`（`StorageDomain`）。⚠️ 上游还有初稿没提的 `remove`。我们的持久化走自己的 `StateStore`（`state.py`），不用它 |
+| `ctx.options` | ✅ 有 | ✅ **已用** | 上游 `promise/plugin.ts:29`；我们 `plugin/index.ts:580`、解析链起点 `:327` |
+| TUI 插件 | ⚠️ **部分核实** | ❌ 未用 | v2.0.22 有独立的 TUI 插件包（`packages/plugin/src/tui/`，`plugin.ts` 的 `Definition` + `context.ts` 的 `Context`），但那个 context 是**观测型**（`on` / `listen` / `session` / `project` / `location` / 各域 `LocationCollection`）。⚠️ **初稿点名的「slots / panel / keymap」三个面本次未核实到，不作断言** |
+| 多端共享一个 session | ⚠️ 由我们自己的键设计决定（宿主不干预） | ❌ 未做 | 与 Hermes/dsh 同构，可做；**本仓库仍无反向索引** |
+
+**初稿的两处错，必须分开看**：
+
+1. **`ctx.permission.list()` / `.reply()` 不是我们的审批回传路径。**
+   我们走 **REST**：`opencode_client.py:374-393` 的
+   `POST /api/session/{id}/permission/{requestID}/reply`（`reply_permission()`），
+   **从不经过插件 ctx**。所以"ctx 权限面现成"对成本**没有贡献**——
+   权限那条路本来就不依赖插件 API。
+2. **「prompt hint、工具拦截、持久存储都现成 → 复刻两方优点更便宜」这个推论不成立。**
+   三个上游能力**确实都现成**，但**我们一个都没接**。hint 注入走的是完全另一条路：
+   `channel_profile.py:251` 的 `with_channel_hint`，由 `inbound_gateway.py:597`
+   在**拼 prompt 字符串时**加，与 `ctx.session.hook("context")` 无关。
+
+**更正后的结论**：宿主缺 cron（要自建）**这条仍成立**；但注入面**对我们几乎没用**——
+`ctx.*` 里只有 4 个成员被碰过。**这不改变任何功能的可行性**：hint 走字符串拼接、
+审批走 REST、提问桥若要做仍可接 `ctx.tool.hook`。
+**但成本估算要回到 Part 6 / Part 9 的口径，不要因为"注入面现成"而低估。**
 
 ---
 
@@ -255,39 +342,39 @@ prompt hint、工具拦截、持久存储都现成。这让"复刻两方优点"�
 
 | # | 功能 | 源自 | 难度 | 备注 |
 |---|---|---|---|---|
-| A1 | **脱敏引擎**：token/手机号/ID 模式 + 赋值形态 + 4 个 chokepoint + 误伤门 + **不可复用哨兵** | Hermes | **M**（3~5d） | 纯 Python 无宿主依赖。必须做词边界与值形状门，否则遮蔽正常中文 |
-| A2 | **授权层统一 + 三段闸门**：入站先过"渠道忽略"，再过网关白名单 | Hermes | **M**（2~3d） | 现有 `TelegramAdapter._allowed()` 下沉到 `base.py`；dsh 的教训是**审批应答必须在白名单之后** |
-| A3 | **默认收紧为显式 opt-in** | Hermes | **S**（0.5d）+ **行为变更** | `allowed_chat_ids: []` 现在=全开。改默认会打破现有用户 → 需迁移期/警告期/配置版本号 |
+| A1 | **脱敏引擎**：token/手机号/ID 模式 + 赋值形态 + 卡口 + 误伤门 | Hermes | **M**（3~5d） | ✅ **已落地 `redaction.py`**。⚠️ **初稿的两处细节已被推翻**：① 「**4 个** chokepoint」——实际是 **2 个**（挂在 logging **handler** 上的 `RedactingFilter`，与挂在 `StateStore` JSON 序列化边界上的 `redact_state_values`，理由见 `redaction.py:11-26`）；② 「**不可复用哨兵**」——那是 Hermes 的做法，我们**没做**，改用**不可逆整段遮蔽** `[REDACTED:<类别>]`（凭据**只遮蔽不摘要**，因为低熵口令的摘要等于离线验证器，理由 `redaction.py:40-51`）。**「确定性 key-hash 方案连带复用哨兵」这条路已被否决，不要当成可用选项**。「误伤门」✅ 保留（`redaction.py:99-102`，命中后再过一次确认门） |
+| A2 | **授权层统一 + 三段闸门**：入站先过"渠道忽略"，再过网关白名单 | Hermes | **M**（2~3d） | ✅ **闸门那半已落地**：`adapters/base.py:278` 的 `admits()` + **13 处调用点**，且 dsh 那条教训写进了 docstring（`:283-285`，审批应答必须在白名单之后）。⚠️ 「三段闸门」中的"渠道忽略"那层未单独做 |
+| A3 | **默认收紧为显式 opt-in** | Hermes | **S**（0.5d）+ **行为变更** | ⏳ **仍未做**。`allowed_chat_ids: []` 现在=全开。改默认会打破现有用户 → 需迁移期/警告期/配置版本号 |
 | A4 | **配对码**（8 位码 + TTL + 限流 + 失败锁定 + 别名集） | Hermes | **M**（3d） | 只在"要开放给陌生人"时需要 |
 | A5 | **Bot 回声防护**（按 conversation 计预算） | Hermes | **S**（0.5d） | 防 agent 输出被当成新输入回灌 |
-| A6 | **`pii_safe`**：prompt 里 id 用确定性 hash、路由用原值 | Hermes | **S**（1d） | 依赖 A1 |
+| A6 | **`pii_safe`**：prompt 里 id 用确定性 hash、路由用原值 | Hermes | **S**（1d） | ✅ **已落地**，但**不是裸确定性 hash**：会话 id / 手机号 / 邮箱一律用 **带进程内随机密钥的 HMAC-SHA256**（`redaction.py:331-350`），因为这三类都是低熵（手机号空间 ~10^10、telegram chat id 13 位内），裸 SHA 枚举几分钟就还原 |
 
 ### B · 身份与会话
 
 | # | 功能 | 源自 | 难度 | 备注 |
 |---|---|---|---|---|
-| B1 | **`SessionSource` 结构化身份 + `build_session_key()` 唯一真源 + 适配器 seam** | Hermes | **L**（5~8d） | **破坏性**：`state.json` 键变更 = IM 会话失忆。必须带迁移 + 旧键回退。收益：跨平台不串、thread/话题可表达 |
-| B2 | 多 chat 共享一个 session（`bySession` 反向索引 + `/continue`） | dsh | **M**（2d） | 依赖 B1 |
-| B3 | **渠道地址簿**（"我在哪些群"，仅索引已连接平台） | Hermes | **M**（2~3d） | C1/C2 的前置；落盘用 `ctx.storage` |
+| B1 | **`SessionSource` 结构化身份 + `build_session_key()` 唯一真源 + 适配器 seam** | Hermes | **L**（5~8d） | 部分落地：取的是 Part 10「关键路径」那条 **80% 方案** —— `identity.py` 的 `platform:local_id`，歧义前缀拒绝猜测。完整 `SessionSource`（20+ 字段）仍未做，thread/话题仍不可表达 |
+| B2 | 多 chat 共享一个 session（`bySession` 反向索引 + `/continue`） | dsh | **M**（2d） | ⏳ 依赖 B1，仍未做 |
+| B3 | **渠道地址簿**（"我在哪些群"，仅索引已连接平台） | Hermes | **M**（2~3d） | ⏳ 仍未做。⚠️ 初稿写「落盘用 `ctx.storage`」——那能力上游有（`promise/storage.ts:4-8`）但**我们没接**；实际会走自己的 `StateStore` |
 
 ### C · 交互质量
 
 | # | 功能 | 源自 | 难度 | 备注 |
 |---|---|---|---|---|
-| C1a | **出站分片算法**：码点切分 + 断点优先级 + 前缀两遍法重编号 | dsh | **S**（0.5d） | 纯函数，dsh 有 9 个测试可读。**最高性价比** |
-| C1b | **入站合并窗口** `..`/`!!` + 5s 超时 + 长输入回执 | dsh | **M**（2d） | 纯函数 + 必须同时做快照落盘（dsh 就漏了这条） |
-| C1c | **审批流加固**：超时回落本地 + 首答生效 + 同 key 不排队 + **迟到回答 30s 去重 + 显式回复门** | dsh | **S~M**（1~2d） | 我们已有 `/approve` 文字版，补超时与去重即可 |
-| C1d | **交互式提问桥**（agent 向 IM 提问，多选/单选/自由输入，第一份答案生效） | dsh + Hermes | **M**（3d） | 借 `ctx.tool.hook("execute.before")` 拦截 ask 类工具 |
-| C1e | **富交互 inline 按钮**覆盖三平台（审批/提问都用按钮 + 回调 id 约定） | Hermes | **M**（3d） | Telegram 已具备（`/setup` 菜单用过），Slack/Discord 需补 |
+| C1a | **出站分片算法**：码点切分 + 断点优先级 + 前缀两遍法重编号 | dsh | **S**（0.5d） | ✅ **已落地 `split.py`**（另加了 dsh 没有的**字素簇原子**与前缀预估） |
+| C1b | **入站合并** `..`/`!!` + 长输入回执 | dsh | **M**（2d） | ✅ **已落地**，但**数字与形态都被改过**：⚠️ 初稿的「**5s 超时**」是 **dsh 的数**、而且那是**窗口**不是超时；我们的是 **15s 保险丝**（`inbound_gateway.py:69`），**只在缓冲打开时存在**，裸文本**零延迟直发**（`inbound_merge.py:26-34`）。⚠️ 初稿要求「必须同时做快照落盘」——**刻意不做**：dsh 做了 `snapshots()` 但自己没接通（Part 3.7 那条仍然成立），而"别丢这条"是 `InboundInbox` 的职责，两者混在一起会替用户编出一句他没说的话（`inbound_merge.py:39-46`） |
+| C1c | **审批流加固**：首答生效 + 同 key 不排队 + 迟到回答去重 | dsh | **S~M**（1~2d） | ⚠️ **初稿有两处幻影**：① 「**超时回落本地**」——**本仓库从来没有审批超时**，那是账本里一条被推翻的设想（`permission_ledger.py` 的 docstring 记着这次推翻）；② 「迟到回答 **30s** 去重」——**30s 是 dsh 的数，我们没抄这个窗**。✅ 真实落地的是 `permission_ledger.py` 的 `PermissionLedger`：**无超时**，只做一件事——在**两条回传路径上同时拒绝第二次回答**（`/approve` 文字命令与 `perm:` 回调） |
+| C1d | **交互式提问桥**（agent 向 IM 提问，多选/单选/自由输入，第一份答案生效） | dsh + Hermes | **M**（3d） | ⏳ 仍未做。借 `ctx.tool.hook("execute.before")` 拦截 ask 类工具 —— 该 hook **上游存在但我们从未调用**（Part 8） |
+| C1e | **富交互 inline 按钮**（审批/提问都用按钮 + 回调 id 约定） | Hermes | **M**（3d） | ⚠️ 初稿说「覆盖**三**平台…Slack/Discord 需补」——**平台数与现状都不对**：现在是 13 个平台，实测 **inline 按钮 1/13**，只有 telegram 声明 `supports_inline_buttons = True`（`adapters/telegram.py:125`），其余 12 家**显式 `False` 并注明原因**（slack/discord 的 blocks 未实现）。成本要按 12 个平台重估，不是 2 个 |
 
 ### D · 输出与可观测
 
 | # | 功能 | 源自 | 难度 | 备注 |
 |---|---|---|---|---|
-| D1 | **出站错误分类**（`SendResult` + 平台中立 `error_kind`） | Hermes | **M**（2d） | 否则失败不可观测（dsh 就是 `.catch(() => undefined)` 全吞） |
-| D2 | **显式能力枚举**（`maxMessageLength` / `supportsInlineButtons` / `typedCommandPrefix`…） | Hermes | **S**（1d） | 平台少 + 要向用户报"不支持"，故取 Hermes 式而非 dsh 的 duck typing |
-| D3 | **状态四态归一 + `--status` 汇总** | dsh + Hermes 共同纪律 | **S**（1d） | 已有 `--check`/`--setup --json` 雏形；纯函数 + 一处汇总 |
-| D4 | **平台 prompt hint 注入**（长度上限 / 无 markdown 渲染 / 回复期望） | Hermes | **S**（1d） | 借 `ctx.session.hook("context")`，**宿主已提供注入面** |
+| D1 | **出站错误分类**（`SendResult` + 平台中立 `error_kind`） | Hermes | **M**（2d） | ✅ **已落地 `hooks.py:74,91`**（7 类 `SendError` + `SendResult`） |
+| D2 | **显式能力枚举**（`maxMessageLength` / `supportsInlineButtons` / `typedCommandPrefix`…） | Hermes | **S**（1d） | ✅ **已落地 `adapters/base.py:107-129`** 的 4 个 flag。⚠️ 初稿的理由「**平台少** + 要向用户报不支持」——"平台少"已不成立（13 个），但**取 Hermes 式而非 dsh duck typing 的结论更对了**：13 个适配器正是"能力必须可枚举"的理由 |
+| D3 | **状态四态归一 + `--status` 汇总** | dsh + Hermes 共同纪律 | **S**（1d） | ✅ **已落地 `status.py`**（`ChannelState` / `normalize_platform_status` / `summarize` / `render_table`） |
+| D4 | **平台 prompt hint 注入**（长度上限 / 无 markdown 渲染 / 回复期望） | Hermes | **S**（1d） | ✅ **已落地**，⚠️ 但**不是**初稿说的「借 `ctx.session.hook("context")`，宿主已提供注入面」——那条路**我们没走**。真实做法：`channel_profile.py:251` 的 `with_channel_hint`，调用点 `inbound_gateway.py:597`，在**拼 prompt 字符串时**加 |
 | D5 | hint 可被用户覆盖（append/replace） | Hermes | **S**（0.5d） | 依赖 D4 |
 
 ### E · 主动能力
@@ -296,8 +383,8 @@ prompt hint、工具拦截、持久存储都现成。这让"复刻两方优点"�
 |---|---|---|---|---|
 | E1 | **定时任务绑 chatId 而非 sessionId** | dsh | **M~L**（4~6d） | opencode **无 cron** → 要自写日历（时区/DST）+ tick + 落盘。**决策本身可抄，实现要自建** |
 | E2 | **主动发送** `bridge_send` 工具 | Hermes（立场相反）/ dsh（做成工具） | **M**（2~3d） | 依赖 B3。需裁决：opt-in 白名单 vs 暴露给模型 |
-| E3 | **推送文件/媒体** `bridge_send_file` | dsh | **M**（2d） | 三平台媒体能力差异大 |
-| E4 | TUI 状态面板 | dsh `client.js` | **M**（3d） | 独立技能域（新语法/新 API） |
+| E3 | **推送文件/媒体** `bridge_send_file` | dsh | **M**（2d） | ⚠️ 初稿说「**三**平台媒体能力差异大」——现在是 13 个平台，实测 **1/13 支持媒体**（只有 telegram，`adapters/telegram.py:126`），其余 12 家显式 `False` 并注明原因。差异比初稿设想的大得多 |
+| E4 | TUI 状态面板 | dsh `client.js` | **M**（3d） | 独立技能域（新语法/新 API）。⚠️ 宿主侧 TUI 插件包 v2.0.22 **确实存在**，但初稿点名的 slots/panel/keymap **本次未核实到**（Part 8），成本估算前要先核实 |
 
 ### F · 已对齐 / 不适用
 
@@ -305,8 +392,8 @@ prompt hint、工具拦截、持久存储都现成。这让"复刻两方优点"�
 |---|---|
 | 应用内 setup 向导 | ✅ 已借鉴（`--setup` / `/setup` / `bridge_setup` / `--setup --json`） |
 | 单例锁 | ✅ 已有（跨进程杀旧重启，与 dsh 的硬链接锁目标相同、实现不同） |
-| 扫码开通（provisioning） | ❌ 不适用 —— 我们 3 平台都是 token，无扫码 |
-| 25 渠道 / 平台插件化 | ❌ 不适用 —— 我们的方向是"做深"不是"做多" |
+| 扫码开通（provisioning） | ❌ 不适用 —— 13 个平台都用预置凭据（bot token / API key / 账号密码），无扫码 |
+| 25 渠道 / 平台插件化 | ⚠️ 初稿写「我们的方向是"做深"不是"做多"」——**这个前提已不成立**：现在就是 13 个平台，"做多"已经发生。真正剩下的判断是"要不要继续加" |
 | 依赖动态安装 | ❌ 不适用 —— 我们零第三方依赖 |
 
 ---
@@ -317,24 +404,43 @@ prompt hint、工具拦截、持久存储都现成。这让"复刻两方优点"�
 （dsh 的 `toTelegramHtml` 死码、Hermes 的配对码状态机在无开放场景时是纯负债）。
 下面按"能拿到的优点全拿、该挡的挡住"排波次。
 
+⚠️ **这是 3 平台时代的计划表，波次本身已不是"待办"。** 下面每条波次后标出实际落地情况，
+**保留原编号与原描述**以便看出当初的判断依据。
+
 ### Wave 0 · 低风险地基（S 为主，1~2 周，不破坏任何现有行为）
 D2 能力枚举 · D3 状态四态归一 + `--status` · **D4 prompt hint 注入** · C1a 分片算法 · C1c 审批超时+迟到去重 · A5 回声防护
 
 > 收益最直观（用户立刻能感到"消息不再被切坏""agent 知道自己在 IM 里""状态一目了然"），
 > 零破坏性，可逐项独立发布与验证。
 
+**现状**：D2 ✅ · D3 ✅ · D4 ✅ · C1a ✅ · A5 ⏳ · **C1c ⚠️ 条目本身写错了**——
+「审批**超时**」是幻影（本仓库无审批超时），「迟到去重 30s」是 dsh 的数；实际落地的是
+`PermissionLedger`（无超时，只拒绝第二次回答）。
+
 ### Wave 1 · 安全闭环（M，1.5 周）
 A1 脱敏引擎 · A2 授权三段闸门 · A6 `pii_safe` · D1 出站错误分类
 　+ **A3 默认收紧**（独立决策：需迁移期与文档，先只加警告不改默认）
 
+**现状**：A1 ✅（2 卡口，非 4；无哨兵，用不可逆遮蔽）· A2 ✅ 闸门那半（13 调用点）·
+A6 ✅（带密钥 HMAC，非裸 hash）· D1 ✅ · **A3 ⏳ 仍未做 —— 本波次唯一的遗留项**。
+
 ### Wave 2 · 交互深度（M，2 周）
 C1b 合并窗口（含快照落盘）· C1d 提问桥 · C1e 三平台按钮 · D5 hint 可覆盖
+
+**现状**：C1b ✅（但形态改了：`..` 才合并 + 15s 保险丝、**刻意不落盘**，见 Part 9 C1b）·
+C1d ⏳ · **C1e ⚠️ 「三平台」已错**（13 个平台，inline 按钮实测 1/13，成本要按 12 个平台重估）·
+D5 ⏳。
 
 ### Wave 3 · 身份模型（L，1.5 周，**破坏性，需单独评审 + 迁移预案**）
 B1 `SessionSource` + 唯一真源 + `state.json` 迁移 · B2 多 chat 共享
 
+**现状**：**这条波次已被下面的"80% 方案"取代**——`identity.py` 的 `platform:local_id`
+已落地（13 个平台全部走统一 id，歧义前缀拒绝猜测）。完整 `SessionSource` 与 B2 仍未做。
+
 ### Wave 4 · 主动能力（M~L，2~3 周，依赖 B3）
 B3 渠道地址簿 → E2 主动发送 → E3 文件推送 → E1 定时（自建日历，最后做）
+
+**现状**：⏳ **整条未动**。B3/E2/E3/E1 全部仍是未完成项。
 
 ### 待定（按需，不排期）
 A4 配对码（要开放给陌生人时）· E4 TUI 面板
@@ -345,7 +451,12 @@ A4 配对码（要开放给陌生人时）· E4 TUI 面板
   若不想付迁移代价，替代方案是保留 `conversation_id` 字符串但**加入平台前缀**
   （`telegram:<id>` / `slack:<id>` / `discord:<id>`），能解决"跨平台同名串台"，
   代价是 thread/话题仍不可表达——**这是个可以先做的 80% 方案**。
+  ✅ **这条 80% 方案已被采纳并落地**（`identity.py`）。所以"Wave 3 是破坏性前置"这个
+  风险**已经解除**：E1/E2 现在按 chat 寻址不再依赖 `SessionSource` 迁移。
 - **Wave 4 的 E1 成本主要在自建日历**（时区 + DST）。若接受"只支持每天 HH:MM + 星期"
   的子集，可省掉大部分 DST 复杂度（dsh 的两遍法收敛可读）。
+  ⚠️ E1 的另一半前提已核实：**v2.0.22 确实没有 scheduler**（Part 8），
+  所以"宿主 someday 会给 cron"这个指望可以划掉了。
 - **A3 是行为变更**，会打破"配好即用"的现状。建议分两步：先加 `allowed_chat_ids_required`
   之类的显式开关与警告（不改默认），下个 minor 再切默认并给迁移指引。
+  ⏳ **仍是遗留项**——它现在是 Part 6 里唯一还完整成立的 P0。

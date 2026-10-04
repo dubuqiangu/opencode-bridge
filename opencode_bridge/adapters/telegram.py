@@ -124,6 +124,8 @@ class TelegramAdapter(Adapter):
     supports_inbound = True
     supports_inline_buttons = True              # 仓库里唯一支持 inline 按钮的平台
     supports_media = True
+    #: ``editMessageText`` 真能把占位气泡顶成最终答复，所以 ``⏳ 处理中…`` 发得。
+    supports_message_edit = True
 
     # Class-level knobs (tests may override them on the instance).
     message_limit = MESSAGE_LIMIT

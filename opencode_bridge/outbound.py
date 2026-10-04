@@ -68,9 +68,34 @@ class OutboundSender:
         adapter: Optional[Adapter] = None,
         session_id: Optional[str] = None,
     ) -> Optional[MsgHandle]:
+        """发一条出站文本。``kind == "progress"`` 且平台**改不了**已发消息时**不发**。
+
+        ⚠️ 这一段是「**不要写你以后要抛下的东西**」（AGENTS.md §8）在出站侧的落点，
+        也是本类唯一的 ``kind == "progress"`` 闸门 —— 三个调用方
+        （:class:`~opencode_bridge.event_stream.EventStream` 的流式首片与重试提示、
+        :class:`~opencode_bridge.inbound_gateway.InboundGateway` 的 ``⏳ 处理中…``）
+        都从这里过，所以**改一处就够**，不必在每个调用点各判一次。
+
+        为什么必须在这里挡：占位消息是一张**承诺**，承诺收尾时会被最终答复顶掉。
+        ``email`` / ``ntfy`` / ``a2a`` / ``homeassistant`` / ``irc`` / ``twitch`` /
+        ``qqbot`` 的 :meth:`~opencode_bridge.adapters.base.Adapter.edit` 恒返回
+        ``False``，于是那条气泡**永远**清不掉：每一轮都留下一个「还在处理中」的
+        僵尸气泡 **加** 一条真正的答复。挡在这里之后 :meth:`finalize` 拿到
+        ``handle=None``，直接发最终答复 —— **答复一条不少、不截断、不重复**，
+        而僵尸气泡从来不存在。
+
+        返回 ``None`` 与「发送失败」同形是刻意的：调用方本来就把返回值当作
+        「有没有可改写的句柄」在用（``Turn.progress_handle``），所以**上游一个字都不用改**。
+        """
         adapter = adapter or self._adapter_for(conversation_id)
         if adapter is None:
             logger.warning("no adapter for %s; cannot send", conversation_id)
+            return None
+        if kind == "progress" and not adapter.supports_message_edit:
+            logger.debug(
+                "%s 无法改写已发消息：不发占位消息（否则它永远清不掉）",
+                adapter.name,
+            )
             return None
         out = Outbound(
             conversation_id=conversation_id,

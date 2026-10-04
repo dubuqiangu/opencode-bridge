@@ -227,6 +227,8 @@ class MattermostAdapter(Adapter):
     supports_inbound = True                    # WebSocket 事件流（T3.2）
     supports_inline_buttons = False            # v1 不发 attachments / actions
     supports_media = False                     # v1 只发纯文本
+    #: ``PUT /posts/{id}/patch`` 真能改写已发消息（见 :meth:`edit`），占位气泡发得。
+    supports_message_edit = True
     typed_command_prefix = "/"
     #: ``site_url`` 与 ``token`` 缺一不可（缺了 ``start()`` 只告警不起线程）。
     required_tokens = ("site_url", "token")

@@ -560,5 +560,136 @@ class EveryRegisteredAdapterCanDescribeItselfTests(unittest.TestCase):
         self.assertTrue(Plain({}, InertHooks()).splits_long_messages)
 
 
+# ----------------------------------------------------------------------
+# 6. 等待期间读者看得见什么 —— C1 曾经在这里说了一句假话
+# ----------------------------------------------------------------------
+#: 会先看到一条占位消息的那一支里，独有的标记。
+_PLACEHOLDER_MARKER = "placeholder"
+
+#: 什么都不会出现的那一支里，独有的标记。
+_SILENCE_MARKER = "nothing at all appears while you work"
+
+
+def progress_paragraph(adapter) -> str:
+    """``render()`` 里讲"等待期间"的那一段。
+
+    按**内容**找而不是按位置找（提示的段落顺序是文案的事，不该被这里钉住）。
+    找到的那一段可能属于"错的那一支"—— 那正是各条断言要揭穿的东西，所以这里
+    如实返回，不替调用方判断。
+    """
+    for paragraph in ChannelProfile.from_adapter(adapter).render().split("\n\n"):
+        if _PLACEHOLDER_MARKER in paragraph or _SILENCE_MARKER in paragraph:
+            return paragraph
+    raise AssertionError(
+        "等待期间那一段既没有提到占位消息、也没说读者在干等：%r" % adapter.name
+    )
+
+
+class TheProgressVisibilityClauseIsConditionalTests(unittest.TestCase):
+    """这一段提示曾经对**七个平台是假的**：它说读者会先看到一条占位消息，
+    而出站那道闸门（见 :meth:`OutboundSender.send_text`）在那些平台上
+    **根本不发**占位消息 —— 读者等待期间什么都看不见。
+
+    "一条骗人的渠道说明比没有渠道说明更糟"，所以这里钉的是**真话**，
+    不是文案：断言的是两个分支各自**独有的事实**，因此任何一边被误接到
+    另一边都会立刻红。
+    """
+
+    def test_every_platform_is_covered(self):
+        """覆盖面守门：13 个已注册平台一个不漏。"""
+        self.assertEqual(len(every_registered_adapter()), 13)
+
+    def test_an_editing_platform_still_says_the_placeholder_is_replaced(self):
+        editing = [a for a in every_registered_adapter() if a.supports_message_edit]
+        self.assertTrue(editing, "一个能改写的平台都没有？那这条断言是空的")
+        for adapter in editing:
+            with self.subTest(platform=adapter.name):
+                paragraph = progress_paragraph(adapter)
+
+                self.assertIn(_PLACEHOLDER_MARKER, paragraph)
+                self.assertIn("cannot be replaced in place", paragraph)
+                self.assertNotIn(
+                    _SILENCE_MARKER, paragraph,
+                    "%s 能改写，却说了'等待期间什么都不会出现'" % adapter.name,
+                )
+
+    def test_a_non_editing_platform_never_mentions_a_placeholder(self):
+        """**证伪测试**：旧那句"posted as a new message below the placeholder"
+        就是靠这一条抓出来的 —— 不能改写的平台上根本没有占位消息。"""
+        silent = [a for a in every_registered_adapter()
+                  if not a.supports_message_edit]
+        self.assertTrue(silent, "一个不能改写的平台都没有？那这条断言是空的")
+        for adapter in silent:
+            with self.subTest(platform=adapter.name):
+                hint = with_channel_hint("看一下 README", adapter)
+
+                self.assertNotIn(
+                    _PLACEHOLDER_MARKER, hint,
+                    "%s 不能改写已发消息，桥**不会**发占位消息，"
+                    "提示里不许出现 placeholder" % adapter.name,
+                )
+
+    def test_a_non_editing_platform_says_the_reader_waits_for_the_finished_answer(self):
+        for adapter in every_registered_adapter():
+            if adapter.supports_message_edit:
+                continue
+            with self.subTest(platform=adapter.name):
+                paragraph = progress_paragraph(adapter)
+
+                self.assertIn(_SILENCE_MARKER, paragraph)
+                self.assertIn("finished answer is ready", paragraph)
+                self.assertIn(
+                    "no sign that anything is happening", paragraph,
+                    "%s 必须说清等待期间读者看不到任何迹象" % adapter.name,
+                )
+
+    def test_the_two_branches_can_never_be_confused(self):
+        """一个平台**只可能**落进一支：两支的独有标记必须互斥。
+
+        这条不依赖文案，只依赖两个标记，所以**改措辞不会误伤**它；而它挡住的是
+        "有人把两支的 if 写反 / 漏了 else"这类改动 —— 那种改动在只断言"提到了
+        占位消息"的测试下是看不出来的。
+        """
+        for adapter in every_registered_adapter():
+            with self.subTest(platform=adapter.name):
+                hint = with_channel_hint("看一下 README", adapter)
+
+                mentions_placeholder = _PLACEHOLDER_MARKER in hint
+                mentions_silence = _SILENCE_MARKER in hint
+
+                self.assertNotEqual(
+                    mentions_placeholder, mentions_silence,
+                    "%s 的提示同时命中或同时落空了两支的标记" % adapter.name,
+                )
+                self.assertEqual(
+                    mentions_placeholder, adapter.supports_message_edit,
+                    "%s 的提示与 supports_message_edit=%r 不符"
+                    % (adapter.name, adapter.supports_message_edit),
+                )
+
+    def test_the_declared_flag_reaches_the_profile(self):
+        for adapter in every_registered_adapter():
+            with self.subTest(platform=adapter.name):
+                self.assertEqual(
+                    ChannelProfile.from_adapter(adapter).supports_message_edit,
+                    adapter.supports_message_edit,
+                )
+
+    def test_the_clause_does_not_name_platforms_or_bridge_internals(self):
+        """这两支都是给模型读的正文：不许出现平台名、也不许出现桥内部的说法。"""
+        forbidden = ("opencode", "bridge", "adapter", "outbound", "edit()")
+        for adapter in every_registered_adapter():
+            with self.subTest(platform=adapter.name):
+                paragraph = progress_paragraph(adapter).lower()
+
+                for word in forbidden:
+                    self.assertNotIn(word, paragraph)
+                for platform_name in platform_names_in_use():
+                    self.assertNotIn(
+                        platform_name, paragraph,
+                        "等待期间那一段提到了平台 %r" % platform_name,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

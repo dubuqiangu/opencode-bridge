@@ -135,6 +135,8 @@ class SlackAdapter(Adapter):
     supports_inbound = True                    # Socket Mode 入站（需另配 app_token）
     supports_inline_buttons = False            # blocks 未实现
     supports_media = False
+    #: ``chat.update`` 真能改写已发消息（见 :meth:`edit`），所以占位气泡发得。
+    supports_message_edit = True
     # 入站必需 app_token：缺它会静默降级为"只发出站"，所以必须声明出来，
     # 让 --status / --setup --json 不会把这种情况报成"已配置"。
     required_tokens = ("bot_token", "app_token")

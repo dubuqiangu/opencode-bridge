@@ -134,6 +134,10 @@ class MatrixAdapter(Adapter):
     supports_inbound = True                     # /sync 长轮询
     supports_inline_buttons = False             # v1 不把 reactions 当交互
     supports_media = False                      # v1 只发 m.text
+    #: ``m.relates_to`` + ``rel_type="m.replace"`` 是真的替换（见 :meth:`edit`），
+    #: 所以占位气泡发得。⚠️ 个别客户端不支持替换，:meth:`edit` 会返回 ``False``，
+    #: 那时收尾退化成"再发一条"—— 能力是**平台级**的，个别客户端的缺口不在这里判。
+    supports_message_edit = True
 
     # Matrix 没有 bot_token 的概念，凭据是 homeserver + access_token。
     # user_id 也列入必需：它是**过滤自己回声**的唯一依据，缺了会无限回环

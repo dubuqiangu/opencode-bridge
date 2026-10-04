@@ -243,6 +243,8 @@ class DiscordAdapter(Adapter):
     supports_inbound = True                    # Gateway v10 入站（T2.2）
     supports_inline_buttons = False            # components 未实现
     supports_media = False
+    #: ``PATCH /channels/{id}/messages/{id}`` 真能改写已发消息，所以占位气泡发得。
+    supports_message_edit = True
     required_tokens = ("bot_token",)           # 入站只多要一个 bot_token（默认值）
 
     message_limit = MESSAGE_LIMIT

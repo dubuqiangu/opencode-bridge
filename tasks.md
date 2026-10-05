@@ -2034,7 +2034,7 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 
 | 平台 | 实测 | 后果 |
 |---|---|---|
-| **irc / twitch** | 私聊时 `target` 是 **bot 自己的 nick**（`irc.py:616`），闸门用 `target`（`:629`） | 自动写入等于**给所有人开门**，无任何日志提示 |
+| **irc / twitch** | 私聊时 `target` 是 **bot 自己的 nick**（`is_private = … target.lower() == self.nick.lower()`），闸门用同一个 `target`（`if not self.admits(target) …`） | 自动写入等于**给所有人开门**，无任何日志提示 |
 | **qqbot** | 闸门比 `target`（`qqbot.py:1093`），conversation_id 是 `scope:target`（`:1057`） | 写入值**永不命中**，表现为「配了白名单还是收不到」 |
 
 ⚠️ **我的表述不完整，这是本条要记的教训**：我在把选项摆给用户时，
@@ -2210,7 +2210,69 @@ code = base32lower(
 翻转后必然被拒。**这条本身就是分两版发布的理由之一。**
 本次**必须**做的配套只有两件：`pairing_supported = False` + 一条启动告警说明
 「私聊的 principal 是 bot 自己的 nick ⇒ 翻转后私聊不可用」。**失败关闭 + 响亮，优于半通不通。**
-nick-as-principal 本身**单独立项**，不在这次改。
+nick-as-principal 本身**单独立项**，不在这次改。**下面是那个条目的内容** ——
+
+#### 🔴 单独立项：irc / twitch 私聊的 principal 是 **bot 自己的 nick**
+
+**实测锚点**（**刻意用符号名而非行号** —— 本条写作时 `irc.py` / `twitch.py`
+正在被并行 lane 编辑，行号在几分钟内就漂了；**给正在被编辑的文件写行号引用本身就是错的**）：
+`irc.py` 与 `twitch.py` 里的 `is_private = bool(self.nick) and target.lower() == self.nick.lower()`
+⇒ 私聊时 `target` 就是 **bot 自己的 nick**；闸门用同一个 `target`（`if not self.admits(target) …`）
+⇒ **`admits()` 拿 bot 的 nick 去比对，等于「任何人的私聊都命中同一条白名单」。**
+两个平台同构。
+
+**仓库自己的测试就是证据**：`tests/test_irc.py::test_private_message_becomes_inbound`
+断言 `ib.conversation_id == f"irc:{NICK}"` —— **「私聊的会话 id 是 bot 自己的 nick」
+被写成了期望值**。`tests/test_twitch.py::test_private_message_needs_no_mention`
+同构（`got[0].conversation_id == f"twitch:{NICK}"`）。
+
+⚠️ **私聊不是「没测试」**：`tests/test_irc.py` 与 `tests/test_twitch.py` 里有 **6 条**
+名字含 `private`/`privmsg` 的测试，它们测的是**消息处理**（成不成为 inbound、
+会不会被拆成多行、tags 解不解析）。而三处用到 `allowed_chat_ids` 的测试
+（`test_irc.py` 两处 + `test_twitch.py` 一处）**填的全是 `"#allowed"`，也就是频道** ——
+⇒ **私聊的授权路径一条测试都没有**。
+⚠️ **我第一版把这条写成「私聊这条路一条测试都没有」，那是错的**（先断言、后测量）。
+**准确说法是「私聊的消息处理有测试，私聊的授权没有」** —— 而缺陷正在后者。
+
+**这不是「principal 取错了字段」，是 IRC 协议层没有这个概念。**
+`PRIVMSG <target>` 的 `target` 只表示「消息发给谁」；对 IRC 服务器而言，
+**发送方的 nick 是客户端自报的字符串**，没有可信来源。所以：
+
+| 平台 | 私聊时的 principal | 语义 |
+|---|---|---|
+| telegram / slack / discord | chat id / channel id | 平台侧**权威分配**的会话标识，发送方无法冒充 |
+| **irc / twitch** | **bot 自己的 nick** | **不是对方的身份**，只是「这是私聊」这个事实 |
+
+⚠️ **私聊不是「没测试」—— 我第一版把这句写成「私聊这条路一条测试都没有」，那是错的**
+（**先断言、后测量**，§7.1）。准确的说法分两层：
+
+- **消息处理有测试**：`tests/test_irc.py` 与 `tests/test_twitch.py` 里有 **6 条**名字含
+  `private`/`privmsg` 的测试（成不成为 inbound、会不会被拆成多行、tags 解不解析）。
+- **授权没有测试**：三处用到 `allowed_chat_ids` 的测试（`test_irc.py` 两处 +
+  `test_twitch.py` 一处）**填的全是 `"#allowed"`，也就是频道** ⇒ **私聊的授权路径零覆盖**。
+
+⇒ **缺陷正好活在「测了消息处理、没测授权」的那条缝里**，所以它能长期存在而不被发现。
+⚠️ 而仓库自己的测试还把缺陷**写成了期望值**：
+`tests/test_irc.py::test_private_message_becomes_inbound` 断言
+`ib.conversation_id == f"irc:{NICK}"` —— 即「私聊的会话 id 是 bot 自己的 nick」。
+
+**根因（§8）**：把「一条私聊」当成了「一个会话身份」。**根问题不是取错字段，
+而是这条路径上根本不存在可信的身份** ⇒ **任何「把私聊当授权单位」的方案在这两个平台上
+都必然出错**，不是换个字段名能修的。
+
+**可选方向（都需要决策，不是实现任务）**：
+1. **私聊默认关闭**，只有运维显式开启 —— 诚实的失败关闭；
+2. 若要开，则**要求凭据**：IRC 服务端的 NickServ / SASL / ident（RFC 1413）
+   **验证过的 nick** 才作 principal —— 但那就还要处理「验过之后 nick 能否被再次改动」；
+3. **把 IRC/Twitch 的授权单位定为频道**，私聊不做授权单位 —— 与现状差异最小。
+
+**无论选哪个，都要先回答**：**用户以为他授权的是「谁」，而机制实际授权的是「什么」。**
+这两者在 IRC 上从一开始就不相等，而现在的实现连这个不等**都没有说出来**。
+
+⚠️ **本次改动必须做的两件配套**（已在实现中）：`pairing_supported = False`
++ 一条启动告警说明「私聊的 principal 是 bot 自己的 nick ⇒ 翻转后私聊不可用」。
+**失败关闭 + 响亮，优于半通不通。** 但那只解决**翻转后的可用性**，
+**没有解决这个 principal 本身是错的问题** —— 上面三条方向仍然待决。
 
 #### 三处假话：**改名，但判定式一个字不动**
 

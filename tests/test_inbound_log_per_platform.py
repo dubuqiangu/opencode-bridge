@@ -31,6 +31,7 @@ qqbot 四条里的 :meth:`PerPlatformRejectionLogTests._assert_fields_survive`
 from __future__ import annotations
 
 import json
+import logging
 import unittest
 
 from opencode_bridge import identity
@@ -48,10 +49,11 @@ from opencode_bridge.adapters.slack import SlackAdapter
 from opencode_bridge.adapters.telegram import TelegramAdapter
 from opencode_bridge.adapters.twitch import TwitchAdapter
 from opencode_bridge.redaction import Redactor
+from opencode_bridge.redaction_coverage import install_order_independent_coverage
 from tests.inbound_log_support import (
     FLIPPED_GATE_CONFIG,
-    FIXED_REDACTION_KEY,
     CapturedLogs,
+    CollectingHandler,
     RecordingHooks,
     SlackFakeWebSocket,
     make_raw_mail,
@@ -79,16 +81,26 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         self,
         platform: str,
         raw_local_id: str,
-        lines: list[str],
+        handler: CollectingHandler,
         expected_conversation_id: str | None = None,
         fingerprinted_local: str | None = None,
     ) -> None:
         """断言"落盘的那一行"：无裸 id、有可关联摘要。
 
-        期望值**从 :class:`Redactor` 直接算**，不调用被测的
-        :func:`redactable_id` —— 否则"实现算出来的"与"断言算出来的"是同一个
-        函数，实现错了断言也会跟着错。
+        收的是**收集器**而不是它攒下来的行，因为期望值必须由**产生那一行的那个
+        redactor 实例**算出来 —— :meth:`CollectingHandler.expected_conversation_fingerprint`
+        就是那个入口。另建一个固定密钥的实例在以前是对的（那时链上只有一层），
+        现在会错：进程里只要多一层进程全局的脱敏，它先跑，而脱敏引擎是幂等的 ⇒
+        固定密钥那一遍是恒等变换 ⇒ 两边变成同一个值的两个不同 HMAC，而报错只说
+        "not found in"。见 :class:`~tests.inbound_log_support.CapturedLogs` 的
+        docstring 与本文件的 :class:`CapturedRedactorProvenanceTests`。
 
+        期望值仍然**不调用被测的** :func:`redactable_id` ——
+        否则"实现算出来的"与"断言算出来的"是同一个函数，实现错了断言也会跟着错。
+        被测对象是「适配器有没有把裸 id 交给日志」，不是摘要怎么算。
+
+        :param handler: :class:`~tests.inbound_log_support.CollectingHandler`；
+            期望值与实际值都必须出自它。
         :param expected_conversation_id: 额外断言"落盘那一行里的摘要**就是**这个
             会话标识的脱敏形态"。给了它，就顺带钉住"日志说的会话 == 真会进
             ``Inbound.conversation_id`` 的那个会话"。
@@ -98,14 +110,11 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
             ``group:<openid>`` 而**不是**裸 openid。这两者的区别正是"裸 id 明明
             还在、却已经不再是日志里那个值"的典型形态，所以要显式分开写。
         """
-        redactor = Redactor(key=FIXED_REDACTION_KEY)
-        # ``fingerprint`` 自带 ``conv#`` 标签，所以平台段拼在**外面**。
-        expected_fingerprint = "%s:%s" % (
+        expected_fingerprint = handler.expected_conversation_fingerprint(
             platform,
-            redactor.fingerprint("conv",
-                                 raw_local_id if fingerprinted_local is None
-                                 else fingerprinted_local),
+            raw_local_id if fingerprinted_local is None else fingerprinted_local,
         )
+        lines = handler.lines
         self.assertTrue(lines, "拒绝路径上一行日志都没记 —— 这条测试量的是空集")
         for line in lines:
             self.assertNotIn(
@@ -124,7 +133,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                          "实参没有经过 redactable_id（平台=%s）" % platform)
         if expected_conversation_id is not None:
             self.assertIn(
-                redactor.scrub(expected_conversation_id), joined,
+                handler.redactor.scrub(expected_conversation_id), joined,
                 "落盘那一行里的摘要不是本适配器真会用的 conversation_id"
                 "（平台=%s，期望 %s）：\n%s"
                 % (platform, expected_conversation_id, joined),
@@ -150,7 +159,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         }}
         with CapturedLogs("telegram") as handler:
             adapter._dispatch_update(update)
-        self._assert_drop_line("telegram", str(chat_id), handler.lines,
+        self._assert_drop_line("telegram", str(chat_id), handler,
                                adapter._conversation_id(chat_id))
         self._rejected("telegram")
 
@@ -163,7 +172,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                     "message": {"message_id": 9, "chat": {"id": chat_id, "type": "group"}}}
         with CapturedLogs("telegram") as handler:
             adapter._handle_callback(callback)
-        self._assert_drop_line("telegram", str(chat_id), handler.lines,
+        self._assert_drop_line("telegram", str(chat_id), handler,
                                adapter._conversation_id(chat_id))
         self._rejected("telegram")
 
@@ -181,7 +190,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         })
         with CapturedLogs("slack") as handler:
             self.assertTrue(adapter._handle_envelope(SlackFakeWebSocket(), envelope))
-        self._assert_drop_line("slack", channel, handler.lines,
+        self._assert_drop_line("slack", channel, handler,
                                adapter._conversation_id(channel))
         self._rejected("slack")
 
@@ -195,9 +204,9 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                    "author": {"id": author_id, "bot": False}}
         with CapturedLogs("discord") as handler:
             self.assertFalse(adapter._handle_message_create(payload))
-        self._assert_drop_line("discord", channel_id, handler.lines,
+        self._assert_drop_line("discord", channel_id, handler,
                                adapter._conversation_id(channel_id))
-        self._assert_drop_line("discord", author_id, handler.lines,
+        self._assert_drop_line("discord", author_id, handler,
                                adapter._conversation_id(author_id))
         self._assert_fields_survive(handler.lines, ("channel=", "author="))
         self._rejected("discord")
@@ -215,7 +224,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                  "content": {"msgtype": "m.text", "body": "hello there"}}
         with CapturedLogs("matrix") as handler:
             adapter._handle_event(room_id, event)
-        self._assert_drop_line("matrix", room_id, handler.lines,
+        self._assert_drop_line("matrix", room_id, handler,
                                adapter._conversation_id(room_id))
         self._rejected("matrix")
 
@@ -231,9 +240,9 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                 "message": "hello there", "type": "", "delete_at": 0, "file_ids": []}
         with CapturedLogs("mattermost") as handler:
             self.assertFalse(adapter._handle_posted(post))
-        self._assert_drop_line("mattermost", channel_id, handler.lines,
+        self._assert_drop_line("mattermost", channel_id, handler,
                                adapter._conversation_id(channel_id))
-        self._assert_drop_line("mattermost", author_id, handler.lines,
+        self._assert_drop_line("mattermost", author_id, handler,
                                adapter._conversation_id(author_id))
         self._assert_fields_survive(handler.lines, ("channel=", "user="))
         self._rejected("mattermost")
@@ -250,7 +259,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                 ":stranger!user@example.org PRIVMSG",
                 [target, "opencodebot: hello there"],
             )
-        self._assert_drop_line("irc", target, handler.lines,
+        self._assert_drop_line("irc", target, handler,
                                adapter._conversation_id(target))
         self._rejected("irc")
 
@@ -266,7 +275,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                 "%s PRIVMSG %s :opencodebot: hello there" % (prefix, target),
                 {"id": "twitch-msg-1"}, prefix, [target, "opencodebot: hello there"],
             )
-        self._assert_drop_line("twitch", target, handler.lines,
+        self._assert_drop_line("twitch", target, handler,
                                adapter._conversation_id(target))
         self._rejected("twitch")
 
@@ -280,7 +289,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                 "topic": topic, "message": "hello there"}
         with CapturedLogs("ntfy") as handler:
             adapter._on_raw(item)
-        self._assert_drop_line("ntfy", topic, handler.lines,
+        self._assert_drop_line("ntfy", topic, handler,
                                identity.format_id("ntfy", topic))
         self._rejected("ntfy")
 
@@ -295,7 +304,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         raw = make_raw_mail(sender=sender)
         with CapturedLogs("email") as handler:
             adapter._on_raw(raw)
-        self._assert_drop_line("email", sender, handler.lines,
+        self._assert_drop_line("email", sender, handler,
                                identity.format_id("email", sender))
         self._rejected("email")
 
@@ -317,9 +326,9 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                    "messageParameters": {}, "messageType": "comment", "systemMessage": ""}
         with CapturedLogs("nextcloud") as handler:
             self.assertFalse(adapter._handle_message(room_token, message))
-        self._assert_drop_line("nextcloud", room_token, handler.lines,
+        self._assert_drop_line("nextcloud", room_token, handler,
                                adapter._conversation_id(room_token))
-        self._assert_drop_line("nextcloud", actor_id, handler.lines,
+        self._assert_drop_line("nextcloud", actor_id, handler,
                                adapter._conversation_id(actor_id))
         self._assert_fields_survive(handler.lines, ("room=", "actor="))
         self._rejected("nextcloud")
@@ -340,9 +349,9 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         with CapturedLogs("qqbot") as handler:
             self.assertFalse(adapter._handle_message(event, data))
         conversation_id = QQBotAdapter.conversation_id_for("group", group_openid)
-        self._assert_drop_line("qqbot", group_openid, handler.lines, conversation_id,
+        self._assert_drop_line("qqbot", group_openid, handler, conversation_id,
                                "group:" + group_openid)
-        self._assert_drop_line("qqbot", author_openid, handler.lines)
+        self._assert_drop_line("qqbot", author_openid, handler)
         self._assert_fields_survive(handler.lines, ("conversation=", "author="))
         self._rejected("qqbot")
 
@@ -356,7 +365,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         with CapturedLogs("a2a") as handler:
             response = adapter._rpc_send_message("req-1", params, peer)
         self.assertTrue(response, "a2a 应当回一条 JSON-RPC 错误而不是静默")
-        self._assert_drop_line("a2a", peer, handler.lines,
+        self._assert_drop_line("a2a", peer, handler,
                                adapter._conversation_id(peer))
         self._rejected("a2a")
 
@@ -376,7 +385,7 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         }}
         with CapturedLogs("homeassistant") as handler:
             self.assertFalse(adapter._handle_event(packet))
-        self._assert_drop_line("homeassistant", entity_id, handler.lines,
+        self._assert_drop_line("homeassistant", entity_id, handler,
                                HomeAssistantAdapter.conversation_id_for(entity_id))
         self._rejected("homeassistant")
 
@@ -394,3 +403,96 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
                 self.assertIn(field, joined,
                               "字段名 %r 消失了 —— 脱敏后值一律显示 conv#，"
                               "区分会话 / 人的最后线索就没了：\n%s" % (field, joined))
+
+
+# ======================================================================
+# 4. 守卫：期望值与实际值必须来自**同一个** redactor 实例
+# ======================================================================
+class CapturedRedactorProvenanceTests(unittest.TestCase):
+    """这一类防的是"隐式的测试间耦合"，不是适配器的行为。
+
+    ## 那次 14 条红的**确切机制**（已定位，不是推测）
+    ================================================
+
+    脱敏有两层：handler 上的 :class:`RedactingFilter`，与
+    :mod:`opencode_bridge.redaction_coverage` 挂在
+    :func:`logging.setLogRecordFactory` 上的那一层。**记录创建时的那一层先跑**，
+    而脱敏引擎按构造**幂等**（第二遍是恒等变换）⇒ 只要进程里存在别的那一层，
+    handler 上这个固定密钥的过滤器**再也碰不到明文**。
+
+    触发者不是 ``default_redactor()`` 被换掉了，而是 ``tests/test_platform_pairing.py``
+    的 ``TestPairCliRedemption`` 在同一进程里调真的
+    :func:`opencode_bridge.__main__.main` —— 它会
+    :func:`~opencode_bridge.redaction.install_redaction_filter`，把那一层按
+    **每进程随机**密钥装上且**不摘**。于是本文件的期望值（固定密钥）与实际值
+    （随机密钥）是同一个值的两个不同 HMAC。
+
+    全量 ``discover`` 是绿的，因为它按字母序、``inbound_log`` 在 ``platform_pairing``
+    之前 —— 也就是说这条债**只有某个顺序能发现**，这正是它此前没被发现的原因。
+
+    ## 为什么守卫长这样
+    ================
+
+    只断言"期望值算对了"是恒真的（它量的是自己刚算出来的东西）。所以这里做的是
+    **把那次泄漏造出来**：装一层**别的密钥**的进程全局脱敏，再要求期望值仍然对得上。
+    :class:`~tests.inbound_log_support.CapturedLogs` 在 :meth:`~CapturedLogs.__enter__`
+    里按自己的密钥占住全局那一层、在退出时原样放回 —— 判据就钉在这一步。
+    """
+
+    #: 探针用的日志 logger 与那一行文案（抄自 a2a 适配器的真实文案形状）。
+    PROBE_LOGGER = "opencode_bridge.adapters.a2a"
+    PROBE_LOCAL_ID = "provenance-probe-local-id"
+
+    def _emit_probe_line(self) -> None:
+        logging.getLogger(self.PROBE_LOGGER).warning(
+            "丢弃非白名单对端 %s 的任务（allowed_chat_ids）",
+            "a2a:" + self.PROBE_LOCAL_ID,
+        )
+
+    def test_the_expectation_is_computed_by_the_redactor_that_scrubbed_the_line(self):
+        """期望值由 :attr:`CollectingHandler.redactor` 算，且落盘那一行含它。"""
+        with CapturedLogs("a2a") as handler:
+            self._emit_probe_line()
+            captured = list(handler.lines)
+        self.assertTrue(captured, "这一行日志都没记下来 —— 这条在量空集")
+        self.assertIn(
+            handler.expected_conversation_fingerprint("a2a", self.PROBE_LOCAL_ID),
+            "\n".join(captured),
+        )
+
+    def test_a_foreign_process_wide_scrubber_cannot_desync_this_module(self):
+        """**把那次泄漏造出来**：另一层、别的密钥的进程全局脱敏，本模块仍要对得上。
+
+        变异测试（``CapturedLogs.__enter__`` 里不再占住全局那一层）⇒ 本条**红**，
+        且同一次运行里 14 条逐平台断言也一起红。
+        """
+        foreign_key = b"foreign-process-wide-scrubber-key!"
+        original_factory = logging.getLogRecordFactory()
+        try:
+            install_order_independent_coverage(redactor=Redactor(key=foreign_key))
+            with CapturedLogs("a2a") as handler:
+                self._emit_probe_line()
+                captured = list(handler.lines)
+        finally:
+            logging.setLogRecordFactory(original_factory)
+        self.assertIn(
+            handler.expected_conversation_fingerprint("a2a", self.PROBE_LOCAL_ID),
+            "\n".join(captured),
+            "落盘那一行是用**别的密钥**算出来的 ⇒ 期望值与实际值不是同一个 "
+            "redactor 实例的产物。这正是 14 条逐平台断言曾经红的原因。",
+        )
+
+    def test_capturing_restores_the_record_factory_it_found(self):
+        """占用全局那一层期间，退出后必须把它**原样**放回去。
+
+        只摘自己装的、不动别人的 —— 那条泄漏（``test_platform_pairing`` 装的）不是
+        我们造成的，也不该由我们替它擦掉。
+        """
+        original_factory = logging.getLogRecordFactory()
+        with CapturedLogs("a2a"):
+            pass
+        self.assertIs(
+            logging.getLogRecordFactory(), original_factory,
+            "CapturedLogs 改了进程全局的 record factory 却不放回去 ⇒ "
+            "它变成了下一个用例的隐式前提",
+        )

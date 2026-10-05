@@ -57,12 +57,18 @@ opencode 可能已经处理了，也可能没有。这类行只告警、绝不�
 **静默的** no-op —— 留下的那行**就是回执**。所以这里是 ``INSERT OR IGNORE``，
 不是 ``INSERT OR REPLACE``：后者会抹掉回执，让重投再跑一遍 agent。
 
-退避阶梯为什么住在这一层
-------------------------
-:meth:`InboundInbox.mark_failed` 要写出 ``not_before``，所以"还差几次预算"这个判断
-必须发生在这里 —— 否则恢复层唯一能看到的东西 :class:`QueuedPrompt` 不带 ``attempts``，
-恢复层无从判断该不该放弃。这个状态就是一行数据库记录，跨进程重启后必须还在，
-所以它属于持久化层而不是策略层。
+退避阶梯与"还差几次预算"住在 :mod:`opencode_bridge.inbox_retry_budget`
+-------------------------------------------------------------------
+阶梯与次数上限在那个模块里，而 :meth:`InboundInbox.mark_failed` 仍在本文件里**算**它
+—— 因为 ``not_before`` 是要写进盘上的一列，判断必须与那次 UPDATE 在同一条连接上。
+拆分的是"常量与它们之间的关系"，不是那个判断。
+
+本模块**只剩一件事**：把一条提示词写成一行、再把一行读回去 —— 写前落盘的状态机、
+恢复层要的四个读取入口、以及连接与锁的生命周期。另外四块各有归属，各自带一份
+"从哪儿搬来的、为什么搬"的说明：:mod:`opencode_bridge.inbox_states`（状态词汇表）、
+:mod:`opencode_bridge.inbox_retry_budget`（阶梯 / 次数上限）、
+:mod:`opencode_bridge.inbox_sqlite`（建表 DDL 与连接配置）、
+:mod:`opencode_bridge.inbox_row_cap`（保留期、行数上限，以及"盘上装不下时丢哪一行"）。
 """
 
 from __future__ import annotations
@@ -75,13 +81,33 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from .inbox_row_cap import evict_beyond_row_cap, prune_expired_delivered, report_eviction
+from .inbox_row_cap import (
+    DEFAULT_DELIVERED_RETENTION_SECONDS as DEFAULT_DELIVERED_RETENTION_SECONDS,
+    DEFAULT_MAX_ROWS as DEFAULT_MAX_ROWS,
+    evict_beyond_row_cap,
+    prune_expired_delivered,
+    report_eviction,
+)
 
 # ⚠️ ``DeliveryState`` 的定义在 :mod:`opencode_bridge.inbox_states`，**不在这里** ——
 # 行数治理那一层也要读它（判"这个状态算不算了结"），住在任一边都会成环（实测过）。
 # 这里 import 之后**再导出**，是为了不动既有的那一百多处
 # ``from opencode_bridge.inbox import DeliveryState``。
 from .inbox_states import DeliveryState as DeliveryState
+
+# ⚠️ 阶梯与次数上限的定义在 :mod:`opencode_bridge.inbox_retry_budget`：恢复层
+# :mod:`opencode_bridge.inbox_recovery` 的告警文案也要读 :data:`MAX_ATTEMPTS`，两边
+# 必须共用**同一个**答案。转发而不是各自定义，是为了不动既有的
+# ``from opencode_bridge.inbox import BACKOFF_LADDER_SECONDS``（``inbox_recovery``
+# 至今仍从本模块 import 这两个名字）。
+#
+# ⚠️ 别把下面这两行改成"去模块上取"（``inbox_retry_budget.BACKOFF_...``）：
+# ``tests/test_inbox_wiring.py`` 用 ``mock.patch.object(inbox_module,
+# "BACKOFF_LADDER_SECONDS", ...)`` 把本模块的全局量旁路成 0，而
+# :meth:`InboundInbox.mark_failed` 读的正是这里绑定的这个名字。
+from .inbox_retry_budget import BACKOFF_LADDER_SECONDS, MAX_ATTEMPTS
+
+from .inbox_sqlite import open_inbox_connection
 
 __all__ = [
     "BACKOFF_LADDER_SECONDS",
@@ -94,44 +120,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger("opencode_bridge.inbox")
-
-#: 重试退避阶梯（秒）。固定阶梯、**不用指数**，与 hermes-agent 的
-#: ``gateway/delivery_ledger.py``（commit ``8a5edab282632443``）一致。
-#:
-#: ⚠️ 阶梯是**期限**（写进 ``not_before``）而不是 sleep：这才是它重启安全的原因 ——
-#: 一个进程重启不会把等待重置一遍，也不会有半个 sleep 睡在内存里。
-#:
-#: 级数与 :data:`MAX_ATTEMPTS` **必须相等减一** —— ``MAX_ATTEMPTS`` 次尝试之间只隔
-#: ``MAX_ATTEMPTS - 1`` 次等待。这条约束是照抄 hermes 的：
-#:
-#:     _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
-#:     assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
-#:
-#: 之前这里写成三级（30/120/600）配 ``MAX_ATTEMPTS = 3``，是**派单规格里的算术错**
-#: （抄了公式却没抄它隐含的级数）：``mark_failed`` 自增后的 ``attempts`` 从 1 起，
-#: 而放弃条件是 ``attempts >= MAX_ATTEMPTS``，于是只有 ``attempts`` 为 1 和 2 时
-#: 会排重试 —— 三级阶梯的第 0 级（30 秒）**永远触发不到**，首次重试被白白多等了
-#: 90 秒（120s 而不是 30s）。
-BACKOFF_LADDER_SECONDS: tuple[float, ...] = (30.0, 120.0)
-
-#: 最多花掉几次投递尝试。第 ``MAX_ATTEMPTS`` 次失败就转 ``abandoned``，
-#: **绝不**再排下一次重试（理由见 :meth:`InboundInbox.mark_failed`）。
-MAX_ATTEMPTS: int = 3
-
-assert len(BACKOFF_LADDER_SECONDS) == MAX_ATTEMPTS - 1, (
-    "MAX_ATTEMPTS 次尝试之间只隔 MAX_ATTEMPTS - 1 次等待，"
-    "所以阶梯级数必须正好等于 MAX_ATTEMPTS - 1；"
-    "多给几级不会更安全——超出部分的级永远轮不到，"
-    "少给则最后一次重试会复用更早的期限，阶梯就白写了"
-)
-
-#: ``delivered`` 行的保留时长（秒）。取 24 小时是为了**当回执用** ——
-#: 平台在保留期内重投，靠的就是这行去重（和 Telegram 自己那份未确认更新的保留期一致）。
-DEFAULT_DELIVERED_RETENTION_SECONDS: float = 86400.0
-
-#: 总行数上限。入站量是人的量级（每分钟几条），500 行足够覆盖很长的故障期；
-#: 它是**兜底**而不是常规路径，真触发时优先牺牲终态行。
-DEFAULT_MAX_ROWS: int = 500
 
 
 @dataclass(frozen=True)
@@ -179,23 +167,6 @@ class InboundInbox:
     清理顺序出错不该让桥在退出路径上炸掉。
     """
 
-    _SCHEMA = """
-        CREATE TABLE IF NOT EXISTS inbox (
-            delivery_id     TEXT PRIMARY KEY,
-            conversation_id TEXT NOT NULL,
-            platform        TEXT NOT NULL,
-            message_id      TEXT,
-            text            TEXT NOT NULL,
-            state           TEXT NOT NULL,
-            attempts        INTEGER NOT NULL DEFAULT 0,
-            not_before      REAL NOT NULL DEFAULT 0,
-            last_error      TEXT,
-            created_at      REAL NOT NULL,
-            updated_at      REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS inbox_due ON inbox(state, not_before);
-    """
-
     def __init__(
         self,
         path: str,
@@ -207,8 +178,7 @@ class InboundInbox:
         self._delivered_retention_seconds = float(delivered_retention_seconds)
         self._max_rows = max(1, int(max_rows))
         self._lock = threading.RLock()
-        self._connection: Optional[sqlite3.Connection] = None
-        self._open_connection()
+        self._connection: Optional[sqlite3.Connection] = open_inbox_connection(self._path)
         # 启动时清一次：上一次运行的 delivered 回执可能早就过期了，
         # 上一次运行留下的行也可能已经超了上限。
         self._prune_expired_delivered(time.time())
@@ -399,29 +369,8 @@ class InboundInbox:
         self.close()
 
     # ------------------------------------------------------------------
-    # 内部：连接、写入口、行数治理
+    # 内部：写入口、行数治理
     # ------------------------------------------------------------------
-    def _open_connection(self) -> None:
-        parent = os.path.dirname(os.path.abspath(self._path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        connection = sqlite3.connect(
-            self._path,
-            check_same_thread=False,
-            isolation_level=None,  # autocommit：每条语句自成一个事务
-            timeout=10.0,
-        )
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA journal_mode=WAL")
-            # 入站量是每分钟几条，FULL 的开销不值得拿耐久性去换。
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.executescript(self._SCHEMA)
-        except sqlite3.Error:
-            connection.close()
-            raise
-        self._connection = connection
-
     def _write(self, statement: str, parameters: tuple) -> None:
         """所有写操作的唯一入口：先判"是否已关闭"，再执行。"""
         if self._connection is None:

@@ -61,11 +61,25 @@ from .inbox_states import DeliveryState
 logger = logging.getLogger("opencode_bridge.inbox")
 
 __all__ = [
+    "DEFAULT_DELIVERED_RETENTION_SECONDS",
+    "DEFAULT_MAX_ROWS",
     "EvictionReport",
     "UNSETTLED_STATES",
     "evict_beyond_row_cap",
     "prune_expired_delivered",
 ]
+
+#: ``delivered`` 行的保留时长（秒）。取 24 小时是为了**当回执用** ——
+#: 平台在保留期内重投，靠的就是这行去重（和 Telegram 自己那份未确认更新的保留期一致）。
+#:
+#: ⚠️ 从 :mod:`opencode_bridge.inbox` 搬来：它就是下面 :func:`prune_expired_delivered`
+#: 的那个 keyword 参数的默认值，放在**用它的函数**旁边，而不是放在收件箱的构造签名里
+#: 让人从三层之外找过来。
+DEFAULT_DELIVERED_RETENTION_SECONDS: float = 86400.0
+
+#: 总行数上限。入站量是人的量级（每分钟几条），500 行足够覆盖很长的故障期；
+#: 它是**兜底**而不是常规路径，真触发时优先牺牲终态行。
+DEFAULT_MAX_ROWS: int = 500
 
 #: **已了结**的状态，按淘汰优先级排列（数字小的先走）。
 #:

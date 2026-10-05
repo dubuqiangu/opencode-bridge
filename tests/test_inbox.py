@@ -22,11 +22,14 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from opencode_bridge.inbox import (
     BACKOFF_LADDER_SECONDS,
@@ -37,11 +40,46 @@ from opencode_bridge.inbox import (
     QueuedPrompt,
 )
 from opencode_bridge.inbox_row_cap import _EVICTION_ORDER, UNSETTLED_STATES
+from opencode_bridge import inbox as inbox_module
+from opencode_bridge import inbox_recovery as inbox_recovery_module
+from opencode_bridge import inbox_retry_budget as inbox_retry_budget_module
+from opencode_bridge import inbox_row_cap as inbox_row_cap_module
+from opencode_bridge import inbox_sqlite as inbox_sqlite_module
+from opencode_bridge.inbox_sqlite import open_inbox_connection
 
 _REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: 仓库内的临时目录。存在就用它 —— 这样即使 TEMP/TMP 指向机器别处，
 #: 测试也**不可能**把文件写到仓库之外。
 _REPOSITORY_TEMP = os.path.join(_REPOSITORY_ROOT, ".tmp")
+
+#: 收件箱家族的源文件路径（供下面那几条结构性断言用）。
+_INBOX_SOURCES = {
+    "inbox": os.path.join(_REPOSITORY_ROOT, "opencode_bridge", "inbox.py"),
+    "inbox_retry_budget": os.path.join(
+        _REPOSITORY_ROOT, "opencode_bridge", "inbox_retry_budget.py"),
+    "inbox_row_cap": os.path.join(_REPOSITORY_ROOT, "opencode_bridge", "inbox_row_cap.py"),
+    "inbox_sqlite": os.path.join(_REPOSITORY_ROOT, "opencode_bridge", "inbox_sqlite.py"),
+}
+
+
+def module_level_assignments(path: str) -> set[str]:
+    """这个源文件在**模块顶层**被赋值（而不是 import）过的名字。
+
+    只看顶层：函数体里的局部赋值不算 —— 我们要问的是"这个定义住在哪个模块"。
+    """
+    with open(path, encoding="utf-8") as source_file:
+        tree = ast.parse(source_file.read(), path)
+    assigned = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assigned.add(node.target.id)
+        elif isinstance(node, ast.ClassDef):
+            assigned.add(node.name)
+    return assigned
 
 
 def make_prompt(
@@ -87,8 +125,6 @@ def _only_row(database_path: str) -> dict:
     if len(rows) != 1:
         raise AssertionError(f"expected exactly one inbox row, got {len(rows)}: {rows}")
     return rows[0]
-
-
 class InboxTestCase(unittest.TestCase):
     """给每个用例一份仓库内的临时目录，以及一个自动关闭的收件箱工厂。"""
 
@@ -688,3 +724,187 @@ def _only_row(database_path: str) -> dict:
     if len(rows) != 1:
         raise AssertionError(f"expected exactly one inbox row, got {len(rows)}: {rows}")
     return rows[0]
+
+
+class TestSplitModuleBoundaries(unittest.TestCase):
+    """收件箱各模块的**边界**必须钉住 —— 搬错了地方不会让任何行为测试变红。
+
+    为什么这些断言不是文字游戏
+    --------------------------
+    每一次搬移都有一个具体的失败模式，而它们**全都不会**让上面那些行为用例变红：
+
+    * 常量被"顺手"复制回 :mod:`opencode_bridge.inbox` —— 行为全绿，而
+      :mod:`opencode_bridge.inbox_recovery` 开始对着**另一份**阶梯算"还差几次预算"，
+      而两份不一致只有在真的重试到分歧的那一级时才会显形；
+    * 建表 / PRAGMA 在搬移时漏掉一行 —— 收件箱照样能跑，只是悄悄丢掉了耐久性或索引；
+    * 阶梯与次数上限那条不变量被孤立 —— 于是没人再校验它。
+
+    所以这里断言的是**同一份定义**与**搬移后的落点**，而不是某个具体数字。
+    """
+
+    def test_each_moved_name_has_exactly_one_definition(self):
+        """每一份搬走的常量必须是**同一个对象**，不是一份拷贝。"""
+        for name, owner in (
+            ("BACKOFF_LADDER_SECONDS", inbox_retry_budget_module),
+            ("MAX_ATTEMPTS", inbox_retry_budget_module),
+            ("DEFAULT_DELIVERED_RETENTION_SECONDS", inbox_row_cap_module),
+            ("DEFAULT_MAX_ROWS", inbox_row_cap_module),
+        ):
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(inbox_module, name), getattr(owner, name),
+                    f"{name} 住在 {owner.__name__}，inbox 只能转发，不能另抄一份",
+                )
+
+    def test_inbox_defines_none_of_the_moved_constants_itself(self):
+        """``inbox.py`` 里不许出现这些名字的**赋值**（import 与转发不算）。"""
+        defined_there = module_level_assignments(_INBOX_SOURCES["inbox"])
+        for name in ("BACKOFF_LADDER_SECONDS", "MAX_ATTEMPTS",
+                     "DEFAULT_DELIVERED_RETENTION_SECONDS", "DEFAULT_MAX_ROWS"):
+            with self.subTest(name=name):
+                self.assertNotIn(
+                    name, defined_there,
+                    f"{name} 的定义权已搬走；inbox.py 里重新赋值一份 = 两边各算各的预算",
+                )
+
+    def test_the_recovery_layer_reads_the_same_budget_as_the_store(self):
+        """恢复层的告警文案里的 N 必须与 ``mark_failed`` 用的是同一个。"""
+        self.assertIs(inbox_recovery_module.MAX_ATTEMPTS,
+                      inbox_retry_budget_module.MAX_ATTEMPTS)
+        self.assertIs(inbox_recovery_module.BACKOFF_LADDER_SECONDS,
+                      inbox_retry_budget_module.BACKOFF_LADDER_SECONDS)
+
+    def test_the_ladder_invariant_is_checked_at_import_time(self):
+        """阶梯级数与次数上限的关系，必须有一条**会在 import 期执行**的断言守着。
+
+        断言本身在 :mod:`opencode_bridge.inbox_retry_budget` 里；这里既验它真的存在
+        （引用了那两个名字），也验它**跑得到** —— :mod:`opencode_bridge.inbox` import
+        了那个模块，所以任何 import 收件箱的进程都会执行到它。
+        """
+        self.assertEqual(len(inbox_retry_budget_module.BACKOFF_LADDER_SECONDS),
+                         inbox_retry_budget_module.MAX_ATTEMPTS - 1)
+        with open(_INBOX_SOURCES["inbox_retry_budget"], encoding="utf-8") as source_file:
+            tree = ast.parse(source_file.read())
+        checked_by_module_level_assert = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assert):
+                checked_by_module_level_assert |= {
+                    child.id for child in ast.walk(node.test)
+                    if isinstance(child, ast.Name)
+                }
+        self.assertIn("BACKOFF_LADDER_SECONDS", checked_by_module_level_assert,
+                      "那条算术不变量（阶梯级数 == 次数上限 - 1）必须有一条顶层断言守着")
+        self.assertIn("MAX_ATTEMPTS", checked_by_module_level_assert)
+        self.assertIn("opencode_bridge.inbox_retry_budget", sys.modules,
+                      "import 收件箱必须连带 import 预算模块，否则那条断言不会执行")
+
+    def test_the_sql_dialect_lives_in_the_sqlite_module_only(self):
+        """``sqlite3.connect`` 与建表 DDL 只许出现在 :mod:`opencode_bridge.inbox_sqlite`。
+
+        这是"搬走了什么"的机器可查版本：收件箱那一层只管把提示词变成一行，而连接的
+        形状（WAL / ``synchronous`` / ``row_factory``）归基座模块。
+        """
+        for source_key in ("inbox", "inbox_retry_budget", "inbox_row_cap"):
+            with open(_INBOX_SOURCES[source_key], encoding="utf-8") as source_file:
+                text = source_file.read()
+            with self.subTest(module=source_key):
+                self.assertNotIn("sqlite3.connect", text,
+                                 "开连接是 SQLite 基座的职责")
+                self.assertNotIn("CREATE TABLE", text,
+                                 "建表 DDL 是 SQLite 基座的职责")
+
+        with open(_INBOX_SOURCES["inbox_sqlite"], encoding="utf-8") as source_file:
+            substrate = source_file.read()
+        self.assertIn("sqlite3.connect", substrate, "基座模块必须真的开连接")
+        self.assertIn("CREATE TABLE IF NOT EXISTS inbox", substrate)
+        self.assertIn("CREATE INDEX IF NOT EXISTS inbox_due", substrate)
+
+    def test_both_pragmas_are_issued_explicitly(self):
+        """两条 PRAGMA 必须**显式发出**，不能靠 SQLite 的编译默认值。
+
+        ⚠️ 这条断言是**必须**的，且是实测出来的：只断言
+        ``PRAGMA synchronous`` 的**读回值**是不够的 —— 本机这个 SQLite 的默认值
+        恰好就是 FULL(2)，所以把那行 ``execute`` 删掉之后读回值**一模一样**，
+        没有任何行为用例会红。可"本机默认值恰好对"不是性质：换一台默认 NORMAL 的
+        机器，耐久性就悄悄降级了，而崩溃窗口那一档（``attempting``）正是靠它才查得到。
+
+        所以这里查**源码里发出去了哪几条 PRAGMA**，而不是查生效后的值 ——
+        生效值那条另有 :meth:`TestSqliteSubstrateContract.test_opened_connection_is_usable_as_documented`
+        在钉，两条合起来才既"显式"又"确实生效"。
+        """
+        with open(_INBOX_SOURCES["inbox_sqlite"], encoding="utf-8") as source_file:
+            tree = ast.parse(source_file.read())
+        issued = {
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and node.value.strip().upper().startswith("PRAGMA")
+        }
+        self.assertEqual(
+            issued, {"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL"},
+            "两条 PRAGMA 都必须显式发出；少了任何一条，收件箱的耐久性就依赖 SQLite "
+            "的编译默认值 —— 那不是本模块能假定的性质",
+        )
+
+
+class TestSqliteSubstrateContract(InboxTestCase):
+    """:func:`~opencode_bridge.inbox_sqlite.open_inbox_connection` 的**承重属性**。
+
+    为什么必须钉住：这四条属性没有任何**行为**用例能观察到 ——
+    ``row_factory`` 错了只是让按列名取值崩在一个离病因很远的地方，``synchronous``
+    掉了会让"崩溃落在投递窗口里"这件事变得不可查，而两条路径都**照样跑绿**。
+    """
+
+    #: ``PRAGMA synchronous`` 的取值：0=OFF 1=NORMAL 2=FULL 3=EXTRA。
+    _SYNCHRONOUS_FULL = 2
+
+    def test_opened_connection_is_usable_as_documented(self):
+        connection = open_inbox_connection(self.database_path("substrate.sqlite3"))
+        self.addCleanup(connection.close)
+
+        self.assertIs(connection.row_factory, sqlite3.Row,
+                      "按列名取值的地方遍布收件箱与行数治理层")
+        self.assertEqual(
+            connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal",
+            "崩溃时留在盘上的那行就是真相，依赖 WAL",
+        )
+        self.assertEqual(
+            connection.execute("PRAGMA synchronous").fetchone()[0],
+            self._SYNCHRONOUS_FULL,
+            "synchronous 必须仍是 FULL：FULL 的开销换的是可查性",
+        )
+        self.assertEqual(connection.isolation_level, None,
+                         "autocommit：每条语句自成一个事务，落盘与返回之间没有待 commit 的窗口")
+
+    def test_schema_and_index_are_created(self):
+        connection = open_inbox_connection(self.database_path("schema.sqlite3"))
+        self.addCleanup(connection.close)
+        table_names = {
+            row["name"] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        index_names = {
+            row["name"] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        self.assertIn("inbox", table_names)
+        self.assertIn("inbox_due", index_names,
+                      "按 (state, not_before) 查到期行，没索引就退化成全表扫")
+
+    def test_the_inbox_actually_goes_through_the_substrate(self):
+        """``InboundInbox`` 必须**转发**给基座模块，而不是自己再开一次连接。
+
+        这是"原处只留调用"那条边界的机器可查版本：一旦有人把连接配置复制回
+        ``inbox.py``，这条会红，而上面所有行为用例都不会。
+        """
+        database_path = self.database_path("delegated.sqlite3")
+        with mock.patch.object(
+            inbox_module, "open_inbox_connection",
+            wraps=inbox_sqlite_module.open_inbox_connection,
+        ) as recorded:
+            with InboundInbox(database_path) as inbox:
+                # 必须在 with 里面断言：出了块 close() 已把 _connection 置成 None。
+                self.assertIs(inbox._connection.row_factory, sqlite3.Row,
+                              "转发来的连接必须仍是配置好的那一条")
+        recorded.assert_called_once_with(database_path)

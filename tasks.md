@@ -1787,11 +1787,36 @@ adapters/telegram.py:327     self._pending.clear()
   **区分「哪个是会话、哪个是人」只剩日志行里的字段名**（`channel=` vs `author=`）。
   且摘要是**进程内**的 HMAC ⇒ **跨进程/跨重启对不上**（用户 `grep` 到时能看到这句）。
 
-  📌 **同类不同因、本次刻意没改**（逐条已由 lane 列明，我核实后同意）：
-  `nextcloud.py` **轮询**路径另有 7 处裸 `token`（那是自己配置里的会话、不是陌生人的，
-  且不在本次放大的路径上）；`telegram.py:536` 把**整个 callback payload** `%r` 进日志；
+  📌 **同类不同因、当初刻意没改**（逐条已由 lane 列明，我核实后同意）：
+  `nextcloud.py` **轮询**路径另有裸 `token`（那是自己配置里的会话、不是陌生人的，
+  且不在本次放大的路径上）；`telegram.py` 把**整个 callback payload** `%r` 进日志；
   `email.py:948/943` 记的是**用户自己写的邮件主题**与第三方 `Message-ID`。
   三者都不属于「拒绝时记裸 principal/author id」这个定义 —— **扩大范围不是「同一处功能」。**
+
+  ✅ **前两条已于 2026-10-05 收掉**（`ac0499b`，把 `redactable_id` 扩展到非拒绝路径）：
+  - **nextcloud 轮询/收发 9 处裸 OCS 会话 token** ⇒ 判据是「**凭据不该进日志**」，
+    **不是隐私刷屏**：那 9 处是用户自己配置的会话，但 token 进 URL `/call/<token>`，
+    而本平台 `pairing_supported=False` 的理由之一正是「用户不该知道它」。
+    ⚠️ **条数修正**：我当时给的清单是 grep 得的行号，**AST 为准 = 10 处**
+    （含 `_drop_inbound` 内已完成的那处）；我列的 `:1025` 与 `:1091-1094` 其实不带 token。
+  - **telegram `_handle_callback` 的 `%r` 整个载荷** ⇒ 改为**记形状不记内容**：
+    `from=`（`from.id` 的可关联摘要）+ `keys=`（**排序后的顶层键名元组**）。
+    ⛔ 绝不记 `data` 的值 / `from.username` / `first_name` / `message.text` / 任何 chat 字段。
+    ⚠️ **`keys=` 那一半是承重的**：只满足「用户数据不出现」的修法是把排障能力
+    换成隐私，**方向是反的** ⇒ 专门一条变异（保留 `%r`、只删 `keys=`）钉住它不是恒真。
+    ⚠️ **可达性不夸大**：`chat_id` 只在 `message.chat.id` 与 `from.id` **都**缺失时才是
+    `None`，而合法 `callback_query` 必带 `from` ⇒ **对格式正确载荷近乎不可达**。
+    是「低概率、高后果、改动极小」，**不是「正在被持续利用」**。
+
+  🔴 **新债（`ac0499b` 的 lane 查到的，我没给它）**：`nextcloud.py` 另有 **5 处早于本次
+  就在用 `%r`** —— `配置非法 %r` ×2、`bad conversation_id %r`、`bad handle %r`、
+  `capabilities … chat.max-length %r`。**后两条会把 conversation_id / handle 整个打出来**
+  ⇒ **同类问题、不同位置**。单列，不混进上面两笔。
+
+  📌 **`email.py:948/943` 仍未处理**（唯一剩下的那笔）：记的是**用户自己写的邮件主题**
+  与第三方 `Message-ID`（`<localpart@domain>` 形态，与本仓库邮箱规则半重叠）。
+  **它不属于任何「拒绝时记裸 id」的定义** —— 要不要改取决于「主题算不算用户隐私」，
+  那是**产品判断不是形式判断**，需要拍板。
 
   🔴 **2026-10-05：这一条从「偶发泄露」升级为「系统性泄露」，必须跟着阶段 G 一起修。**
   **翻转前**，一次丢弃需要「配了非空白名单 + 从名单外来」⇒ **偶发**。

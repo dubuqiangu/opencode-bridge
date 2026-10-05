@@ -34,6 +34,14 @@
 opencode 可能已经处理了，也可能没有。这类行只告警、绝不重放（用户 2026-10-03 拍板，
 理由：下游是有副作用的 coding agent，重复执行副作用未必比丢一条消息轻）。
 
+"丢了算谁的" —— 行数上限的规矩在 :mod:`opencode_bridge.inbox_row_cap`
+------------------------------------------------------------------
+盘上装不下时丢哪一行，是一件**独立于持久化**的决定，所以它住在自己的模块里。
+那里有一条铁律：**上限只许丢已经"了结"的行**（``delivered`` / ``abandoned``），
+其余三种状态每一行都还欠着用户点什么 —— 其中 ``attempting`` 最要紧：
+:mod:`~opencode_bridge.inbox_recovery` 对它是**只告警、绝不重放**，所以淘汰它
+换不来任何补偿，只会把一次本可以发现的"不确定"变成彻底的静默丢失。
+
 ``attempting`` 的**第五个**出口：409（会话忙）
 ------------------------------------------
 409 只有在 ``prompt()`` **返回之后**才认得，而 ``attempting`` 必须紧贴那个调用
@@ -66,6 +74,14 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+from .inbox_row_cap import evict_beyond_row_cap, prune_expired_delivered, report_eviction
+
+# ⚠️ ``DeliveryState`` 的定义在 :mod:`opencode_bridge.inbox_states`，**不在这里** ——
+# 行数治理那一层也要读它（判"这个状态算不算了结"），住在任一边都会成环（实测过）。
+# 这里 import 之后**再导出**，是为了不动既有的那一百多处
+# ``from opencode_bridge.inbox import DeliveryState``。
+from .inbox_states import DeliveryState as DeliveryState
 
 __all__ = [
     "BACKOFF_LADDER_SECONDS",
@@ -116,32 +132,6 @@ DEFAULT_DELIVERED_RETENTION_SECONDS: float = 86400.0
 #: 总行数上限。入站量是人的量级（每分钟几条），500 行足够覆盖很长的故障期；
 #: 它是**兜底**而不是常规路径，真触发时优先牺牲终态行。
 DEFAULT_MAX_ROWS: int = 500
-
-
-class DeliveryState:
-    """收件箱一行的状态。纯字符串常量，便于直接落进 SQLite 与日志。"""
-
-    #: 已落盘、尚未尝试投递。
-    PENDING = "pending"
-    #: 正在投递。**落在这一行的崩溃 = 结果不可知**，只告警不重放。
-    ATTEMPTING = "attempting"
-    #: 投递成功。这一行同时是平台重投时的**回执**。
-    DELIVERED = "delivered"
-    #: 投递明确失败，等 ``not_before`` 到期后重放。
-    FAILED = "failed"
-    #: 重试预算耗尽。终态 + 一次告警。
-    ABANDONED = "abandoned"
-
-
-#: 行数上限的淘汰优先级：数字小的先走。``pending`` 故意不出现 ——
-#: 那是一笔**还没兑现的处理义务**，行数上限不该有权把它丢掉。
-#: 同档之内最旧的先走。
-_EVICTION_PRIORITY = (
-    ("WHEN ? THEN 0", DeliveryState.DELIVERED),
-    ("WHEN ? THEN 1", DeliveryState.ABANDONED),
-    ("WHEN ? THEN 2", DeliveryState.ATTEMPTING),
-    ("WHEN ? THEN 3", DeliveryState.FAILED),
-)
 
 
 @dataclass(frozen=True)
@@ -460,49 +450,25 @@ class InboundInbox:
         return [_prompt_from_row(row) for row in rows]
 
     def _prune_expired_delivered(self, moment: float) -> None:
-        """删掉超过保留期的 ``delivered`` 行。
-
-        ``abandoned`` **不在这里删** —— 它是终态，要留在状态输出里看得见，
-        由下面那道行数上限兜底。
-        """
-        with self._lock:
-            self._write(
-                "DELETE FROM inbox WHERE state = ? AND updated_at <= ?",
-                (DeliveryState.DELIVERED, moment - self._delivered_retention_seconds),
-            )
-
-    def _enforce_row_cap(self) -> None:
-        """把总行数压回上限：先淘汰 ``delivered``，再 ``abandoned``，同档内最旧的先走。"""
+        """删掉超过保留期的 ``delivered`` 回执（策略在 :mod:`.inbox_row_cap`）。"""
         with self._lock:
             if self._connection is None:
                 return
-            total = self._connection.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
-            surplus = int(total) - self._max_rows
-            if surplus <= 0:
+            prune_expired_delivered(
+                self._connection,
+                delivered_retention_seconds=self._delivered_retention_seconds,
+                moment=moment,
+            )
+
+    def _enforce_row_cap(self) -> None:
+        """把总行数压回上限，**只许丢已了结的行**（策略见 :mod:`.inbox_row_cap`）。
+
+        无可淘汰的行时**不硬凑**：超限就超着并如实告警，把"保住了哪些行"写进日志。
+        不可重放的状态（``pending`` / ``attempting`` / ``failed``）被静默淘汰，
+        就是一次无失败记录、无告警的消息丢失。
+        """
+        with self._lock:
+            if self._connection is None:
                 return
-            priority_clause = " ".join(fragment for fragment, _state in _EVICTION_PRIORITY)
-            # 内层 SELECT 显式排除 pending：那是一笔还没兑现的义务，
-            # 行数上限无权丢它（宁可超上限并告警，见下面那段 warning）。
-            self._write(
-                "DELETE FROM inbox WHERE delivery_id IN ("
-                " SELECT delivery_id FROM inbox WHERE state != ?"
-                f" ORDER BY CASE state {priority_clause} ELSE 4 END,"
-                " updated_at ASC, delivery_id ASC LIMIT ?)",
-                (DeliveryState.PENDING,)
-                + tuple(state for _fragment, state in _EVICTION_PRIORITY)
-                + (surplus,),
-            )
-            remaining = self._connection.execute(
-                "SELECT COUNT(*) FROM inbox"
-            ).fetchone()[0]
-            logger.debug(
-                "inbox %s: evicted %d row(s) to stay under the %d-row cap",
-                self._path, surplus, self._max_rows,
-            )
-            if int(remaining) > self._max_rows:
-                # 只可能是 pending 行顶上来了 —— 那是还没兑现的义务，行数上限无权丢它。
-                logger.warning(
-                    "inbox %s: %d pending row(s) exceed the %d-row cap and were kept;"
-                    " the cap will not drop unfulfilled obligations",
-                    self._path, int(remaining) - self._max_rows, self._max_rows,
-                )
+            report = evict_beyond_row_cap(self._connection, max_rows=self._max_rows)
+            report_eviction(report, inbox_path=self._path)

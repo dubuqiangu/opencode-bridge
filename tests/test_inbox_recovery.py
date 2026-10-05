@@ -490,6 +490,75 @@ class TestARowRewoundByBusyIsStillBudgetBounded(unittest.TestCase):
                          [self._DELIVERY_ID])
 
 
+class TestAnEvictedUncertainRowWouldBeASilentLoss(unittest.TestCase):
+    """``attempting`` 行一旦被淘汰，恢复层**连告警都发不出来** —— 这条钉住它。
+
+    用**真**收件箱（上限真触发）+ **真** :func:`recover_pending`：这件事的害处正是
+    "静默"，而 :class:`FakeInbox` 没有行数上限这条路径，测不到。
+
+    改动之前：5 行 ``attempting`` + 上限 5 + 新消息 → 淘汰 1 行 →
+    ``outcome.uncertain`` 只有 4 条、告警说"4 条" —— 少掉的那条既没有失败记录、
+    也没有告警，消息就这么没了。
+    """
+
+    _CONVERSATION_COUNT = 5
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        crashed = InboundInbox(self.database_path)
+        for index in range(self._CONVERSATION_COUNT):
+            crashed.record(make_prompt(f"telegram:100200:c{index}"))
+            crashed.mark_attempting(f"telegram:100200:c{index}")
+        crashed.close()
+
+        self.inbox = InboundInbox(self.database_path, max_rows=self._CONVERSATION_COUNT)
+        self.addCleanup(self.inbox.close)
+        self.notify = RecordingNotifier()
+        # 新来一条消息把上限顶破 —— 走的是 record() 那条真实路径。
+        self.inbox.record(make_prompt("telegram:100200:new"))
+
+    def test_every_crashed_message_is_still_reported_as_uncertain(self):
+        outcome = recover_pending(
+            self.inbox, dispatch=RecordingDispatcher(), notify=self.notify
+        )
+
+        self.assertEqual(
+            len(outcome.uncertain), self._CONVERSATION_COUNT,
+            "崩溃行必须一条不少地出现在 uncertain 里 —— 少一条就是一条静默丢失的消息",
+        )
+        self.assertEqual(
+            [prompt.delivery_id for prompt in outcome.uncertain],
+            [f"telegram:100200:c{index}" for index in range(self._CONVERSATION_COUNT)],
+        )
+        # 5 行同属一个会话，按会话合并后是**一条**告警；而条数必须是真的 5。
+        # 改动之前被淘汰的那一行不参与计数，这条告警会说"4 条"。
+        self.assertEqual(
+            [conversation_id for conversation_id, _text in self.notify.alerts],
+            ["telegram:100200"],
+            "同一会话的崩溃行合并成一条告警 —— 被淘汰的那一行连这条都没有",
+        )
+        self.assertIn(str(self._CONVERSATION_COUNT), self.notify.alerts[0][1],
+                      "告警里的条数必须是真的 5 —— 少算一条就是有一条被静默丢了")
+
+    def test_an_evicted_row_would_still_be_a_settled_row_afterwards(self):
+        """反面确认：新来的那条**是** pending、**确实**被重放了 —— 告警与重放都在发生。
+
+        写这条是为了让上面那条不是"因为什么都没发生才绿的"：若上限把 5 条崩溃行
+        全保住了，那 ``replayed`` 里就该正好是那条新来的 ``pending``。
+        """
+        outcome = recover_pending(
+            self.inbox, dispatch=RecordingDispatcher(), notify=self.notify
+        )
+
+        self.assertEqual(
+            [prompt.delivery_id for prompt in outcome.replayed],
+            ["telegram:100200:new"],
+            "pending 行照旧被直接重放 —— 上限那条新规没有削弱它",
+        )
+        self.assertEqual(_read_state_by_delivery_id(
+            self.database_path, "telegram:100200:new"), DeliveryState.DELIVERED)
+
+
 class TestRecoveryNeverRaises(unittest.TestCase):
     """恢复失败**绝不能**让桥起不来 —— 这是它被允许存在的唯一前提。"""
 
@@ -581,3 +650,14 @@ def _read_column(database_path: str, column: str) -> float:
 
 def _read_state(database_path: str) -> str:
     return _read_column(database_path, "state")
+
+
+def _read_state_by_delivery_id(database_path: str, delivery_id: str) -> str:
+    """读**指定那一行**的状态 —— 一行盘上有多行时，``_read_state`` 只看第一行。"""
+    connection = sqlite3.connect(database_path)
+    try:
+        return connection.execute(
+            "SELECT state FROM inbox WHERE delivery_id = ?", (delivery_id,)
+        ).fetchone()[0]
+    finally:
+        connection.close()

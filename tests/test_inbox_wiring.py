@@ -125,13 +125,18 @@ class InboxWiringTestCase(unittest.TestCase):
         client: FakeClient | None = None,
         adapter: FakeAdapter | None = None,
         with_inbox: bool = True,
+        inbox_options: dict | None = None,
     ) -> tuple[BridgeCore, FakeClient, FakeAdapter, InboundInbox | None]:
-        """搭一个 core。``with_inbox=False`` 就是"收件箱关闭"的部署形态。"""
+        """搭一个 core。``with_inbox=False`` 就是"收件箱关闭"的部署形态。
+
+        ``inbox_options`` 透传给 :class:`InboundInbox`（行数上限用例用
+        ``{"max_rows": 3}`` 把上限压到几条，让 :mod:`inbox_row_cap` 真的触发）。
+        """
         client = client or FakeClient()
         adapter = adapter if adapter is not None else FakeAdapter()
         inbox = None
         if with_inbox:
-            inbox = InboundInbox(self.inbox_path)
+            inbox = InboundInbox(self.inbox_path, **(inbox_options or {}))
             self.addCleanup(inbox.close)
         core = BridgeCore(Config(), client, StateStore(self.state_path), inbox=inbox)
         core.attach(adapter)
@@ -321,6 +326,59 @@ class CrashInsidePrompt(InboxWiringTestCase):
         )
         self.assertEqual(
             [row["state"] for row in read_inbox_rows(self.inbox_path)], ["attempting"]
+        )
+
+
+class CrashInsidePromptIsNotEvictedByTheRowCap(InboxWiringTestCase):
+    """真崩溃留下的 ``attempting`` 行不会被行数上限吃掉 —— 于是告警不会少算。
+
+    这条把 :class:`CrashInsidePrompt` 的语义与 :mod:`inbox_row_cap` 的白名单接在一起：
+    ``attempting`` 是恢复层唯一**只告警、绝不重放**的一档，所以它一旦被淘汰，
+    ``uncertain_prompts()`` 就再也看不到它 —— 消息静默消失、无失败记录、无告警。
+    走的是真 :class:`BridgeCore` + 真收件箱 + 真 ``start()``（含真恢复）。
+    """
+
+    def test_the_alert_still_counts_every_crashed_message_after_the_cap_fires(self):
+        core, client, _adapter, _inbox = self.make_core(
+            inbox_options={"max_rows": 3}
+        )
+        # ⚠️ 必须**一条一个会话**：崩溃是从 ``_drain`` 里逃出来的 ``BaseException``，
+        # 逃得掉也意味着 ``_draining`` 没被清掉 —— 同一会话的下一条会以为"已经有人在
+        # 排空我了"而直接返回，于是压根不会走到 prompt()（实测：第二轮 assertRaises
+        # 失败，SimulatedCrash 没被抛出）。换会话才是五次独立的崩溃。
+        crashed_conversations = [f"chat:crash{index}" for index in range(5)]
+        for index, conversation_id in enumerate(crashed_conversations):
+            client.prompt_errors.append(SimulatedCrash("killed mid-prompt"))
+            with self.assertRaises(SimulatedCrash):
+                core.on_inbound(inbound_message(
+                    f"第 {index} 条", conversation_id=conversation_id,
+                    message_id=str(20 + index),
+                ))
+
+        rows = read_inbox_rows(self.inbox_path)
+        self.assertEqual(
+            [row["state"] for row in rows], ["attempting"] * 5,
+            "上限 3 而 attempting 有 5 条时，一条都不许被淘汰",
+        )
+        core.stop()
+
+        core2, client2, adapter2, _inbox2 = self.make_core(
+            inbox_options={"max_rows": 3}
+        )
+        self.start_bridge(core2, client2)
+
+        self.assertEqual(client2.prompts, [], "attempting 仍绝不重放")
+        alerts = [out.text for out in adapter2.sent if "状态未知" in out.text]
+        # 一个会话一条告警，所以这里断言的是"每个会话都还有它那一行"，
+        # 而不是"5 条消息合成一条" —— 崩溃行分属不同会话。
+        self.assertEqual(len(alerts), len(crashed_conversations))
+        for alert in alerts:
+            self.assertIn("1", alert,
+                          "每条告警必须说真的 1 条 —— 少算就意味着有条被静默丢了")
+        self.assertEqual(
+            sorted(row["delivery_id"] for row in read_inbox_rows(self.inbox_path)),
+            sorted(f"telegram:{conversation_id}:{20 + index}"
+                   for index, conversation_id in enumerate(crashed_conversations)),
         )
 
 

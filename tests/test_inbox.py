@@ -36,6 +36,7 @@ from opencode_bridge.inbox import (
     MAX_ATTEMPTS,
     QueuedPrompt,
 )
+from opencode_bridge.inbox_row_cap import _EVICTION_ORDER, UNSETTLED_STATES
 
 _REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: 仓库内的临时目录。存在就用它 —— 这样即使 TEMP/TMP 指向机器别处，
@@ -521,6 +522,103 @@ class TestRetentionAndRowCap(InboxTestCase):
         with InboundInbox(database_path, max_rows=2):
             rows = read_inbox_rows(database_path)
             self.assertEqual(len(rows), 2)
+
+
+class TestUnsettledRowsAreNeverSilentlyEvicted(InboxTestCase):
+    """不可重放的状态**不会**被行数上限静默淘汰（这条性质不许退化）。
+
+    为什么这一整类都要钉住：``inbox_recovery`` 对这几档的处置各不相同 ——
+    ``pending``/``failed`` 会被重放（丢了就丢一条本来送得到的），而
+    ``attempting`` 是**只告警、绝不重放**：淘汰它换不来任何补偿，只会让一次
+    本可以发现的"结果不可知"变成彻底的静默丢失 —— 连告警都不会有，因为
+    ``uncertain_prompts()`` 已经看不到它了。
+    """
+
+    def _crash_leaving_attempting(self, database_path: str, count: int) -> None:
+        """摆 ``count`` 行 ``attempting``：模拟进程在 ``prompt()`` 中途被杀。"""
+        crashed = InboundInbox(database_path)
+        for index in range(count):
+            prompt = make_prompt(f"telegram:100200:x{index}", message_id=f"x{index}")
+            crashed.record(prompt)
+            crashed.mark_attempting(prompt.delivery_id)
+        crashed.close()
+
+    def test_the_row_cap_keeps_every_attempting_row(self):
+        """5 行 ``attempting`` + 上限 5 + 新来一条 → 一行都不许少。
+
+        改动之前这里会淘汰 1 行，恢复层随后只看到 4 条、告警也跟着少算一条 ——
+        消息静默消失，无失败记录、无告警。
+        """
+        database_path = self.database_path()
+        self._crash_leaving_attempting(database_path, count=5)
+
+        capped = InboundInbox(database_path, max_rows=5)
+        self.addCleanup(capped.close)
+        with self.assertLogs("opencode_bridge.inbox", level="WARNING") as captured:
+            capped.record(make_prompt("telegram:100200:new", message_id="new"))
+
+        self.assertEqual(
+            [row["delivery_id"] for row in read_inbox_rows(database_path)
+             if row["state"] == DeliveryState.ATTEMPTING],
+            [f"telegram:100200:x{index}" for index in range(5)],
+            "attempting 是恢复层唯一'只告警不重放'的一档，淘汰它 = 静默丢消息",
+        )
+        self.assertIn("attempting=5", "\n".join(captured.output),
+                      "超限必须按状态说清留下了什么，否则读者无从判断是不是漏了消息")
+
+    def test_the_row_cap_keeps_failed_rows_too(self):
+        """``failed`` 到期就会**真的**被投递，淘汰它等于丢掉一条送得到的消息。"""
+        database_path = self.database_path()
+        builder = InboundInbox(database_path)
+        for index in range(3):
+            prompt = make_prompt(f"slack:C0ABCDEF:f{index}",
+                                 conversation_id="slack:C0ABCDEF", platform="slack",
+                                 message_id=f"f{index}")
+            builder.record(prompt)
+            builder.mark_failed(prompt.delivery_id, "boom")
+        builder.close()
+
+        capped = InboundInbox(database_path, max_rows=1)
+        self.addCleanup(capped.close)
+        capped.record(make_prompt("slack:C0ABCDEF:new", conversation_id="slack:C0ABCDEF",
+                                  platform="slack", message_id="new"))
+
+        self.assertEqual(
+            [row["delivery_id"] for row in read_inbox_rows(database_path)
+             if row["state"] == DeliveryState.FAILED],
+            [f"slack:C0ABCDEF:f{index}" for index in range(3)],
+        )
+
+    def test_settled_rows_are_still_evicted_so_the_cap_is_not_dead(self):
+        """白名单不是"什么都不删"：已了结的 ``delivered``/``abandoned`` 照旧淘汰。"""
+        database_path = self.database_path()
+        builder = InboundInbox(database_path)
+        for index in range(2):
+            prompt = make_prompt(f"irc:#ops:s{index}", conversation_id="irc:#ops",
+                                 platform="irc", message_id=f"s{index}")
+            builder.record(prompt)
+            builder.mark_delivered(prompt.delivery_id)
+        builder.close()
+
+        with InboundInbox(database_path, max_rows=1):
+            self.assertEqual(len(read_inbox_rows(database_path)), 1)
+
+    def test_every_delivery_state_is_either_settled_or_unsettled(self):
+        """每个状态都必须**主动**归类：忘了归类的将来会被静默淘汰。
+
+        这条是白名单（fail-closed）该有的守卫。加上新状态而没往
+        :data:`~opencode_bridge.inbox_row_cap.UNSETTLED_STATES` 里放，那一行既不在
+        白名单里也不在未了结清单里 —— 上限会当它是可淘汰的，而没有任何测试会红。
+        """
+        every_state = {
+            value for name, value in vars(DeliveryState).items()
+            if not name.startswith("_") and isinstance(value, str)
+        }
+        self.assertEqual(
+            every_state,
+            set(_EVICTION_ORDER) | set(UNSETTLED_STATES),
+            "DeliveryState 的全集必须被 _EVICTION_ORDER 与 UNSETTLED_STATES 精确瓜分",
+        )
 
 
 class TestLifecycleSafety(InboxTestCase):

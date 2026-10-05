@@ -8,11 +8,12 @@
 一次"每个平台各写各的"（``chat:`` / ``channel:`` / ``room:`` 前缀）的亏。
 所以本模块只做两件事，把**值**收口在两条必经之路上：
 
-1. :class:`RedactingFilter` —— 挂在 **handler** 上（:func:`install_redaction_filter`）。
-   全仓库 34 个 logger 全部是 ``opencode_bridge.*`` 的后代（``grep getLogger`` 可核），
-   记录一律 ``propagate`` 到 root，而 root 的 handler 是 ``logging.basicConfig`` 建的
-   **唯一** handler —— 全仓库**没有任何** ``addHandler``。所以挂在 root handler 上的
-   过滤器覆盖"现有 13 个平台 + 将来每一个"，而**要改的调用点是 0 处**。
+1. :class:`RedactingFilter` —— 挂在 **handler** 上（:func:`install_redaction_filter`），
+   **外加** :mod:`opencode_bridge.redaction_coverage` 那一层顺序无关的覆盖
+   （记录**创建**时就脱敏）。全仓库 34 个 logger 全部是 ``opencode_bridge.*`` 的
+   后代（``grep getLogger`` 可核），记录一律 ``propagate`` 到 root，而 root 的 handler
+   是 :func:`logging.basicConfig` 建的**唯一** handler —— 全仓库**没有任何**
+   ``addHandler``。所以要改的调用点是 0 处。
 
    为什么挂 handler 而不是挂 logger：这是 stdlib 的过滤语义决定的。
    ``Logger.filter()`` **只对 logger 自己那条记录**生效，祖先 logger 的 filter
@@ -20,6 +21,12 @@
    ``handler.handle``）。所以"给 ``opencode_bridge`` 这个 logger 加个 filter 就当
    作覆盖了全部子 logger"是**错的**，而 ``Handler.filter()`` 对**每一条经过它的
    记录**都生效。
+
+   ⚠️ **而 handler 那一层是有顺序依赖的**（实测结论见
+   :func:`install_redaction_filter` 的文档字符串）：它只覆盖走位里排在它**之后**的
+   handler。排在它**之前**的（典型：挂在命名空间 logger 上的本地 handler）会先拿到
+   明文。``redaction_coverage`` 那一层就是为了消掉这个依赖而存在的 —— 它挂在记录
+   **创建**那一刻，与 handler 的数量、时机、走位顺序**全都无关**。
 
 2. :func:`redact_state_values` —— 挂在
    :meth:`~opencode_bridge.state.StateStore._write_locked` 的 **JSON 序列化边界**。
@@ -516,7 +523,8 @@ def install_redaction_filter(
     redactor: Optional[Redactor] = None,
     include_root: bool = True,
 ) -> list:
-    """把 :class:`RedactingFilter` 挂到**已经存在**的 handler 上。
+    """把 :class:`RedactingFilter` 挂到**已经存在**的 handler 上，并**顺带**装上
+    顺序无关的那一层（:mod:`opencode_bridge.redaction_coverage`，记录创建时就脱敏）。
 
     :param redactor: 用哪个脱敏器；默认 :func:`default_redactor`。
     :param include_root: 是否也挂到 root logger 的 handler 上。**默认要**
@@ -528,12 +536,32 @@ def install_redaction_filter(
 
     返回挂到的 handler 列表（便于测试断言，也便于调用方确认"确实挂上了"）。
 
-    ⚠️ 已知的边界：在这之后**新挂**上去的 handler 不会被覆盖，除非再调一次本
-    函数。本仓库的生产代码里 handler 只由 :func:`logging.basicConfig` 建一次，
-    而 :func:`~opencode_bridge.__main__._setup_logging` 在它**之后**调本函数，
-    所以真实运行路径没有这个缺口。
+    ⚠️ **handler 那一层依赖"它在走位里的位置"，这一点曾经被记错了**：
+    此前这里写的是"之后**新挂**上去的 handler 不会被覆盖"。**实测不成立** ——
+    :class:`RedactingFilter` 是**就地改**那条共享的 ``LogRecord``，而
+    ``Logger.callHandlers`` 把**同一个对象**交给走位里的每个 handler，所以只要走位
+    里有**任意一个**带过滤器的 handler，后面那些（挂得更晚的、级别不够的、
+    ``logging.lastResort``）拿到的都已经是脱敏过的。
+
+    真正的条件是另一条，也更窄也更险：**排在所有带过滤器 handler 之前**的那个 handler
+    会先拿到明文 —— 典型就是挂在 :data:`LOGGER_NAMESPACE` 或更深的 logger 上的本地
+    handler（``callHandlers`` 从发出记录的 logger 往上走，它比 root 近）。
+    生产代码今天没有这种 handler（本包**零** ``addHandler``），所以那是个**潜伏**
+    缺口。
+
+    **根治**是把脱敏挪到**记录创建**那一刻 —— 那一层与 handler 的数量、挂上去的时刻、
+    走位顺序都无关，见 :func:`~opencode_bridge.redaction_coverage.
+    install_order_independent_coverage`。它在这里被调用，是因为
+    ``__main__`` 只调本函数，而"覆盖"这件事**不该由调用点的顺序决定**。
     """
     the_redactor = redactor if redactor is not None else default_redactor()
+
+    # 顺序无关的那一层：记录**创建**时就脱敏，于是"handler 什么时候挂、挂在哪一段
+    # 走位上"都不再影响覆盖。延迟导入是为了避开本模块与它的循环依赖。
+    from .redaction_coverage import install_order_independent_coverage
+
+    install_order_independent_coverage(redactor=the_redactor)
+
     targets: list = []
     bridge_logger = logging.getLogger(LOGGER_NAMESPACE)
     targets.extend(_handlers_of(bridge_logger))
@@ -560,6 +588,30 @@ def install_redaction_filter(
         except Exception:  # noqa: BLE001 - 挂不上就当没挂，绝不打断启动
             continue
     return covered
+
+
+def remove_redaction_filter() -> bool:
+    """把 :func:`install_redaction_filter` 装上的东西**都**摘掉；摘掉了返回 ``True``。
+
+    ⚠️ handler 那一层原本**没有**卸载口（只能重新 ``install`` 覆盖）。而顺序无关
+    那一层挂在**进程全局**的 :func:`logging.setLogRecordFactory` 上 —— 全局的安装
+    必须有配对的全局卸载，否则"曾经装过一次"的进程会**永久**带着它（测试进程里就是
+    "后面每个用例的前提都被前面的用例改了，而没人会想到去查日志"）。
+
+    只摘**带我们自己标记**的过滤器，别人的 ``RedactingFilter`` 不动。
+    """
+    from .redaction_coverage import remove_order_independent_coverage
+
+    removed = remove_order_independent_coverage()
+    for name in (LOGGER_NAMESPACE, None):        # None = root
+        for handler in logging.getLogger(name).handlers:
+            kept = [
+                existing for existing in handler.filters
+                if not getattr(existing, "_opencode_bridge_redaction", False)
+            ]
+            removed = removed or len(kept) != len(handler.filters)
+            handler.filters = kept
+    return removed
 
 
 def redact_state_values(document: Any, *, redactor: Optional[Redactor] = None) -> Any:

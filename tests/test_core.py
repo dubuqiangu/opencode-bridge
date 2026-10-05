@@ -32,6 +32,7 @@ from opencode_bridge.core import (
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
 from opencode_bridge.outbound import OutboundSender, one_message_budget
+from opencode_bridge import redaction
 from opencode_bridge.state import StateStore
 from tests.test_outbound import CONVERSATION, ScriptedAdapter
 
@@ -2053,6 +2054,19 @@ class CliTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
         return path
+
+    def setUp(self) -> None:
+        """本类会走**真的** :func:`cli.main`，而它会调 :func:`cli._setup_logging`
+        → :func:`~opencode_bridge.redaction.install_redaction_filter`。
+
+        那里面有一层挂在**进程全局**的 :func:`logging.setLogRecordFactory` 上，
+        所以不撤就会**活过这个用例**：``tests/test_inbound_gateway.py`` 有一条断言
+        期望日志里出现未脱敏的 ``chat:55``，而在这一类跑过之后它必然变成
+        ``chat:conv#...`` —— 一个与它毫无关系的用例因为**跑在别人后面**而变红。
+
+        ⚠️ 这就是"全局安装必须配全局卸载"的实际代价，不是可以绕开的噪音。
+        """
+        self.addCleanup(redaction.remove_redaction_filter)
 
     def test_empty_adapter_tokens_exit_0_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:

@@ -115,20 +115,18 @@ class _FilterHarness(unittest.TestCase):
     上下文**之内**再挂一次 —— 而这恰好也顺带证明了"装在 handler 上"这个卡口
     选对了：换成"挂在某个 logger 上"，这里就挂不上（祖先 logger 的 filter 不会
     在 propagate 途中被调用）。
+
+    ⚠️ 清理动作必须把**两层**都撤掉：顺序无关那一层挂在**进程全局**的
+    :func:`logging.setLogRecordFactory` 上，只撤 handler 上的过滤器会让它**活过**
+    这个用例 —— 于是 :meth:`NonVacuityTests.
+    test_without_the_filter_the_log_line_still_holds_the_plaintext` 那条对照用例
+    会在"前面某个用例装过"之后**必然变红**，而且红得莫名其妙。所以走
+    :func:`~opencode_bridge.redaction.remove_redaction_filter` 这一条公共出口，
+    而不是在这里手写第二遍卸载逻辑（两份卸载逻辑必然会漂）。
     """
 
     def setUp(self) -> None:
-        self.addCleanup(self._restore_every_filter)
-
-    @staticmethod
-    def _restore_every_filter() -> None:
-        for name in (redaction.LOGGER_NAMESPACE, ""):
-            for handler in logging.getLogger(name).handlers:
-                handler.filters = [
-                    existing
-                    for existing in handler.filters
-                    if not getattr(existing, "_opencode_bridge_redaction", False)
-                ]
+        self.addCleanup(redaction.remove_redaction_filter)
 
 
 # ----------------------------------------------------------------------

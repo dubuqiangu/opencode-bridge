@@ -1722,6 +1722,16 @@ adapters/telegram.py:327     self._pending.clear()
   覆盖到」，`:532-534` 给出理由：嵌入式只暴露 `logging.basicConfig`、生产路径经
   `__main__._setup_logging` 只装一次、实际生产路径没有漏装）。生产代码的 handler
   只由 `basicConfig` 建一次，顺序正确。
+- **一处跨 lane 的断言冲突，已裁决（2026-10-05）**：
+  `tests/test_inbound_gateway.py` 的
+  `test_an_alert_that_cannot_be_delivered_is_logged_not_swallowed`
+  断言 `chat:55` **原样**出现在日志行里，而 C2 的脱敏把它变成
+  `chat:conv#<6位>-<6位>`。**两者不能同时成立** —— 一条要求「日志保留原始 id」，
+  另一条就是「把它洗掉」。
+  **裁决：测试改为断言脱敏后的指纹形式。** 那个指纹的存在意义**正是**让被脱敏的
+  日志行仍能跨行关联到同一会话（C2 的设计如此），所以脱敏**不损失**可运维性；
+  反过来，断言原始 id 等于**要求日志泄露**，与 C2 相悖。
+  **判据：一条测试若要求生产代码泄露它承诺要洗掉的东西，那这条测试才是需要改的一方。**
 
 ##### 过程中抓到的两个真 bug
 

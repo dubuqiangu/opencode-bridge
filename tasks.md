@@ -3629,6 +3629,78 @@ app_token · access_token · token ×4 …）⇒ **全部在读取器之外**，
 ② 配置系统是否**阻止**在单个键下放 dict（若有，`%r` 可能打出用户自己写的子树 ——
 但那仍是用户自己写的值，不是配置树自动泄露）。
 
+## ✅ irc/twitch 凭据认证（B 方向）：查了参考实现，**它也没有做** —— 我们已与之一致（2026-10-06）
+
+§6.1 要求「能抄就抄，不要靠推测」。我用 `gh` 现查了首选项
+**`NousResearch/hermes-agent`（250806 stars）**的 IRC 适配器真实代码
+（`plugins/platforms/irc/adapter.py`，614 行，**不是快照**）。
+
+### 它的作者逐字写了和我一样的结论
+
+`adapter.py:389-392`（交互式配置的原文输出）：
+
+```
+🔒 Access control: restrict who can message the bot
+   IRC nicks are not authenticated — anyone can claim any nick.
+   For public channels, pair with NickServ-only mode on your network
+   if you want stronger identity guarantees.
+```
+
+⚠️ 我先前独立得出的结论（「IRC 协议层没有发送者身份，猜一个身份等于开门」）
+**与它一字不差**。
+
+### 它的 NickServ 用来干什么 —— **保护自己，不认证别人**
+
+```
+:557  if nickserv_password := ... IRC_NICKSERV_PASSWORD
+:558      await conn.raw(f"PRIVMSG NickServ :IDENTIFY {...}")
+```
+
+⇒ 它发 `IDENTIFY` 是为了**别让别人抢走 bot 自己那个 nick**，
+⛔ **不是**为了认证「别人是谁」。**全仓无 SASL。**
+
+### ⭐ 一个我没想到的差别：它的「空 = 全放行」和我**翻转前**一样
+
+```
+:310  if self._allowed_users_lower and sender_nick.lower() not in self._allowed_users_lower:
+```
+
+注意那个 **`and`** ⇒ **空清单 ⇒ 整个判定被跳过 ⇒ 放行一切**。
+
+⇒ 那它靠什么安全？**靠交互式配置流程默认拒绝**：
+
+```
+:393  prompt_yes_no("Allow all users in the channel to talk to the bot?", False)   ← 默认 False
+:396  print_warning("Open access — any nick in the channel can command the bot.")
+:406  "No nicks allowed — the bot will ignore all messages until you add nicks."
+:394/:398  另有独立的 IRC_ALLOW_ALL_USERS 开关（true / false）
+```
+
+⇒ **安全在提示流程里，不在代码里。** 这是 §8 第 3 条说的典型
+「**恢复一份从来没记录过的信息**」的反面教材：它靠「用户走过 setup」这个**未记录的事实**。
+
+### 逐项对照
+
+| | hermes | 我们 |
+|---|---|---|
+| 是否认证发件人 | **不认证**，并在配置里写明理由 | 不认证，`pairing_supported=False`，理由进台账 |
+| 空清单语义 | 代码层「空 = 全放行」 | **代码层已翻成「空 = 全拒」**（`config_version>=2`） |
+| 私聊 principal | `sender_nick`（对方 nick，可冒充） | **自己**的 nick ⇒ **更糟**，已改成**拒绝构造** |
+| SASL | 无 | 无 |
+| NickServ | 保护自己的 nick | （我们没有） |
+
+### ⇒ 结论：**B 方向没有大规模验证过的先例**
+
+25 万 star 的参考实现**选择的是「写明警告 + 默认拒绝」**，而这正是我们已经落地的做法。
+⇒ **不必再问用户「你的 IRC 服务器支不支持 SASL」** —— 因为**连参考实现都没走这条路**，
+走了也没人证明它可行。
+
+📌 **唯一值得借鉴的小差异**（**未做，需拍板**）：它有一个**显式的
+`IRC_ALLOW_ALL_USERS` 布尔开关**，把「我要开放」变成**用户主动写下的意图**。
+我们的 `config_version` 是**版本机制**（靠「有没有这个键」推断语义），
+不如一个显式开关直接。
+⇒ 但这是配置语义变更，⛔ 不自授权。
+
 ## 📋 待办：拆 `tests/test_nick_in_allowlist.py`（746 行，方案已量好，**别让执行者发明边界**）
 
 `AGENTS.md` §5.0 实测：**746 物理行 / SLOC 495 / 文档 34%** ⇒ 不满足豁免（文档需 >45%）

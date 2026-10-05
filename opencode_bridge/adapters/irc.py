@@ -800,7 +800,18 @@ class IRCAdapter(Adapter):
         return transport.send_line(line)
 
     def send(self, out: Outbound) -> MsgHandle | None:
-        """``PRIVMSG <target> :<text>``（超长按 512 字节上限切成多条）。"""
+        """``PRIVMSG <target> :<text>``（超长按 512 字节上限切成多条）。
+
+        ⚠️ **分片逐片重读连接**：循环里每片各走一次 :meth:`_write_line` →
+        ``transport.send_line`` → 重新读 ``transport.connection``。所以连接在**分片中途**
+        被换掉（读循环已重连）时，**剩余分片会发到新连接上，整条消息仍算发完**，不报
+        ``TRANSIENT``。这与迁移前不同 —— 迁移前 ``send()`` 一次抓一个 socket 发完所有
+        分片，连接中途断掉就返回 ``TRANSIENT`` + 一个部分句柄。已判定**新行为更好**：
+        IRC 不关心 TCP 边界，每片本来就是独立的 ``PRIVMSG``，能发完比报错更符合预期
+        （``tasks.md``「A1/A2 迁移第 1 家：IRC」的「出站分片跨重连」条目）。
+        ⛔ 别把它"优化"回一次抓一个 socket，也别加"连接变了就整条放弃"的守卫 ——
+        ``tests/test_irc_outbound_reconnect.py`` 会立刻变红。
+        """
         target = self._target(out.conversation_id)
         if not target:
             logger.warning("irc: bad conversation_id %r", out.conversation_id)

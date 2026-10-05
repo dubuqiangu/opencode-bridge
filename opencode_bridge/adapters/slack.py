@@ -133,6 +133,9 @@ class SlackAdapter(Adapter):
     label = "Slack"
     max_message_length = MESSAGE_LIMIT          # chat.postMessage 文本上限 40000
     supports_inbound = True                    # Socket Mode 入站（需另配 app_token）
+    #: principal = channel id：(a) 会话唯一且稳定，(b) 用户能直接看到它，
+    #: (c) Slack 对发件人做过认证。三条都成立。
+    pairing_supported = True
     supports_inline_buttons = False            # blocks 未实现
     supports_media = False
     #: ``chat.update`` 真能改写已发消息（见 :meth:`edit`），所以占位气泡发得。
@@ -416,14 +419,18 @@ class SlackAdapter(Adapter):
         channel = str(event.get("channel") or "")
         if not text or not channel:
             return True
-        # 授权闸门必须在最前：未授权者的消息不许进入上层（否则能用命令/审批字绕过）
-        if not self.admits(channel):
+        # 授权闸门必须在最前：未授权者的消息不许进入上层（否则能用命令/审批字绕过）。
+        # ⚠️ /pair 在未授权时也要能进来，所以 conversation_id 提到闸门之前算。
+        conversation_id = self._conversation_id(channel)
+        if not self.admits(channel) and not self.answer_pairing_request(
+            channel, conversation_id, text
+        ):
             logger.info("slack: dropping message from non-whitelisted channel %s", channel)
             return True
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(channel),
+                    conversation_id=conversation_id,
                     text=text,
                     kind="text",
                     user_id=str(event.get("user") or "") or None,

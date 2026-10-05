@@ -297,6 +297,14 @@ class QQBotAdapter(Adapter):
     #: **自选的保守值**，不是官方数字（见 :data:`MESSAGE_LIMIT`）。
     max_message_length = MESSAGE_LIMIT
     supports_inbound = True             # WebSocket 网关事件流
+    #: ⛔ **显式 False（已裁决，不再重开）** —— 判据 (a)/(b) 都成立（``group_openid`` 是
+    #: 稳定会话 id），但 principal 与「**谁能驱动**」不是一回事：同一个群里的**任何**
+    #: 成员都共享它。拿它当配对锚点，等于把整个群一起授权进白名单 —— 而那正是
+    #: 配对回信里那句范围声明要防的后果。
+    #:
+    #: 复核已确认本判据成立。要改之前先回答：授权一个 ``group_openid`` 之后，
+    #: 群里任何一个 @ 机器人的人是不是都因此获得了执行权限？
+    pairing_supported = False
     supports_inline_buttons = False     # API 有 keyboard 字段，但本适配器不构造它
     supports_media = False              # 只发纯文本（msg_type=0）
     typed_command_prefix = "/"
@@ -1090,7 +1098,12 @@ class QQBotAdapter(Adapter):
             return False
         # 4) 授权闸门：principal = **会话目标**（group_openid / user_openid /
         #    channel_id），与 ``allowed_chat_ids`` 的语义一致。
-        if not self.admits(target):
+        #    ⚠️ 本平台 :attr:`pairing_supported` 用基类默认 False —— principal 虽
+        #    是稳定会话 id，但 principal 与"谁能驱动"并不是一回事（同群任何成员
+        #    都共享它），拿它当配对锚点会把整个群一起授权。失败关闭。
+        if not self.admits(target) and not self.answer_pairing_request(
+            target, cid, content
+        ):
             self._drop_inbound("未在白名单", cid, author_id)
             return False
 

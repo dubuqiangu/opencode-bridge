@@ -28,12 +28,14 @@ from typing import Sequence
 
 from .adapters import build
 from .allowlist import resolve_allowlist
-from .config import Config, DEFAULT_CONFIG_NAME
+from .config import Config, DEFAULT_CONFIG_NAME, adapter_scoped_config
 from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
+from .pairing import empty_allowlist_is_open
+from .pairing_cli import run_pair
 from .redaction import install_redaction_filter
 from .state import StateStore
 
@@ -121,6 +123,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="汇总服务连通性 / 各平台配置与能力 / bridge 运行态证据，然后退出",
     )
+    parser.add_argument(
+        "--pair",
+        metavar="配对码",
+        help=(
+            "把 bot 里 /pair 给出的那串码兑换成 allowed_chat_ids 里的一项，"
+            "然后退出（要重启桥接才生效）"
+        ),
+    )
+    parser.add_argument(
+        "--conversation",
+        metavar="platform:local_id",
+        help=(
+            "配合 --pair 使用：要授权哪个会话（形如 telegram:12345，"
+            "就是 /pair 回信里那个值）。码绑定会话，只凭码无法确定是哪个。"
+        ),
+    )
     return parser
 
 
@@ -135,23 +153,26 @@ _NOT_READY_MISSING_CREDENTIALS = "missing_credentials"
 _NOT_READY_NO_ALLOWLIST = "no_allowlist"
 
 
-def _not_ready_reasons(
-    *, configured: bool, accepts_any_sender: bool, has_allowlist: bool,
-) -> list[str]:
+def _not_ready_reasons(*, configured: bool, has_allowlist: bool) -> list[str]:
     """这个平台能不能对用户说"配好了"。空列表 = 可以说。
 
     ⚠️ **判据里的关键一条：没配凭据的平台**不**报 ``no_allowlist``。**
-    它收不到任何消息，"谁都能驱动"对它是假话；只报 ``missing_credentials``。
-    真正的暴露只在"能跑"之后才存在。
+    它收不到任何消息，"没授权任何人"对它是假话；只报 ``missing_credentials``。
 
-    ⚠️ 刻意**不**把"白名单为空"当成错误 —— 它是本仓库被文档化、被示例配置固化的
-    默认（``config.example.json`` 抄的就是 ``[]``），翻转它要产品决策与迁移期。
-    本函数只保证**它不会被说成"配好了"**。
+    ⚠️ **``has_allowlist`` 就是全部判据了** —— 此前还有一个 ``accepts_any_sender``
+    与它取合取，而翻转之后那个字段恒为 False（见
+    :attr:`~opencode_bridge.allowlist.AllowlistResolution.admits_nobody` 的注释），
+    于是合取项**冗余**。留着它只会让人以为"两个条件都得满足"，而去查它为什么总是
+    成立 —— 一个恒真的合取项是**噪音**，不是保险。
+
+    ⚠️ 本函数**跨两个配置版本都成立**，这正是 :data:`_NOT_READY_NO_ALLOWLIST` 作为
+    **稳定 token** 的意义（见该常量注释）：空清单在旧语义下是"全开"（真的不能
+    说配好了），在新语义下是"全拒"（**同样**不能说配好了）—— 结论一致，token 零断裂。
     """
     reasons: list[str] = []
     if not configured:
         reasons.append(_NOT_READY_MISSING_CREDENTIALS)
-    elif accepts_any_sender and not has_allowlist:
+    elif not has_allowlist:
         reasons.append(_NOT_READY_NO_ALLOWLIST)
     return reasons
 
@@ -209,7 +230,6 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
         allowlist = resolve_allowlist(entry)
         not_ready = _not_ready_reasons(
             configured=configured,
-            accepts_any_sender=allowlist.accepts_any_sender,
             has_allowlist=bool(allowlist.entries),
         )
         out.append(
@@ -227,13 +247,22 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 "inbound_implemented": supports_inbound,
                 "missing": missing,
                 # --- 授权暴露面（新增；configured 的含义不变）----------------
-                # 解析出的白名单条目数。0 = 空 = **全开**（闸门的真实语义）。
+                # 解析出的白名单条目数。0 = 空 = **闸门不放行任何人**
+                # （新语义）或 **放行所有人**（旧语义）—— 见下面两个字段。
                 "allowed_chat_ids_count": len(allowlist.entries),
                 # 有没有真的限人。读它来回答"别人能不能开我的 bot"。
                 "allowlist_configured": bool(allowlist.entries),
-                # 「空 = 全开」这个语义是承重的，所以显式报出来，
-                # 而不是让消费者从 count == 0 反推。
-                "accepts_any_sender": allowlist.accepts_any_sender,
+                # ⛔ **键已改名**：``accepts_any_sender`` → ``admits_nobody``。
+                # **不删键** —— 删了就逼消费者从 ``count == 0`` 反推策略，
+                # 那正是 :mod:`opencode_bridge.allowlist` 当初被拆出来要消灭的事。
+                # 新名下的判定式一个字没动，变的只是"空清单"指向哪一边。
+                "admits_nobody": allowlist.admits_nobody,
+                # 这个配置下闸门**是否真的会放行一切**。消费者要答"别人能不能开我的
+                # bot"就读它 —— 它把 :attr:`admits_nobody` 与配置版本合成一个答案，
+                # 于是它在新旧两种语义下都是**同一件事**：闸门此刻的实际行为。
+                "admits_any_sender": allowlist.gate_admits_everyone(
+                    cfg.config_version
+                ),
                 # 配置里出现过的授权键名（可能多于一个 → 见 allowlist_conflict）
                 "allowlist_keys_present": list(allowlist.present_keys),
                 # 多个授权键解析出不同结果时的诊断（含实际生效的键与项数）；
@@ -375,7 +404,11 @@ def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]
         ]
         caps: dict = {}
         try:
-            caps = dict(build(key, entry, _NullHooks()).capabilities())
+            # 与 run_bridge 走**同一个**投影，否则状态视图会在一个真实运行着的
+            # 适配器上读出另一套语义（它也构造适配器，见 :class:`_NullHooks` 的说明）。
+            caps = dict(
+                build(key, adapter_scoped_config(cfg, entry), _NullHooks()).capabilities()
+            )
         except Exception as exc:  # 能力读取失败不该让 --status 崩
             caps = {"error": str(exc)[:80]}
         # 授权面与闸门同源：同一个 resolve_allowlist，不另写一份解析。
@@ -459,7 +492,16 @@ def run_status(cfg: Config) -> int:
     print("== 渠道配置与能力 ==")
     print("  说明：「配置」= 必需 token 全部齐备；「入站」= 入站已实现且配置齐备。")
     print("        两者都不代表连接状态（连接状态见下方运行态）")
-    print("        「白名单」为空 = 未设 = **全开**：任何能联系到 bot 的人都能驱动它")
+    # ⚠️ **图例要按配置版本给两套文案** —— 写死一套会让另一个版本的用户读到假话，
+    # 而这张表唯一的作用就是"用户读到的 == 闸门的真实行为"。
+    if empty_allowlist_is_open(cfg.config_version):
+        print("        「白名单」为空 = 未设 = **全开**：任何能联系到 bot 的人都能驱动它")
+        print("        （你的配置没有 config_version 或 < 2 ⇒ 沿用旧的「空 = 全开」。")
+        print("          下一版起此处改为「空 = 全拒」；届时在 bot 内发 /pair 一步授权，")
+        print("          不必手改本文件。）")
+    else:
+        print("        「白名单」为空 = 未设 = **全拒**：任何人都进不来（最安全的状态）。")
+        print("        （你的配置是 config_version >= 2。在 bot 内发 /pair 即可授权那个会话。）")
     rows = _channel_config_rows(cfg)
     # 列宽按**显示宽度**自适应：平台名长短不一（"IRC" 3 字符、"Nextcloud Talk" 14），
     # 写死宽度会让长名字挤掉与下一列之间的空格。
@@ -477,10 +519,16 @@ def run_status(cfg: Config) -> int:
             )
             continue
         allowed = caps.get("allowed_chat_ids_count")
-        # ⚠️ 空白的白名单不是"没填"，是**全开** —— 原先渲染成「未设(全开)」，
-        # 那句话在表格里既不显眼也没说清后果，用户扫一眼就过去了。改成带警示符的
-        # 等式：「未设=全开」。仍然短（这是个状态表），但扫得出来。
-        wl = f"{allowed} 项" if allowed else "⚠ 未设=全开"
+        # ⚠️ 空白的白名单不是"没填"，是**闸门的一个具体行为**，而那个行为取决于
+        # 配置版本：旧语义下是**全开**（危险，要警示符），新语义下是**全拒**
+        # （最安全，不该报警 —— 对安全状态报警会教会用户忽略这一列）。
+        # 两套文案**都**要短：这是个状态表，长句会把表撑烂。
+        if allowed:
+            wl = f"{allowed} 项"
+        elif empty_allowlist_is_open(cfg.config_version):
+            wl = "⚠ 未设=全开"
+        else:
+            wl = "未设=全拒"
         conflict_detail = caps.get("allowlist_conflict")
         if conflict_detail:
             wl += " ⚠键冲突"
@@ -587,7 +635,10 @@ def _run_bridge_locked(cfg: Config) -> int:
     usable = 0
     for name, entry in list((cfg.adapters or {}).items()):
         try:
-            adapter = build(name, entry if isinstance(entry, dict) else {}, core)
+            # ⚠️ **必须过** ``adapter_scoped_config``：适配器只看得到自己的子树，
+            # 而 ``pairing_secret`` / ``config_version`` 是**顶层**标量 —— 不投影
+            # 进去，闸门就永远读不到（``--status`` 那条路径同样投影，两边必须一致）。
+            adapter = build(name, adapter_scoped_config(cfg, entry), core)
         except KeyError:
             logger.warning("unknown adapter %r in config; skipped", name)
             continue
@@ -660,6 +711,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_setup(cfg, args.setup, bool(args.json))
         if args.status:
             return run_status(cfg)
+        if args.pair is not None:
+            # 改完配置就退出，不去连 opencode、不建适配器。
+            return run_pair(cfg, args.pair, args.conversation)
         return run_bridge(cfg)
     except KeyboardInterrupt:
         logger.info("已中断")

@@ -1356,13 +1356,30 @@ class TestAccessGate(QQBotTestCase):
                                     group_message_packet(group_openid=target)["d"])
         )
 
-    def test_empty_allowlist_admits_everything(self):
+    def test_empty_allowlist_admits_everything_without_config_version(self):
+        """无 ``config_version`` ⇒ 沿用旧的「空 = 全开」（本夹具不传该键）。"""
         hooks = RecordingHooks()
         adapter = make_adapter(hooks)
         self.assertTrue(
             adapter._handle_message("GROUP_AT_MESSAGE_CREATE",
                                     group_message_packet()["d"])
         )
+
+    def test_empty_allowlist_rejects_everything_once_config_version_flips(self):
+        """``config_version >= 2`` ⇒ 空 = 全拒。
+
+        ⚠️ 顺带钉住 qqbot 用**基类默认** ``pairing_supported = False``：principal
+        虽然是稳定会话 id，但它与"谁能驱动"不是一回事（同群任何成员共享它），
+        拿它当配对锚点等于把整个群一起授权。
+        """
+        hooks = RecordingHooks()
+        adapter = make_adapter(hooks, config_version=2)
+        self.assertFalse(
+            adapter._handle_message("GROUP_AT_MESSAGE_CREATE",
+                                    group_message_packet()["d"])
+        )
+        self.assertEqual(len(hooks.inbounds), 0)
+        self.assertFalse(adapter.pairing_supported)
 
     def test_on_inbound_exception_does_not_escape(self):
         hooks = RecordingHooks()

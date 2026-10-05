@@ -319,7 +319,8 @@ class TestMatrixInbound(unittest.TestCase):
         self.assertEqual(len(hooks.inbounds), 1)
         self.assertEqual(hooks.inbounds[0].conversation_id, "matrix:!ok:example.org")
 
-    def test_empty_allowlist_admits_all(self):
+    def test_empty_allowlist_admits_all_without_config_version(self):
+        """无 ``config_version`` ⇒ 沿用旧的「空 = 全开」（本夹具不传该键）。"""
         adapter, hooks = make_matrix()
         self.assertTrue(adapter.admits(ROOM))
         adapter._request = lambda *a, **k: (
@@ -328,6 +329,17 @@ class TestMatrixInbound(unittest.TestCase):
         )
         adapter._sync_once()
         self.assertEqual(len(hooks.inbounds), 1)
+
+    def test_empty_allowlist_drops_everything_once_config_version_flips(self):
+        """``config_version >= 2`` ⇒ 空 = 全拒：**消息根本不该产生 Inbound**。"""
+        adapter, hooks = make_matrix(config={"config_version": 2})
+        self.assertFalse(adapter.admits(ROOM))
+        adapter._request = lambda *a, **k: (
+            200,
+            sync_payload([text_event(text="open")], next_batch="s1"),
+        )
+        adapter._sync_once()
+        self.assertEqual(len(hooks.inbounds), 0, "全拒语义下不得产生任何 Inbound")
 
     def test_non_message_rooms_shapes_are_tolerated(self):
         adapter, hooks = make_matrix()

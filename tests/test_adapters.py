@@ -511,9 +511,11 @@ class TestSlackInbound(unittest.TestCase):
         adapter._handle_envelope(ws, self._envelope("e2", event=self._msg(channel="C_allow")))
         self.assertEqual(len(hooks.inbounds), 1)
 
-    def test_empty_allowlist_admits_all(self):
+    def test_empty_allowlist_admits_all_without_config_version(self):
         hooks = RecordingHooks()
-        adapter = self._adapter(hooks)  # 未设白名单 = 全开（v1 语义）
+        # 未设白名单 + 无 config_version = 旧的「空 = 全开」语义。
+        # 本夹具不传 config_version，所以这条守住的是**既有用户**不被翻转波及。
+        adapter = self._adapter(hooks)
         ws = FakeWS()
         adapter._handle_envelope(ws, self._envelope(event=self._msg(channel="C_any")))
         self.assertEqual(len(hooks.inbounds), 1)
@@ -991,10 +993,32 @@ class TestCapabilities(unittest.TestCase):
 class TestAccessGate(unittest.TestCase):
     """T1.2 — 授权闸门统一到基类，三平台同一套判定。"""
 
-    def test_empty_allowlist_admits_all(self):
+    def test_empty_allowlist_admits_all_without_config_version(self):
+        """无 ``config_version`` ⇒ 旧的「空 = 全开」（既有用户不会被突然关在门外）。"""
         adapter = build("telegram", {"bot_token": "t"}, RecordingHooks())
         self.assertTrue(adapter.admits(55))
         self.assertTrue(adapter.admits("任意 chat"))
+
+    def test_empty_allowlist_admits_nobody_once_config_version_flips(self):
+        """⚠️ 这条是**本次改动的核心**：`config_version >= 2` ⇒ 空 = 谁都不放行。"""
+        adapter = build(
+            "telegram", {"bot_token": "t", "config_version": 2}, RecordingHooks()
+        )
+        self.assertEqual(adapter.allowed_chat_ids, set())
+        self.assertFalse(adapter.admits(55))
+        self.assertFalse(adapter.admits("任意 chat"))
+
+    def test_populated_allowlist_behaves_the_same_under_both_versions(self):
+        """非空清单**两个版本完全一致** —— 翻转只动"空"这一支。"""
+        for version in (0, 2):
+            with self.subTest(config_version=version):
+                adapter = build(
+                    "telegram",
+                    {"bot_token": "t", "config_version": version, "allowed_chat_ids": [55]},
+                    RecordingHooks(),
+                )
+                self.assertTrue(adapter.admits(55))
+                self.assertFalse(adapter.admits(77))
 
     def test_allowlist_filters(self):
         adapter = build(

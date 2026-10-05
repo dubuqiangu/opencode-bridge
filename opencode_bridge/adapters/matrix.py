@@ -132,6 +132,9 @@ class MatrixAdapter(Adapter):
     label = "Matrix"
     max_message_length = MESSAGE_LIMIT          # 取保守值（事件体整体上限 64KB）
     supports_inbound = True                     # /sync 长轮询
+    #: principal = room id：(a) 会话唯一且稳定，(b) 用户能直接看到它，
+    #: (c) Matrix 对发件人做过认证（access token）。三条都成立。
+    pairing_supported = True
     supports_inline_buttons = False             # v1 不把 reactions 当交互
     supports_media = False                      # v1 只发 m.text
     #: ``m.relates_to`` + ``rel_type="m.replace"`` 是真的替换（见 :meth:`edit`），
@@ -414,14 +417,18 @@ class MatrixAdapter(Adapter):
         if not isinstance(body, str) or not body:
             return
         event_id = event.get("event_id")
-        # 授权闸门必须在最前：未授权房间的消息不许进入上层（否则能用命令/审批字绕过）
-        if not self.admits(room_id):
+        # 授权闸门必须在最前：未授权房间的消息不许进入上层（否则能用命令/审批字绕过）。
+        # ⚠️ /pair 在未授权时也要能进来，所以 conversation_id 提到闸门之前算。
+        conversation_id = self._conversation_id(room_id)
+        if not self.admits(room_id) and not self.answer_pairing_request(
+            room_id, conversation_id, body
+        ):
             logger.info("matrix: dropping message from non-whitelisted room %s", room_id)
             return
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(room_id),
+                    conversation_id=conversation_id,
                     text=body,
                     kind="text",
                     user_id=sender or None,

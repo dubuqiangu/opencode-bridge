@@ -122,6 +122,9 @@ class TelegramAdapter(Adapter):
     label = "Telegram"
     max_message_length = MESSAGE_LIMIT          # Bot API: 4096 字符
     supports_inbound = True
+    #: principal = chat id：(a) 会话唯一且稳定，(b) 用户在 Telegram 里能直接看到它，
+    #: (c) 平台对发件人做过认证 —— 三条判据都成立。
+    pairing_supported = True
     supports_inline_buttons = True              # 仓库里唯一支持 inline 按钮的平台
     supports_media = True
     #: ``editMessageText`` 真能把占位气泡顶成最终答复，所以 ``⏳ 处理中…`` 发得。
@@ -489,7 +492,9 @@ class TelegramAdapter(Adapter):
         if not isinstance(chat, dict) or chat.get("id") is None:
             return
         conversation_id = self._conversation_id(chat.get("id"))
-        if not self._allowed(chat.get("id")):
+        if not self._allowed(chat.get("id")) and not self.answer_pairing_request(
+            chat.get("id"), conversation_id, text
+        ):
             logger.info("telegram: dropped message from non-whitelisted chat %s", chat.get("id"))
             return
         from_user = message.get("from") or {}
@@ -527,15 +532,17 @@ class TelegramAdapter(Adapter):
             from_user = cq.get("from")
             if isinstance(from_user, dict):
                 chat_id = from_user.get("id")
-        if chat_id is None or not self._allowed(chat_id):
-            if chat_id is not None:
-                logger.info(
-                    "telegram: dropped callback from non-whitelisted chat %s", chat_id
-                )
-            else:
-                logger.warning("telegram: callback without chat context: %r", cq)
+        if chat_id is None:
+            logger.warning("telegram: callback without chat context: %r", cq)
             return
         conversation_id = self._conversation_id(chat_id)
+        if not self._allowed(chat_id) and not self.answer_pairing_request(
+            chat_id, conversation_id, None
+        ):
+            logger.info(
+                "telegram: dropped callback from non-whitelisted chat %s", chat_id
+            )
+            return
         payload = data if isinstance(data, str) else ""
         # 1) push the event into the core, 2) notify the core, 3) ack Telegram.
         try:

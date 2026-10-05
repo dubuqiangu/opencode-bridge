@@ -225,6 +225,9 @@ class MattermostAdapter(Adapter):
     #: 官方文档没公布这个上限，服务端是运行时算出来的，所以不能硬编码当成精确值。
     max_message_length = MESSAGE_LIMIT
     supports_inbound = True                    # WebSocket 事件流（T3.2）
+    #: principal = channel id：(a) 会话唯一且稳定，(b) 用户能直接看到它，
+    #: (c) Mattermost 对发件人做过认证。三条都成立。
+    pairing_supported = True
     supports_inline_buttons = False            # v1 不发 attachments / actions
     supports_media = False                     # v1 只发纯文本
     #: ``PUT /posts/{id}/patch`` 真能改写已发消息（见 :meth:`edit`），占位气泡发得。
@@ -862,14 +865,18 @@ class MattermostAdapter(Adapter):
         if not channel_id:
             self._drop_inbound("缺 channel_id", channel_id, author)
             return False
-        # 6) 授权闸门必须在产生 Inbound **之前**（否则能用命令 / 审批字绕过）
-        if not self.admits(channel_id):
+        # 6) 授权闸门必须在产生 Inbound **之前**（否则能用命令 / 审批字绕过）。
+        #    ⚠️ /pair 在未授权时也要能进来，所以 conversation_id 提到闸门之前算。
+        conversation_id = self._conversation_id(channel_id)
+        if not self.admits(channel_id) and not self.answer_pairing_request(
+            channel_id, conversation_id, text
+        ):
             self._drop_inbound("未在白名单", channel_id, author)
             return False
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(channel_id),
+                    conversation_id=conversation_id,
                     text=text,
                     kind="text",
                     user_id=author or None,

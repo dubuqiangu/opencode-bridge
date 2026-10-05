@@ -171,10 +171,15 @@ class TestSetupJsonReportsExposure(unittest.TestCase):
     """Part 1b —— ``--setup --json`` 必须报出授权暴露面。"""
 
     def test_wide_open_platform_is_not_reported_as_ready_for_the_agent(self):
+        """空清单（旧语义 = 全开）⇒ 绝不许报成「配好了」。"""
         cfg = Config(adapters={"slack": {"bot_token": "xoxb-t", "app_token": "xapp-t"}})
         row = status_row(cfg, "slack")
         self.assertTrue(row["configured"], "凭据齐备这件事本身不变")
-        self.assertTrue(row["accepts_any_sender"])
+        self.assertTrue(row["admits_nobody"], "空清单 ⇒ 谁都不放行（判定式本身）")
+        self.assertTrue(
+            row["admits_any_sender"],
+            "旧语义（无 config_version）下空清单**确实**放行一切 —— 闸门的真实行为",
+        )
         self.assertFalse(row["allowlist_configured"])
         self.assertEqual(row["allowed_chat_ids_count"], 0)
         self.assertIn(cli._NOT_READY_NO_ALLOWLIST, row["not_ready_reasons"])
@@ -182,6 +187,26 @@ class TestSetupJsonReportsExposure(unittest.TestCase):
             row["ready_for_agent"],
             "无白名单（空 = 全开）时不得报成可以告诉用户「配好了」",
         )
+
+    def test_new_semantics_empty_allowlist_admits_nobody_but_is_still_not_ready(self):
+        """``config_version >= 2`` ⇒ 空清单真的全拒；``ready_for_agent`` **仍**为假。
+
+        ⚠️ 后半句是承重的：翻转后"空"从"全开"变成"全拒"，两种情况**都**不能让
+        用户以为配好了。理由不同（旧：危险 / 新：还没授权任何人），结论一致 ——
+        这就是 ``_NOT_READY_NO_ALLOWLIST`` 作为**稳定 token** 的价值。
+        """
+        cfg = Config(
+            config_version=2,
+            adapters={"slack": {"bot_token": "xoxb-t", "app_token": "xapp-t"}},
+        )
+        row = status_row(cfg, "slack")
+        self.assertTrue(row["admits_nobody"])
+        self.assertFalse(
+            row["admits_any_sender"],
+            "新语义下空清单**不放行任何人** —— 闸门的真实行为",
+        )
+        self.assertIn(cli._NOT_READY_NO_ALLOWLIST, row["not_ready_reasons"])
+        self.assertFalse(row["ready_for_agent"])
 
     def test_restricted_platform_is_reported_ready(self):
         cfg = Config(
@@ -192,7 +217,8 @@ class TestSetupJsonReportsExposure(unittest.TestCase):
         )
         row = status_row(cfg, "slack")
         self.assertTrue(row["allowlist_configured"])
-        self.assertFalse(row["accepts_any_sender"])
+        self.assertFalse(row["admits_nobody"])
+        self.assertFalse(row["admits_any_sender"])
         self.assertEqual(row["allowed_chat_ids_count"], 1)
         self.assertEqual(row["not_ready_reasons"], [])
         self.assertTrue(row["ready_for_agent"])
@@ -224,8 +250,10 @@ class TestSetupJsonReportsExposure(unittest.TestCase):
         )
         self.assertEqual(absent["allowlist_keys_present"], [])
         self.assertEqual(written["allowlist_keys_present"], ["allowed_chat_ids"])
-        self.assertTrue(absent["accepts_any_sender"])
-        self.assertTrue(written["accepts_any_sender"])
+        self.assertTrue(absent["admits_nobody"])
+        self.assertTrue(written["admits_nobody"])
+        self.assertTrue(absent["admits_any_sender"], "旧语义下两者都是空 = 全开")
+        self.assertTrue(written["admits_any_sender"])
         self.assertFalse(written["ready_for_agent"], "写了空数组同样不许报就绪")
 
     def test_json_output_is_serialisable_and_carries_the_new_fields(self):
@@ -235,11 +263,27 @@ class TestSetupJsonReportsExposure(unittest.TestCase):
         encoded = json.loads(json.dumps(payload, ensure_ascii=False))
         discord = next(r for r in encoded["platforms"] if r["key"] == "discord")
         for field in (
-            "allowed_chat_ids_count", "allowlist_configured", "accepts_any_sender",
+            "allowed_chat_ids_count", "allowlist_configured",
+            # ⚠️ 两个都在：``admits_nobody`` 是判定式本身（"清单为空"），
+            # ``admits_any_sender`` 是**这个配置下**闸门的真实行为。消费者要答
+            # "别人能不能开我的 bot" 读后者 —— 它在新旧两种语义下都是同一件事。
+            "admits_nobody", "admits_any_sender",
             "allowlist_keys_present", "allowlist_conflict",
             "not_ready_reasons", "ready_for_agent",
         ):
             self.assertIn(field, discord, f"--setup --json 缺字段 {field}")
+
+    def test_the_renamed_key_is_not_the_old_one(self):
+        """⛔ 旧键名必须**消失**：留着它就是两个名字表达两件事。
+
+        而它若被留下且语义不变，它会恒为 True（= 每份配置都"放行所有人"），
+        仓库外的消费者会照着它把每个桥都报成全开 —— 比字段缺失更坏。
+        """
+        row = status_row(Config(adapters={"discord": {"bot_token": "t"}}), "discord")
+        self.assertNotIn(
+            "accepts_any_sender", row,
+            "accepts_any_sender 已被 admits_nobody 取代，不许并存",
+        )
 
 
 class TestConflictingAllowlistKeys(unittest.TestCase):
@@ -248,16 +292,35 @@ class TestConflictingAllowlistKeys(unittest.TestCase):
     #: 派单点名的那个洞：非空的意图，拿到的是全开。
     HOLE_CONFIG = {"bot_token": "t", "allowed_chat_ids": [], "allowed_chats": [42]}
 
-    def test_gate_still_admits_everyone(self):
-        """⚠️ 这条锁的是**行为不变**：先出现者胜没有被偷偷改掉。
+    def test_gate_still_admits_everyone_under_the_legacy_semantics(self):
+        """⚠️ 这条锁的是**旧语义未被改动**：先出现者胜没有被偷偷改掉。
 
         若将来有人"顺手改成非空优先"，这里会红 —— 而那正是 §8 说的"悄悄换掉一个
         已被依赖的行为"。要改必须先改这里、写明理由与迁移期。
+
+        ⚠️ 同时它守住发布方式的核心承诺：**没有** ``config_version`` 的配置
+        （绝大多数既有用户就是）**仍然全开**。这是"任何人都不会被困死"的兑现点。
         """
         adapter = build("telegram", dict(self.HOLE_CONFIG), None)
         self.assertEqual(adapter.allowed_chat_ids, set())
-        self.assertTrue(adapter.admits("任何人"), "空 = 全开是既有语义，未被改动")
+        self.assertTrue(
+            adapter.admits("任何人"),
+            "无 config_version ⇒ 沿用旧的「空 = 全开」，未被改动",
+        )
         self.assertTrue(adapter.admits("42"))
+
+    def test_the_same_hole_is_closed_once_config_version_flips(self):
+        """同一个配置，加上 ``config_version: 2`` ⇒ **谁都不放行**。
+
+        判定式一个字没改（仍是"空清单 ⇒ 无条件下判定"），变的只是"无条件"指向
+        哪一边：见 ``AllowlistResolution.admits_nobody`` 的 docstring。
+        """
+        adapter = build(
+            "telegram", {**self.HOLE_CONFIG, "config_version": 2}, None
+        )
+        self.assertEqual(adapter.allowed_chat_ids, set())
+        self.assertFalse(adapter.admits("任何人"), "config_version >= 2 ⇒ 空 = 全拒")
+        self.assertFalse(adapter.admits("42"))
 
     def test_conflict_is_reported_and_states_the_resolved_value(self):
         adapter = build("telegram", dict(self.HOLE_CONFIG), None)
@@ -271,7 +334,12 @@ class TestConflictingAllowlistKeys(unittest.TestCase):
         self.assertIn("allowed_chat_ids", detail)
         self.assertIn("allowed_chats", detail)
         self.assertIn("0 项", detail)
-        self.assertIn("全开", detail, "必须说出后果，否则用户不知道要急")
+        # ⚠️ 0 项的后果**按配置版本分两套**，所以文案必须**两套都写出来**
+        # （本函数不接收版本，所以它只能同时说两种可能）。写死一种会让另一个
+        # 版本的用户读到假话，而这条文案的作用恰恰是"用户读到的 == 真实行为"。
+        self.assertIn("全开", detail, "旧语义（无 config_version）下 0 项 = 全开")
+        self.assertIn("全拒", detail, "新语义（config_version >= 2）下 0 项 = 全拒")
+        self.assertIn("/pair", detail, "必须告诉用户新语义下怎么进来")
 
     def test_startup_logs_a_warning_for_the_conflict(self):
         with _CaptureLogs("opencode_bridge.allowlist") as captured:
@@ -283,7 +351,11 @@ class TestConflictingAllowlistKeys(unittest.TestCase):
         )
         self.assertIn(
             "全开", joined,
-            "警告必须说出后果（=全开），只说「键冲突」用户仍然不知道严重性",
+            "警告必须说出后果（旧语义下 = 全开），只说「键冲突」用户仍不知严重性",
+        )
+        self.assertIn(
+            "全拒", joined,
+            "警告也必须说出新语义下 0 项的含义，否则翻转后的用户被误导",
         )
 
     def test_single_key_config_is_not_a_conflict(self):
@@ -333,21 +405,74 @@ class TestConflictingAllowlistKeys(unittest.TestCase):
         self.assertFalse(row["ready_for_agent"])
 
 
-class TestWideOpenIsLoud(unittest.TestCase):
-    """Part 2a —— 已配置却空=全开 ⇒ 喊出来。"""
+class TestEmptyAllowlistIsStatedOutLoud(unittest.TestCase):
+    """Part 2a —— 已配置却空清单 ⇒ **把现状说出来**。
 
-    def test_configured_adapter_with_empty_allowlist_warns(self):
+    ⚠️ 类名与断言都从「全开」改成「空清单」，因为翻转之后"空"有两解，而旧函数
+    :func:`opencode_bridge.allowlist.warn_if_wide_open` 会为**最安全的那个状态**
+    发一条安全告警 —— 那比不报警更坏（教会用户忽略这条日志）。
+    """
+
+    def test_configured_adapter_with_empty_allowlist_states_both_semantics(self):
         with _CaptureLogs("opencode_bridge.allowlist") as captured:
             build("telegram", {"bot_token": "t"}, None)
         joined = "\n".join(captured.messages)
-        self.assertIn("全开", joined, "空白名单必须被说成是全开")
+        self.assertIn(
+            "全开", joined,
+            "旧语义（无 config_version）下空白名单必须被说成是全开",
+        )
         self.assertIn(
             "allowed_chat_ids", joined,
             "警告必须指出要填哪个键，否则用户不知道动哪里",
         )
+        self.assertIn("/pair", joined, "必须预告下一版起改为全拒，届时用 /pair")
+        self.assertIn(
+            "下一版", joined,
+            "预告必须写明是「下一版」—— 让用户知道现在还没变、可以先补白名单",
+        )
+
+    def test_flipped_config_states_that_empty_means_nobody(self):
+        """``config_version >= 2`` ⇒ 文案必须说「全拒」且**不再**说成全开。"""
+        with _CaptureLogs("opencode_bridge.allowlist") as captured:
+            build("telegram", {"bot_token": "t", "config_version": 2}, None)
+        joined = "\n".join(captured.messages)
+        self.assertIn("全拒", joined)
+        self.assertIn("/pair", joined, "必须告诉用户怎么授权那个会话")
+        self.assertNotIn(
+            "任何能联系到 bot 的人都能驱动它", joined,
+            "新语义下说「谁能驱动」是**假话** —— 那正是要防的那条误报",
+        )
+
+    def test_flipped_config_logs_information_not_a_security_warning(self):
+        """⚠️ 对**安全状态**报警比不报警更坏，所以这条守的是**日志级别**。"""
+        records: list[tuple[str, str]] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append((record.levelname, record.getMessage()))
+
+        handler = _Collect()
+        logger = logging.getLogger("opencode_bridge.allowlist")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            build("telegram", {"bot_token": "t", "config_version": 2}, None)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        warnings = [msg for level, msg in records if level == "WARNING"]
+        self.assertEqual(
+            [m for m in warnings if "allowed_chat_ids" in m and "为空" in m], [],
+            f"空清单 = 全拒 是**最安全**的状态，不许对它发 WARNING。实际：{warnings!r}",
+        )
+        self.assertTrue(
+            any(level == "INFO" and "全拒" in msg for level, msg in records),
+            f"但必须有一行 INFO 说清现状。实际：{records!r}",
+        )
 
     def test_unconfigured_adapter_does_not_warn_about_being_open(self):
-        """没凭据的适配器收不到消息 —— 对它喊"谁都能驱动"是假话。"""
+        """没凭据的适配器收不到消息 —— 对它喊"谁能驱动"是假话。"""
         with _CaptureLogs("opencode_bridge.allowlist") as captured:
             build("telegram", {}, None)
         self.assertEqual(
@@ -393,12 +518,29 @@ class TestStatusTableShowsTheExposure(unittest.TestCase):
         raise AssertionError(f"--status 输出里找不到 {label} 那一行")
 
     def test_empty_allowlist_is_rendered_as_an_exposure_not_a_blank(self):
+        """旧语义（无 ``config_version``）⇒ 单元格必须带警示符地写「全开」。"""
         rendered = self._render(Config(adapters={"telegram": {"bot_token": "t"}}))
         row = self._row_for(rendered, "Telegram")
         self.assertIn("未设=全开", row)
+        self.assertNotIn("未设=全拒", row, "旧语义下说全拒是假话")
         self.assertNotIn(
             "未设(全开)", row,
             "旧串「未设(全开)」不显眼也没说清后果，已被替换",
+        )
+
+    def test_flipped_config_renders_empty_allowlist_as_closed_not_open(self):
+        """⚠️ 翻转后**不许**再对那一行报警 —— 那是**最安全**的状态。
+
+        仍要写出来（用户需要知道"我还没授权任何人"），但不带警示符。
+        """
+        rendered = self._render(
+            Config(config_version=2, adapters={"telegram": {"bot_token": "t"}})
+        )
+        row = self._row_for(rendered, "Telegram")
+        self.assertIn("未设=全拒", row)
+        self.assertNotIn(
+            "全开", row,
+            "新语义下那一行标成「全开」是**假话**，且会让用户误以为桥是敞开的",
         )
 
     def test_populated_allowlist_still_renders_a_plain_count(self):
@@ -413,8 +555,21 @@ class TestStatusTableShowsTheExposure(unittest.TestCase):
         )
 
     def test_status_legend_explains_the_column(self):
+        """图例必须解释那一列**在当前配置下**是什么意思。"""
         rendered = self._render(Config(adapters={}))
-        self.assertIn("全开", rendered.split("== 渠道配置与能力 ==")[1][:400])
+        legend = rendered.split("== 渠道配置与能力 ==")[1][:500]
+        self.assertIn("全开", legend)
+        self.assertIn(
+            "/pair", legend,
+            "旧语义下必须**预告**下一版起改为全拒、届时用 /pair —— 不预告就等于"
+            "让用户在某次升级后突然被关在门外",
+        )
+
+    def test_flipped_legend_states_closed_and_how_to_authorize(self):
+        rendered = self._render(Config(config_version=2, adapters={}))
+        legend = rendered.split("== 渠道配置与能力 ==")[1][:500]
+        self.assertIn("全拒", legend)
+        self.assertIn("/pair", legend, "必须告诉用户怎么授权那个会话")
 
     def test_conflict_is_listed_below_the_table_with_the_resolved_value(self):
         rendered = self._render(

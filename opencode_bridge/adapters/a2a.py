@@ -423,6 +423,10 @@ class A2aAdapter(Adapter):
     #: 所以上面那个数是请求体**字节**上限，不是"一条消息能装多少字"。
     splits_long_messages = False
     supports_inbound = True
+    #: ⛔ **显式 False** —— principal 是**对端 peer**，判据 (a) 不成立：
+    #: peer 是对方自报的标识，不同对端实现下同一个"会话"可以长得一模一样，
+    #: 授权它等于授权一个**不可验证**的字符串。
+    pairing_supported = False
     #: A2A 没有"按钮"这个概念（Part 只有 text/raw/url/data，§4.1.6）。
     supports_inline_buttons = False
     #: 同上：本适配器不落地文件，也不下载对端的 ``url`` / ``raw``。
@@ -916,7 +920,11 @@ class A2aAdapter(Adapter):
         task = self._new_task(context_id, peer)
 
         # --- 闸门在**任何**后续处理之前（T1.2 的调用顺序要求）----------
-        if not self.admits(peer):
+        # ⚠️ 本平台 :attr:`pairing_supported` = False（principal 是对端自报的
+        # peer），配对分支恒不成立；保留那半行是为了与其它平台同一形态。
+        if not self.admits(peer) and not self.answer_pairing_request(
+            peer, f"{self.name}:{peer}", text
+        ):
             logger.info("a2a: 丢弃非白名单对端 %r 的任务（allowed_chat_ids）", peer)
             return self._reject(
                 task, req_id,

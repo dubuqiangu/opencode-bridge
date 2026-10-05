@@ -18,9 +18,16 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
-__all__ = ["DEFAULT_CONFIG_NAME", "Config"]
+from .pairing import CONFIG_VERSION_KEY, PAIRING_SECRET_KEY
+
+__all__ = [
+    "DEFAULT_CONFIG_NAME",
+    "ADAPTER_SCOPED_TOP_LEVEL_KEYS",
+    "Config",
+    "adapter_scoped_config",
+]
 
 logger = logging.getLogger("opencode_bridge.config")
 
@@ -37,7 +44,25 @@ _KNOWN_KEYS = frozenset(
         "log_level",
         "state_path",
         "bridge",
+        PAIRING_SECRET_KEY,
+        CONFIG_VERSION_KEY,
     }
+)
+
+#: 顶层标量里**必须**传进每个适配器子树的那些。
+#:
+#: ⚠️ 存在的理由很具体：**适配器只看得到自己的子树**
+#: （``adapters.telegram`` 那一个 dict），而 :attr:`Adapter.config` 就是它 ——
+#: ``resolve_allowlist(self.config)`` 读的正是它。所以顶层键如果不投影进去，
+#: 闸门就永远读不到。
+#:
+#: 用**投影**（把顶层标量并进子树）而不是给 :func:`~opencode_bridge.adapters.base.
+#: build` 加新参数，是因为本仓库既有做法就是"适配器的配置全在那个 dict 里"，
+#: 且 ``--status`` 那条路径也**自己构造适配器**（``__main__._channel_config_rows``）：
+#: 两个构造点投影同一份，闸门与状态视图才不会各说各话。
+ADAPTER_SCOPED_TOP_LEVEL_KEYS: Final[tuple[str, ...]] = (
+    PAIRING_SECRET_KEY,
+    CONFIG_VERSION_KEY,
 )
 
 #: Defaults for the optional ``bridge`` sub-section (Lane C).  The values are
@@ -82,6 +107,7 @@ _STR_FIELDS = frozenset(
         "permissions_mode",
         "log_level",
         "state_path",
+        PAIRING_SECRET_KEY,
     }
 )
 
@@ -100,6 +126,24 @@ class Config:
         default_factory=lambda: dict(_BRIDGE_DEFAULTS)
     )  # {"edit_interval_seconds": 1.5, "max_message_chars": 4000,
         #     "long_input_ack_chars": 180, "merge_continue_timeout_seconds": 15.0}
+    #: 配对码的派生密钥。**空 = 不提供配对**（绝不是"用空串派生"，见
+    #: :mod:`opencode_bridge.pairing`）。
+    #:
+    #: ⛔ **刻意不复用任何既有键**：
+    #:
+    #: * ``permissions_mode`` 是 ``"ask"|"allow"|"deny"`` 三值枚举、README 公开
+    #:   写着 ⇒ 从它派生的码对读过 README 的人**可枚举**；
+    #: * ``opencode_password`` 默认 ``""``（auto-discover），**那是常态不是边缘**；
+    #: * 凭据类（``bot_token`` 等）会让码依赖"哪个适配器发的"，而轮换 token 会用
+    #:   用户看不懂的方式杀掉在途码。
+    #:
+    #: ⛔ **不自动生成、也不回写** —— 那会让每次启动都依赖一个配置写者。
+    pairing_secret: str = ""
+    #: 配置格式版本。**0 / 缺失 = 这个文件早于「空 = 全拒」那次翻转** ⇒ 保持旧的
+    #: 开放语义；``>= 2`` ⇒ 采新语义（空 = 谁都不放行）。
+    #:
+    #: 判定只有一处：:func:`opencode_bridge.pairing.empty_allowlist_is_open`。
+    config_version: int = 0
 
     # ------------------------------------------------------------------
     # loading
@@ -222,9 +266,39 @@ class Config:
             return isinstance(value, dict)
         if key == "bridge":
             return isinstance(value, dict)
+        if key == CONFIG_VERSION_KEY:
+            # ``bool`` 不是版本号（``True`` 会变成 1 = "旧语义"，纯属误导）。
+            return isinstance(value, int) and not isinstance(value, bool)
         if key in _STR_FIELDS:
             return isinstance(value, str)
         return True
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
+
+
+def adapter_scoped_config(cfg: "Config", entry: object) -> dict:
+    """把 :data:`ADAPTER_SCOPED_TOP_LEVEL_KEYS` 投影进某个适配器的子树。
+
+    纯函数；**不改动**传入的 ``entry``（调用方的 ``cfg.adapters`` 原样保留，
+    否则 ``--status`` 读到的就不再是用户写的那份配置了）。
+
+    ⚠️ **顶层一律胜出**：子树里同名且**值不同**的键会被覆盖并记一条 warning。
+    授权配置里一个"看着生效了其实没生效"的键，比没有这个键危险得多
+    （与 :mod:`opencode_bridge.allowlist` 的键冲突上报同一条纪律）。
+
+    ⚠️ **两个构造点都必须过这个函数** —— ``run_bridge`` 真正建适配器，
+    ``_channel_config_rows`` 为 ``--status`` 建。漏一个，状态视图就会在一个
+    适配器都没配过的桥上报出另一套语义。
+    """
+    subtree = dict(entry) if isinstance(entry, dict) else {}
+    for key in ADAPTER_SCOPED_TOP_LEVEL_KEYS:
+        value = getattr(cfg, key, None)
+        if key in subtree and subtree.get(key) != value:
+            logger.warning(
+                "adapters 里的 %r 被**顶层同名键覆盖**（顶层 = %r）—— 删掉子树里那个。",
+                key,
+                value,
+            )
+        subtree[key] = value
+    return subtree

@@ -755,10 +755,26 @@ class TestMessageFilter(unittest.TestCase):
         adapter, _ = make_adapter({"allowed_chat_ids": ["r_ok"]})
         self.assertIs(type(adapter).admits, BaseAdapter.admits)
 
-    def test_empty_whitelist_admits_everything(self):
+    def test_empty_whitelist_admits_everything_without_config_version(self):
+        """无 ``config_version`` ⇒ 沿用旧的「空 = 全开」（本夹具不传该键）。"""
         adapter, hooks = make_adapter()
         self.assertTrue(adapter._handle_message(ROOM2, message()))
         self.assertEqual(len(hooks.inbounds), 1)
+
+    def test_empty_whitelist_rejects_everything_once_config_version_flips(self):
+        """``config_version >= 2`` ⇒ 空 = 全拒。
+
+        ⚠️ 顺带钉住 ``pairing_supported = False`` 对本平台的含义：即使有人发了
+        ``/pair``，也不会有配对回信（principal 是 OCS token，用户不知道它）。
+        """
+        adapter, hooks = make_adapter({"config_version": 2})
+        self.assertFalse(adapter._handle_message(ROOM2, message()))
+        self.assertEqual(len(hooks.inbounds), 0)
+        self.assertFalse(adapter.pairing_supported)
+        self.assertFalse(
+            adapter.answer_pairing_request(ROOM2, "nextcloud:tok", "/pair"),
+            "配对本平台已禁用 ⇒ /pair 不得触发配对回信",
+        )
 
     def test_missing_self_uid_stops_inbound_entirely(self):
         """拿不到 uid 就无法防回环 —— 宁可停摆也不能自问自答。"""

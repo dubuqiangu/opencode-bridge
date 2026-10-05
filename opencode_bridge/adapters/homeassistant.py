@@ -382,6 +382,9 @@ class HomeAssistantAdapter(Adapter):
     #: ⚠️ 自选的保守上限（官方未公布任何数字，见 :data:`MESSAGE_LIMIT`）。
     max_message_length = MESSAGE_LIMIT
     supports_inbound = True              # WS 事件总线（订阅命令拿到的 event 消息）
+    #: ⛔ **显式 False** —— principal 是 ``entity_id``，判据 (b) 不成立：
+    #: 那是实体标识，不是"谁能跟我说话"的会话，用户也无法据此判断授权对不对。
+    pairing_supported = False
     supports_inline_buttons = False      # WS API 里根本没有按钮这个概念
     supports_media = False               # 出站只发 service 的文本参数
     typed_command_prefix = "/"
@@ -1084,7 +1087,11 @@ class HomeAssistantAdapter(Adapter):
 
         cid = self.conversation_id_for(entity_id)
         # 授权闸门必须在产生 Inbound **之前**（否则能用命令 / 审批字绕过，不变量 3）。
-        if not self.admits(entity_id):
+        #    ⚠️ 本平台 :attr:`pairing_supported` = False（principal 是 entity_id），
+        #    配对分支恒不成立；保留那半行是为了与其它平台同一形态。
+        if not self.admits(entity_id) and not self.answer_pairing_request(
+            entity_id, cid, text
+        ):
             self._drop_inbound("未在白名单", entity_id)
             return False
         message_id = str(context.get("id") or "").strip()

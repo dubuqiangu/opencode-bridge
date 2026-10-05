@@ -6,6 +6,8 @@
   "permissions_mode": "ask",
   "log_level": "INFO",
   "state_path": "state.json",
+  "pairing_secret": "",
+  "config_version": 0,
   "bridge": {
     "edit_interval_seconds": 1.5,
     "max_message_chars": 4000

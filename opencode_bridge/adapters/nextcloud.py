@@ -256,6 +256,10 @@ class NextcloudAdapter(Adapter):
     #: 交叉校验 / 细化（读不到就沿用本值），出站分片按运行时的有效值切。
     max_message_length = MESSAGE_LIMIT
     supports_inbound = True                     # lookIntoFuture=1 长轮询
+    #: ⛔ **显式 False** —— principal 是 **OCS 会话 token**，判据 (b) 不成立：
+    #: 用户既不知道这个 token 是什么，也不**该**知道（它是凭据，贴进白名单等于
+    #: 把凭据抄进另一处）。显式写出来，是为了让"关"是一个**声明**而不是遗漏。
+    pairing_supported = False
     supports_inline_buttons = False             # v1 不发 reactions / 卡片
     supports_media = False                      # v1 只发纯文本
     #: ``PUT chat/{token}/{messageId}`` 真能改写已发消息（见 :meth:`edit`），
@@ -877,13 +881,18 @@ class NextcloudAdapter(Adapter):
             return False
         # 6) 授权闸门必须在产生 Inbound **之前**（否则能用命令 / 审批字绕过）。
         #    allowed_chat_ids 填的是**会话 token**，不是 user id。
-        if not self.admits(token):
+        #    ⚠️ 本平台 :attr:`pairing_supported` = False，所以配对分支恒不成立；
+        #    保留那半行是为了与其它平台**同一形态**（结构断言据此逐处点名）。
+        conversation_id = self._conversation_id(token)
+        if not self.admits(token) and not self.answer_pairing_request(
+            token, conversation_id, text
+        ):
             self._drop_inbound("未在白名单", token, actor_id)
             return False
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(token),
+                    conversation_id=conversation_id,
                     # ⚠️ 这是含 ``{mention-call1}`` 占位符的模板串，v1 不做提及渲染
                     text=text,
                     kind="text",

@@ -16,9 +16,17 @@ from ..allowlist import (
     AllowlistResolution,
     resolve_allowlist,
     warn_if_conflicting_keys,
-    warn_if_wide_open,
+    warn_if_no_allowlist,
 )
 from ..hooks import Hooks, MsgHandle, Outbound, SendError, SendResult
+from ..pairing import (
+    CONFIG_VERSION_KEY,
+    PAIRING_SECRET_KEY,
+    derive_pairing_code,
+    pairing_reply_text,
+    reads_pairing_trigger,
+    warn_if_pairing_unavailable,
+)
 
 logger = logging.getLogger("opencode_bridge.adapters.base")
 
@@ -198,6 +206,26 @@ class Adapter(abc.ABC):
     #: ``AttributeError`` —— 状态视图问的是"能不能答"，答不出不该让它崩。
     allowlist_resolution: AllowlistResolution = AllowlistResolution()
 
+    #: 本平台**是否提供配对**（未授权会话发 ``/pair`` 能否拿到码）。默认 **False**，
+    #: 逐个平台显式 opt-in —— 没人继承"支持"这个属性。
+    #:
+    #: 三条判据，**必须同时**成立才允许开：
+    #:
+    #: (a) principal 是**会话唯一且稳定**的（换台机器还是同一个值）；
+    #: (b) 用户**能知道**自己那个值是什么（否则要往 ``allowed_chat_ids`` 里填一个
+    #:     自己都不知道的东西，且没有任何途径查出来）；
+    #: (c) **平台对发件人做过认证** —— 这一条最承重，它决定"码只对那个会话有效"
+    #:     是不是一句真话。
+    #:
+    #: 显式关掉的四家及理由：
+    #:
+    #: * ``irc`` / ``twitch`` —— (c) 不成立：IRC **根本没有认证**，任何人都能声称
+    #:   任何 nick。私聊的 principal 还是 bot 自己的 nick，配对无从谈起。
+    #: * ``nextcloud`` —— principal 是 **OCS token**：用户不知道它，也不该知道。
+    #: * ``homeassistant`` —— principal 是 ``entity_id``。
+    #: * ``a2a`` —— principal 是对端 peer。
+    pairing_supported: bool = False
+
     @property
     def effective_max_length(self) -> int:
         """**运行期真正生效**的单条出站上限，即 :meth:`send` 实际切分的那个数。
@@ -304,26 +332,113 @@ class Adapter(abc.ABC):
         self.allowed_chat_ids = set(resolution.entries)
         label = self.name or type(self).__name__
         warn_if_conflicting_keys(label, resolution)
-        warn_if_wide_open(label, resolution, has_credentials=self._has_any_credential())
+        warn_if_no_allowlist(
+            label,
+            resolution,
+            has_credentials=self._has_any_credential(),
+            config_version=self.config.get(CONFIG_VERSION_KEY, 0),
+        )
+        warn_if_pairing_unavailable(
+            label,
+            self.config.get(PAIRING_SECRET_KEY),
+            has_credentials=self._has_any_credential(),
+        )
+
+    def _gate_rejects(self, principal: object) -> bool:
+        """闸门的**判定式本身**（:meth:`admits` 取它的反）。
+
+        ⚠️ **单独一个私有方法，而不是让 :meth:`admits` 内联**：配对分支需要
+        "这个 principal 是不是没被授权"这个答案，而如果它在
+        :meth:`answer_pairing_request` 里**再调一次** :meth:`admits`，一条入站
+        消息就会触发**两次**闸门调用 —— 而
+        ``tests/test_slack.py`` / ``tests/test_discord_gateway.py`` 正是靠**数
+        闸门调用次数**来守"闸门在产生 Inbound 之前且只跑一次"这个顺序不变量的。
+        次数悄悄变成 2 会让那条不变量看起来破了，而实际上什么都没坏。
+
+        所以两个方法共用这一份判定式，而**对外的闸门入口仍然只有** :meth:`admits`。
+        """
+        resolution = self.allowlist_resolution
+        if resolution.gate_admits_everyone(self.config.get(CONFIG_VERSION_KEY, 0)):
+            return False
+        return str(principal).strip() not in self.allowed_chat_ids
 
     def admits(self, principal: object) -> bool:
         """入站闸门：**任何**入站消息（文本 / 命令 / 回调）都必须先过这里。
 
-        语义（v1 保持现状）：白名单为空 = 全部允许；非空 = 只放行列表内的 chat。
+        非空清单 = 只放行列表内的 chat（**两个版本都一样，这条没变**）。
 
-        ⚠️ 「为空 = 全部允许」是一个**被文档化的默认**（README / ``docs/install.md`` /
-        ``config.example.json`` 三处都这么写），且安装脚本把示例原样落盘 ⇒
-        **自助安装出来的桥接默认全开**。翻转它需要产品决策与迁移期（会打破现有用户），
-        本仓库刻意**不**在这里翻转；但现状由 :mod:`opencode_bridge.allowlist` 负责
-        说出来（启动 warning + ``--status`` / ``--setup --json``）。
+        空清单的含义**按 ``config_version`` 分两套**，判定只有
+        :meth:`~opencode_bridge.allowlist.AllowlistResolution.gate_admits_everyone`
+        一处（它内部走 :func:`opencode_bridge.pairing.empty_allowlist_is_open`）：
+
+        * **没有** ``config_version``（或 < 2）⇒ **空 = 全放行**。旧文件保持原语义，
+          免得配好凭据却还没配白名单的用户突然被关在门外。
+        * ``config_version >= 2`` ⇒ **空 = 谁都不放行**。
 
         ⚠️ 调用顺序要求（对照 dsh 的反面教训）：授权判定必须在**命令解析与
         审批应答之前**，否则未授权者能用 ``/approve`` 这类命令字绕过闸门。
         入站适配器应在本方法返回 False 时**直接丢弃**，不要把消息交给上层。
+
+        ⚠️ **本方法保持为纯函数谓词**：它**不发消息**。`--status` 那条路径会构造
+        适配器（``__main__._channel_config_rows``），一个会发信的谓词在那里是纯粹的
+        副作用。配对回复是**另一个**方法（:meth:`answer_pairing_request`）的事。
         """
-        if not self.allowed_chat_ids:
-            return True
-        return str(principal).strip() in self.allowed_chat_ids
+        return not self._gate_rejects(principal)
+
+    def answer_pairing_request(
+        self, principal: object, conversation_id: str, text: object
+    ) -> bool:
+        """未授权且这条正文在请求配对 ⇒ 回一条码，返回 ``True``（**仍丢弃该消息**）。
+
+        ⚠️ 返回 ``True`` 的含义是"**已经回过了，调用方照旧别把消息放进来**"：
+        ``/pair`` 是一条命令，而**命令解析只发生在**
+        :meth:`opencode_bridge.inbound_gateway.InboundGateway.on_inbound` ——
+        未授权的消息活不到那里，所以这里**只**回信，**绝不**顺手执行命令。
+
+        调用形态是每个平台一行机械替换::
+
+            if not self.admits(principal) and not self.answer_pairing_request(
+                    principal, conversation_id, text):
+                return
+
+        ⚠️ 那个 ``not self.admits(...)`` **不是**可以省的短路：调用点靠它把
+        "已授权"这件事挡在外面，否则已授权的会话发 ``/pair`` 也会收到一条码。
+
+        为什么不复用 ``/setup`` 作触发词：那条文案冻结在
+        :mod:`opencode_bridge.commands` 里且被测试钉住，让同一个词在授权 / 未授权
+        两种状态下表示两件完全不同的事，等于把一份冻结输出变成状态相关的。
+        """
+        if not self._gate_rejects(principal):
+            # 已授权 —— 走闸门那条路，不该再回一条码。
+            return False
+        if not self.pairing_supported:
+            # 失败关闭：本平台三条判据有一条不成立（见 :attr:`pairing_supported`）。
+            # 沉默是对的 —— 回一句"这里不能配对"等于告诉未授权者去别处找办法。
+            return False
+        if not reads_pairing_trigger(text):
+            return False
+        secret = self.config.get(PAIRING_SECRET_KEY)
+        code = derive_pairing_code(secret, self.name, conversation_id)
+        if not code:
+            # secret 空 = 不提供配对（⛔ 绝不用空串派生，见 opencode_bridge.pairing）。
+            return False
+        label = self.label or self.name or type(self).__name__
+        self._deliver_pairing_reply(
+            conversation_id, pairing_reply_text(label, conversation_id, code)
+        )
+        return True
+
+    def _deliver_pairing_reply(self, conversation_id: str, text: str) -> None:
+        """把配对回信投出去。失败只记日志 —— 它是**尽力而为**的旁路，不是主流程。
+
+        抽出来是为了让各平台能覆盖投递方式（有的要复用已有的 :meth:`send`，
+        有的 inbound 路径本身就有自己的发送助手），而 :meth:`answer_pairing_request`
+        那一段判定与文案保持**只有一份**。
+        """
+        try:
+            self.send(Outbound(conversation_id=conversation_id, text=text))
+        except Exception as exc:  # noqa: BLE001 - 配对是旁路，炸了不许打断轮询
+            logger.warning("%s: 配对回信投递失败: %s", self.name or "adapter", exc)
 
     # --- lifecycle -----------------------------------------------------
     @abc.abstractmethod

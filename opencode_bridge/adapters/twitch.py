@@ -246,6 +246,9 @@ class TwitchAdapter(Adapter):
     label = "Twitch"
     max_message_length = MESSAGE_LIMIT          # 保守字符上限（见常量注释）
     supports_inbound = True
+    #: ⛔ **显式 False** —— 判据 (c) 不成立：Twitch 的 IRC 通道**不认证**任何用户，
+    #: 任何客户端都能声称任何 nick。配对码发出去也证明不了发件人是谁。
+    pairing_supported = False
     supports_inline_buttons = False             # IRC 协议里没有按钮
     supports_media = False
 
@@ -680,7 +683,9 @@ class TwitchAdapter(Adapter):
         if message_id and not self._remember_id(message_id):
             return          # 重连后 Twitch 可能重发，丢弃重复
         # 授权闸门在最前：未授权频道的消息不许进入上层（否则能用命令/审批字绕过）
-        if not self.admits(target):
+        if not self.admits(target) and not self.answer_pairing_request(
+            target, self._conversation_id(target), text
+        ):
             logger.info("twitch: dropping message from non-whitelisted channel %s", target)
             return
         try:

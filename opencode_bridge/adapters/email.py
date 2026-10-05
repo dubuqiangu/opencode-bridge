@@ -424,6 +424,9 @@ class EmailAdapter(Adapter):
     #: **不是**"一封邮件能装多少字"，对外也绝不能这么说。
     splits_long_messages = False
     supports_inbound = True                     # IMAP 轮询
+    #: principal = 发件地址：(a) 会话唯一且稳定，(b) 用户知道自己那个地址，
+    #: (c) SMTP/IMAP 对发件人做过认证。四条判据里最接近"天然成立"的一家。
+    pairing_supported = True
     supports_inline_buttons = False             # 邮件没有 inline 按钮
     supports_media = False                      # v1 只发 text/plain
     #: 邮件**没有**斜杠命令：命令必须在正文里整句写。留空串表示"无类型化命令前缀"，
@@ -947,11 +950,13 @@ class EmailAdapter(Adapter):
         if not text.strip():
             return
         # 授权闸门必须在产生 Inbound **之前**（基类 docstring 的硬要求）。
-        if not self.admits(sender):
+        # ⚠️ /pair 在未授权时也要能进来，所以 conversation_id 提到闸门之前算。
+        conversation_id = format_id(self.name, sender)
+        if not self.admits(sender) and not self.answer_pairing_request(
+            sender, conversation_id, text
+        ):
             logger.info("email: 发件人 %s 不在白名单，丢弃", sender)
             return
-
-        conversation_id = format_id(self.name, sender)
         if message_id:
             self._remember_thread(conversation_id, message_id, subject)
         try:

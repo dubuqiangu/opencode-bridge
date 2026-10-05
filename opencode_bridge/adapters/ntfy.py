@@ -84,6 +84,9 @@ class NtfyAdapter(Adapter):
     label = "ntfy"
     max_message_length = MESSAGE_LIMIT          # 4096 —— 但单位是**字节**
     supports_inbound = True
+    #: principal = topic：(a) 会话唯一且稳定，(b) 用户自己命名的 topic、知道它是什么，
+    #: (c) ntfy 对发布者做过认证（token 鉴权）。三条都成立。
+    pairing_supported = True
     supports_inline_buttons = False             # v1 不做 actions 按钮
     supports_media = False
     typed_command_prefix = "/"
@@ -243,14 +246,18 @@ class NtfyAdapter(Adapter):
         if not text:
             return
         topic = str(item.get("topic") or self.topic)
-        # 授权闸门在产生 Inbound 之前
-        if not self.admits(topic):
+        # 授权闸门在产生 Inbound 之前。⚠️ /pair 在未授权时也要能进来，
+        # 所以 conversation_id 提到闸门之前算。
+        conversation_id = format_id(self.name, topic)
+        if not self.admits(topic) and not self.answer_pairing_request(
+            topic, conversation_id, text
+        ):
             logger.info("ntfy: dropping message from non-whitelisted topic %s", topic)
             return
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=format_id(self.name, topic),
+                    conversation_id=conversation_id,
                     text=text,
                     kind="text",
                     user_id=None,          # ntfy 无用户身份，见类 docstring

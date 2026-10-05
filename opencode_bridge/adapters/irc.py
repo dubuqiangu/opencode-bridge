@@ -55,6 +55,7 @@ from typing import Any, Callable, List, Optional
 
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
+from ..pairing import CONFIG_VERSION_KEY, empty_allowlist_is_open
 from ..split import split_text
 from ..transport import NOTHING, TcpLineTransport
 from .base import Adapter, register
@@ -285,6 +286,15 @@ class IRCAdapter(Adapter):
     label = "IRC"
     max_message_length = MESSAGE_LIMIT          # 512 字节行上限减去前缀开销后的安全值
     supports_inbound = True
+    #: ⛔ **显式 False** —— 判据 (c) 不成立：IRC **根本没有认证**，任何人都能声称
+    #: 任何 nick。配对码发出去也证明不了发件人是谁。
+    #:
+    #: ⚠️ 私聊尤其糟：私聊的 principal 是 **bot 自己的 nick**（见
+    #: :meth:`~opencode_bridge.adapters.irc.IRCAdapter._handle_line` 里
+    #: ``is_private`` 那段），也就是"所有私聊共用同一个 principal"。翻转后私聊
+    #: 不可用、而配对已对本平台禁用 ⇒ 用户拿不到任何入口。**失败关闭 + 响亮**
+    #: 优于半通不通，所以 :meth:`_init_access` 会为此发一条启动告警。
+    pairing_supported = False
     supports_inline_buttons = False             # IRC 无按钮
     supports_media = False                      # v1 只发纯文本
 
@@ -319,6 +329,7 @@ class IRCAdapter(Adapter):
             str(self.config.get("realname") or "").strip() or self.nick or "opencode-bridge"
         )
         # allowed_chat_ids 已由基类 _init_access() 统一解析（T1.2）
+        self._warn_private_messages_unpairable()
         self._transport: Optional[_IrcTransport] = None
         self._throttle_lock = threading.Lock()
         self._last_send: dict[str, float] = {}
@@ -335,6 +346,31 @@ class IRCAdapter(Adapter):
         self._known_nicks: set[str] = {self.nick.lower()} if self.nick else set()
         # 测试注入点：TLS 包装（真 TLS 需要证书，测试里替换成 no-op）
         self._tls_wrap = self._default_tls_wrap
+
+    def _warn_private_messages_unpairable(self) -> None:
+        """启动时把"私聊不可用"这件事喊出来（且只在它真会咬人时喊）。
+
+        ⚠️ 条件是**新语义 + 空清单**两个都成立：老配置（无 ``config_version``）
+        仍然是"空 = 全开"，私聊照常能进，这时候喊是**假话**。反之清单非空时私聊
+        本来就靠 ``allowed_chat_ids`` 里的 nick 授权，用户并不缺入口。
+
+        为什么值得单独喊：私聊的 principal 是 **bot 自己的 nick**，所以**所有**私聊
+        共用同一个 principal —— 它压根不是"某个会话"，是"所有私聊"。而配对码绑定
+        conversation，绑在"所有私聊"这个值上等于没有绑定；加上 IRC 无认证
+        （:attr:`pairing_supported` = False），私聊在新语义下就**真的进不来了**。
+        **失败关闭 + 响亮，优于半通不通**：用户至少知道自己该往频道里发。
+        """
+        if self.allowed_chat_ids:
+            return
+        if empty_allowlist_is_open(self.config.get(CONFIG_VERSION_KEY, 0)):
+            return
+        logger.warning(
+            "irc: `config_version >= 2` 且 allowed_chat_ids 为空 ⇒ 本平台**当前进不来**"
+            "任何消息（空 = 全拒）。⚠️ **私聊不可用**：私聊的 principal 是 bot 自己的 nick"
+            "（%r），所有私聊共用它，配对又已对本平台禁用（IRC 无认证）⇒ "
+            "请把要授权的频道名或 nick 填进 allowed_chat_ids。",
+            self.nick or "<未设>",
+        )
 
     # ------------------------------------------------------------------
     # 配置
@@ -625,14 +661,19 @@ class IRCAdapter(Adapter):
         text = strip_control_codes(text)
         if not text:
             return
-        # 授权闸门在最前：未授权会话的消息不许进入上层（否则能用命令/审批字绕过）
-        if not self.admits(target):
+        # 授权闸门在最前：未授权会话的消息不许进入上层（否则能用命令/审批字绕过）。
+        # ⚠️ conversation_id 在闸门**之前**算好：配对分支也需要它，而它现在两个
+        # 分支都要用（原先只在放行分支里算）。
+        conversation_id = self._conversation_id(target)
+        if not self.admits(target) and not self.answer_pairing_request(
+            target, conversation_id, text
+        ):
             logger.info("irc: dropping message from non-whitelisted target %s", target)
             return
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(target),
+                    conversation_id=conversation_id,
                     text=text,
                     kind="text",
                     user_id=sender,

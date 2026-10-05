@@ -241,6 +241,9 @@ class DiscordAdapter(Adapter):
     label = "Discord"
     max_message_length = MESSAGE_LIMIT          # 消息内容上限 2000 字符
     supports_inbound = True                    # Gateway v10 入站（T2.2）
+    #: principal = channel id：(a) 会话唯一且稳定，(b) 用户能直接看到它，
+    #: (c) Discord 对发件人做过认证。三条都成立。
+    pairing_supported = True
     supports_inline_buttons = False            # components 未实现
     supports_media = False
     #: ``PATCH /channels/{id}/messages/{id}`` 真能改写已发消息，所以占位气泡发得。
@@ -906,14 +909,18 @@ class DiscordAdapter(Adapter):
         if not channel_id:
             self._drop_inbound("缺 channel_id", channel_id, author_id, is_bot)
             return False
-        # 6) 授权闸门必须在产生 Inbound **之前**（否则能用命令/审批字绕过）
-        if not self.admits(channel_id):
+        # 6) 授权闸门必须在产生 Inbound **之前**（否则能用命令/审批字绕过）。
+        #    ⚠️ /pair 在未授权时也要能进来，所以 conversation_id 提到闸门之前算。
+        conversation_id = self._conversation_id(channel_id)
+        if not self.admits(channel_id) and not self.answer_pairing_request(
+            channel_id, conversation_id, content
+        ):
             self._drop_inbound("未在白名单", channel_id, author_id, is_bot)
             return False
         try:
             self.hooks.on_inbound(
                 Inbound(
-                    conversation_id=self._conversation_id(channel_id),
+                    conversation_id=conversation_id,
                     text=content,
                     kind="text",
                     user_id=author_id or None,

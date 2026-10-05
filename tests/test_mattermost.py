@@ -588,11 +588,23 @@ class TestAccessGate(MattermostTestCase):
         adapter._handle_packet(FakeWS(), post_frame("未授权", channel_id="c_stranger"))
         self.assertEqual(len(hooks.inbounds), 1, "未授权频道必须在产生 Inbound 之前丢")
 
-    def test_empty_whitelist_admits_everything(self):
+    def test_empty_whitelist_admits_everything_without_config_version(self):
+        """无 ``config_version`` ⇒ 沿用旧的「空 = 全开」（本夹具不传该键）。"""
         adapter, hooks = make_adapter()
         self.assertEqual(adapter.allowed_chat_ids, set())
         adapter._handle_packet(FakeWS(), post_frame("任意频道", channel_id="c_any"))
         self.assertEqual(len(hooks.inbounds), 1)
+
+    def test_empty_whitelist_drops_everything_once_config_version_flips(self):
+        """``config_version >= 2`` ⇒ 空 = 全拒：不得产生 Inbound。
+
+        ⚠️ 这条同时守着**顺序不变量**：闸门仍在产生 Inbound **之前**，
+        所以全拒时连 Inbound 都不该被构造出来（而只是把它丢掉）。
+        """
+        adapter, hooks = make_adapter({"config_version": 2})
+        self.assertEqual(adapter.allowed_chat_ids, set())
+        adapter._handle_packet(FakeWS(), post_frame("任意频道", channel_id="c_any"))
+        self.assertEqual(len(hooks.inbounds), 0)
 
     def test_gate_runs_before_command_parsing(self):
         """未授权者的 /approve 之类命令字必须拿不到（沿用基类 admits，不自建白名单）。"""

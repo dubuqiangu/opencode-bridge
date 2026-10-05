@@ -20,6 +20,10 @@
 断点优先级（窗口内从后往前找，命中即切）：
     换行 ``\\n`` → 中文句末 ``。！？…；`` → 英文 ``". "`` / ``", "`` 之后 → 硬切。
 
+**分段编号默认关闭**：``prefix_fmt`` 的默认值是 :data:`NO_PREFIX_FMT`（空串），
+编号模板 :data:`SEGMENT_NUMBERING_FMT` 必须**显式传入**才启用。这个默认值不是随手
+挑的 —— 依据与逐条证据记在 :func:`split_text` 的 docstring 里。
+
 退化行为：
     * ``max_len <= 0`` → 不切分，返回 ``[text]``（空串返回 ``[]``）；
     * 前缀本身就吃掉 ``max_len`` → 放弃前缀，纯硬切；
@@ -33,13 +37,18 @@ from __future__ import annotations
 
 import unicodedata
 
-__all__ = ["split_text"]
+__all__ = ["NO_PREFIX_FMT", "SEGMENT_NUMBERING_FMT", "split_text"]
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-#: 默认分段前缀（``str.format`` 模板，支持 ``{i}`` / ``{n}`` 具名占位）。
-DEFAULT_PREFIX_FMT = "（{i}/{n}）"
+#: 默认分段前缀：**空串，即不加编号**。13 个生产调用点全都走这一条，所以不传
+#: ``prefix_fmt`` 的效果与它们逐字节一致。依据见 :func:`split_text` 的 docstring。
+NO_PREFIX_FMT = ""
+
+#: 可选的**分段编号**前缀（``str.format`` 模板，支持 ``{i}`` / ``{n}`` 具名占位）。
+#: 形如 ``（1/3）``。**默认不启用** —— 要用必须显式 ``prefix_fmt=SEGMENT_NUMBER_FMT``。
+SEGMENT_NUMBERING_FMT = "（{i}/{n}）"
 
 #: 前缀段数重算轮数上限（``T1.4`` 冻结需求：最多重算 3 轮）。
 _MAX_PREFIX_PASSES = 3
@@ -256,17 +265,34 @@ def _apply_prefix(
 # ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
-def split_text(text: str, max_len: int, *, prefix_fmt: str = DEFAULT_PREFIX_FMT) -> list[str]:
+def split_text(text: str, max_len: int, *, prefix_fmt: str = NO_PREFIX_FMT) -> list[str]:
     """把 ``text`` 切成每段码点数不超过 ``max_len`` 的序列。
 
     Args:
         text: 原始文本（按 Python ``str`` 码点处理）。
         max_len: 单段上限（码点数）。``<= 0`` 表示不切分。
-        prefix_fmt: 分段前缀模板，如 ``"（{i}/{n}）"`` 或 ``"[{i}/{n}]"``。
+        prefix_fmt: 分段编号前缀模板，如 ``"（{i}/{n}）"`` 或 ``"[{i}/{n}]"``。
+            **默认 :data:`NO_PREFIX_FMT`（空串，不加编号）**；要编号必须显式传。
 
     Returns:
         段列表。短文本原样返回单元素；``text`` 为空串返回 ``[]``；
         ``max_len <= 0`` 返回 ``[text]``。
+
+    ## 为什么默认是「不加编号」
+
+    分段编号对本仓库是**从未启用过的可选能力**。全部 13 个生产调用点都**显式**传
+    ``prefix_fmt=""``（``outbound.py:375``，以及 telegram / slack / discord / matrix /
+    mattermost 两处 / irc / twitch / ntfy / nextcloud / qqbot / homeassistant 各一处），
+    所以生产输出里从来没有出现过 ``（i/n）``。
+
+    这个默认值曾是非空的 ``"（{i}/{n}）"``，于是**漏传参数的新适配器会静默开启一件
+    所有现役平台都没开的事** —— 而漏传正是最容易犯的错（13 个调用点全都在传，本身就
+    说明没人依赖默认值）。改成空串之后，漏传的结果与生产行为**逐字节相同**，陷阱关闭。
+
+    ⚠️ 为什么不反过来给 13 个平台打开编号：编号是否默认开启，引入本模块时**被明确
+    推迟**了（``tasks.md`` T1.4 记着"是否默认开启留待后续决策"，2026-10-05 订正为
+    "从来没有人去做那个决策"）。改成默认开启等于**拿一个从没做过的决定**去改 13 个
+    平台的用户可见输出 —— 那是产品决定，不是重构（AGENTS.md §8）。
     """
     if not text:
         return []

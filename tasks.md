@@ -3484,6 +3484,34 @@ fix-124 中途报过一次空错误，重启后正在迭代、**已把自己的�
 
 ---
 
+## 📋 待办：拆 `tests/test_nick_in_allowlist.py`（746 行，方案已量好，**别让执行者发明边界**）
+
+`AGENTS.md` §5.0 实测：**746 物理行 / SLOC 495 / 文档 34%** ⇒ 不满足豁免（文档需 >45%）
+⇒ **超 400 须拆**。上一条 lane（`fix-142`）只做了债一（测试顺序依赖，已 `6465134` 落地），
+**债二没做就报空退出** ⇒ 方案在此备好。
+
+**该文件本身有天然边界：5 个类职责互不相关**，且顶部有共享的 AST 辅助与常量。
+
+| 拆出去的文件 | 内容 | 行数 |
+|---|---|---|
+| `tests/nick_trap_support.py`（**新建，不以 `test_` 开头**） | `ADAPTERS_DIR` · `README_PATH` · `_module_source` · `_read_text` · `_walk_without_nested_functions` · `_is_self_admits_call` · `_scan_admits_calls`（+ 审计要用的 `GATE_PRINCIPAL_BY_PLATFORM` · `SELF_IDENTITY_PRINCIPAL_PLATFORMS` · `SELF_IDENTITY_SYMBOLS`） | ~85 |
+| `test_gate_principal_audit.py` | `GatePrincipalAuditTests` —— **跨 13 平台 AST 重扫**，判据 1~4 | 167 |
+| `tests/test_nick_in_allowlist.py`（**保留此名**） | `NickInAllowlistTests` —— 拒构造 / 拒运行期赋值 / 拒大小写变体 | 160 |
+| `test_nick_checkpoint.py` | `NickCheckpointTests` —— `nick` 是 property 且绕不开 setter | 67 |
+| `test_private_rejection_wording.py` | `PrivateMessageRejectionWordingTests` —— 文案 + README 钉在一起 + **那个空格是承重的** | 109 |
+| `test_bridge_startup_refusal.py` | `BridgeStartupRefusalTests` —— **真起子进程**跑 `python -m opencode_bridge` + 对照组 | 83 |
+
+**依赖方向只有一个**：`nick_trap_support` ← 其余五个，**其余五个彼此无依赖**
+⇒ 可以并行读、不可并行写同一个 support 文件。
+
+⚠️ **`BridgeStartupRefusalTests` 尤其该独立**：它起真子进程、依赖 `opencode_url` 与
+`password` 齐备（否则 `main()` 也会返回 1 ⇒ **假证明**，它自带对照组正是为此），
+与其它块没有任何共享状态。混在一起只会让「跑哪几个用例」变成一个不确定的开关。
+
+**验收**：① 拆分是纯结构调整 —— 拆分前后**用例集合逐字相同**（名字/数量/断言内容），
+`Ran N tests` 两次一致；② 每个文件都过 §5.0；③ **删除既有断言 = 0**；
+④ `tests/test_platform_pairing.py` **一个字都不许动**（上一笔刚改过它一条夹具）。
+
 ## 🔴🔴 生产缺陷：脱敏规则会**吞掉 id 紧跟的中文尾注**（2026-10-05 实测）
 
 **严重度高于同批的测试顺序依赖**：那个只烦开发者，**这个伤生产日志的可观测性**。

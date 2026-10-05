@@ -187,8 +187,18 @@ class OutboundSender:
         冻结的是哪一段只有 ``shown_progress_text`` 知道（见
         :attr:`~opencode_bridge.event_stream.Turn.shown_progress_text`），所以改写
         失败时**只补发读者还没看到的那截**；整段重发会重复，按猜测的偏移补发会丢。
-        它不是 ``text`` 的前缀时（失败文案、空答复、占位消息压根没发出去）一律整段
-        发 —— 宁可多发也绝不丢。
+        算「哪截」的那一步在 :meth:`_spans_the_reader_has_not_seen` —— 它**不能**假设
+        冻结的那一截是 ``text`` 的前缀（乱序 delta 会让那一截落在中间的偏移上）。
+
+        **⚠️ 有界残留（已量过，无法在没有「删除」原语的前提下修掉）**：占位消息
+        一条 ``edit()`` 都没成功过时，它会永远停在 ``⏳ 处理中…`` 上 —— 读者因此
+        看到一个卡住的气泡**外加**一条真正的答复。七个不可改写的平台压根没有这条路
+        （:meth:`send_text` 的 ``kind == "progress"`` 闸门），所以这条只落在**声明了
+        ``supports_message_edit`` 却改不动**的平台上（部署关掉了能力 / 客户端不支持 /
+        网络）。清掉它需要平台提供**删除消息**的原语，本仓库没有这个能力声明，
+        也不打算凭空发明一个 —— 于是按 AGENTS.md §8「信息确实不可恢复且无解」记成
+        残留，而不是假装解决了。**答复本身仍然恰好一次到达**（下面那条
+        ``shown_progress_text`` 为空的路），丢的只是那个气泡。
 
         ``kind`` 是**收尾语义**，不是文案：成功走 ``"final"``，失败走 ``"error"``。
         ``adapters/a2a.py`` 靠 ``kind == "error"`` 把 A2A 任务判成
@@ -247,14 +257,9 @@ class OutboundSender:
                 )
             return
 
-        # 改不动：那条消息冻结在 shown_progress_text。只补发它还没显示的那截。
-        already_shown = (
-            shown_progress_text
-            if shown_progress_text and final.startswith(shown_progress_text)
-            else ""
-        )
-        remainder = final[len(already_shown):]
-        if not remainder:
+        # 改不动：那条消息冻结在 shown_progress_text。只补发它还没显示的那几段。
+        unseen_spans = self._spans_the_reader_has_not_seen(final, shown_progress_text)
+        if not unseen_spans:
             # 冻结的那一截**已经就是整条答复**（流式那一路最后写成功的就是全文，
             # 收尾这次改写恰好失败）。读者手上已经是完整答复 —— 什么都不用补，
             # 再发一遍才是重复。
@@ -264,15 +269,83 @@ class OutboundSender:
                 adapter.name,
             )
             return
+        already_shown = len(final) - sum(len(span) for span in unseen_spans)
         logger.warning(
             "%s: could not complete the progress message (%d of %d chars are "
             "showing); sending the remaining %d chars as new messages",
-            adapter.name, len(already_shown), len(final), len(remainder),
+            adapter.name, already_shown, len(final), len(final) - already_shown,
         )
-        self.send_text(
-            conversation_id, remainder, kind=kind, adapter=adapter,
-            session_id=session_id,
-        )
+        for span in unseen_spans:
+            self.send_text(
+                conversation_id, span, kind=kind, adapter=adapter,
+                session_id=session_id,
+            )
+
+    @staticmethod
+    def _spans_the_reader_has_not_seen(
+        final: str, shown_progress_text: str,
+    ) -> list[str]:
+        """读者**还没读到**的那几段 ``final`` —— 按原文顺序，不含空段。
+
+        收尾改写失败时那条消息被**冻结**在 ``shown_progress_text``，所以要补发的是
+        「``final`` 减去它已经占住的那一段」，而**不是**一条后缀。
+
+        ## 为什么不能假设冻结的那一截是前缀
+
+        :meth:`~opencode_bridge.event_stream.Turn.assemble` 是**按 ordinal 排序**拼
+        起来的，而 delta **可能乱序到达**：ordinal 1 先到时正文已经显示成第 2 段，
+        随后 ordinal 0 才补上第一段。于是最后一次成功写入的内容可能是
+        ``final[300:400]`` 那样的一段 —— **落在中间的偏移上，不是前缀**。此前这里
+        只认前缀，于是那一路**整段重发**：读者先把第 4 段读了一遍，再从第 1 段重读
+        全文 —— 同一段话出现两次（实测 400 字的答复被读成 500 字）。
+
+        ## 三种可能，只在能判定时才判
+
+        * **前缀**（正常情形：delta 按序到达，或各 ``assistantMessageID`` 依次追加）
+          ⇒ 补发它后面那一段。读者连着读下来**逐字节等于原文**。
+        * **在 ``final`` 里恰好出现一次** ⇒ 读者读过的是
+          ``final[offset:offset+len(shown)]``，没读过的是它**前后两段**。两段分别发，
+          于是**每个字符恰好到达一次**，既没重复也没丢。
+        * **出现多次或压根不出现** ⇒ 偏移**不可判定**，于是**整段发**。宁可多发也
+          绝不丢，也绝不猜一个偏移（AGENTS.md §8：猜错必然在某些输入上错）。
+
+        ``shown_progress_text`` 为空（占位消息压根没发出去、或一次写入都没成功过）
+        落到第一种：读者什么也没读过，整段都是欠账。
+
+        ## ⚠️ 有界残留：第二种情形下**顺序**恢复不了
+
+        冻结的那一段已经被读者**按它自己的样子**读过了（它是流式进度的一部分），
+        而它落在 ``final`` 的**中间或末尾**偏移上 —— 所以「冻结的那段 + 后面补发的
+        两段」拼起来是原文的一个**轮转**。**每字恰好一次**成立，
+        **按序等于原文**不成立。
+
+        **恢复不了，也没有别的选法**：那条消息改不动（否则这里根本走不到）、平台
+        没有「删除 / 撤回」这个原语（见 :meth:`finalize` 里那段有界残留），于是已经
+        印出去的那一段既挪不动也抹不掉。
+
+        ⚠️ 另一种选法是**整段重发**（也就是修好之前的行为）：最后那条消息会是完整
+        的原文，代价是那一段被读两遍。两者都兑现不了同一份契约，本方法选
+        **「不重复」** —— 重复正是本方法存在的理由，而顺序在这里**不可判定**。
+
+        ⚠️ 曾经想在上游堵：让流式闸门只发布**追加式**的正文（不是当前显示内容的
+        延伸就拒绝写）。**已否决**，它会让情况更糟 —— 正文在闸门那里就**追不上**了：
+        乱序投递 ``(1,) (0,) (2,)`` 而节流放行了前两帧时，闸门会一直停在 ``"b"`` 上，
+        而放行第二帧时它本来能追上 ``"abc"``（那是个正经前缀，收尾只需补 ``"d"``）。
+        换句话说：闸门的职责是"把正文发出去"，不是"自己判断顺序对不对"。
+        """
+        if not shown_progress_text:
+            return [final]
+        if final.startswith(shown_progress_text):
+            unseen = final[len(shown_progress_text):]
+            return [unseen] if unseen else []
+        if final.count(shown_progress_text) == 1:
+            offset = final.index(shown_progress_text)
+            return [
+                span for span in (
+                    final[:offset], final[offset + len(shown_progress_text):],
+                ) if span
+            ]
+        return [final]
 
     def _split_for_the_placeholder(
         self, final: str, budget: int, shown_progress_text: str,

@@ -697,10 +697,16 @@ class EventStream:
             f"任务失败 [{error_type}]: {error_message}",
             session_id,
             kind="error",
-            # ⚠️ 失败文案与本轮正文**毫无关系**，所以它几乎永远不是
-            # ``shown_progress_text`` 的延伸。``finalize`` 会自己校验这一点，
-            # 校验不过就整段发出去 —— 绝不拿正文的前缀去给一条报错算偏移。
-            shown_progress_text=turn.shown_progress_text if turn else "",
+            # ⚠️ 失败文案与本轮正文**毫无关系**，所以占位消息当前显示的那一截**不是**
+            # 这段文字的一段。传下来等于告诉 ``finalize``「读者已经读过这段文字里的
+            # 某个片段」—— 一句不成立的话；它按这句话算出的补发内容会从报错里**挖掉**
+            # 一块（读者读到的是一句中间少了一截的报错）。
+            #
+            # 这里是**唯一**知道这件事的地方（失败文案由本方法生成），所以就在这里
+            # 说清楚：``""`` = 我们不知道那条消息显示着什么，也确实没有任何一段是
+            # 这段文字的一部分。``finalize`` 因此整段发 —— 见 ``outbound.py`` 里
+            # ``_spans_the_reader_has_not_seen`` 的第一种情形。
+            shown_progress_text="",
         )
         # a failed execution leaves the session idle -> release queued messages
         self._flush_queue(conversation_id)

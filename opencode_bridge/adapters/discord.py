@@ -1026,6 +1026,36 @@ class DiscordAdapter(Adapter):
         return handle
 
     def edit(self, handle: MsgHandle, out: Outbound) -> bool:
+        """``PATCH /channels/{id}/messages/{id}`` —— 真的原地改写。
+
+        ⚠️ **超限就地拒收，抛** ``ValueError`` —— 与
+        :meth:`TelegramAdapter.edit` **同一件事、同一句话术**（只差平台名）：
+        ``outbound.py`` 的两条改写路
+        （:meth:`~opencode_bridge.outbound.OutboundSender.edit_progress` 与
+        ``finalize``）都把 ``ValueError`` 认成「**本地**判定的正文超限」并各自
+        兜底（进度那条宁可不改；收尾那条补发读者没读到的那几段）。基类
+        ``edit`` 的契约是「失败 -> 记日志、返回 ``False``」，而同一件事在两个平台上
+        表达得不一样本身就是缺陷：调用方只能靠**猜**哪条路是哪条。
+
+        **为什么不能靠平台回 400**：它确实会回 400，但那时请求已经发出去了 ——
+        一次注定失败的往返，外加 :meth:`_throttle` 的那一次等待，而且调用方拿到的
+        只是一个 ``False``，与"网络失败""权限不足"完全分不开。
+
+        **什么时候会走到**：流式闸门与收尾都按
+        :func:`~opencode_bridge.outbound.one_message_budget` 判，正常路径下**不该**
+        超限（不变式由 ``tests/test_event_stream.py`` 与
+        ``tests/test_progress_placeholder.py`` 钉着）。这一道是**纵深防御**：闸门与收尾
+        读的是两次 ``adapter_for``，而 Mattermost / Nextcloud 的
+        :attr:`~opencode_bridge.adapters.base.Adapter.message_limit` 会被服务端的
+        ``MaxPostSize`` 之类**启动后细化** —— 若细化发生在一次写入与一次收尾之间，
+        预算会当场变小，而 ``finalize`` 那个 ``max(len(head), len(shown))`` 下界会把
+        已显示的长度原样放回去。于是本地这道闸就是那唯一一处能在**请求发出之前**说
+        「装不下」的地方。
+        """
+        if len(out.text) > self.effective_max_length:
+            raise ValueError(
+                f"discord edit text too long: {len(out.text)} > {self.effective_max_length}"
+            )
         channel = self._channel_id(handle.conversation_id)
         if not channel or not handle.message_id:
             logger.warning("discord: bad handle %r", handle)

@@ -1117,9 +1117,13 @@ class FinalizeTests(EventStreamTestCase):
         self.assertEqual(text, "任务失败 [ProviderError]: boom")
         self.assertEqual(session_id, SESSION_ID)
         self.assertEqual(kind, "error")
-        # 占位消息当前显示的那一截也要传下去：失败文案与正文毫无关系，
-        # ``finalize`` 会自己校验它不是前缀从而整段重发（见 outbound 的说明）。
-        self.assertEqual(shown, "half an answer")
+        # ⚠️ **这条断言改过**（原来钉的是 ``"half an answer"``）：失败文案与本轮正文
+        # 毫无关系，所以占位消息当前显示的那一截**不是**这段文字的一段 —— 把它当作
+        # "读者已经读过这段文字里的某个片段"传下去，是一句不成立的话，而
+        # ``finalize`` 会按这句话从报错里**挖掉**一块（读者读到的是一句中间少了
+        # 一截的报错）。这里是唯一知道这件事的地方（失败文案由本方法生成），
+        # 所以 ``""`` 就是那句"我们不知道，也确实没有任何一段属于这段文字"。
+        self.assertEqual(shown, "")
         # 关键：没有第二条消息被发出去
         self.assertEqual(len(self.send_text.outgoing), 1)
         self.assertEqual(self.send_text.outgoing[0].kind, "progress")

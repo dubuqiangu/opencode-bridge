@@ -311,6 +311,7 @@ def _slack() -> PlatformUnderTest:
 
 def _discord() -> PlatformUnderTest:
     from opencode_bridge.adapters.discord import DiscordAdapter
+    from opencode_bridge.adapters.discord import MESSAGE_LIMIT as DISCORD_LIMIT
 
     under_test = PlatformUnderTest(
         "discord", DiscordAdapter({"bot_token": "d"}, _InertHooks()), "discord:123",
@@ -319,7 +320,15 @@ def _discord() -> PlatformUnderTest:
 
     def fake_request(method, path, payload, *, timeout=None):
         counter["n"] += 1
-        under_test.wire.append(payload["content"])
+        content = payload["content"]
+        under_test.wire.append(content)
+        # ⚠️ **超限必须真的被拒**。这个替身曾经对**任何长度**的 PATCH 都回 200，于是
+        # 「收尾那次改写失败」这条路径**从来没被走到过** —— 本仓库关于"改不动"的
+        # 断言全都靠 :func:`_instrument_adapter_boundary` 的 ``fail_edits_from`` 人工
+        # 制造失败，而不是靠平台真的拒收。Discord 对超限的 message content 回
+        # HTTP 400 + code 50035（``Invalid Form Body``），这里照抄。
+        if len(content) > DISCORD_LIMIT:
+            return 400, {"code": 50035, "message": "Invalid Form Body"}
         return 200, {"id": "100%d" % counter["n"], "channel_id": "123"}
 
     under_test.adapter._request = fake_request
@@ -701,6 +710,9 @@ def uncontinued_fragments(
 def run_one_turn(
     under_test: PlatformUnderTest, answer: str, *, stream_progress: bool = True,
     chunk_size: int | None = None,
+    delivered_deltas: list[tuple[int, str]] | None = None,
+    edit_interval_seconds: float | None = None,
+    between_deltas_and_finalize: Callable[[BridgeCore], None] | None = None,
 ) -> None:
     """在**真桥**上跑完整的一轮：入站 → prompt → 流式 delta → 收尾。
 
@@ -715,12 +727,25 @@ def run_one_turn(
     用来钉住 :meth:`Turn.assemble` 会按 ordinal 排序。给了 ``chunk_size`` 就按顺序
     一小片一小片投递 —— 更贴近真实模型输出，也让**每一种长度**下占位消息都真的被
     流式写过（否则超长答复一次流式改写都不会发生，"改不动"那条路就无从复现）。
+
+    ``delivered_deltas`` 直接给出 ``(ordinal, delta)`` 的**投递计划**，绕过上面两种
+    切分：只有"乱序到什么程度"本身是被测对象时才需要它（见
+    ``tests/test_placeholder_edit_failures.py``）。``edit_interval_seconds`` 同理是
+    为了把"只有第一帧发得出去"那种节流形态复现出来 —— 生产的默认窗口是 1.5 秒，
+    一次乱序就足以让闸门只发布一帧。
+
+    ``between_deltas_and_finalize`` 在**流式写完、收尾开始之前**那一个时刻拿到
+    ``BridgeCore``：只有"两拍之间平台把上限改小了"这种形状没法从外面造出来
+    （Mattermost / Nextcloud 启动后拿服务端 ``MaxPostSize`` 细化就是它）。
     """
     os.makedirs(_REPOSITORY_TEMP, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=_REPOSITORY_TEMP) as tempdir:
         config = Config()
         config.bridge = {
-            "edit_interval_seconds": 0 if stream_progress else 10 ** 9,
+            "edit_interval_seconds": (
+                (0 if stream_progress else 10 ** 9) if edit_interval_seconds is None
+                else edit_interval_seconds
+            ),
             "max_message_chars": BRIDGE_MAX_MESSAGE_CHARS,
         }
         core = BridgeCore(
@@ -738,7 +763,9 @@ def run_one_turn(
             session_id = core.client.created_ids[0]
             stream = core.event_stream
             stream.dispatch(event("session.execution.started", sessionID=session_id))
-            if chunk_size is None:
+            if delivered_deltas is not None:
+                halves = list(delivered_deltas)
+            elif chunk_size is None:
                 # 两半、故意先投后半：证明收尾时拼回的是按 ordinal 排的原文。
                 halves = [
                     (1, answer[len(answer) // 2:]),
@@ -754,6 +781,8 @@ def run_one_turn(
                     "session.text.delta", sessionID=session_id,
                     assistantMessageID="msg_a", ordinal=ordinal, delta=delta,
                 ))
+            if between_deltas_and_finalize is not None:
+                between_deltas_and_finalize(core)
             stream.dispatch(event(
                 "session.execution.succeeded", sessionID=session_id,
             ))

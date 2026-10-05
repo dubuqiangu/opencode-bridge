@@ -537,7 +537,21 @@ class TelegramAdapter(Adapter):
             if isinstance(from_user, dict):
                 chat_id = from_user.get("id")
         if chat_id is None:
-            logger.warning("telegram: callback without chat context: %r", cq)
+            # 只记**载荷的形状**，绝不记**载荷的内容**。
+            # `keys=` 是排序后的顶层键名 —— 排障真正要的就是"有没有 message／
+            # 有没有 from"，它不含任何用户数据；`from=` 取不到时由 redactable_id
+            # 自己落到 MISSING_ID（见 _redactable_ids 的行为 1）。
+            # ⛔ 绝不记 data 的值、from.username、first_name/last_name、
+            # message.text 或 message 里任何 chat 字段：那是 PII **加上**
+            # 用户自己那段正文，而这一行的用途只是解释"为什么没找到 chat"。
+            from_user = cq.get("from")
+            logger.warning(
+                "telegram: callback without chat context: from=%s keys=%s",
+                redactable_id(
+                    self.name, from_user.get("id") if isinstance(from_user, dict) else None
+                ),
+                tuple(sorted(cq)) if isinstance(cq, dict) else (),
+            )
             return
         conversation_id = self._conversation_id(chat_id)
         if not self._allowed(chat_id) and not self.answer_pairing_request(

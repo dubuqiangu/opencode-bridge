@@ -689,7 +689,8 @@ class NextcloudAdapter(Adapter):
         if full:
             # 全量刷新才对账：把已经消失（被删 / 被移出）的会话踢掉。
             for token in [t for t in self.rooms if t not in seen]:
-                logger.info("nextcloud: 会话 %s 已消失（被删或我被移出），停止轮询", token)
+                logger.info("nextcloud: 会话 %s 已消失（被删或我被移出），停止轮询",
+                            redactable_id(self.name, token))
                 del self.rooms[token]
         with self._poll_lock:
             # 轮转顺序保持稳定（按 token 排序），新增的追加到末尾。
@@ -713,13 +714,13 @@ class NextcloudAdapter(Adapter):
         if resp.status < 200 or resp.status >= 300:
             logger.info(
                 "nextcloud: 会话 %s 游标 bootstrap 失败 (HTTP %s)，游标保持 0",
-                token, resp.status,
+                redactable_id(self.name, token), resp.status,
             )
             return 0
         cursor = _header_int(resp.headers, "x-chat-last-given")
         if cursor <= 0:
             logger.info("nextcloud: 会话 %s 的 X-Chat-Last-Given 缺失或非法，游标保持 0",
-                        token)
+                        redactable_id(self.name, token))
         return max(0, cursor)
 
     def _next_room(self) -> Optional[str]:
@@ -742,7 +743,8 @@ class NextcloudAdapter(Adapter):
             try:
                 self._poll_once(token)
             except Exception:  # noqa: BLE001
-                logger.exception("nextcloud: 轮询会话 %s 失败", token)
+                logger.exception("nextcloud: 轮询会话 %s 失败",
+                                 redactable_id(self.name, token))
 
     # ------------------------------------------------------------------
     # 长轮询
@@ -780,12 +782,13 @@ class NextcloudAdapter(Adapter):
         if resp.status < 200 or resp.status >= 300:
             logger.warning(
                 "nextcloud: 长轮询 %s 失败 (HTTP %s): %s",
-                token, resp.status, _error_detail(resp.data),
+                redactable_id(self.name, token), resp.status, _error_detail(resp.data),
             )
             return
         code, data = _ocs_data(resp.data)
         if code and code >= 400:
-            logger.warning("nextcloud: 长轮询 %s 的 ocs 状态码 %s", token, code)
+            logger.warning("nextcloud: 长轮询 %s 的 ocs 状态码 %s",
+                           redactable_id(self.name, token), code)
             return
 
         # ---- 先推进游标，再逐条处理 --------------------------------------
@@ -797,7 +800,7 @@ class NextcloudAdapter(Adapter):
         elif data:
             logger.info(
                 "nextcloud: 会话 %s 的 200 响应缺 X-Chat-Last-Given，游标保持 %d"
-                "（可能重复投递）", token, room.cursor,
+                "（可能重复投递）", redactable_id(self.name, token), room.cursor,
             )
         for message in (data or []):
             if self._stop_event.is_set():
@@ -807,7 +810,8 @@ class NextcloudAdapter(Adapter):
             try:
                 self._handle_message(token, message)
             except Exception:  # noqa: BLE001 - 单条异常不许拖垮整轮
-                logger.exception("nextcloud: 处理会话 %s 的消息失败", token)
+                logger.exception("nextcloud: 处理会话 %s 的消息失败",
+                                 redactable_id(self.name, token))
 
     # ------------------------------------------------------------------
     # 消息过滤
@@ -1017,7 +1021,8 @@ class NextcloudAdapter(Adapter):
             )
             return None
         if not self._can_send_to(token):
-            logger.warning("nextcloud: 会话 %s 只读 / 无发言权限，不发", token)
+            logger.warning("nextcloud: 会话 %s 只读 / 无发言权限，不发",
+                           redactable_id(self.name, token))
             self._note_send_failure(SendError.FORBIDDEN, "room is read-only / no PERM_CHAT")
             return None
         chunks = split_text(out.text, self.effective_max_length, prefix_fmt="")

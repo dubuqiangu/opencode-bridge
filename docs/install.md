@@ -142,7 +142,9 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 > ⚠️ **`allowed_chat_ids` 是安全边界**：留空 = 任何人都能驱动你的 agent（任意能给 bot 发消息的人可以以用户权限执行操作）。务必填入用户自己的纯数字 chat id。
 >
-> 这不是"配错了才出事"：安装脚本从 `config.example.json` 生成的 `config.json` 里，`allowed_chat_ids` **就是空数组**，只填 `bot_token` 就重启的话，你得到的是一个**完全开放**的桥接。三个平台（Telegram / Slack / Discord）都是如此。
+> 这不是"配错了才出事"：安装脚本从 `config.example.json` 生成的 `config.json` 里，`allowed_chat_ids` **就是空数组**，而且 **`config_version` 是 `0`（< 2）** ⇒ 现在仍是「空 = 全部放行」。只填 `bot_token` 就重启的话，你得到的是一个**完全开放**的桥接。三个平台（Telegram / Slack / Discord）都是如此。
+>
+> ⚠️ **下一版起这里会变成「空 = 谁都不放行」**（由 `config_version` 兜底：`< 2` = 旧语义，`>= 2` = 新语义；启动时会有醒目预告）。届时**不必手改配置文件**：填顶层键 `pairing_secret` → 重启 → 在 bot 里发 `/pair` 拿码 → 本机 `python -m opencode_bridge --pair <码> --conversation platform:local_id` → **再重启一次**。三条边界见 README「7. 安全须知」，其中一条必须先知道：**irc / twitch 的私聊在翻转后对所有人都不可用**（这两个平台也不提供 `/pair`）。
 
 #### Slack（支持双向对话 · Socket Mode，无需公网地址）
 
@@ -261,6 +263,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 4. 在频道里 **`@你的昵称` / `昵称:`** 发一句话，或直接私聊该昵称
 
 > - **只响应提及或私聊**。**`channels` 是入站前提**，留空则只能主动发。
+> - ⚠️ **翻转成「空 = 全拒」（`config_version >= 2`）后，IRC 的私聊对所有人不可用** —— 私聊时闸门比对的 principal 是 **bot 自己的 nick**，IRC 根本没有发件人认证 ⇒ 闸门无法区分。**频道里照常工作**（`#channel` 是真会话标识）。⛔ **IRC 不提供 `/pair` 配对**，白名单只能手填。
 > - **IRC 无编辑消息**，长任务进度会退化成连续发多条消息。
 > - **正文换行折成空格**（单行协议约束，原样发会被注入命令）。整行上限 512 字节。
 > - 昵称冲突（`433`）会自动换名重试；`bot_password` 填密码即启用 SASL PLAIN。
@@ -282,6 +285,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > - `channel` 填**小写频道名、不带 `#`**。**只响应提及**。命令前缀是 `!`。
 > - **Twitch 无编辑消息**，长任务进度会退化成连续发多条消息。
 > - 400 字符上限与限流阈值是**社区经验值**，非官方公开常量。
+> - ⚠️ **翻转成「空 = 全拒」（`config_version >= 2`）后，Twitch 的私聊对所有人不可用**（原因同 IRC）。**频道里照常工作。** ⛔ **Twitch 不提供 `/pair` 配对**。
 
 #### Nextcloud Talk（支持双向对话 · HTTP 长轮询，无需公网地址）
 
@@ -304,7 +308,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > - **只走 `ocs/v2.php`** —— `ocs/v1.php` 的 HTTP 状态码**恒为 200**，失败看不出来。
 > - **`304` 不是错误** —— 长轮询"无新消息"时服务端返回 304，而 `urllib` 把它**抛成 `HTTPError`**。
 >
-> 其它：`allowed_chat_ids` 填**会话 token**；消息上限 **32000 字符是源码硬编码常量、不可配置**（超限 413）；**支持编辑消息**但**超 24 小时不能改**；`poll_timeout` **上限就是 30**（源码 clamp）；`@提及` 不做渲染（模板串原样透传）。
+> 其它：`allowed_chat_ids` 填**会话 token**；⛔ **nextcloud 不支持 `/pair` 配对** —— 这里的 principal 就是那个 OCS token，用户既不知道也不该知道它，所以**只能手填**，不能靠配对自助授权；消息上限 **32000 字符是源码硬编码常量、不可配置**（超限 413）；**支持编辑消息**但**超 24 小时不能改**；`poll_timeout` **上限就是 30**（源码 clamp）；`@提及` 不做渲染（模板串原样透传）。
 
 #### ntfy（支持双向对话 · HTTP 拉取，无需公网地址）
 

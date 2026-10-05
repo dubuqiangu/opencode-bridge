@@ -230,14 +230,24 @@ export function ensureMaterialized(stable: string, pkgRoot: string): Materialize
         fs.copyFileSync(src, dstCfg)
         res.wroteConfig = true
         emit(null, "log", `自举：已生成 config.json（需填写 bot_token）→ ${dstCfg}`)
-        // 模板里各平台的 allowed_chat_ids 都是空数组，而空 = 全部放行。不说这一句，
-        // 就等于默默递了一份「谁都能驱动 agent」的配置 —— 与 a2a.py 拒绝静默开洞同一取舍：
-        // 宁可让用户当场看见这句提醒，也不要事后才发现。**只陈述事实与出路，不改默认**
-        // （默认收紧是产品决定，自举不该替用户做），也不新增配置键。
+        // 模板里各平台的 allowed_chat_ids 都是空数组（example 里的 config_version
+        // 是 0，不是 2）⇒ 现在仍然是旧语义「空 = 全部放行」。不说这一句，就等于默默
+        // 递了一份「谁都能驱动 agent」的配置 —— 与 a2a.py 拒绝静默开洞同一取舍：宁可让
+        // 用户当场看见这句提醒，也不要事后才发现。**只陈述事实与出路，不改默认**
+        // （默认收紧是产品决定，自举不该替用户做），也不替用户生成 pairing_secret。
+        //
+        // 两件事都必须点破：① 现在就是开放的；② 下一版起改为「空 = 谁都不放行」，
+        // 且届时**不必手改本文件**（/pair + --pair）。只说「留空 = 全部放行」不够 ——
+        // 那样用户不知道自己接下来该做什么。
         warn(
-          `自举生成的 config.json 里 allowed_chat_ids 是空数组 = 不限制发件人：` +
-            `任何能私聊/@ 到 bot 的人都能以你的权限驱动 agent。` +
-            `请在 ${dstCfg} 里填上自己的 chat id；不确定填什么就先跑 ` +
+          `自举生成的 ${dstCfg} 里 allowed_chat_ids 是空数组、config_version 也不是 2：` +
+            `现在仍是「空 = 全部放行」= 不限制发件人 —— 任何能私聊/@ 到 bot 的人都能以你的权限` +
+            `驱动 agent（读文件 / 改代码 / 执行命令）。` +
+            `⚠️ 下一版起此处改为「空 = 谁都不放行」，届时不必手改本文件：` +
+            `生成随机串填进顶层键 pairing_secret（留空 = 不提供配对）→ 在 bot 里发 /pair 拿码 → ` +
+            `在本机执行 python -m opencode_bridge --pair <码> --conversation platform:local_id （会顺手写上 config_version: 2）→ ` +
+            `重启桥（改配置没有热重载）。` +
+            `现在就手填也行：请在 ${dstCfg} 里填上自己的 chat id；不确定填什么就先跑 ` +
             `"python -m opencode_bridge --setup <平台>" 看分步引导。`,
         )
       }

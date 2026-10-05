@@ -170,7 +170,7 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 | 能力表达 | 常量标志位 + 方法查询 + 模板方法 + feature-detect | 可选方法 duck typing | **显式能力枚举**：`adapters/base.py:107-129` 的 4 个 flag（`supports_inbound` / `supports_inline_buttons` / `supports_media` / `supports_message_edit`）+ `Base.answer` 空 stub（`:319`）。**「try/except 降级」是 3 平台时代的做法**，现已换成 Hermes 式的显式枚举 |
 | 会话身份 | `SessionSource` 20+ 字段 + 唯一真源 | `${channelId}:${chatId}` | `identity.py` 统一 **`platform:local_id`**；歧义前缀（`channel:` 被 slack/discord/mattermost 三家共用）**拒绝猜测**，抛 `AmbiguousConversationId`。**「裸 `conversation_id: str`」已不成立** |
 | 多端共享会话 | 支持（profile route） | 支持（`bySession` 反向索引，跨渠道互见） | 无（全仓无反向索引）—— **仍为真** |
-| 授权 | 三段闸门 + PairingStore + allowlist 并集 | 一层白名单（默认全开）+ UI 一键批准 | `adapters/base.py:278` 的 `admits()` + **13 处调用点**（每适配器一处）。⚠️ 白名单为空 = 全开，**仍是 opt-out**（Part 9 A3 未做）。**「仅 telegram 白名单」已不成立** |
+| 授权 | 三段闸门 + PairingStore + allowlist 并集 | 一层白名单（默认全开）+ UI 一键批准 | `adapters/base.py:278` 的 `admits()` + **13 处调用点**（每适配器一处）+ 极简配对码（`/pair` + `--pair`，无 TTL/限流/锁定）。⚠️ 白名单为空的语义现由顶层 `config_version` 决定：**`< 2`（含没有该键）= 旧语义「全放行」+ 启动预告，`>= 2` = 新语义「全拒」** ⇒ **不是一步翻转**（Part 9 A3）。**「仅 telegram 白名单」已不成立** |
 | 出站错误 | `SendResult` + 7 类 `error_kind` | `send` 返回 void，失败全吞 | **7 类 `SendError`（`hooks.py:74`）+ `SendResult`（`hooks.py:91`，含 `partial` / `retry_after` / `error_detail`）**。**「无分类」已不成立** |
 | 富交互 | 原生按钮 + 回调 id 硬约定 | 纯文本编号 + 关键词 | 实测 **inline 按钮 1/13**：只有 telegram 声明 `supports_inline_buttons = True`（`adapters/telegram.py:125`），其余 12 家显式 `False`。**「纯文字提示」低估、「覆盖三平台」高估，两个都不对** |
 | 主动发送 | cron/CLI/MCP（**明确非模型工具**） | `im_send_file` / `im_cron_*`（做成工具） | 无（唯一注册的工具是只读的 `bridge_setup`）—— **仍为真** |
@@ -233,7 +233,7 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 | 项 | 原因 |
 |---|---|
 | `toTelegramHtml` 死码 + `parse_mode:'HTML'` 组合 | dsh 现存隐性 bug（HTML 实体） |
-| 默认 `allowAllUsers: true` / 空 `allowed_chat_ids` 即全开 | Hermes 要求显式 opt-in 才开放；我们目前是 **opt-out**，见下节 P0 |
+| 默认 `allowAllUsers: true` / 空 `allowed_chat_ids` 即全开 | Hermes 要求显式 opt-in 才开放；我们**已改**为「空 = 全拒」，但用 `config_version` 兜底分两步走（见下节 P0 / A3） |
 | 实例锁 `instance-lock.ts` | 我们是插件进程，无共享 home 概念。仅"pid+token 双匹配释放"可作通用防误删模式 |
 | `cronMaxConcurrent` 死配置 / merge 快照半成品 | 反面教材：声明了不接，等于活文档误导 |
 | Hermes 的配对码（PairingStore） | 一整套限流/TTL/锁定状态机；等真要在群里开放给陌生人再上 |
@@ -250,7 +250,7 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 |---|---|---|---|
 | **P0** | 授权层下沉到 `base.py`，三平台共用闸门 | Hermes 三段闸门 + dsh 都有白名单层，我们只有 telegram 一家。**且 dsh 证明了"审批在白名单之前"的危险** | ✅ 已落地并扩到 **13 平台**：`adapters/base.py:278` 的 `admits()` + 13 处调用点；dsh 那条教训写进了 docstring（`:283-285`） |
 | **P0** | 脱敏（`redact.py` + 不可复用哨兵） | 两家都有，我们 0。且我们的 `/status` 会把 session_id 回显到 IM | ✅ 已落地 `redaction.py`，但**形态与初稿设想不同**：**2 个**卡口（不是 4 个），且**没有做 Hermes 那种"不可复用哨兵"**——凭据改成**只遮蔽不摘要**的 `[REDACTED:<类别>]`，靠不可逆达成同等目的（理由见 `redaction.py:40-51`） |
-| **P0** | **默认开放改为显式 opt-in** | 我们 `allowed_chat_ids: []` = 全部允许，与 dsh 的 `allowAllUsers: true` 同为 opt-out；Hermes 是"没配 allowlist → pair/ignore，且 `_ALLOW_ALL_USERS` 要显式开" | ⏳ **仍未做**（`admits()` 里白名单为空仍直接放行）。这是本表**唯一还完整成立的 P0** |
+| **P0** | **默认开放改为显式 opt-in** | 我们 `allowed_chat_ids: []` = 全部允许，与 dsh 的 `allowAllUsers: true` 同为 opt-out；Hermes 是"没配 allowlist → pair/ignore，且 `_ALLOW_ALL_USERS` 要显式开" | ✅ **已做，但用 `config_version` 兜底分两步走**（不是一步翻）：新增顶层 `config_version` —— **`< 2`**（含没有该键；`config.example.json` 给的是 `0`）= 沿用旧语义「空 = 全放行」+ 启动时醒目预告；**`>= 2`** = 新语义「空 = 谁都不放行」。`--pair` 成功时顺手写上 `2`。详见 Part 9 的 **A3** |
 | **P1** | 分片算法（码点 + 断点 + 两遍法） | 直接可抄，成本极低 | ✅ 已落地 `split.py` |
 | **P1** | 权限/提问应答的去重与超时 | dsh 的 30s 窗 + 显式回复门，比我们现有实现更完整 | ⚠️ **"超时"是幻影**：本仓库从来没有审批超时，那是账本里一条被推翻的设想。真实落地的是 `permission_ledger.py` 的 `PermissionLedger`——**拒绝第二次回答**，无超时。**30s 是 dsh 的数字** |
 | **P2** | `SessionSource` 化身份模型 | **破坏性**（会话映射变了 = IM 会话失忆），需迁移。三方都做了，维度上 dsh 最弱、Hermes 最强 | ✅ 取了下面「关键路径与风险」里那条 **80% 方案**（`platform:` 前缀），`identity.py` 已落地；完整 `SessionSource` 仍未做 |
@@ -344,8 +344,8 @@ ctx 的完整形状在 `packages/plugin/src/promise/plugin.ts:26-54`（`Context`
 |---|---|---|---|---|
 | A1 | **脱敏引擎**：token/手机号/ID 模式 + 赋值形态 + 卡口 + 误伤门 | Hermes | **M**（3~5d） | ✅ **已落地 `redaction.py`**。⚠️ **初稿的两处细节已被推翻**：① 「**4 个** chokepoint」——实际是 **2 个**（挂在 logging **handler** 上的 `RedactingFilter`，与挂在 `StateStore` JSON 序列化边界上的 `redact_state_values`，理由见 `redaction.py:11-26`）；② 「**不可复用哨兵**」——那是 Hermes 的做法，我们**没做**，改用**不可逆整段遮蔽** `[REDACTED:<类别>]`（凭据**只遮蔽不摘要**，因为低熵口令的摘要等于离线验证器，理由 `redaction.py:40-51`）。**「确定性 key-hash 方案连带复用哨兵」这条路已被否决，不要当成可用选项**。「误伤门」✅ 保留（`redaction.py:99-102`，命中后再过一次确认门） |
 | A2 | **授权层统一 + 三段闸门**：入站先过"渠道忽略"，再过网关白名单 | Hermes | **M**（2~3d） | ✅ **闸门那半已落地**：`adapters/base.py:278` 的 `admits()` + **13 处调用点**，且 dsh 那条教训写进了 docstring（`:283-285`，审批应答必须在白名单之后）。⚠️ 「三段闸门」中的"渠道忽略"那层未单独做 |
-| A3 | **默认收紧为显式 opt-in** | Hermes | **S**（0.5d）+ **行为变更** | ⏳ **仍未做**。`allowed_chat_ids: []` 现在=全开。改默认会打破现有用户 → 需迁移期/警告期/配置版本号 |
-| A4 | **配对码**（8 位码 + TTL + 限流 + 失败锁定 + 别名集） | Hermes | **M**（3d） | 只在"要开放给陌生人"时需要 |
+| A3 | **默认收紧为显式 opt-in** | Hermes | **S**（0.5d）+ **行为变更** | ✅ **已做，但按下面的「关键路径与风险」那条建议分两步走**：一次发，靠顶层 `config_version` 兜底 —— **`< 2`**（含没有该键；example 给的是 `0`）= 旧语义「空 = 全放行」+ 启动时醒目预告，**`>= 2`** = 新语义「空 = 谁都不放行」。⚠️ **诚实代价**：未配对用户的暴露**仍然存在**，且因为没强制，多数人不会去配 ⇒ 暴露只会**随时间慢慢收窄**，不会一天归零。若要立刻归零只能硬翻（无闸门），代价是所有空名单用户当场失声 —— **这是知情取舍，不是「问题已解决」** |
+| A4 | **配对码** | Hermes | **M**（3d，原方案）/ **S**（极简版，已做） | ✅ **已做的是极简版**，不是本行初稿写的那套：8 字符 HMAC 派生码（`HMAC-SHA256(key=pairing_secret, msg="opencode-bridge/pair/v1\n"+platform+"\n"+conversation_id)`，取前 8 个 base32 小写字符），**无 TTL / 无签发记录 / 无一次性使用 / 无失败锁定**；触发词 `/pair`（⛔ 不复用 `/setup`，后者文案已冻结并被测试钉住），用户在未授权的 chat 上就能用 ⇒ 没人会被困死。轮换 `pairing_secret` 就是过期机制本身。⚠️ 初稿的 **「TTL + 限流 + 失败锁定 + 别名集」全部刻意不做**（YAGNI）；⛔ 轮换 secret **只让未兑换的码失效，不撤销已完成的配对**（授权已物化进 `allowed_chat_ids`）。`pairing_supported` 类属性默认 `False`、逐个 opt-in：**irc / twitch**（平台对发件人无认证，私聊 principal 是 bot 自己的 nick ⇒ **翻转后私聊对所有人不可用**）、**nextcloud**（principal 是 OCS token）、**homeassistant**（entity_id）、**a2a**（peer）、**qqbot**（principal 是同群所有人共享的会话 id，拿它当配对锚点会把整个群一起授权）**不支持配对**；telegram / slack / discord / matrix / mattermost / ntfy / email 支持 |
 | A5 | **Bot 回声防护**（按 conversation 计预算） | Hermes | **S**（0.5d） | 防 agent 输出被当成新输入回灌 |
 | A6 | **`pii_safe`**：prompt 里 id 用确定性 hash、路由用原值 | Hermes | **S**（1d） | ✅ **已落地**，但**不是裸确定性 hash**：会话 id / 手机号 / 邮箱一律用 **带进程内随机密钥的 HMAC-SHA256**（`redaction.py:331-350`），因为这三类都是低熵（手机号空间 ~10^10、telegram chat id 13 位内），裸 SHA 枚举几分钟就还原 |
 
@@ -459,4 +459,9 @@ A4 配对码（要开放给陌生人时）· E4 TUI 面板
   所以"宿主 someday 会给 cron"这个指望可以划掉了。
 - **A3 是行为变更**，会打破"配好即用"的现状。建议分两步：先加 `allowed_chat_ids_required`
   之类的显式开关与警告（不改默认），下个 minor 再切默认并给迁移指引。
-  ⏳ **仍是遗留项**——它现在是 Part 6 里唯一还完整成立的 P0。
+  ✅ **这条建议已被采纳（决策记录在 `tasks.md` 的「阶段 G」）—— 但采取的形态比这里建议的更好**：
+  分两步**不等于两版发布**。本项目**一次发**，用顶层 `config_version` 兜底区分新旧配置：
+  **`< 2`**（含没有该键）= 沿用旧语义「空 = 全放行」+ 启动时醒目预告，**`>= 2`** = 新语义「空 = 全拒」。
+  配对命令 `/pair` 在**未授权**的 chat 上就能用 ⇒ **没人被困死**；而 `--pair` 成功时会顺手写上
+  `config_version: 2`，所以配过对的用户立刻拿到新语义。⚠️ 诚实代价：未配对用户的暴露**仍然存在**，
+  且因为没强制，**暴露只会随时间慢慢收窄，不会一天归零**。Part 6 那条 P0 因此**已完整落地**。

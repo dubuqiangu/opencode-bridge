@@ -204,11 +204,22 @@ function Invoke-Installer {
         }
         Copy-Item -LiteralPath $exampleCfg -Destination $bridgeCfg
         Write-Info "       已从 config.example.json 生成: $bridgeCfg"
-        # 模板里各平台的 allowed_chat_ids 都是空数组，而空 = 全部放行。这里必须点破：
-        # 照着下一步只填 bot_token 就重启，得到的是一个**任何人都能驱动**的 agent。
-        Write-Warn "       ⚠️ 模板里的 allowed_chat_ids 是空数组 = 不限制发件人："
-        Write-Warn "          任何能私聊/@ 到 bot 的人都能以你的权限驱动 agent。"
-        Write-Warn "          启动前请在第 1 步把 allowed_chat_ids 填上自己的 chat id（数字不要加引号）。"
+        # 模板里各平台的 allowed_chat_ids 都是空数组，且 config_version 不是 2 ⇒ 现在
+        # 仍然是旧语义「空 = 全部放行」。这里必须点破两件事：
+        #   ① 现在就是开放的（照着下一步只填 bot_token 就重启 = 任何人都能驱动 agent）；
+        #   ② 下一版起改为「空 = 谁都不放行」，且届时**不必手改本文件**（/pair + --pair）。
+        # 只说「留空 = 全部放行」不够 —— 那样用户不知道自己接下来该做什么。
+        Write-Warn "       ⚠️ 模板里的 allowed_chat_ids 是空数组，且这份 config.json 的 config_version 不是 2："
+        Write-Warn "          ⇒ 现在仍是「空 = 全部放行」：任何能私聊/@ 到 bot 的人都能以你的权限"
+        Write-Warn "            驱动 agent（读文件 / 改代码 / 执行命令）。"
+        Write-Warn "       ⚠️ 下一版起此处改为「空 = 谁都不放行」。届时不必手改本文件："
+        Write-Warn "          1) 自己生成一段随机串，填进顶层键 pairing_secret（留空 = 不提供配对）"
+        Write-Warn "             例：python -c 'import secrets; print(secrets.token_hex(32))'"
+        Write-Warn "          2) 在 bot 里发 /pair，拿到一条授权码"
+        Write-Warn "          3) 在 bridge 目录里执行 python -m opencode_bridge --pair <码> --conversation platform:local_id"
+        Write-Warn "             （它会把那个 chat 写进 allowed_chat_ids，并顺手写上 config_version: 2）"
+        Write-Warn "          4) 重启桥 —— 改配置没有热重载，不重启不生效"
+        Write-Warn "       现在就手填也行：把 allowed_chat_ids 填上自己的 chat id（数字不要加引号）。"
     } else {
         Write-Info "       config.json 已存在，保持不变: $bridgeCfg"
     }
@@ -262,7 +273,9 @@ function Invoke-Installer {
     Write-Info "       adapters.telegram.allowed_chat_ids   ← 数组，数字不要加引号，如 [123456789]"
     Write-Info "       adapters.slack.allowed_chat_ids      ← 数组，填频道 id，如 [`"C0123456789`"]"
     Write-Info "       adapters.discord.allowed_chat_ids    ← 数组，填频道 id，如 [`"123456789012345678`"]"
-    Write-Info "       ⚠️ 这三项留空 = 全部放行（见上面 [2/4] 的警告）"
+    Write-Info "       ⚠️ 这三项留空 = 全部放行（见上面 [2/4] 的警告）。下一版起改为「空 = 谁都不放行」："
+    Write-Info "          届时用 /pair + --pair 一步授权即可，不必手改本文件。做法见 [2/4] 的警告。"
+    Write-Info "     不想等下一版的话，现在就把白名单填上（填完重启 opencode 生效）。"
     Write-Info "     Slack / Discord 的 token 获取步骤见 README「接入平台引导」；也可在 bot 内发送 /setup 查看分步引导"
     Write-Info "  2. 重启 opencode 服务让插件生效:"
     Write-Info "       opencode service restart"

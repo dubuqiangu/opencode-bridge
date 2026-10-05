@@ -132,6 +132,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
    - macOS / Linux：`$XDG_CONFIG_HOME/opencode-bridge/config.json`（或 `~/.config/opencode-bridge/config.json`）
 
    至少填 `adapters.telegram.bot_token`（Telegram 里找 [@BotFather](https://t.me/BotFather) 创建 bot 获取），并把 `adapters.telegram.allowed_chat_ids` 设为你的 chat id（给 [@userinfobot](https://t.me/userinfobot) 发消息即可拿到自己的 id）。
+   ⚠️ 刚生成的 `config.json` 里 `allowed_chat_ids` 是空数组、且 `config_version` 是 `0`（< 2）⇒ 现在仍是「空 = 全部放行」，启动时你会看到预告。**这一步就是白名单的位置，别跳**；若想要另一条路（`/pair` + `--pair`），见「7. 安全须知」的「两步走」。
 2. **重启 opencode 服务让插件生效**：
 
    ```bash
@@ -325,6 +326,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **整行上限 512 字节**（含 `PRIVMSG` 前缀与 CRLF），桥接逐字节算预算并按字符边界切分，不会切出半个多字节字符。`max_message_length=400` 是扣掉前缀后的保守字符值。
 > - 服务器与昵称冲突（收到 `433`）会自动换名重试；`nick` 必须在该网络已注册。
 > - SASL：`bot_password` 填密码即可（走 `PASS`/`SASL PLAIN` 协商）。
+> - ⚠️ **翻转成「空 = 全拒」后，IRC 的私聊对所有人不可用。** 私聊时闸门比对的 principal 是 **bot 自己的 nick**（IRC 根本没有发件人认证，任何人都能声称任何 nick），所以闸门无法区分。**频道里照常工作**（频道名 `#channel` 是真会话标识）。⛔ **IRC 不提供 `/pair`**（平台必须对发件人做过认证），白名单**只能手填**。这不是「部分能用」，是**没人能用**。
 
 ### Twitch（支持双向对话 · IRC over TLS WebSocket，无需公网地址）
 
@@ -345,6 +347,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **Twitch 没有编辑消息**，`edit()` 恒 `False` —— 长任务进度会退化成连续发多条消息。
 > - 消息长度上限（默认 400 字符）与限流阈值是**社区经验值**，非官方文档公开常量。
 > - 填了 `client_id` 就能用 Helix API 取自己的 user id，回声过滤更准；不填则退回按昵称过滤。
+> - ⚠️ **翻转成「空 = 全拒」后，Twitch 的私聊对所有人不可用**（原因同 IRC：私聊 principal 是 bot 自己的 nick）。**频道里照常工作。** ⛔ **Twitch 不提供 `/pair`**，白名单**只能手填**。
 
 ### Nextcloud Talk（支持双向对话 · HTTP 长轮询，无需公网地址）
 
@@ -368,7 +371,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **`304` 不是错误** —— 长轮询"没有新消息"时服务端返回 304，而 `urllib` 会把它**抛成 `HTTPError`**。这是本适配器最容易写错的一处。
 >
 > 其它要点：
-> - `allowed_chat_ids` 填**会话 token**（`ocs.data[].token`），不是 user id。
+> - `allowed_chat_ids` 填**会话 token**（`ocs.data[].token`），不是 user id。⛔ **nextcloud 不支持 `/pair` 配对**（principal 就是那个 OCS token，用户既不知道也不该知道）⇒ 白名单**只能手填**。
 > - 消息长度上限 **32000 字符，是源码里的硬编码常量、不可配置**（网上没有对应的 `occ config` 设置）。超限服务端返回 413。
 > - **支持编辑消息**（`edit()` 会真正生效），但**超过 24 小时不能改**；且需会话权限含 128、且会话非只读 / 非 lobby。
 > - `max_concurrent_polls`（默认 5）别调大：每个长轮询请求会占住一个服务端 worker 30 秒。`poll_timeout` **上限就是 30**（源码 clamp，填更大也会被服务端压回）。
@@ -586,6 +589,8 @@ copy config.example.json config.json
 
 # 2) 编辑 config.json：至少填 telegram.bot_token，并把 allowed_chat_ids 设为你的 chat id
 #    （在 Telegram 里给 @userinfobot 发消息即可拿到自己的 id）
+#       ⚠️ config.example.json 里 allowed_chat_ids 是 [] 且 config_version 是 0
+#       ⇒ 现在仍是「空 = 全部放行」。别跳这一步，见「7. 安全须知」。
 
 # 3) 连通性自检（只查 /api/info，不创建任何会话）
 $env:OPENCODE_URL='http://127.0.0.1:4096'
@@ -600,7 +605,7 @@ python -m opencode_bridge
 命令行参数：
 
 ```
-python -m opencode_bridge [--config PATH] [--verbose] [--check]
+python -m opencode_bridge [--config PATH] [--verbose] [--check] --pair <码> --conversation platform:local_id
 ```
 
 | 参数 | 说明 |
@@ -608,6 +613,8 @@ python -m opencode_bridge [--config PATH] [--verbose] [--check]
 | `--config PATH` | 指定配置文件（默认：`$OPENCODE_BRIDGE_CONFIG` → `./config.json`） |
 | `--verbose` | 输出 DEBUG 日志 |
 | `--check` | 只做连通性自检后退出（不创建 session、不启动适配器） |
+| `--conversation platform:local_id` | 配合 `--pair` 用：**首次配对必填**，值就是 `/pair` 回信里那个 `platform:local_id`（如 `telegram:12345`）。⚠️ **码绑定会话，只凭一串码无法确定是哪个** —— 那需要遍历所有可能的会话 id，是无界搜索、等于给 40 bit 造 oracle。**省略它不会「按码自动反查」**：那个兜底只在**已经授权过**的会话里找（重新配对已有会话的便利），首次配对时会直接报错退出并告诉你补上这个参数 |
+| `--pair <码>` | 用 `/pair` 给出的授权码把**那个会话**写进 `allowed_chat_ids`，并顺手写上 `config_version: 2`。⚠️ **只允许本机执行**（没有网络 oracle）；⛔ **绝不创建不存在的 `config.json`**；**写完必须重启桥才生效**（本项目没有热重载，改 `bot_token` 同样要重启）。⚠️ 逐会话不是逐人；⚠️ 不提供 TTL / 一次性使用 / 锁定 |
 
 退出码：`0` 正常（含**未配置任何 adapter** 的优雅退出，会打印提示）；`1` 自检失败 / 未捕获异常 / adapter 构建失败。
 
@@ -648,6 +655,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 | `/allow <请求ID>` | 同 `/approve` |
 | `/deny <请求ID>` | 拒绝权限请求 |
 | `/setup` | 查看分平台接入引导（`/setup telegram` / `slack` / `discord` 可直达） |
+| `/pair` | 取一条**绑定到当前会话**的授权码，供本机 `python -m opencode_bridge --pair <码> --conversation platform:local_id` 完成白名单授权（**未授权的 chat 也能用**，这是「默认拒绝」不会把人困死的原因）。⛔ 需要 `config.json` 里有 `pairing_secret`；⛔ `irc / twitch / nextcloud / homeassistant / a2a / qqbot` 不支持。⚠️ **逐会话、不是逐人**：在群里拿到的码授权的是**那个群**；⚠️ 回信里只有命令形状、没有本机路径 |
 | 其它以 `/` 开头 | 视为未知命令，回一条用法提示（**不会**转发给模型） |
 
 普通文本直接发送即可；权限请求也会以文字形式推送（形如 `🔐 权限请求 … 回复: /approve xxx`），用上面的命令回复。
@@ -682,10 +690,12 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `permissions_mode` | `"ask"` | `ask` / `allow` / `deny`，对应新建 session 的权限规则集 |
 | `log_level` | `"INFO"` | 日志级别（`--verbose` 会强制 `DEBUG`） |
 | `state_path` | `"state.json"` | `conversation_id ↔ session_id` 与 per-conversation 元数据的持久化文件（原子写） |
+| `config_version` | `0` | 授权闸门的语义版本。**`< 2`（包括 example 模板与安装脚本给的 `0`，以及没有这个键的老文件）** ⇒ 沿用旧语义「白名单为空 = 全部放行」，并在启动时打一条醒目预告；**`>= 2`** ⇒ 新语义「白名单为空 = 谁都不放行」。`--pair` 成功时会顺手写上 `2` |
+| `pairing_secret` | `""` | `/pair` 授权码的派生密钥，**自己生成**（如 `python -c "import secrets; print(secrets.token_hex(32))"`）填在这里。⛔ **留空 = 不提供配对**（绝不等于「用空串派生」）。⚠️ 改这个值 = 让所有**未兑换**的码失效；**已完成的配对不受影响**（授权已物化进 `allowed_chat_ids`），所以换 secret **踢不掉已授权的人** |
 | `bridge.edit_interval_seconds` | `1.5` | 流式增量编辑同一条 IM 消息的最小间隔（秒），用于节流 |
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
-| `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：空数组 = 全部允许；非空则只响应列表内的 chat id。⚠️ **默认值 `[]` 就是全放行**（每个平台都一样），任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
+| `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
 | `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
 | `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
@@ -756,7 +766,45 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 ## 7. 安全须知
 
 1. **IM 是低信任入口**：`permissions_mode` 默认 `ask`（每次敏感操作都要确认），**不要**轻易改成 `allow`——那等于允许任何能给 bot 发消息的人以你的权限执行任意操作。
-2. **务必配置 `allowed_chat_ids` 白名单**：未列入白名单的 chat 的消息会在适配器层被直接丢弃。⚠️ 反过来更要注意 —— **`[]`（默认值，也是 `config.example.json` 与安装脚本生成的初值）不是"没人能说话"，而是"所有人都能说话"**：`permissions_mode` 默认 `ask` 只在 agent 想做敏感操作时才问你，而**读文件、跑命令、改代码本身不需要你确认**。也就是说把 bot 放进公开群、或让它能被陌生人私聊，就等于把你的 shell 交给了对方。
+2. **务必配置 `allowed_chat_ids` 白名单**：未列入白名单的 chat 的消息会在适配器层被直接丢弃。⚠️ 反过来更要注意 —— **刚由安装脚本 / 自举生成的 `config.json` 里 `allowed_chat_ids` 是 `[]` 且 `config_version` 不是 2 ⇒ 它现在仍是「空 = 全部放行」**：`permissions_mode` 默认 `ask` 只在 agent 想做敏感操作时才问你，而**读文件、跑命令、改代码本身不需要你确认**。也就是说把 bot 放进公开群、或让它能被陌生人私聊，就等于把你的 shell 交给了对方。启动时你会看到一条预告：**下一版起此处改为「空 = 谁都不放行」**。
+
+   ### 两步走的过渡：怎么从「全放行」变成「默认拒绝」
+
+   闸门语义由顶层键 `config_version` 决定（见「6. 配置项说明」）：
+
+   | `config.json` 的 `config_version` | `allowed_chat_ids` 为空时 |
+   |---|---|
+   | **`< 2`**（含没有这个键的老文件、以及模板给的 `0`） | **全部放行**（旧语义）+ 启动时醒目预告 |
+   | **`>= 2`** | **谁都不放行**（新语义） |
+
+   ⇒ **没有人会被困死**：`/pair` 在**未授权**的 chat 上就能用，被拒的人发一条 `/pair` 就能拿到授权码。要走这条路：
+
+   ```bash
+   # 1) 自己生成一段随机串，填进 config.json 的顶层键 pairing_secret
+   #    （⛔ 留空 = 不提供配对，不是「用空串派生」）
+   python -c "import secrets; print(secrets.token_hex(32))"
+
+   # 2) 重启桥，然后在 bot 里发 /pair —— 它会回一条绑定到**那个会话**的授权码
+
+   # 3) 在 bridge 目录里执行（写盘 + .bak 备份 + 顺手写上 config_version: 2）
+   python -m opencode_bridge --pair <码> --conversation platform:local_id
+
+   # 4) 再重启一次 —— 改配置没有热重载（改 bot_token 也一样要重启）
+   ```
+
+   ⚠️ **三条必须知道的边界**：
+
+   - **irc / twitch：翻转后私聊对所有人都不可用。** 它们的私聊 principal 是 **bot 自己的 nick**，不是对方的身份（IRC 根本没有发件人认证，任何人都能声称任何 nick），所以闸门无法区分。**频道里照常工作**（频道名是真会话标识）。⛔ **配对已对这两个平台禁用** —— 平台必须对发件人做过认证。这不是「从能用退化为部分能用」，是**从能用变成没人能用**。
+   - **配对是逐会话的，不是逐人的。** 在群里执行 `--pair` 加进去的是**那个群**，不是你自己的私聊；群里其他人抄走码也能在你机器上执行它，效果相同（授权的是码所指向的那个会话）。
+   - **轮换 `pairing_secret` 只让未兑换的码失效，不撤销已完成的配对** —— 授权已经物化进 `allowed_chat_ids` 了。换 secret **不能**用来把人踢出去，要踢就改 `allowed_chat_ids`。
+
+   **逐平台是否支持配对**：
+
+   | 支持 | 不支持 |
+   |---|---|
+   | telegram / slack / discord / matrix / mattermost / ntfy / email | **irc / twitch**（无发件人认证）、**nextcloud**（principal 是 OCS token，用户不知道也不该知道）、**homeassistant**（entity_id）、**a2a**（peer）、**qqbot**（principal 是同群所有人共享的会话 id，拿它当配对锚点会连整个群一起授权） |
+
+   ⛔ 不支持的平台上，`/pair` 不会给码，未授权的会话**只能手改 `allowed_chat_ids`**。
 3. **`opencode_url` 留空时会自动读取 `~/.local/state/opencode/service.json`**（含密码），因此本桥接**只应在本机 / 可信网络上运行**，不要把端口暴露到公网。
 4. **桥接进程拥有和你一样的文件与 shell 权限**：它驱动的是本机 opencode agent，请只在你信任的目录、你信任的 bot token 下运行；配置文件与 `state.json` 含敏感信息，请妥善保管。
 
@@ -784,7 +832,9 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | 发消息没有回复、日志见 `409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
 | 日志见 `provider.transport` 重试（`⏳ 重试中 (attempt N): ...`） | 上游模型服务不可达 / 超时，opencode 正在按退避重试；检查网络与 provider 配置 |
 | `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。按「接入平台引导」填好**该平台自己的凭据键**（不都是 `bot_token`：Slack 入站另需 `app_token`、Matrix 用 `homeserver`/`access_token`/`user_id`、IRC 用 `host`/`nick`/`channels`、Mattermost 用 `site_url`/`token`、Twitch 用 `token`/`channel`）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge。用 `--status` 逐平台核对缺什么 |
-| bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中 |
+| bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中。⚠️ 若是升级后**突然**收不到消息、而你的 `allowed_chat_ids` 是空的：多半是这次翻转。查 `config.json` 的 `config_version` —— **`< 2`**（含没有这个键）时是「空 = 全放行」，**`>= 2`** 则是新语义「空 = 全拒」。解法见「7. 安全须知」的「两步走」：`/pair` 在未授权的 chat 上就能用 |
+| irc / twitch 私聊没反应（频道里正常） | **已知的行为变更**：私聊的 principal 是 bot 自己的 nick，闸门无法区分 ⇒ 白名单为空且 `config_version >= 2` 时必然被拒。频道不受影响（频道名是真会话标识）。这两个平台**不提供 `/pair`**（无发件人认证），只能在 `allowed_chat_ids` 里手填 |
+| 收不到 `/pair` 的回信 | 多半是 `pairing_secret` 没填（**留空 = 不提供配对**，不会用空串派生）。生成后**要重启桥**才会生效；`irc / twitch / nextcloud / homeassistant / a2a / qqbot` 本身不支持配对 |
 | 会话行为异常 / 想清空上下文 | 发送 `/new`（或 `/reset`）重建 session |
 | 插件没拉起 bridge | 看 `<bridgeDir>\bridge-plugin.log` 与 `<bridgeDir>\.bridge-plugin.lock`；确认插件目录里的 `config.json` 中 `bridgeDir` 指向真实存在的目录 |
 | 原生安装后日志里找不到「自举」字样 | 自举发生在配置解析阶段（`logDir` 还没确定），按设计只进 opencode 主日志：`~/.local/share/opencode/log/opencode.log` 搜 `[bridge-plugin]`。可直接检查稳定目录是否已铺好：`<稳定目录>\opencode_bridge\__init__.py` 是否存在 |

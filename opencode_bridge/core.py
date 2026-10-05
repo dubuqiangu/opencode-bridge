@@ -137,30 +137,39 @@ DEFAULT_EDIT_INTERVAL = 1.5
 #: declared static floor), refined at runtime through the
 #: :attr:`~opencode_bridge.adapters.base.Adapter.message_limit` slot (declared
 #: ``0`` = "not refined"; Mattermost / Nextcloud fill it from the server), and
-#: always take the resolved value from
+#: ⚠️ **This default exceeds the real limit on 5 of the 13 platforms** (measured
+#: 2026-10-05): ``discord`` 2000, ``email`` 998, ``irc`` 400, ``qqbot`` 2000,
+#: ``twitch`` 400. ``mattermost``'s static floor merely *coincides* at 4000 (it
+#: is refined from ``config/client`` ``MaxPostSize`` at runtime), so it is not
+#: counted as "exceeded".
+#:
+#: Always take the resolved value from
 #: :attr:`~opencode_bridge.adapters.base.Adapter.effective_max_length` — that
 #: property is the single resolver (``adapters/base.py:190``).
 #:
-#: ⚠️ **This default exceeds the real limit on 6 of the 13 platforms** (measured
-#: 2026-10-05): ``discord`` 2000, ``email`` 998, ``irc`` 400, ``qqbot`` 2000,
-#: ``twitch`` 400 sit below it, and ``mattermost``'s static floor merely
-#: coincides at 4000 (it is refined from ``config/client`` ``MaxPostSize``).
-#: It is therefore narrowed by ``min()`` against ``effective_max_length`` at
-#: :meth:`~opencode_bridge.outbound.OutboundSender.finalize`
-#: (``outbound.py:188``) — **that is the only place it is narrowed.**
+#: Both readers now narrow this value through **one** function,
+#: :func:`~opencode_bridge.outbound.one_message_budget`:
+#: the streaming gate (``event_stream.py``) and
+#: :meth:`~opencode_bridge.outbound.OutboundSender.finalize`.
 #:
-#: ⚠️ Known residual, left alone on purpose: the streaming gate
-#: (``event_stream.py:510``) compares against this value **un-narrowed**, so on a
-#: platform below 4000 a body between the platform limit and 4000 passes it. If
-#: the first successful streaming *send* is such a body, the adapter splits it
-#: and hands back the last chunk's handle while ``Turn.shown_progress_text``
-#: records the whole body; ``finalize``'s lower bound
-#: ``max(len(head), len(shown_progress_text))`` then restores the full length, so
-#: the edit is attempted over the platform limit and the placeholder keeps a
-#: fragment. The reader still gets the complete answer exactly once
-#: (``finalize`` then sends only the missing suffix), so this is cosmetic rather
-#: than data loss. Closing it means narrowing that gate — a behaviour change,
-#: deliberately not done here.
+#: ⚠️ **This paragraph used to document an open residual, and deliberately so.**
+#: The streaming gate once compared against this value **un-narrowed** while
+#: ``finalize`` narrowed it, so on a platform below 4000 a body between the two
+#: passed the gate; the adapter split it and handed back the last chunk's
+#: handle while ``Turn.shown_progress_text`` recorded the whole body, and
+#: ``finalize``'s lower bound ``max(len(head), len(shown_progress_text))``
+#: restored the full length — the edit went out over the platform limit.
+#: Cosmetic rather than data loss (the reader still got the complete answer
+#: exactly once), but it also falsified the invariant written at
+#: ``outbound.py``'s ``_split_for_the_placeholder`` that *``shown_progress_text``
+#: fits the budget by construction*.
+#:
+#: **Closed** by narrowing the gate to the same quantity. The two alternatives
+#: were traced and both rejected: clamping ``shown_progress_text`` makes the
+#: suffix too long and **re-sends** the span (duplication), and clamping inside
+#: ``finalize`` makes the edit succeed at ``final[:budget]`` over a message that
+#: already showed past it — the reader sees that span **twice**. Only narrowing
+#: the gate keeps "the reader gets the answer exactly once" true.
 DEFAULT_MAX_MESSAGE_CHARS = 4000
 
 

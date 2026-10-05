@@ -31,7 +31,7 @@ from opencode_bridge.core import (
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
-from opencode_bridge.outbound import OutboundSender
+from opencode_bridge.outbound import OutboundSender, one_message_budget
 from opencode_bridge.state import StateStore
 from tests.test_outbound import CONVERSATION, ScriptedAdapter
 
@@ -1808,7 +1808,13 @@ class CoreLifecycleTests(unittest.TestCase):
 # 在核**注释里的具体主张**，而不是核常量还在不在。
 # 顺带把两件容易被下一个读代码的人搞错的事钉住：
 # ① 4000 **超过** 6/13 个平台的真实上限，所以它不是"安全发送长度"；
-# ② 它**只在** ``OutboundSender.finalize`` 那一个地方被 min() 收窄。
+# ② 它必须**每一处**都与平台上限取小者 —— 这一条以前只有 finalize 做到，
+#    流式闸门没做，于是两处读者漂了（见下面那条"反过来写"的用例）。
+#
+# ⛔ ``core.py`` 里 ``DEFAULT_MAX_MESSAGE_CHARS`` 的文档字符串**还有一段已经过期**
+# （它把"闸门未收窄"记成"已知残留，刻意不改"）。那个文件不在本轮范围内，所以
+# 这里只记着：谁改那段注释时，请连同 ``outbound.one_message_budget`` 与
+# ``event_stream._on_text_delta`` 的现状一起看。
 class DocumentedDefaultConstantTests(unittest.TestCase):
     def test_the_two_constants_still_hold_their_documented_values(self):
         """``1.5`` 与 ``4000`` 必须原样 —— 这次改动是纯注释。"""
@@ -1868,12 +1874,24 @@ class DocumentedDefaultConstantTests(unittest.TestCase):
                 )
 
     def test_a_body_over_the_platform_limit_reaches_the_edit_via_shown_progress(self):
-        """钉住注释里描述的那条残留路径本身。
+        """⚠️ **这条用例已经反过来写** —— 它原来断言的是缺陷本身。
 
-        这是最容易"注释说了但其实没那回事"的一处，所以必须跑出来：``finalize``
-        的下界是 ``max(len(head), len(shown_progress_text))``，所以当流式记录过
-        一段比**收窄后**预算更长的正文时，编辑会按记录的长度发出去。读者仍拿到
-        完整答复（``finalize`` 只补发缺失的后缀），所以这是观感问题不是丢数据。
+        原来：给 ``finalize`` 一个比收窄后预算更长的 ``shown_progress_text``，
+        断言编辑长度**超过**平台上限。这条路当时真的走得通（流式闸门只按桥的
+        预算判，于是会记下超额的量），而 ``core.py`` 的 ``DEFAULT_MAX_MESSAGE_CHARS``
+        文档字符串里那段「已知残留，刻意不改」描述的就是它。
+
+        现在那条路**走不通**了：流式闸门与 ``finalize`` 都问
+        ``one_message_budget``，所以 ``shown_progress_text`` 至多等于收尾用的预算。
+        下面是"给定一个超额的 ``shown_progress_text``"这个**假设前提**下的断言 ——
+        它证明不了不变式（不变式说的是**流式那一侧记不下**超额的值，而那在
+        ``tests/test_event_stream.py`` 里直接断言），只证明收尾的下界确实还是那个
+        下界。**留着的意义**：哪天有人删掉那个下界，这里会红；而下界一旦没了，
+        不变式就没有第二道防线了。
+
+        要真正的不变式与"读者恰好一次"，见
+        ``tests/test_event_stream.py::ShownProgressTextFitsTheFinalizeBudgetTests``
+        与 ``tests/test_progress_placeholder.py::TheTwoReadersAgreeOnOneBudgetTests``。
         """
         platform_limit = 2000
         adapter = ScriptedAdapter()
@@ -1892,8 +1910,38 @@ class DocumentedDefaultConstantTests(unittest.TestCase):
 
         self.assertGreater(
             len(adapter.edited[-1][1].text), platform_limit,
-            "这条路径不存在了 —— core.py 里关于残留的那段注释要改",
+            "收尾那个 max(len(head), len(shown_progress_text)) 下界不见了 —— "
+            "它是不变式的第二道防线（第一道是流式闸门按同一个预算判）",
         )
+
+    def test_the_streaming_gate_and_finalize_ask_for_the_same_budget(self):
+        """两个读者问的**必须是同一个数** —— 这是这个缺陷的根，不是它的表现。
+
+        之前两侧各写一遍 ``min(...)``（闸门那遍还漏了平台上限），于是它们漂了。
+        现在两侧都调 ``one_message_budget``；这条断言它给出的数确实是"两条上限的
+        小者"，并且在 6/13 个平台上**确实小于**桥的预算 —— 也就是漂了就会出事的那
+        些平台上，它不是一个恒等于 4000 的装饰函数。
+        """
+        for platform_limit in (2000, 400, 998, 4096, 40000):
+            with self.subTest(platform_limit=platform_limit):
+                adapter = ScriptedAdapter()
+                adapter.max_message_length = platform_limit
+
+                self.assertEqual(
+                    one_message_budget(DEFAULT_MAX_MESSAGE_CHARS, adapter),
+                    min(DEFAULT_MAX_MESSAGE_CHARS, platform_limit),
+                )
+
+        below = self._platforms_relative_to_the_default()[0]
+        self.assertTrue(below, "没有任何平台低于 4000 —— 那这个预算就没有约束力")
+        for name in below:
+            with self.subTest(platform=name):
+                adapter = build(name, {}, hooks=_NoOpHooks())
+                self.assertLess(
+                    one_message_budget(DEFAULT_MAX_MESSAGE_CHARS, adapter),
+                    DEFAULT_MAX_MESSAGE_CHARS,
+                    "%s 的上限低于 4000，而这个函数没有把预算收窄下来" % name,
+                )
 
     @staticmethod
     def _platforms_relative_to_the_default() -> tuple[list[str], list[str]]:

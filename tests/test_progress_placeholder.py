@@ -112,9 +112,24 @@ class PlatformUnderTest:
 
     # -- 派生视图 ------------------------------------------------------
     def identities(self) -> dict[str, list[str]]:
-        """``消息身份 -> 依次写上去的文本``（按发生顺序）。"""
+        """``消息身份 -> 依次**真的写上去**的文本``（按发生顺序）。
+
+        ⚠️ **失败的那次改写不算写上去。** :func:`_instrument_adapter_boundary` 会把
+        失败的改写也记一条（``edited=False``），因为"试过但没改成"本身就是被测行为；
+        但读者**看不到**它 —— 平台没换成功，那条消息上仍是上一次的内容。
+        混进来的后果不是"多算一点"，而是**方向性错误**：夹具会让
+        :func:`reader_view` 把一条从未显示过的正文算进读者眼里，于是
+        "读者拿到完整答复恰好一次"这条判据在**改写失败**的那一轮里必然为假。
+
+        这条曾经是错的，而且被一个更宽松的夹具盖住了：discord 的假 ``_request``
+        对**任何长度**的 PATCH 都回 200，于是收尾那次改写"成功"了，失败路径根本没
+        被走到过。流式闸门收窄之后（platform 上限低于桥的预算时它真的会失败），
+        这个错才暴露出来 —— 所以它是**被修好的缺陷暴露出来的**，不是新引入的。
+        """
         written: dict[str, list[str]] = {}
         for delivery in self.deliveries:
+            if not delivery.edited:
+                continue
             written.setdefault(delivery.identity, []).append(delivery.text)
         return written
 
@@ -1063,6 +1078,97 @@ class TheAnswerArrivesExactlyOnceTests(TurnTestCase):
             "说明这条路径根本没被走到，后面的断言就是空的",
         )
 
+
+
+# ----------------------------------------------------------------------
+# 5. 一个平台的真上限，桥自己也知道 —— 两处读者必须问同一个数
+# ----------------------------------------------------------------------
+class TheTwoReadersAgreeOnOneBudgetTests(TurnTestCase):
+    """**决定性用例**：一条消息里写下的字符数，永远不超过平台的真上限。
+
+    这个缺陷的形状是"两处读者问的不是同一个问题"：
+    :meth:`OutboundSender.finalize` 取 ``min(桥的预算, 平台上限)``，而流式闸门
+    （``event_stream.py``）曾只按桥的预算判。于是 Discord（2000，桥的预算 4000）
+    上正文涨过 2000 之后仍然照发，``Turn.shown_progress_text`` 记下的是**整段**，
+    收尾时 ``max(len(head), len(shown_progress_text))`` 那个下界又把超额的长度原样
+    放了回去。实测（真桥 + 真 Discord + 真传输层记录器）：**收尾那次改写带 3973
+    字符去了一个 2000 字符的平台**，32 次投递里 16 次超限。
+
+    判据落在**交给适配器的那段文本本身**（``Delivery.text`` / ``wire``），不是子串、
+    不是"看起来对"：一次改写就是**一条**消息，超了就是超了。
+    """
+
+    def test_no_edit_is_ever_handed_more_than_the_platform_accepts(self):
+        """discord 是**唯一**上限低于桥的默认预算（4000）的可改写平台 ——
+        所以这里既是决定性用例，也是这条缺陷唯一的真实受害者。"""
+        under_test = build_platform("discord")
+        platform_limit = int(under_test.adapter.effective_max_length)
+        self.assertLess(platform_limit, BRIDGE_MAX_MESSAGE_CHARS,
+                        "前提变了：discord 不再低于桥的预算，这条用例就测不到东西了")
+        answer = answer_of_length(BRIDGE_MAX_MESSAGE_CHARS)
+
+        run_one_turn(under_test, answer, stream_progress=True,
+                     chunk_size=STREAMING_CHUNK)
+
+        over_limit = [
+            delivery.text for delivery in under_test.deliveries
+            if delivery.via == "edit" and len(delivery.text) > platform_limit
+        ]
+        self.assertEqual(
+            over_limit, [],
+            "有 %d 次改写超过了 discord 的 %d 字符上限；最长的一次 %d 字符"
+            % (len(over_limit), platform_limit,
+               max((len(t) for t in over_limit), default=0)),
+        )
+        # 线路那一侧同样：适配器可以把一段**发信**切成多条，但每一条都得装得下。
+        over_wire = [
+            text for text in under_test.wire_text() if len(text) > platform_limit
+        ]
+        self.assertEqual(
+            over_wire, [],
+            "线路上有 %d 段超过 discord 的 %d 字符上限"
+            % (len(over_wire), platform_limit),
+        )
+
+    def test_the_reader_still_gets_the_whole_answer_exactly_once_there(self):
+        """同一轮里，**不许**因为收窄了闸门而丢字或重字。
+
+        这是 ``a0f877e`` 那条承诺（占位消息会被最终答复顶掉）在收窄之后的形状：
+        正文越过平台上限之后不再流式发布，但收尾必须把**整条**答复交出去。
+        """
+        under_test = build_platform("discord")
+        answer = answer_of_length(BRIDGE_MAX_MESSAGE_CHARS)
+
+        run_one_turn(under_test, answer, stream_progress=True,
+                     chunk_size=STREAMING_CHUNK)
+
+        self.assertEqual(reader_view(under_test), answer,
+                         "读者读到的不是完整原文（丢了 / 重复了 / 乱序了）")
+        self.assertEqual(under_test.left_showing_the_placeholder(), [],
+                         "留下了僵尸占位气泡")
+
+    def test_the_platform_limit_is_refined_at_runtime_and_the_gate_follows(self):
+        """Mattermost 启动后拿服务端 ``MaxPostSize`` 细化上限 —— 闸门必须跟着变。
+
+        这条专门盯住"运行期细化"：``effective_max_length`` 那个槽非 0 时胜出，而
+        闸门读的是**同一个属性**。若哪天有人把上限**缓存**下来（而不是每次读那个
+        属性），启动前的静态值就会永久留在闸门里 —— 而这条会红。
+        """
+        under_test = build_platform("mattermost")
+        refined_limit = 500
+        under_test.adapter.message_limit = refined_limit
+        self.assertEqual(int(under_test.adapter.effective_max_length),
+                         refined_limit, "前提不成立：运行期细化没有生效")
+
+        run_one_turn(under_test, answer_of_length(refined_limit * 3),
+                     stream_progress=True, chunk_size=137)
+
+        over_limit = [
+            delivery.text for delivery in under_test.deliveries
+            if delivery.via == "edit" and len(delivery.text) > refined_limit
+        ]
+        self.assertEqual(over_limit, [],
+                         "闸门没有跟着运行期细化走")
 
 
 # ----------------------------------------------------------------------

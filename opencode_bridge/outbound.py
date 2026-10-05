@@ -36,6 +36,34 @@ NO_OUTPUT_TEXT = "（无输出）"
 AdapterFor = Callable[[str], Optional[Adapter]]
 
 
+def one_message_budget(bridge_budget: int, adapter: Optional[Adapter]) -> int:
+    """桥往 IM **一条**消息里最多能写多少字符 —— 取两条上限的**小者**。
+
+    两条上限各管一件事：
+
+    * ``bridge_budget``（``bridge.max_message_chars``）是**桥的**预算 —— 用户的配置。
+    * ``adapter.effective_max_length`` 是**平台**真正接受的一条消息长度。它是
+      **唯一**该读"我按多少切"的地方：静态下限 ``max_message_length`` 会被
+      Mattermost / Nextcloud 在启动后用服务端的 ``MaxPostSize`` 细化（槽
+      ``message_limit``，非 0 时胜出），所以类属性不是真值。
+
+    ⚠️ **这个函数是唯一一处算这个数的地方**，因为**曾经有两处**算它而它们不一致：
+    :meth:`OutboundSender.finalize` 取小者（正确），而
+    ``event_stream.py`` 的流式闸门只拿 ``bridge_budget`` 比 —— 于是 6/13 个平台上
+    一段"平台上限与 ``bridge_budget`` 之间"的正文能过闸，适配器把它切成多条、
+    只交回最后一条的句柄，而 ``Turn.shown_progress_text`` 记下的是**整段**；
+    收尾时那个下界 ``max(len(head), len(shown_progress_text))`` 于是把长度**还原**
+    回超出平台上限的值。**两个读者必须问同一个问题，否则承诺（占位消息会被最终答复
+    顶掉）就有一处兑现不了。**
+
+    ``adapter`` 为 ``None`` 时**没有平台可问**，只按桥的预算走 —— 与
+    :meth:`OutboundSender.finalize` 那条"找不到适配器就整段发出去"的路一致。
+    """
+    if adapter is None:
+        return int(bridge_budget)
+    return min(int(bridge_budget), int(adapter.effective_max_length))
+
+
 class OutboundSender:
     """Everything the bridge writes back to the IM side."""
 
@@ -185,7 +213,12 @@ class OutboundSender:
         # 会在 Discord 上翻车 —— 默认配置 4000 > Discord 的 2000，于是 2001~4000
         # 字的答复会被拿去改写、平台拒收、改写返回 False、整段重发，占位消息就此
         # 留下一截正文。那正是本方法要消灭的那种残留。
-        budget = min(self._max_message_chars, int(adapter.effective_max_length))
+        #
+        # ⚠️ 走 :func:`one_message_budget` 而不是在这里重写一遍 ``min(...)``：
+        # ``event_stream.py`` 的流式闸门问的是同一个问题，两处各算一次就会漂
+        # （闸门曾只按桥的预算判，于是记下超额的 ``shown_progress_text``，收尾
+        # 时这个下界又把超额的长度放了回来）。**唯一真相在那个函数里。**
+        budget = one_message_budget(self._max_message_chars, adapter)
         head, tail = self._split_for_the_placeholder(
             final, budget, shown_progress_text,
         )
@@ -251,8 +284,18 @@ class OutboundSender:
         读者看到的分段与「整段直接发」一模一样。
 
         ⚠️ ``len(head)`` **不许小于**占位消息已经显示的长度：那会让读者已经读过
-        的那一截凭空消失（数据丢失）。``shown_progress_text`` 按构造不超过预算
-        （流式那一路只在装得下时才写），所以这个下界不会把 ``head`` 顶出预算。
+        的那一截凭空消失（数据丢失）。
+
+        ⚠️ 这条下界**曾经**会把 ``head`` 顶出预算，而当时的注释写的是
+        「``shown_progress_text`` 按构造不超过预算」。那句话**曾经为真**：那时
+        流式闸门与本方法的预算都是 4000。后来闸门仍按 4000 判、而本方法改成了
+        取两条上限的小者，两者变成两个量，于是 Discord（2000）上记下了 3973 字符
+        的 ``shown_progress_text``，这里的下界把 3973 原样放了回去，一次收尾改写
+        就带着 3973 字符去了一个 2000 字符的平台。
+        **现在它靠构造成立**：流式闸门与本方法都问 :func:`one_message_budget`，
+        而闸门只在装得下时才写、``shown_progress_text`` 只记写成功的那一份 ——
+        所以它**至多**等于本方法用的那个预算。这条不变式由
+        ``tests/test_event_stream.py`` 里那条直接断言它的用例钉着。
         """
         if len(final) <= budget:
             return final, ""

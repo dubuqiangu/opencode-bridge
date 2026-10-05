@@ -22,6 +22,7 @@ from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import EventStream, Turn
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.opencode_client import OpenCodeError
+from opencode_bridge.outbound import OutboundSender, one_message_budget
 from opencode_bridge.permission_ledger import (
     ANSWER_PENDING,
     ANSWER_RESOLVED_UPSTREAM,
@@ -29,6 +30,7 @@ from opencode_bridge.permission_ledger import (
     PermissionLedger,
 )
 from opencode_bridge.state import StateStore
+from tests.test_outbound import ScriptedAdapter
 
 CONVERSATION = "chat:55"
 PLATFORM = "fake"
@@ -127,6 +129,25 @@ def text_delta(session_id: str, text: str, ordinal: int = 0,
               assistantMessageID=assistant, ordinal=ordinal, delta=text)
 
 
+class FakeAdapter:
+    """``EventStream`` 现在按 ``adapter_for`` 问平台上限，所以替身得答得上来。
+
+    默认上限**远大于本文件任何 ``max_message_chars``**：这个文件的用例测的是事件流
+    自己的行为（按 ordinal 拼装、节流、长度闸门），闸门理应由**桥的预算**决定 ——
+    与闸门被收窄之前的行为一致，于是本文件其余用例一条都不用改。
+    要走"平台上限比桥的预算小"那条路的用例把 :attr:`max_message_length` 调小即可
+    （见 :class:`ProgressGateTests`）。
+    """
+
+    def __init__(self, max_message_length: int = 1_000_000) -> None:
+        self.max_message_length = max_message_length
+
+    @property
+    def effective_max_length(self) -> int:
+        """与真适配器同名同义 —— 这是基类上**唯一**该读"我按多少切"的地方。"""
+        return int(self.max_message_length)
+
+
 # ----------------------------------------------------------------------
 # 基类：造一套 EventStream（**没有** BridgeCore）
 # ----------------------------------------------------------------------
@@ -151,6 +172,9 @@ class EventStreamTestCase(unittest.TestCase):
         self.finalize_calls: list[tuple] = []
         self.flush_queue_calls: list[str] = []
         self.adapter_for_calls: list[str] = []
+        #: 替身适配器。默认上限远高于 ``max_message_chars``，所以本文件其余用例
+        #: 看到的仍是"闸门只按桥的预算判"；要测平台上限更小的路就改这个属性。
+        self.adapter = FakeAdapter()
         #: 真对象：本文件要断言的正是"事件流有没有在 ``permission.asked`` 上记账、
         #: 在 ``permission.replied`` 上销账"，所以不能拿替身把它糊过去。
         self.permission_ledger = PermissionLedger()
@@ -173,7 +197,7 @@ class EventStreamTestCase(unittest.TestCase):
     # --- 五个协作者的可调用替身 -----------------------------------------
     def _adapter_for(self, conversation_id: str):
         self.adapter_for_calls.append(conversation_id)
-        return object()
+        return self.adapter
 
     def _record_edit_progress(self, conversation_id, handle, text,
                               session_id) -> bool:
@@ -537,35 +561,79 @@ class TurnLifecycleTests(EventStreamTestCase):
 # 9-11: 文本合并、节流与长度上限
 # ----------------------------------------------------------------------
 class ProgressGateTests(EventStreamTestCase):
-    """闸门本身：它是**桥的**预算，**不按平台收窄**（`core.py` 里记着这条）。
+    """闸门本身：它判的是**一条消息装得下多少**，与收尾那一步同一个数。
 
-    ⚠️ 为什么值得单独钉住：上面那条「收窄只发生在 finalize」是
-    ``DEFAULT_MAX_MESSAGE_CHARS`` 文档字符串里的**主张**，而如果它写错了、
-    有人照着它去改代码，损失是"以为 4000 是安全发送长度"。所以这里**驱动真实闸门**
-    而不是复述那个常数的算术 —— 复述常数的测试对"闸门有没有被收窄"完全瞎。
+    ⚠️ 这里**驱动真实闸门**、喂真实适配器，而不是复述 ``DEFAULT_MAX_MESSAGE_CHARS``
+    的算术 —— 上一版就是这么写的，结果它对"闸门有没有按平台收窄"完全瞎：
+    把闸门收窄掉（一次变异）它照样全绿。算术恒真，证明不了任何实现选择。
+
+    闸门的判据是 :func:`~opencode_bridge.outbound.one_message_budget`：
+    桥的预算与平台上限的**小者**。
     """
 
-    def test_a_body_between_the_platform_limit_and_the_default_still_gets_through(self):
-        """Discord 上限 2000、桥的预算 4000：2500 字**能过闸**。
+    def test_a_body_between_the_platform_limit_and_the_bridge_budget_is_refused(self):
+        """Discord 上限 2000、桥的预算 4000：2500 字**过不去**。
 
-        这就是文档字符串记的残留：闸门拿未收窄的 4000 比。
-        若哪天有人收窄了它，这条会红 —— 那正是该回来改注释、并单独决策的时机。
+        修好之前这里过得去，于是 ``Turn.shown_progress_text`` 记下 2500，而收尾的
+        下界把 2500 原样放回编辑正文 —— 一个 2000 字符的平台收到了 2500 字符。
         """
-        self.rebuild(max_message_chars=2500)
+        self.adapter.max_message_length = 2000
+        self.rebuild(max_message_chars=4000)
         self.start_turn()
 
         self.feed(text_delta(SESSION_ID, "字" * 2500))
 
         self.assertEqual(
-            [len(out.text) for out in self.send_text.outgoing], [2500],
-            "闸门把 2500 字挡住了 —— 它已被收窄，core.py 的注释要改",
+            self.send_text.outgoing, [],
+            "2500 字过了闸 —— 闸门只按桥的预算判了，shown_progress_text 会记下超额的量",
         )
+        self.assertEqual(self.edit_progress_calls, [])
+        self.assertEqual(self.turns[SESSION_ID].assemble(), "字" * 2500,
+                         "被闸门挡下不等于丢掉正文")
 
-    def test_the_gate_still_drops_anything_past_the_budget(self):
-        """闸门**必须仍在工作**：超过预算的一帧不发不改写，也不烧节流窗口。
+    def test_a_refused_frame_does_not_burn_the_throttle_window(self):
+        """被这一关挡下的帧**不该**消耗节流窗口 —— 与上面那道长度闸同一个规矩。
 
-        与上一条成对 —— 上一条证明"没有被收窄"，这一条证明"没有被绕开"。
+        这条不是洁癖：如果它烧了窗口，那么第一次被平台上限挡下之后，即使正文**缩回**
+        预算内（重试、多段拼接都可能出现）也要干等一个 ``edit_interval`` 才发得出去。
         """
+        self.adapter.max_message_length = 2000
+        self.rebuild(max_message_chars=4000)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "字" * 2500))
+
+        self.assertEqual(self.turns[SESSION_ID].last_edit_ts, 0.0)
+
+    def test_a_throttled_frame_never_asks_the_platform(self):
+        """被节流挡下的帧**不该**去问适配器 —— 这条钉的是**排列**，不是性质。
+
+        为什么在意：§6.3 说 delta 极度碎片化（实测 5.7 KB 回答 = 3402 个 delta），
+        每个 delta 都过一次这里。所以"先问平台再判节流"等于把一次路由查询放大到
+        每个 delta —— 而绝大多数 delta 都被节流挡下、什么都不会发出去。
+
+        与 :func:`test_a_refused_frame_does_not_burn_the_throttle_window` 成对：
+        那条管"被平台上限挡下不烧窗口"，这条管"被节流挡下不去问平台"。
+        两条一起把"闸门放在节流检查之后、``last_edit_ts`` 落盘之前"这个位置钉住。
+        """
+        self.rebuild(max_message_chars=4000)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "A"))
+        self.assertEqual(len(self.adapter_for_calls), 1, "首发那一次要问")
+
+        self.adapter_for_calls.clear()
+        self.feed(text_delta(SESSION_ID, "B"))
+        self.assertEqual(self.adapter_for_calls, [],
+                         "被节流挡下的帧不该去问适配器")
+
+        self.ticks[0] += 10.0
+        self.feed(text_delta(SESSION_ID, "C"))
+        self.assertEqual(self.adapter_for_calls, [CONVERSATION],
+                         "走过节流窗口之后就该问一次了")
+
+    def test_the_gate_still_drops_anything_past_the_bridge_budget(self):
+        """平台比桥还宽松时，闸门由**桥的预算**决定 —— 它没有被收窄成"永远发不出去"。"""
         self.rebuild(max_message_chars=5)
         self.start_turn()
 
@@ -587,6 +655,155 @@ class ProgressGateTests(EventStreamTestCase):
         self.assertEqual([len(o.text) for o in self.send_text.outgoing], [5],
                          "超出预算的那一帧本该被丢")
 
+    def test_the_platform_boundary_is_inclusive_too(self):
+        """平台上限那个边界同样闭区间：恰好 2000 字过得去，2001 过不去。"""
+        self.adapter.max_message_length = 2000
+        self.rebuild(max_message_chars=4000)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "字" * 2000))
+        self.assertEqual([len(o.text) for o in self.send_text.outgoing], [2000])
+
+        self.feed(text_delta(SESSION_ID, "字", ordinal=1))
+        self.assertEqual([len(o.text) for o in self.send_text.outgoing], [2000],
+                         "超出平台上限的那一帧本该被丢")
+
+    def test_no_adapter_means_no_narrowing_and_no_crash(self):
+        """``adapter_for`` 返回 ``None`` 时**没有平台可问**，行为与收窄前一致。
+
+        这条存在的理由是"别把一条新分支写成 AttributeError"：闸门现在要读
+        ``adapter.effective_max_length``，而适配器可能压根不存在（挂载之前、
+        或者路由查不到）。这时候预算只能取桥的那一个 —— 于是闸门退化成收窄前的
+        行为，而不是崩掉。
+        """
+        self.rebuild(max_message_chars=4000, adapter_for=lambda conversation_id: None)
+        self.start_turn()
+
+        self.feed(text_delta(SESSION_ID, "字" * 3000))
+
+        self.assertEqual(
+            [len(out.text) for out in self.send_text.outgoing], [3000],
+            "没有适配器时不该按任何平台上限收窄（那条路本来也发不出去，"
+            "所以这里断言的是**没有崩**且沿用桥的预算）",
+        )
+        # 桥的预算仍然生效：4001 装不下
+        self.ticks[0] += 10.0
+        self.feed(text_delta(SESSION_ID, "字" * 1001, ordinal=1))
+        self.assertEqual(
+            [len(out.text) for out in self.send_text.outgoing], [3000],
+            "没有适配器不等于没有闸门 —— 桥的预算仍在",
+        )
+
+
+class ShownProgressTextFitsTheFinalizeBudgetTests(EventStreamTestCase):
+    """**不变式本身**：记进 ``shown_progress_text`` 的量，装得进收尾真正用的预算。
+
+    ⚠️ 这条**直接**断言不变式，而不是断言它的推论。推论（"收尾那次改写不会超上限"）
+    在别的用例里也有，但那条会**绕过**这个量去查 —— 一旦有人改了记录那一侧的
+    条件（上一版就把记录条件写反过），推论照样成立、不变式已经断了，只有这条会红。
+
+    判据那一侧用的是**真** :class:`~opencode_bridge.outbound.OutboundSender`，
+    不是替身：不变式说的是"与收尾用的同一个数"，拿替身去比就等于自己证明自己。
+    """
+
+    #: Discord 的上限。桥的预算（4000）比它大，于是这里正好落在两者的窗口里。
+    PLATFORM_LIMIT = 2000
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.adapter.max_message_length = self.PLATFORM_LIMIT
+        self.recording_adapter = ScriptedAdapter()
+        self.recording_adapter.max_message_length = self.PLATFORM_LIMIT
+        self.finalize_calls = []
+        self.sender = OutboundSender(
+            adapter_for=lambda conversation_id: self.recording_adapter,
+            max_message_chars=self.max_message_chars,
+        )
+
+        def recording_finalize(conversation_id, handle, text, session_id,
+                               *, kind="final", shown_progress_text=""):
+            self.finalize_calls.append((text, shown_progress_text))
+            self.sender.finalize(
+                conversation_id, handle, text, session_id, kind=kind,
+                shown_progress_text=shown_progress_text,
+            )
+
+        self.stream = self.rebuild(finalize=recording_finalize)
+
+    def _stream_beyond_the_platform_limit(self) -> None:
+        """逐帧投喂，让正文**越过**平台上限（而不只是越过桥的预算）。
+
+        每帧 500 字：前四帧装得下（合计 2000，正好等于平台上限），第五帧越界。
+        于是记录下来的量应当**恰好**是平台上限 —— 一个字都不能多，而正文本身
+        仍然攒到 2500（被闸门挡下不等于丢掉正文，收尾要整段发出去）。
+        """
+        self.start_turn()
+        for ordinal in range(5):
+            self.ticks[0] += 10.0  # 走过节流窗口
+            self.feed(text_delta(SESSION_ID, "字" * 500, ordinal=ordinal))
+
+    def test_what_is_recorded_fits_the_budget_finalize_will_use(self):
+        """**这就是那条不变式**，原样断言。
+
+        平台 2000、桥的预算 4000：正文涨到 2500 时闸门必须挡住，于是记下来的量
+        至多 —— 而且**恰好**是 2000；而收尾用的预算是 ``min(4000, 2000) = 2000``。
+        """
+        self._stream_beyond_the_platform_limit()
+        recorded = self.turns[SESSION_ID].shown_progress_text
+
+        self.assertEqual(len(recorded), self.PLATFORM_LIMIT,
+                         "记下来的量应当恰好停在平台上限上")
+        self.assertLessEqual(
+            len(recorded),
+            one_message_budget(self.max_message_chars, self.adapter),
+            "记进 shown_progress_text 的量超出了收尾用的预算 —— "
+            "收尾那个 max(len(head), len(shown_progress_text)) 下界会把超额的长度放回去",
+        )
+
+    def test_finalizing_with_that_recorded_text_edits_within_the_platform_limit(self):
+        """把真实记录喂给**真**收尾，断言交给适配器的那段文本本身。"""
+        self._stream_beyond_the_platform_limit()
+        recorded = self.turns[SESSION_ID].shown_progress_text
+        answer = self.turns[SESSION_ID].assemble()
+
+        handle = self.recording_adapter.send(
+            Outbound(conversation_id=CONVERSATION, text=""))
+        self.sender.finalize(CONVERSATION, handle, answer, SESSION_ID,
+                             shown_progress_text=recorded)
+
+        self.assertTrue(self.recording_adapter.edited, "收尾必须尝试改写占位消息")
+        edited = self.recording_adapter.edited[-1][1].text
+        self.assertLessEqual(
+            len(edited), self.PLATFORM_LIMIT,
+            "收尾把 %d 字符交给了 %d 字符的平台" % (len(edited), self.PLATFORM_LIMIT),
+        )
+
+    def test_the_reader_still_gets_the_whole_answer_exactly_once(self):
+        """修这个缺陷**不许**动 ``a0f877e``：读者仍然拿到完整答复，恰好一次。"""
+        self._stream_beyond_the_platform_limit()
+        recorded = self.turns[SESSION_ID].shown_progress_text
+        answer = self.turns[SESSION_ID].assemble()
+
+        handle = self.recording_adapter.send(
+            Outbound(conversation_id=CONVERSATION, text=""))
+        self.sender.finalize(CONVERSATION, handle, answer, SESSION_ID,
+                             shown_progress_text=recorded)
+
+        self.assertEqual(self._what_the_reader_ends_up_with(), answer,
+                         "读者按顺序读下来不等于完整原文（丢了 / 重复了 / 乱序了）")
+
+    def _what_the_reader_ends_up_with(self) -> str:
+        """读者最终看到的拼接：占位消息的**最后一次成功改写** + 之后另发的那些。
+
+        占位消息首发时是空串（这里只造一个句柄，不发正文），所以读者看到的就是
+        收尾那次改写的内容，再加上收尾另发的续段。``ScriptedAdapter`` 只在
+        ``edit_result == "ok"`` 时返回成功，本类没有改成失败，所以 ``edited``
+        里的每一条都真的写上去了。
+        """
+        overwritten = "".join(out.text for _, out in self.recording_adapter.edited)
+        extra = "".join(out.text for out in self.recording_adapter.sent if out.text)
+        return overwritten + extra
+
 
 class TextDeltaTests(EventStreamTestCase):
     def test_deltas_are_merged_into_one_streaming_message(self):
@@ -601,7 +818,18 @@ class TextDeltaTests(EventStreamTestCase):
         self.assertEqual(self.send_text.outgoing[0].text, "Hel")
         self.assertEqual(self.send_text.outgoing[0].kind, "progress")
         self.assertEqual(self.edit_progress_calls[-1][2], "Hello world")
-        self.assertEqual(self.adapter_for_calls, [CONVERSATION])
+        # ⚠️ 这条断言**改过**（原来是一个 ``[CONVERSATION]``）：现在**每一帧**都要问一次
+        # 适配器，因为长度闸门必须与收尾用同一个预算（``one_message_budget``），而那个
+        # 预算来自 ``adapter_for``。修好之前只有**首发**那一次 —— 问的是发信那条路上的
+        # 替身，而替身 ``send_text`` / ``edit_progress`` 自己不问，所以计数才是一。
+        self.assertEqual(
+            set(self.adapter_for_calls), {CONVERSATION},
+            "每一帧都必须按 conversation 问适配器，不能问错会话",
+        )
+        self.assertEqual(
+            len(self.adapter_for_calls), 3,
+            "首发 + 两次改写 = 三帧发布，三次查询",
+        )
 
     def test_out_of_order_ordinals_are_sorted(self):
         self.start_turn()

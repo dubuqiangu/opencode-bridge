@@ -29,6 +29,11 @@ from .adapters import Adapter
 from .hooks import MsgHandle
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient
+# 只借一个**纯函数**（见它的 docstring）：出站的那些方法是注入进来的 callable，
+# 而"一条消息装得下多少"这个数**必须**由一处算 —— 两处各算一次就会漂，而它们
+# 漂过一次（闸门只按桥的预算判，收尾取小者），后果是记下超额的
+# ``shown_progress_text``。这不是把出站服务拖进本模块，只是共用它的答案。
+from .outbound import one_message_budget
 from .permission_ledger import PermissionLedger
 from .state import StateStore
 
@@ -520,6 +525,22 @@ class EventStream:
             now = self.clock()
             if (now - turn.last_edit_ts) < self._edit_interval:
                 return  # throttled
+            # ⚠️ 判据是**平台**真正接受的一条长度，与收尾那一步
+            # (:meth:`~opencode_bridge.outbound.OutboundSender.finalize`) 同一个数。
+            # 只按 ``bridge.max_message_chars`` 判会让 2001~4000 字的正文过闸：
+            # 适配器把它切成多条、只交回最后一条的句柄，而下面记下的
+            # ``shown_progress_text`` 是**整段** —— 收尾时那个
+            # ``max(len(head), len(shown_progress_text))`` 下界于是把超额的长度
+            # 放了回去。实测（真桥 + 真 Discord）：收尾改写带 3973 字符去了一个
+            # 2000 字符的平台。不变式「记下来的量装得进收尾用的预算」就断在这里。
+            #
+            # 为什么放在节流检查**之后**、``last_edit_ts`` 落盘**之前**：被这一关
+            # 挡下的那一帧**不该**烧掉节流窗口（与上面那道长度闸同一个规矩），而
+            # 一旦落到发信那条路上，``adapter_for`` 就会被调 —— 放在这里等于
+            # "每发一次才问一次平台"，与原来那条路上的调用频次一样。
+            adapter = self._adapter_for(conversation_id)
+            if len(text) > one_message_budget(self._max_message_chars, adapter):
+                return
             turn.last_edit_ts = now
 
         if handle is None:
@@ -527,7 +548,7 @@ class EventStream:
                 conversation_id,
                 text,
                 kind="progress",
-                adapter=self._adapter_for(conversation_id),
+                adapter=adapter,
                 session_id=session_id,
             )
             with self._lock:

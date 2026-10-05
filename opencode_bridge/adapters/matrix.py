@@ -560,6 +560,20 @@ class MatrixAdapter(Adapter):
           内容不丢，但会多出一条。**调用方不应把它当成"原地改写"来做幂等判断。**
         * 新正文超过 :attr:`effective_max_length` 时**退化为发一条新消息**（普通
           ``send``，会自行分片），不再带编辑语义。
+          **⚠️ 这里刻意与 telegram / discord / slack / mattermost / nextcloud 不一样，
+          而且那五家才是"该抛"的那一类** —— 理由是本适配器根本**不在同一个族里**：
+          ① Matrix 没有标准的编辑 API，本方法**自己就是那条 ``send``**，所以"退化
+          成 send"在这里根本不是退化，它就是本方法平时的做法；② :data:`MESSAGE_LIMIT`
+          是**我们自己选的保守值**（按事件体 64KB 上限反推），不是 Matrix 会拒收的
+          阈值 —— 抛 ``ValueError`` 等于**拒绝投递一条 Matrix 乐意收下的消息**，
+          那才是真把正文弄丢。
+          反过来，那五家是真的会被**拒收**（discord 400/50035、telegram 400
+          "message is too long"、slack ``msg_too_long``、mattermost 400
+          ``model.post.is_valid.message_length.app_error``、nextcloud 413），所以它们
+          在本地就抛、零请求。**别把这一家"改成一致"** —— 代价是矩阵上会丢正文，
+          而且那五家改成这一家会把占位消息上已经显示的那一截**读两遍**
+          （实测 4000 字读成 5500 字，见 ``tests/test_edit_length_guard.py``）。
+          两族的分工写在 :meth:`~opencode_bridge.adapters.base.Adapter.edit`。
         * 因为带 ``m.relates_to``，本条消息会被自己的入站过滤跳过
           （见 :meth:`_handle_event`），不会形成回声。
 

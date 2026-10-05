@@ -1027,7 +1027,29 @@ class NextcloudAdapter(Adapter):
         需要服务端开启 ``edit-messages`` capability（Talk 19+ 默认开）。
 
         返回 ``True``/``False``（基类契约），成功码是 **200 或 202**。
+
+        ⚠️ **超限就地拒收，抛** ``ValueError`` —— 与
+        :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter.edit` 与
+        :meth:`~opencode_bridge.adapters.discord.DiscordAdapter.edit` 同一件事、
+        同一句话术。上面的 **413** 那一行就是依据：Talk 对超长的 ``PUT
+        chat/{token}/{messageId}`` 回 413（``_classify_nc_error`` 早就把 413 归成
+        ``SendError.TOO_LONG``）。本地先判一道，省掉一次注定失败的往返与一次
+        :meth:`_throttle` 等待。
+
+        **为什么不能退化成"发一条新消息"**：占位消息是**另外发出去的**那条消息，
+        上面已经显示着一截正文；把整段再发一遍，读者就把那一截读了两遍
+        （实测 4000 字读成 5500 字，见 ``tests/test_edit_length_guard.py``）。
+
+        **注意本平台尤其容易被这条命中**：:meth:`_apply_max_chat_length` 会在
+        ``start()`` 之后用服务端的 ``spreed.config.chat.max-length`` 改小
+        :attr:`message_limit`，而它是**运行期**的槽 —— 若细化落在"一次流式写入"与
+        "一次收尾"之间，收尾用的预算当场变小，而 ``finalize`` 那个
+        ``max(len(head), len(shown_progress_text))`` 下界会把已显示的长度放回去。
         """
+        if len(out.text) > self.effective_max_length:
+            raise ValueError(
+                f"nextcloud edit text too long: {len(out.text)} > {self.effective_max_length}"
+            )
         token = self._token(handle.conversation_id)
         message_id = str(handle.message_id or "").strip()
         if not token or not message_id:

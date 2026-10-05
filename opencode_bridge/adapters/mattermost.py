@@ -1040,7 +1040,31 @@ class MattermostAdapter(Adapter):
 
         ⚠️ **不要用** ``PUT /posts/{id}``：那是"整条替换"，会把请求里没列出的字段
         （props、file_ids 等）**清空**。编辑只用 ``/patch``（部分更新）。
+
+        ⚠️ **超限就地拒收，抛** ``ValueError`` —— 与
+        :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter.edit` 与
+        :meth:`~opencode_bridge.adapters.discord.DiscordAdapter.edit` 同一件事、
+        同一句话术。Mattermost 在 ``server/channels/api4/post.go`` 里对
+        ``updatePost`` 与 ``patchPost`` **都**调 :func:`rejectOversizedMessage`
+        （``utf8.RuneCountInString(message) > MaxPostSize`` ⇒ HTTP **400**，
+        ``model.post.is_valid.message_length.app_error``），而 ``model.Post.IsValid``
+        里还有同一道检查 —— 所以它**拒收，不截断**。本地先判一道，省掉一次注定
+        失败的往返与一次 :meth:`_throttle` 等待，也让日志说出真正的原因。
+
+        **为什么不能退化成"发一条新消息"**：占位消息是**另外发出去的**那条消息，
+        上面已经显示着一截正文；把整段再发一遍，读者就把那一截读了两遍
+        （实测 4000 字读成 5500 字，见 ``tests/test_edit_length_guard.py``）。
+
+        **这一条尤其该有**：:meth:`_apply_max_post_size` 会在 ``start()`` 之后用
+        服务端的 ``MaxPostSize`` 改小 :attr:`message_limit`，而那个槽是**运行期**
+        的 —— 若它落在"一次流式写入"与"一次收尾"之间，收尾用的预算当场变小，
+        ``finalize`` 那个 ``max(len(head), len(shown_progress_text))`` 下界又把已显示
+        的长度原样放回去，于是**一条超限的改写真的会被构造出来**。
         """
+        if len(out.text) > self.effective_max_length:
+            raise ValueError(
+                f"mattermost edit text too long: {len(out.text)} > {self.effective_max_length}"
+            )
         post_id = str(handle.message_id or "").strip()
         if not post_id or not self.token or not self.site_url:
             logger.warning("mattermost: bad handle %r", handle)

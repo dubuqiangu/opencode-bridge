@@ -504,6 +504,36 @@ class SlackAdapter(Adapter):
         return handle
 
     def edit(self, handle: MsgHandle, out: Outbound) -> bool:
+        """``chat.update`` —— 真的原地改写。
+
+        ⚠️ **超限就地拒收，抛** ``ValueError`` —— 与
+        :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter.edit` 与
+        :meth:`~opencode_bridge.adapters.discord.DiscordAdapter.edit` 同一件事、
+        同一句话术。Slack 对超限的 ``chat.update`` 回 ``ok:false`` +
+        ``msg_too_long``（官方错误表：*"Message text is too long. The ``text`` field
+        cannot exceed 4,000 characters."*），所以本地先判一道：一次注定失败的往返
+        外加 :meth:`_throttle` 的那一次等待都是白花，而调用方拿到的只是一个
+        ``False``，与"网络失败""权限不足"完全分不开。
+
+        ⚠️ **这一道挡不住 Slack 全部的拒收**，而且原因值得写下来：
+        :data:`MESSAGE_LIMIT` 是 ``chat.postMessage`` 的上限（40000，官方文档说
+        超过会**截断**），而 ``chat.update`` 的官方上限是 **4000** —— 同一个平台
+        两个不同的数，而 :attr:`~opencode_bridge.adapters.base.Adapter` 只有
+        ``effective_max_length`` **一个**出口。所以 Slack 上真正的防线是桥的预算
+        （``one_message_budget`` 取两条上限的小者，默认配置下就是 4000）；本方法
+        这一道是**纵深防御**：预算被调大时它至少不会把一条**注定**失败的请求发出去。
+
+        **为什么不能退化成"发一条新消息"**：占位消息是一条**另外发出去的**消息，
+        它上面已经显示着一截正文；适配器把整段再发一遍，读者就把那一截读了两遍
+        （实测 4000 字的答复被读成 5500 字，见
+        ``tests/test_edit_length_guard.py``）。而
+        :meth:`~opencode_bridge.outbound.OutboundSender.finalize` 本来就知道"读者还
+        没看到哪几段"（``shown_progress_text``），由它补发才是对的。
+        """
+        if len(out.text) > self.effective_max_length:
+            raise ValueError(
+                f"slack edit text too long: {len(out.text)} > {self.effective_max_length}"
+            )
         channel = self._channel_id(handle.conversation_id)
         if not channel or not handle.message_id:
             logger.warning("slack: bad handle %r", handle)

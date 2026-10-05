@@ -351,7 +351,35 @@ class Adapter(abc.ABC):
 
     @abc.abstractmethod
     def edit(self, handle: MsgHandle, out: Outbound) -> bool:
-        """Edit a previously sent message. Failure -> log, return False."""
+        """Edit a previously sent message. Failure -> log, return False.
+
+        ## 正文超上限时：**五个适配器抛、一个不抛**，而这个差别是对的
+
+        * **平台会拒收这一类** —— 改写是真的把另一条已发出去的消息重写一遍，而平台
+          有自己的上限：``discord`` 回 400 ``50035``、``telegram`` 回 400
+          "message is too long"、``slack`` 回 ``msg_too_long``、``mattermost`` 回
+          400 ``model.post.is_valid.message_length.app_error``（``api4/post.go`` 的
+          ``rejectOversizedMessage``，``updatePost`` 与 ``patchPost`` 都调）、
+          ``nextcloud`` 回 413。**这五个在本地就抛** ``ValueError``、**一个请求都
+          不发**，把"本地判定的超限"与"网络失败 / 权限不足"分开。
+        * **平台压根没有"改写"这个概念** —— ``matrix``：Matrix 无标准编辑 API，
+          它的 :meth:`~opencode_bridge.adapters.matrix.MatrixAdapter.edit` **自己
+          就是一条 ``send``（``m.replace`` 回落写法），而它的上限是**我们自选**的
+          保守值（按事件体 64KB 上限反推）。按保守值抛异常等于**拒绝投递一条平台
+          乐意收下的消息**，所以它退化成普通 ``send``。
+
+        ⚠️ **两种表达都被调用方接住了**：``outbound.py`` 的两条改写路都先接
+        ``ValueError`` 再接 ``Exception``，``commands.py`` 那一处接 ``Exception``。
+        ``tests/test_edit_length_guard.py`` 用源码结构断言把这一点钉住 ——
+        **一旦有人新增一个不接的调用点，那条断言会红**，因为"抛出去会不会中断这一轮"
+        是这条契约能不能成立的前提。
+
+        ⚠️ **别把"退化成 send"推广到那五个**：占位消息是**另外发出去**的那条消息，
+        它上面已经显示着一截正文；把整段再发一遍，读者就把那一截读了两遍（实测
+        4000 字的答复被读成 5500 字）。补发读者没读到的那几段是
+        :meth:`~opencode_bridge.outbound.OutboundSender.finalize` 的活，它手里有
+        ``shown_progress_text``。
+        """
 
     def answer(self, query_id: str, text: str = "") -> None:
         """Acknowledge an inline-keyboard callback query (optional)."""

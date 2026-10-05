@@ -1760,14 +1760,36 @@ adapters/telegram.py:327     self._pending.clear()
 
 > 2026-10-05 复核：**两条都仍然成立**，各补一个实测锚点。
 
-- **裸 local id 仍在日志里明文**。实测锚点：`adapters/telegram.py:493`
+- **裸 local id 仍在日志里明文**。实测锚点：`adapters/telegram.py:498`
   `logger.info("telegram: dropped message from non-whitelisted chat %s", chat.get("id"))`
-  （⚠️ 原写 `telegram.py:492`，该行已漂移；这是 chat id，不是 `identity.py`
-  意义上的 local id，两者都是平台侧 id）。
+  （⚠️ 原写 `telegram.py:492`，**又漂到 `:493`，现为 `:498`** —— 本文件**第五次**行号漂移；
+  这是 chat id，不是 `identity.py` 意义上的 local id，两者都是平台侧 id）。
   **按形状不可修** —— discord snowflake **本身就是合法的纳秒时间戳**，
   任何涵盖它的数字范围也涵盖时间戳/端口/行号；`~15 行`这个数量本次**未重数**
   （数法见下方 F4 那一节的口径问题），故不再引用它。
   根治是让适配器改记带前缀的 `conversation_id`，属于 `adapters/**`，不在 C2 范围内。
+
+  🔴 **2026-10-05：这一条从「偶发泄露」升级为「系统性泄露」，必须跟着阶段 G 一起修。**
+  **翻转前**，一次丢弃需要「配了非空白名单 + 从名单外来」⇒ **偶发**。
+  **翻转后**（`config_version >= 2` 且清单为空）⇒ **每个 chat 的每条消息都会被丢弃
+  并记一行裸 id** —— 一个话多的陌生人就能用自己的 id 把日志灌满。
+  ⇒ **`redaction.py` 里「代价（明说）」那段，本轮开始要按期支付了。**
+
+  **实测落点（13 个平台全都有这条路径，行号现查后再动手）**：telegram / slack /
+  discord / matrix / mattermost / irc / twitch / ntfy / email / nextcloud / qqbot /
+  a2a / homeassistant。其中 5 家有自己的 `_drop_inbound(reason, …, id, …)` 封装，
+  **而它有 9~10 个调用点**（bot 自己发的、系统消息、空正文、格式非法、回环防护……）
+  ⇒ **修那一层一次修好所有理由**，比只修「未在白名单」那一支彻底。
+  ⛔ **`nextcloud` 那条记的是 OCS 会话 `token` + 发件人 `actor`（凭据级），最高危。**
+
+  ⚠️ **一条必须守住的约束**：`README.md:835` 的排障表**按字符串**引用了
+  `dropped message from non-whitelisted chat`（用户照它搜日志）⇒
+  **改 id 参数，不改那些英文词**；若确要改文案，README 那行必须一起改。
+
+  ⚠️ **可运维性不丢**：`conversation_id` 被 C2 洗成 `platform:conv#<摘要>`，
+  而 C2 的设计意图**正是**让被脱敏的行仍能跨行关联到同一会话 ⇒
+  换过去**两样都成立**（隐私 + 可关联），不是拿可运维性换隐私。
+
 - **装好之后再挂的 handler 不会被覆盖** —— 原文照录于
   `redaction.py:531-534`（`:531`「⚠️ 未知文本边界：**之后**再挂的 handler 不会被
   覆盖到」，`:532-534` 给出理由：嵌入式只暴露 `logging.basicConfig`、生产路径经

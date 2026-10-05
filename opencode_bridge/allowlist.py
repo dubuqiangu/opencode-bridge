@@ -65,11 +65,32 @@ __all__ = [
     "ALLOWLIST_CONFIG_KEYS",
     "AllowlistConflict",
     "AllowlistResolution",
+    "NICK_IN_ALLOWLIST_CONSEQUENCE",
+    "NO_SENDER_IDENTITY_REASON",
     "resolve_allowlist",
     "describe_no_allowlist",
     "warn_if_no_allowlist",
     "warn_if_conflicting_keys",
+    "nick_in_allowlist",
+    "describe_nick_in_allowlist",
 ]
+
+#: 私聊被闸门拒时**必须**出现在日志里的那句判据。
+#:
+#: ⛔ 通用文案「not-whitelisted」对私聊是**假话**：真相是"这条路径没有可用的发件人
+#: 身份"（irc / twitch 的私聊 principal 是 bot 自己的 nick，协议层没有发件人认证），
+#: 而不是"你不在名单里"。照着假话去查白名单会把人引到错误的方向。
+#:
+#: ⚠️ 这句话**逐字**写在两个适配器的日志格式串里，也逐字写在 ``README.md`` 的排障表里
+#: —— 三处由 ``tests/test_nick_in_allowlist.py`` 钉在一起。改任何一处而不同步另两处，
+#: 那条断言会红（这正是 fix-118 钉 README 排障表锚点的做法）。
+NO_SENDER_IDENTITY_REASON = "这条路径没有可用的发件人身份"
+
+#: 拒绝启动时**必须**说清的后果：白名单里那条 nick 会给**所有人**的私聊开门。
+#:
+#: ⛔ 不能只写「invalid nick」：用户读到那句话时，唯一能做的事是"把配置里某一行的
+#: 值改对"，而他必须先知道**那一行值错了会造成什么**才会去改。
+NICK_IN_ALLOWLIST_CONSEQUENCE = "这一条会把所有人的私聊一起放行"
 
 #: 授权键的**接受顺序**，先出现者胜。改这个顺序就是改行为 —— 见模块 docstring。
 ALLOWLIST_CONFIG_KEYS: Final[tuple[str, ...]] = (
@@ -305,3 +326,82 @@ def warn_if_conflicting_keys(platform_label: str, resolution: AllowlistResolutio
     if resolution.conflict is None:
         return
     logger.warning("%s: %s", platform_label, resolution.conflict.describe())
+
+
+# ======================================================================
+# 「自己的 nick 进了白名单」——把一个静默的洞变成明确的拒绝
+# ======================================================================
+def nick_in_allowlist(
+    nick: object, allowed_chat_ids: object
+) -> Optional[str]:
+    """自己的 ``nick`` 是不是被写进了闸门用的那份白名单。命中则返回**那条原始条目**。
+
+    ## 为什么这是必须拒绝的配置
+
+    irc / twitch 的私聊报文是 ``PRIVMSG <target> :<body>``，而 ``<target>`` 是
+    **「发给谁」= bot 自己**。两个适配器判「这是私聊」与授权闸门**用的是同一个
+    ``target``** ⇒ 私聊的 principal 是 bot 自己的 nick ⇒ **所有私聊共用同一个
+    principal**。于是用户一旦为了「让私聊能用」把自己的 bot nick 填进
+    ``allowed_chat_ids``，闸门就会把**任何人**的私聊当成已授权放进来。
+
+    ⚠️ 这不是"配置写错了"，是**静默的开门**：用户以为他授权了自己一个人，
+    实际授权的是全世界的私聊。所以它必须是**拒绝**（抛异常），不是 warning。
+
+    ## 比对的是**闸门真正用的那份集合**
+
+    实参必须是 :attr:`opencode_bridge.adapters.base.Adapter.allowed_chat_ids` 本身 ——
+    也就是 :meth:`~opencode_bridge.adapters.base.Adapter._gate_rejects` 拿来判的
+    那一个 ``set``。⛔ **不要**在这里重新调 :func:`resolve_allowlist`：那样会出现
+    两条解析路径，而"闸门读 A、检查读 B"一旦分叉，这个检查就会在 A 上生效、
+    在 B 上漏掉 —— 那正是它本该防的那类洞。
+
+    ## 为什么用 ``casefold()`` 而不是 ``lower()``
+
+    :func:`str.casefold` 是为**无大小写匹配**设计的，比 :meth:`str.lower` 更进一步
+    （``ß`` → ``ss``、``ﬁ`` → ``fi``、``İ`` → ``i̇``）。这里**必须比闸门更严**：
+
+    * 判私聊那一步用的是 ``target.lower() == self.nick.lower()``；
+    * 闸门比对本身是**大小写敏感**的（:func:`_entries_of` 不做折叠），
+      所以「闸门认不出」不代表「没有人能拿它进门」。
+
+    方向性是单向的：检查**过严**的代价是用户删掉一行配置就能启动；检查**过松**的代价
+    是一扇对所有人开着的门。宁可误报。IRC 的 nick 等价折叠（RFC 1459 casemapping，
+    ``{}`` ≡ ``[]`` ≡ ``\\``）比这两者都更宽，**不在**这个检查的范围内 ——
+    见交付报告里"发现但刻意没改"那条。
+
+    空 nick 直接放行：``bool(self.nick)`` 是判私聊的前置条件，空 nick 根本成不了
+    私聊的 principal（而白名单条目经 :func:`_entries_of` 也不会是空串）。
+    """
+    text = str(nick or "").strip()
+    if not text:
+        return None
+    folded_nick = text.casefold()
+    try:
+        entries = allowed_chat_ids or ()
+    except TypeError:
+        return None
+    for entry in entries:
+        if str(entry).strip().casefold() == folded_nick:
+            return str(entry)
+    return None
+
+
+def describe_nick_in_allowlist(
+    platform_label: str, nick: object, offending_entry: object
+) -> str:
+    """拒绝启动时给用户的话：**说清后果**，并给出唯一可行的改法。"""
+    return (
+        f"{platform_label}: 拒绝启动 —— `allowed_chat_ids` 里的 "
+        f"{str(offending_entry)!r} 就是本适配器自己的 nick（当前 {str(nick)!r}）。"
+        f"⛔ 后果：{NICK_IN_ALLOWLIST_CONSEQUENCE}"
+        f" —— irc / twitch 的私聊报文是 `PRIVMSG <target> :<body>`，"
+        f"`<target>` 是「发给谁」也就是 bot 自己，"
+        f"于是私聊的 principal 是 bot 自己的 nick，"
+        f"**所有**私聊共用同一个 principal；"
+        f"所以这一条不是「只授权你自己」，{NICK_IN_ALLOWLIST_CONSEQUENCE}。"
+        f"请把这一条从 `allowed_chat_ids` 里删掉。"
+        f"要授权就用**频道名**（形如 `#channel`）—— 频道名才是真会话标识。"
+        f"⚠️ 删掉之后本平台的私聊**依然不可用**：这两个平台的协议层没有发件人认证"
+        f"（配对已对它们禁用），闸门无法区分是谁在私聊；"
+        f"这不是「配错了」，私聊在这两个平台上就是没有可授权的身份。"
+    )

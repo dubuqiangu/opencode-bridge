@@ -327,6 +327,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - 服务器与昵称冲突（收到 `433`）会自动换名重试；`nick` 必须在该网络已注册。
 > - SASL：`bot_password` 填密码即可（走 `PASS`/`SASL PLAIN` 协商）。
 > - ⚠️ **翻转成「空 = 全拒」后，IRC 的私聊对所有人不可用。** 私聊时闸门比对的 principal 是 **bot 自己的 nick**（IRC 根本没有发件人认证，任何人都能声称任何 nick），所以闸门无法区分。**频道里照常工作**（频道名 `#channel` 是真会话标识）。⛔ **IRC 不提供 `/pair`**（平台必须对发件人做过认证），白名单**只能手填**。这不是「部分能用」，是**没人能用**。
+> - ⛔ **`allowed_chat_ids` 里绝不能出现 `nick` 自己的值**（大小写任意写法都不行）：那一行不是「只授权你自己」，**这一条会把所有人的私聊一起放行** —— 私聊的 principal 就是这个 nick，所有人的私聊共用它。桥接在构造适配器时就**拒绝启动**并给出这句话（不是 warning），Twitch 也一样，且连「运行期由 Helix 查到的 nick」也照样拒。删掉那一行即可，频道授权不受影响。
 
 ### Twitch（支持双向对话 · IRC over TLS WebSocket，无需公网地址）
 
@@ -348,6 +349,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - 消息长度上限（默认 400 字符）与限流阈值是**社区经验值**，非官方文档公开常量。
 > - 填了 `client_id` 就能用 Helix API 取自己的 user id，回声过滤更准；不填则退回按昵称过滤。
 > - ⚠️ **翻转成「空 = 全拒」后，Twitch 的私聊对所有人不可用**（原因同 IRC：私聊 principal 是 bot 自己的 nick）。**频道里照常工作。** ⛔ **Twitch 不提供 `/pair`**，白名单**只能手填**。
+> - ⛔ **`allowed_chat_ids` 里绝不能出现 `nick` 自己的值**，理由与 IRC 相同：**这一条会把所有人的私聊一起放行**。⚠️ Twitch 的 nick 可能**不来自配置**（填了 `client_id` 时由 Helix 查出来，运行期才知道）⇒ 桥接在**每一次** nick 变成已知值时都重新查一次，查到就**拒绝**（`TwitchAdapter.nick` 的 setter 是唯一入口，配置里没写 nick 也一样）。
 
 ### Nextcloud Talk（支持双向对话 · HTTP 长轮询，无需公网地址）
 
@@ -834,6 +836,8 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。按「接入平台引导」填好**该平台自己的凭据键**（不都是 `bot_token`：Slack 入站另需 `app_token`、Matrix 用 `homeserver`/`access_token`/`user_id`、IRC 用 `host`/`nick`/`channels`、Mattermost 用 `site_url`/`token`、Twitch 用 `token`/`channel`）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge。用 `--status` 逐平台核对缺什么 |
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中。⚠️ 若是升级后**突然**收不到消息、而你的 `allowed_chat_ids` 是空的：多半是这次翻转。查 `config.json` 的 `config_version` —— **`< 2`**（含没有这个键）时是「空 = 全放行」，**`>= 2`** 则是新语义「空 = 全拒」。解法见「7. 安全须知」的「两步走」：`/pair` 在未授权的 chat 上就能用。⚠️ **日志里那个 chat 已经不是原值了**：脱敏层只认 `platform:local_id` 这种带前缀的形式（裸 id 按形状无法脱敏 —— discord 雪花号本身就是个合法纳秒时间戳），所以落盘形态是 `<平台>:conv#<6位>-<6位>`，例如 `telegram:conv#4f5307-ab5f8c`。**同一个会话在多行日志里仍是同一个 `conv#`** ⇒ 「是不是同一个人 / 同一个 chat 在刷屏」照样查得到；**跨进程 / 跨重启对不上**（摘要密钥只在内存里，别拿昨天的 `conv#` 对今天的） |
 | irc / twitch 私聊没反应（频道里正常） | **已知的行为变更**：私聊的 principal 是 bot 自己的 nick，闸门无法区分 ⇒ 白名单为空且 `config_version >= 2` 时必然被拒。频道不受影响（频道名是真会话标识）。这两个平台**不提供 `/pair`**（无发件人认证），只能在 `allowed_chat_ids` 里手填 |
+| irc / twitch 启动失败，日志有 `拒绝启动` 且写着「**这一条会把所有人的私聊一起放行**」 | `allowed_chat_ids` 里写了本适配器**自己的 nick**。⛔ 这一行不是「只授权你自己」：**这一条会把所有人的私聊一起放行**（私聊的 principal 就是 bot 自己的 nick，所有人的私聊共用它）⇒ 桥接**拒绝启动**，而不是打个 warning 继续跑。**改法**：把这一行从 `allowed_chat_ids` 里删掉；频道授权（`#channel`）不受影响。⚠️ Twitch 报这条时 nick 可能来自 Helix 而非配置（配置里没写 `nick` 也一样会被拒） |
+| irc / twitch 日志有 `dropping private message from non-whitelisted nick`（**这条路径没有可用的发件人身份**） | 私聊被拒。**这不是「你不在白名单里」** —— 私聊的 principal 是 bot 自己的 nick，两个平台的协议层都没有发件人认证，闸门分不出是谁在私聊，所以这条路径**本来就没有可授权的身份**。频道里照常工作 |
 | 收不到 `/pair` 的回信 | 多半是 `pairing_secret` 没填（**留空 = 不提供配对**，不会用空串派生）。生成后**要重启桥**才会生效；`irc / twitch / nextcloud / homeassistant / a2a / qqbot` 本身不支持配对 |
 | 会话行为异常 / 想清空上下文 | 发送 `/new`（或 `/reset`）重建 session |
 | 插件没拉起 bridge | 看 `<bridgeDir>\bridge-plugin.log` 与 `<bridgeDir>\.bridge-plugin.lock`；确认插件目录里的 `config.json` 中 `bridgeDir` 指向真实存在的目录 |

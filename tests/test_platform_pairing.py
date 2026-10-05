@@ -499,7 +499,13 @@ class TestIrcPrivateMessages(unittest.TestCase):
         )
 
     def test_no_warning_when_the_allowlist_is_populated(self):
-        """清单非空时私聊本来就有入口 ⇒ 喊"进不来"是假话。"""
+        """清单非空时私聊本来就有入口 ⇒ 喊"进不来"是假话。
+
+        ⚠️ 清单里那一条**刻意用频道名**而不是本适配器自己的 nick：后者会被
+        :class:`~opencode_bridge.adapters.base.AdapterError` 直接拒掉
+        （见 :mod:`tests.test_nick_in_allowlist`）—— 而这条要验的是
+        "清单非空 ⇒ 不发那条告警"，用频道名才验得到它本来要验的东西。
+        """
         import logging
 
         records: list[logging.LogRecord] = []
@@ -516,7 +522,7 @@ class TestIrcPrivateMessages(unittest.TestCase):
         try:
             build(
                 "irc",
-                {**self.IRC_CONFIG, "config_version": 2, "allowed_chat_ids": ["opencodebot"]},
+                {**self.IRC_CONFIG, "config_version": 2, "allowed_chat_ids": ["#lab"]},
                 RecordingHooks(),
             )
         finally:

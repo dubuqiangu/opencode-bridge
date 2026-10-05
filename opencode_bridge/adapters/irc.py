@@ -53,13 +53,14 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
+from ..allowlist import describe_nick_in_allowlist, nick_in_allowlist
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..pairing import CONFIG_VERSION_KEY, empty_allowlist_is_open
 from ..split import split_text
 from ..transport import NOTHING, TcpLineTransport
 from ._redactable_ids import redactable_id
-from .base import Adapter, register
+from .base import Adapter, AdapterError, register
 
 logger = logging.getLogger("opencode_bridge.adapters.irc")
 
@@ -317,10 +318,45 @@ class IRCAdapter(Adapter):
     reconnect_delay = RECONNECT_DELAY
     max_reconnect_delay = MAX_RECONNECT_DELAY
 
+    # ------------------------------------------------------------------
+    # 自己的 nick：**唯一**的写入检查点
+    # ------------------------------------------------------------------
+    @property
+    def nick(self) -> str:
+        """本适配器自己的 nick，也就是**私聊的 principal**。
+
+        读它没有危险，**写**它才是（见 :meth:`nick` 的 setter）。因此它做成 property：
+        将来任何新增的 ``self.nick = ...`` 都会自动过一次检查，而**不是**去两处
+        call site 打补丁 —— 后者正是"下一个改代码的人加一行赋值就绕过"的那种洞。
+        """
+        return self._nick
+
+    @nick.setter
+    def nick(self, value: object) -> None:
+        """任何"本平台自己的 nick 变成已知值"的时刻都过这里。
+
+        ⛔ 被拒的是**构造**（抛 :class:`~opencode_bridge.adapters.base.AdapterError`），
+        不是 warning：这条配置会让闸门把**所有人**的私聊当已授权放进来
+        （判据见 :func:`~opencode_bridge.allowlist.nick_in_allowlist`）。
+        适配器起不来 ⇒ 私聊那条路压根不存在，比"跑起来但全开"好。
+
+        比对的是 :attr:`~opencode_bridge.adapters.base.Adapter.allowed_chat_ids` ——
+        **闸门自己用的那一份**，不重新解析配置。
+        """
+        text = str(value or "").strip()
+        offending_entry = nick_in_allowlist(text, self.allowed_chat_ids)
+        if offending_entry is not None:
+            raise AdapterError(
+                describe_nick_in_allowlist(
+                    self.label or self.name, text, offending_entry
+                )
+            )
+        self._nick = text
+
     def __init__(self, config: dict, hooks: Hooks) -> None:
         super().__init__(config, hooks)
         self.host: str = str(self.config.get("host") or "").strip()
-        self.nick: str = str(self.config.get("nick") or "").strip()
+        self.nick = str(self.config.get("nick") or "")
         self.channels: List[str] = self._channel_list(self.config.get("channels"))
         self.use_tls: bool = bool(self.config.get("use_tls"))
         self.port: int = self._resolve_port()
@@ -669,10 +705,26 @@ class IRCAdapter(Adapter):
         if not self.admits(target) and not self.answer_pairing_request(
             target, conversation_id, text
         ):
-            logger.info(
-                "irc: dropping message from non-whitelisted target %s",
-                redactable_id(self.name, target),
-            )
+            # ⚠️ 私聊与频道**分开说**。通用文案「not-whitelisted」对私聊是假话：
+            # 私聊的 principal 是 bot 自己的 nick（所有私聊共用它），被拒的真正
+            # 原因是「这条路径没有可用的发件人身份」，不是"你不在名单里"——
+            # 照着假话去查白名单会把人引到错误的方向。
+            # ⚠️ 频道那一句**逐字不动**：它是 grep 锚点，README 排障表按它引用。
+            if is_private:
+                # ⚠️ 判据后面那个**空格是承重的**：脱敏层的会话 id 形状
+                # ``<平台>:<后面所有非空白字符>``（见 ``redaction._CONVERSATION_ID_PATTERN``）
+                # 会把紧跟在 id 后面的中文判据**一起当成 id 吞掉** ⇒ 那句话根本不会落盘。
+                # 写成 ``%s（…）`` 时实测落盘只剩前半句；中间留一个空格才留得住。
+                logger.info(
+                    "irc: dropping private message from non-whitelisted nick %s "
+                    "（这条路径没有可用的发件人身份，不是你不在白名单里）",
+                    redactable_id(self.name, target),
+                )
+            else:
+                logger.info(
+                    "irc: dropping message from non-whitelisted target %s",
+                    redactable_id(self.name, target),
+                )
             return
         try:
             self.hooks.on_inbound(

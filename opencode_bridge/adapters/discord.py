@@ -93,6 +93,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import NOTHING, ReconnectNow, WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.discord")
@@ -864,11 +865,22 @@ class DiscordAdapter(Adapter):
         )
 
     def _drop_inbound(self, reason: str, channel: str, author: str, is_bot: bool) -> None:
+        """记一行"为什么丢"，两个 id 一律走 :func:`redactable_id`。
+
+        ⚠️ **雪花号不按形状脱敏**（C2 明写）：discord 的 17~20 位 id **本身就是**
+        一个合法的纳秒时间戳，所以裸值明文进日志。补前缀后被洗成
+        ``discord:conv#<摘要>``，而"同一个人 / 同一条频道跨多行仍能对上"正是
+        C2 选带密钥 HMAC 摘要（而不是遮蔽）的理由 ⇒ **可关联性没丢**。
+
+        ⚠️ 本方法只改**记什么**。9 个调用点（含"未在白名单"那一支）传的仍是同一批
+        参数，每一个 ``return False`` 与闸门判定都原样未动 —— 所以这里修一处，
+        9 个理由一起不再是明文。
+        """
         logger.info(
             "discord: 丢弃消息（%s）channel=%s author=%s author_is_bot=%s",
             reason,
-            channel or "?",
-            author or "?",
+            redactable_id(self.name, channel),
+            redactable_id(self.name, author),
             is_bot,
         )
 

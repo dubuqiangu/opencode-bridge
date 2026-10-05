@@ -70,6 +70,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import ReconnectNow, WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.slack")
@@ -425,7 +426,10 @@ class SlackAdapter(Adapter):
         if not self.admits(channel) and not self.answer_pairing_request(
             channel, conversation_id, text
         ):
-            logger.info("slack: dropping message from non-whitelisted channel %s", channel)
+            logger.info(
+                "slack: dropping message from non-whitelisted channel %s",
+                redactable_id(self.name, channel),
+            )
             return True
         try:
             self.hooks.on_inbound(

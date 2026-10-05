@@ -66,6 +66,7 @@ from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text  # 统一分片实现（T1.4b），此处再导出保持向后兼容
 from ..transport import NOTHING, PollingTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
@@ -495,7 +496,10 @@ class TelegramAdapter(Adapter):
         if not self._allowed(chat.get("id")) and not self.answer_pairing_request(
             chat.get("id"), conversation_id, text
         ):
-            logger.info("telegram: dropped message from non-whitelisted chat %s", chat.get("id"))
+            logger.info(
+                "telegram: dropped message from non-whitelisted chat %s",
+                redactable_id(self.name, chat.get("id")),
+            )
             return
         from_user = message.get("from") or {}
         user_id = str(from_user.get("id")) if isinstance(from_user, dict) else None
@@ -540,7 +544,8 @@ class TelegramAdapter(Adapter):
             chat_id, conversation_id, None
         ):
             logger.info(
-                "telegram: dropped callback from non-whitelisted chat %s", chat_id
+                "telegram: dropped callback from non-whitelisted chat %s",
+                redactable_id(self.name, chat_id),
             )
             return
         payload = data if isinstance(data, str) else ""

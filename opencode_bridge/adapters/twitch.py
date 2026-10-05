@@ -65,6 +65,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 # 纯解析/文本工具复用 IRC 适配器的唯一实现（不重复实现，也不修改它）
 from .irc import (
@@ -686,7 +687,10 @@ class TwitchAdapter(Adapter):
         if not self.admits(target) and not self.answer_pairing_request(
             target, self._conversation_id(target), text
         ):
-            logger.info("twitch: dropping message from non-whitelisted channel %s", target)
+            logger.info(
+                "twitch: dropping message from non-whitelisted channel %s",
+                redactable_id(self.name, target),
+            )
             return
         try:
             self.hooks.on_inbound(

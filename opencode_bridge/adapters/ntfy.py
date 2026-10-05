@@ -49,6 +49,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import NOTHING, EventQueue, PollingTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.ntfy")
@@ -252,7 +253,10 @@ class NtfyAdapter(Adapter):
         if not self.admits(topic) and not self.answer_pairing_request(
             topic, conversation_id, text
         ):
-            logger.info("ntfy: dropping message from non-whitelisted topic %s", topic)
+            logger.info(
+                "ntfy: dropping message from non-whitelisted topic %s",
+                redactable_id(self.name, topic),
+            )
             return
         try:
             self.hooks.on_inbound(

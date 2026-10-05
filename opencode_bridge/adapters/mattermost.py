@@ -101,6 +101,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.mattermost")
@@ -817,11 +818,19 @@ class MattermostAdapter(Adapter):
 
     # -- 事件过滤 ---------------------------------------------------------
     def _drop_inbound(self, reason: str, channel_id: str, author: str) -> None:
+        """记一行"为什么丢"，两个 id 一律走 :func:`redactable_id`。
+
+        ⚠️ mattermost 的 id 恰好 26 位小写字母数字，**与哈希片段无法区分**
+        （C2 明写），所以按形状脱敏不可能 —— 补上前缀是唯一的路。脱敏后是
+        ``mattermost:conv#<摘要>``，**同一条频道 / 同一个作者跨行仍可关联**。
+
+        ⚠️ 本方法只改**记什么**：9 个调用点与每一个 ``return False`` 都原样未动。
+        """
         logger.info(
             "mattermost: 丢弃消息（%s）channel=%s user=%s",
             reason,
-            channel_id or "?",
-            author or "?",
+            redactable_id(self.name, channel_id),
+            redactable_id(self.name, author),
         )
 
     def _handle_posted(self, data: object) -> bool:

@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.nextcloud")
@@ -812,8 +813,25 @@ class NextcloudAdapter(Adapter):
     # 消息过滤
     # ------------------------------------------------------------------
     def _drop_inbound(self, reason: str, token: str, actor: str) -> None:
+        """记一行"为什么丢"。
+
+        ⚠️ **两个 id 都不带前缀就等于明文**：C2 的会话 id 规则只认
+        ``platform:local_id``，而 OCS 的 room token 与 ``actorId`` 都是**裸**的
+        local 侧 id。room token 尤其是**能进 URL 的那一种**
+        （``https://<host>/call/<token>``），而 :attr:`pairing_supported` = False
+        的理由之一就是"用户不该知道它" —— 所以它连"用户能看见"的程度都没到，
+        却每次丢弃都明文进日志。经 :func:`~opencode_bridge.adapters._redactable_ids.redactable_id`
+        补上前缀后，C2 把它洗成 ``nextcloud:conv#<摘要>``：**同一条会话仍然跨行
+        可关联**（这正是 C2 用带密钥 HMAC 摘要而不是遮蔽的原因）。
+
+        ⚠️ 本方法**只改记什么**，不碰"丢不丢"：调用点的每一个 ``return False``
+        与闸门判定都是原样的（它只在调用之后才被调用）。
+        """
         logger.info(
-            "nextcloud: 丢弃消息（%s）room=%s actor=%s", reason, token or "?", actor or "?"
+            "nextcloud: 丢弃消息（%s）room=%s actor=%s",
+            reason,
+            redactable_id(self.name, token),
+            redactable_id(self.name, actor),
         )
 
     @staticmethod

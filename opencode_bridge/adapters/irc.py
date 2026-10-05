@@ -58,6 +58,7 @@ from ..identity import format_id
 from ..pairing import CONFIG_VERSION_KEY, empty_allowlist_is_open
 from ..split import split_text
 from ..transport import NOTHING, TcpLineTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, register
 
 logger = logging.getLogger("opencode_bridge.adapters.irc")
@@ -668,7 +669,10 @@ class IRCAdapter(Adapter):
         if not self.admits(target) and not self.answer_pairing_request(
             target, conversation_id, text
         ):
-            logger.info("irc: dropping message from non-whitelisted target %s", target)
+            logger.info(
+                "irc: dropping message from non-whitelisted target %s",
+                redactable_id(self.name, target),
+            )
             return
         try:
             self.hooks.on_inbound(

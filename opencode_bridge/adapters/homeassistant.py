@@ -190,6 +190,7 @@ from .. import identity
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
 from ..transport import WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, register
 
 logger = logging.getLogger("opencode_bridge.adapters.homeassistant")
@@ -1033,8 +1034,20 @@ class HomeAssistantAdapter(Adapter):
     # 入站：事件 → Inbound
     # ------------------------------------------------------------------
     def _drop_inbound(self, reason: str, entity_id: str = "") -> None:
+        """记一行"为什么丢"。
+
+        ⚠️ ``entity_id`` 就是本平台的 principal（也是会话 local 段），裸值明文；
+        补前缀后被洗成 ``homeassistant:conv#<摘要>``，**同一条会话跨行仍可关联**。
+
+        ⚠️ 本方法只改**记什么**：10 个调用点与每一个 ``return False`` 都原样未动 ——
+        其中 8 个**不是**闸门（未订阅的事件类型 / 空 data / 自己刚调服务造成的回声 /
+        渲染不出正文…），它们与本次闸门翻转无关，但**同样打裸值**，
+        所以修在这一层而不是只修"未在白名单"那一支。
+        """
         logger.info(
-            "homeassistant: 丢弃事件（%s）entity=%s", reason, entity_id or "?",
+            "homeassistant: 丢弃事件（%s）entity=%s",
+            reason,
+            redactable_id(self.name, entity_id),
         )
 
     def _handle_event(self, packet: dict) -> bool:

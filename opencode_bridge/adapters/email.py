@@ -86,6 +86,7 @@ import smtplib
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..transport import NOTHING, EventQueue, PollingTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, register
 
 logger = logging.getLogger("opencode_bridge.adapters.email")
@@ -955,7 +956,10 @@ class EmailAdapter(Adapter):
         if not self.admits(sender) and not self.answer_pairing_request(
             sender, conversation_id, text
         ):
-            logger.info("email: 发件人 %s 不在白名单，丢弃", sender)
+            logger.info(
+                "email: 发件人 %s 不在白名单，丢弃",
+                redactable_id(self.name, sender),
+            )
             return
         if message_id:
             self._remember_thread(conversation_id, message_id, subject)

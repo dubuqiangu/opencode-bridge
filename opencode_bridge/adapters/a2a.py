@@ -107,6 +107,7 @@ from ..httpsrv import (
     is_loopback_host,
 )
 from ..identity import format_id
+from ._redactable_ids import redactable_id
 from .base import Adapter, register
 
 logger = logging.getLogger("opencode_bridge.adapters.a2a")
@@ -925,7 +926,10 @@ class A2aAdapter(Adapter):
         if not self.admits(peer) and not self.answer_pairing_request(
             peer, f"{self.name}:{peer}", text
         ):
-            logger.info("a2a: 丢弃非白名单对端 %r 的任务（allowed_chat_ids）", peer)
+            logger.info(
+                "a2a: 丢弃非白名单对端 %s 的任务（allowed_chat_ids）",
+                redactable_id(self.name, peer),
+            )
             return self._reject(
                 task, req_id,
                 "peer not authorised (not in allowed_chat_ids)",

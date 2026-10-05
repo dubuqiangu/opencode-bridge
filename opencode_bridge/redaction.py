@@ -99,9 +99,18 @@
 * **裸的 local id 不按形状脱敏**。discord 的 17~20 位雪花号**就是**一个合法的
   纳秒时间戳，mattermost 的 26 位小写字母数字与哈希片段无法区分；按形状脱敏会
   把时间戳和日志正文一起毁掉。只脱敏**带平台前缀**的完整 ``platform:local_id``
-  —— 那才是可判定、无歧义的形式。**代价（明说）**：仍打**裸** id 的那几行
-  （例如 ``telegram: dropped message from non-whitelisted chat %s``）会漏。
-  要根治得让适配器改打 ``conversation_id``，而 ``adapters/**`` 本次不许动。
+  —— 那才是可判定、无歧义的形式。
+  ✅ **原来说这里的「代价」是：适配器仍打裸 id 的那几行会漏**（原文点名
+  ``telegram: dropped message from non-whitelisted chat %s``），并写着
+  「要根治得让适配器改打 ``conversation_id``，而 ``adapters/**`` 本次不许动」。
+  **那一处已修**（2026-10-05）：适配器侧新增
+  :func:`opencode_bridge.adapters._redactable_ids.redactable_id`，
+  13 个平台的拒绝路径（含 ``_drop_inbound`` 内部那些**在授权闸门之前**就跑的
+  非闸门理由）都改打 ``platform:local_id`` ⇒ 这里不再漏。
+  ⚠️ **代价换成了另一个，已写明**：会话 id 规则**只有一个标签** ``conv#``，
+  所以「作者 / 发件人」这类**不是会话**的 id 脱敏后也显示成 ``conv#``；
+  区分「哪个是会话、哪个是人」只剩**日志行里的字段名**（``channel=`` vs ``author=``）。
+  且摘要是**进程内**的 HMAC ⇒ **跨进程/跨重启对不上**。
 * **连接串**（``postgres://user:pass@host/db``）不在 §2.1 的形状里，也不加 ——
   它与"路径 + 主机"高度重叠，误伤面比收益大。
 * **国际手机号**只收中国大陆 ``1[3-9]`` + 9 位（可带 ``+86`` / ``86`` 前缀）。

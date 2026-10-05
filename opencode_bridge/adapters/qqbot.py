@@ -114,6 +114,7 @@ from .. import identity
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
 from ..transport import ReconnectNow, WebSocketTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.qqbot")
@@ -1044,8 +1045,26 @@ class QQBotAdapter(Adapter):
         return SCOPE_CHANNEL, str(data.get("channel_id") or "")
 
     def _drop_inbound(self, reason: str, cid: str, author: str) -> None:
+        """记一行"为什么丢"。
+
+        ⚠️ **本平台只有 ``author`` 需要处理**：``cid`` 进来时**已经**是
+        ``qqbot:<scope>:<target>``（见 :meth:`conversation_id_for`），也就是
+        :func:`~opencode_bridge.adapters._redactable_ids.redactable_id` 唯一认得的
+        形式 —— 所以它原样打出去即可（:func:`redactable_id` 对已带前缀的入参
+        **幂等**，拼两次不会变成 ``qqbot:qqbot:...``）。原先的 ``cid or "?"``
+        换成了同一个函数：它对空串也返回 ``?``，于是"缺会话标识"那一支仍然
+        **说得清是"没有"而不是"有但被洗掉了"**。
+
+        ``author`` 是 ``member_openid`` / ``user_openid``，裸值明文；补前缀后被
+        洗成 ``qqbot:conv#<摘要>``，**同一个人跨行仍可关联**。
+
+        ⚠️ 本方法只改**记什么**：8 个调用点与每一个 ``return False`` 都原样未动。
+        """
         logger.info(
-            "qqbot: 丢弃消息（%s）conversation=%s author=%s", reason, cid or "?", author or "?",
+            "qqbot: 丢弃消息（%s）conversation=%s author=%s",
+            reason,
+            redactable_id(self.name, cid),
+            redactable_id(self.name, author),
         )
 
     def _handle_message(self, event: str, data: object) -> bool:

@@ -56,6 +56,7 @@ from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
 from ..transport import NOTHING, PollingTransport
+from ._redactable_ids import redactable_id
 from .base import Adapter, classify_http, register
 
 logger = logging.getLogger("opencode_bridge.adapters.matrix")
@@ -423,7 +424,10 @@ class MatrixAdapter(Adapter):
         if not self.admits(room_id) and not self.answer_pairing_request(
             room_id, conversation_id, body
         ):
-            logger.info("matrix: dropping message from non-whitelisted room %s", room_id)
+            logger.info(
+                "matrix: dropping message from non-whitelisted room %s",
+                redactable_id(self.name, room_id),
+            )
             return
         try:
             self.hooks.on_inbound(

@@ -158,8 +158,13 @@ SLOC 下「达标」，却恰恰是该拆的那个文件。**
 > `Get-Content f.py | Measure-Object -Line` **系统性少算约 13%**：
 > `inbox.py` 报 **412** 而 `splitlines()` 是 **474**；`inbox_states.py` 报 **26** 而实际 **33**。
 > 我据这个数差点**推翻一条正确的记录**（把一条 lane 报的对数当成错的）。
-> ⇒ **落盘成 `.py` 再跑**（`len(io.open(p, encoding="utf-8").read().splitlines())`），
-> 并**两种量法交叉验证**（`splitlines()` 与 `count("\n") + 1`）。
+> ⇒ **落盘成 `.py` 再跑**（`len(io.open(p, encoding="utf-8").read().splitlines())`）。
+> ⚠️ **别拿 `count("\n") + 1` 当交叉验证** —— 它与 `splitlines()` **不是等价写法**：
+> **文件以换行结尾时它多数 1**。实测 `inbox_states.py`：`splitlines()` = **33** 而
+> `count("\n") + 1` = **34**；`inbox.py`（不以换行结尾）两者都是 474，所以**看起来**一致。
+> ⇒ 要交叉验证就换**另一个独立**的口径，例如
+> `len(src.splitlines())` vs `src.count("\n") + (0 if src.endswith("\n") else 1)`，
+> 或与 `git diff --numstat` / AST 的 `end_lineno` 对照。
 > 这与下面「PowerShell 里做复杂检查会被反引号吃掉」是同一条纪律的两面：
 > **凡是要复算的量，都不要在 shell 里算。**
 

@@ -12,6 +12,12 @@ import re
 import threading
 from typing import Dict, Optional, Type
 
+from ..allowlist import (
+    AllowlistResolution,
+    resolve_allowlist,
+    warn_if_conflicting_keys,
+    warn_if_wide_open,
+)
 from ..hooks import Hooks, MsgHandle, Outbound, SendError, SendResult
 
 logger = logging.getLogger("opencode_bridge.adapters.base")
@@ -186,6 +192,12 @@ class Adapter(abc.ABC):
     #: 本来就没有歧义旧前缀）。
     local_id_pattern: Optional[re.Pattern[str]] = None
 
+    #: 授权配置的解析结果（:func:`opencode_bridge.allowlist.resolve_allowlist` 的产物）。
+    #: **类级兜底**：声明在类上而不是 ``__init__`` 里，于是任何绕过
+    #: :meth:`_init_access` 的子类也拿得到一个"未解析"的对象，而不是
+    #: ``AttributeError`` —— 状态视图问的是"能不能答"，答不出不该让它崩。
+    allowlist_resolution: AllowlistResolution = AllowlistResolution()
+
     @property
     def effective_max_length(self) -> int:
         """**运行期真正生效**的单条出站上限，即 :meth:`send` 实际切分的那个数。
@@ -261,24 +273,49 @@ class Adapter(abc.ABC):
         }
 
     # --- 授权闸门（T1.2：统一到基类，所有平台同一套判定）-------------------
+    def _has_any_credential(self) -> bool:
+        """配置里**有没有填上**本平台的任一凭据键。
+
+        用它给"空=全开"那条警告把门：没填凭据的适配器收不到任何消息，
+        对它喊"谁都能驱动"是假话。判据取 ``required_tokens`` ∪ ``outbound_tokens``
+        的并集 —— 只看前者会漏掉"出站凭据齐了但入站键没填"这种半配置状态。
+        """
+        keys = set(getattr(self, "required_tokens", ()) or ())
+        keys |= set(getattr(self, "outbound_tokens", ()) or ())
+        return any(str(self.config.get(key) or "").strip() for key in keys)
+
     def _init_access(self) -> None:
-        """从配置读 ``allowed_chat_ids`` 到统一形态（三种键名都认）。"""
-        raw: object = None
-        for key in ("allowed_chat_ids", "allowed_chats", "allowlist"):
-            if key in self.config:
-                raw = self.config.get(key)
-                break
-        items: list[object] = []
-        if isinstance(raw, (list, tuple, set)):
-            items = list(raw)
-        elif raw not in (None, ""):
-            items = [raw]
-        self.allowed_chat_ids = {str(x).strip() for x in items if str(x).strip()}
+        """从配置读 ``allowed_chat_ids`` 到统一形态（三种键名都认）。
+
+        ⚠️ **空 = 全开**，而 ``config.example.json`` / ``plugin/index.ts`` /
+        ``install.*`` 都把 ``[]`` 原样抄进用户配置 —— 所以每个自助安装出来的桥接
+        **开局就是全开的**。把默认翻过来是产品决策，不在这里；但两件事在这里做：
+
+        1. **把现状说出来**：配好凭据却空=全开 ⇒ ``logger.warning``；
+        2. **把写错的配置说出来**：多个授权键同时出现且解析结果不同 ⇒ 报出
+           **实际生效的是哪个键、几项**。
+
+        判定逻辑本身在 :func:`opencode_bridge.allowlist.resolve_allowlist`，
+        ``--setup --json`` / ``--status`` 读的是**同一个**函数 —— 两处各解析一次
+        就会出现"状态说有限白名单、闸门说全开"，那比没有状态视图更坏。
+        """
+        resolution = resolve_allowlist(self.config)
+        self.allowlist_resolution = resolution
+        self.allowed_chat_ids = set(resolution.entries)
+        label = self.name or type(self).__name__
+        warn_if_conflicting_keys(label, resolution)
+        warn_if_wide_open(label, resolution, has_credentials=self._has_any_credential())
 
     def admits(self, principal: object) -> bool:
         """入站闸门：**任何**入站消息（文本 / 命令 / 回调）都必须先过这里。
 
         语义（v1 保持现状）：白名单为空 = 全部允许；非空 = 只放行列表内的 chat。
+
+        ⚠️ 「为空 = 全部允许」是一个**被文档化的默认**（README / ``docs/install.md`` /
+        ``config.example.json`` 三处都这么写），且安装脚本把示例原样落盘 ⇒
+        **自助安装出来的桥接默认全开**。翻转它需要产品决策与迁移期（会打破现有用户），
+        本仓库刻意**不**在这里翻转；但现状由 :mod:`opencode_bridge.allowlist` 负责
+        说出来（启动 warning + ``--status`` / ``--setup --json``）。
 
         ⚠️ 调用顺序要求（对照 dsh 的反面教训）：授权判定必须在**命令解析与
         审批应答之前**，否则未授权者能用 ``/approve`` 这类命令字绕过闸门。

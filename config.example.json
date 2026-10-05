@@ -12,7 +12,7 @@
   },
   "adapters": {
     "telegram": { "bot_token": "", "allowed_chat_ids": [] },
-    "slack": { "bot_token": "" },
-    "discord": { "bot_token": "" }
+    "slack": { "bot_token": "", "app_token": "", "allowed_chat_ids": [] },
+    "discord": { "bot_token": "", "allowed_chat_ids": [] }
   }
 }

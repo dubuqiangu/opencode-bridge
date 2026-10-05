@@ -27,6 +27,7 @@ import time
 from typing import Sequence
 
 from .adapters import build
+from .allowlist import resolve_allowlist
 from .config import Config, DEFAULT_CONFIG_NAME
 from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
@@ -110,7 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="与 --setup 搭配：输出机器可读 JSON（配置路径 + 各平台是否已配 token）",
+        help=(
+            "与 --setup 搭配：输出机器可读 JSON（配置路径 + 各平台是否已配 token"
+            " + 授权白名单状态 + 是否谁都能驱动）"
+        ),
     )
     parser.add_argument(
         "--status",
@@ -122,6 +126,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _token_present(entry: dict, key: str) -> bool:
     return bool(str(entry.get(key) or "").strip())
+
+
+#: ``not_ready_reasons`` 的取值。**稳定 token**，不是给人看的话 —— 人看的是
+#: ``detail`` 字段。理由码单独成常量，是为了让消费方（含测试）能按值断言，
+#: 而不是去匹配会改字的提示语。
+_NOT_READY_MISSING_CREDENTIALS = "missing_credentials"
+_NOT_READY_NO_ALLOWLIST = "no_allowlist"
+
+
+def _not_ready_reasons(
+    *, configured: bool, accepts_any_sender: bool, has_allowlist: bool,
+) -> list[str]:
+    """这个平台能不能对用户说"配好了"。空列表 = 可以说。
+
+    ⚠️ **判据里的关键一条：没配凭据的平台**不**报 ``no_allowlist``。**
+    它收不到任何消息，"谁都能驱动"对它是假话；只报 ``missing_credentials``。
+    真正的暴露只在"能跑"之后才存在。
+
+    ⚠️ 刻意**不**把"白名单为空"当成错误 —— 它是本仓库被文档化、被示例配置固化的
+    默认（``config.example.json`` 抄的就是 ``[]``），翻转它要产品决策与迁移期。
+    本函数只保证**它不会被说成"配好了"**。
+    """
+    reasons: list[str] = []
+    if not configured:
+        reasons.append(_NOT_READY_MISSING_CREDENTIALS)
+    elif accepts_any_sender and not has_allowlist:
+        reasons.append(_NOT_READY_NO_ALLOWLIST)
+    return reasons
 
 
 def _status_platform_keys() -> list[str]:
@@ -148,6 +180,12 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
     ``configured`` 要求该平台 ``required_tokens`` **全部**齐备。Slack 缺
     ``app_token`` 时"只发出站"仍可用，但入站根本没通 —— 这种情况必须能被机器
     读出来，只看 ``bot_token`` 会把"入站没通"误报成已配置。
+
+    ⚠️ **本函数不新增"已配好"的含义，只新增独立的授权暴露面字段。**
+    ``configured`` 的原义（凭据齐备）一个字没改，否则每个既有消费者都得重新学一遍
+    这套输出。真正要挡的坑是：**凭据齐了 + 空=全开** 曾被报成"配置好了"，而
+    ``bridge_setup`` 工具会照着这句话告诉用户"配好了"。所以另给一个
+    :attr:`_NOT_READY_NO_ALLOWLIST` 级别的诚实判定 :func:`_not_ready_reasons`。
     """
     from .adapters import adapter_class
 
@@ -165,12 +203,21 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
         optional = bool(getattr(cls, "config_optional", False))
         missing = [] if optional else [k for k in required if not _token_present(entry, k)]
         supports_inbound = bool(getattr(cls, "supports_inbound", False))
+        configured = not missing
+        # 授权面与闸门读**同一个**解析函数（``allowlist.resolve_allowlist``）——
+        # 状态视图说"有限白名单"而闸门放行一切，比没有状态视图更坏。
+        allowlist = resolve_allowlist(entry)
+        not_ready = _not_ready_reasons(
+            configured=configured,
+            accepts_any_sender=allowlist.accepts_any_sender,
+            has_allowlist=bool(allowlist.entries),
+        )
         out.append(
             {
                 "key": key,
                 "label": str(getattr(cls, "label", "") or labels.get(key) or key),
                 # 全部必需 token 齐备才算配好（入站必需项也算在里面）
-                "configured": not missing,
+                "configured": configured,
                 # 出站凭据各平台不同（Matrix 用 homeserver/access_token、IRC 用
                 # host/nick…），必须由适配器声明，不能硬编码 bot_token。
                 "outbound_ready": optional
@@ -179,6 +226,24 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 "inbound_ready": supports_inbound and not missing,
                 "inbound_implemented": supports_inbound,
                 "missing": missing,
+                # --- 授权暴露面（新增；configured 的含义不变）----------------
+                # 解析出的白名单条目数。0 = 空 = **全开**（闸门的真实语义）。
+                "allowed_chat_ids_count": len(allowlist.entries),
+                # 有没有真的限人。读它来回答"别人能不能开我的 bot"。
+                "allowlist_configured": bool(allowlist.entries),
+                # 「空 = 全开」这个语义是承重的，所以显式报出来，
+                # 而不是让消费者从 count == 0 反推。
+                "accepts_any_sender": allowlist.accepts_any_sender,
+                # 配置里出现过的授权键名（可能多于一个 → 见 allowlist_conflict）
+                "allowlist_keys_present": list(allowlist.present_keys),
+                # 多个授权键解析出不同结果时的诊断（含实际生效的键与项数）；
+                # 无冲突为 None。两个键值相同**不算**冲突 —— 结果毫无歧义。
+                "allowlist_conflict": (
+                    allowlist.conflict.as_dict() if allowlist.conflict else None
+                ),
+                # 能不能对用户说"这个平台配好了"。空 = []。
+                "not_ready_reasons": not_ready,
+                "ready_for_agent": not not_ready,
             }
         )
     return out
@@ -289,6 +354,11 @@ def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]
 
     能力来自各适配器的显式声明（T1.1），必需 token 来自 ``required_tokens``，
     平台清单来自注册表 —— 三者都不在这里硬编码。
+
+    ``capabilities`` 里会**额外并入**授权面的几个键（键名是否出现、是否冲突）。
+    为什么不在 :meth:`opencode_bridge.adapters.base.Adapter.capabilities` 里加：
+    那个快照的键集合被 ``test_adapters`` 逐个钉死，而这里是**状态视图自己的**
+    组装处 —— 派生事实并进状态行，不必去动适配器的公共契约。
     """
     from .adapters import adapter_class, build
 
@@ -305,9 +375,15 @@ def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]
         ]
         caps: dict = {}
         try:
-            caps = build(key, entry, _NullHooks()).capabilities()
+            caps = dict(build(key, entry, _NullHooks()).capabilities())
         except Exception as exc:  # 能力读取失败不该让 --status 崩
             caps = {"error": str(exc)[:80]}
+        # 授权面与闸门同源：同一个 resolve_allowlist，不另写一份解析。
+        allowlist = resolve_allowlist(entry)
+        caps["allowlist_keys_present"] = list(allowlist.present_keys)
+        caps["allowlist_conflict"] = (
+            allowlist.conflict.as_dict() if allowlist.conflict else None
+        )
         label = str(caps.get("label") or getattr(cls, "label", "") or key)
         supports_inbound = bool(getattr(cls, "supports_inbound", False))
         rows.append((key, label, not missing, supports_inbound and not missing, caps))
@@ -383,6 +459,7 @@ def run_status(cfg: Config) -> int:
     print("== 渠道配置与能力 ==")
     print("  说明：「配置」= 必需 token 全部齐备；「入站」= 入站已实现且配置齐备。")
     print("        两者都不代表连接状态（连接状态见下方运行态）")
+    print("        「白名单」为空 = 未设 = **全开**：任何能联系到 bot 的人都能驱动它")
     rows = _channel_config_rows(cfg)
     # 列宽按**显示宽度**自适应：平台名长短不一（"IRC" 3 字符、"Nextcloud Talk" 14），
     # 写死宽度会让长名字挤掉与下一列之间的空格。
@@ -391,6 +468,7 @@ def run_status(cfg: Config) -> int:
         "  " + _pad("平台", name_w) + _pad("配置", 8) + _pad("入站", 8)
         + _pad("按钮", 6) + _pad("媒体", 6) + _pad("长度上限", 12) + "白名单"
     )
+    conflicts: list[tuple[str, str]] = []
     for key, label, configured, inbound_ready, caps in rows:
         if caps.get("error"):
             print(
@@ -399,7 +477,14 @@ def run_status(cfg: Config) -> int:
             )
             continue
         allowed = caps.get("allowed_chat_ids_count")
-        wl = "未设(全开)" if not allowed else f"{allowed} 项"
+        # ⚠️ 空白的白名单不是"没填"，是**全开** —— 原先渲染成「未设(全开)」，
+        # 那句话在表格里既不显眼也没说清后果，用户扫一眼就过去了。改成带警示符的
+        # 等式：「未设=全开」。仍然短（这是个状态表），但扫得出来。
+        wl = f"{allowed} 项" if allowed else "⚠ 未设=全开"
+        conflict_detail = caps.get("allowlist_conflict")
+        if conflict_detail:
+            wl += " ⚠键冲突"
+            conflicts.append((label, str(conflict_detail.get("detail") or "")))
         print(
             "  " + _pad(label, name_w)
             + _pad("已配置" if configured else "未配置", 8)
@@ -408,6 +493,14 @@ def run_status(cfg: Config) -> int:
             + _pad("是" if caps.get("supports_media") else "否", 6)
             + _pad(str(caps.get("max_message_length")), 12) + wl
         )
+
+    # 键冲突不塞进表格列里：那句说明有一百多字，塞进去会把整张表撑烂。
+    # 单独列在表下 —— 用户扫表时已经看到「⚠键冲突」的标记了。
+    if conflicts:
+        print("")
+        print("== ⚠ 授权键冲突（实际生效的是哪一个键已在此说明） ==")
+        for label, detail in conflicts:
+            print(f"  {label}: {detail}")
 
     print("")
     print("== bridge 运行态 ==")

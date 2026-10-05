@@ -117,6 +117,16 @@ def _config_path_hint() -> str:
 
 
 #: Frozen per-platform onboarding guides (factual copy; do not reword).
+#:
+#: ⚠️ **2026-10-05 例外：授权那一行是"承重"的，不是措辞。**
+#: Slack / Discord 的引导原先**只写 token、不写白名单**，于是照着它配完的用户得到一个
+#: **完全开放**的桥接 —— 而 ``config.example.json`` 抄的就是 ``[]``，安装脚本又把它
+#: 原样落盘，所以"什么都不改"就是全开。三个平台现在都给出**非空**
+#: ``allowed_chat_ids``，并各带一句「留空 = 全开」。
+#:
+#: 这条之所以守得住：``tests/test_allowlist_visibility.py`` **把每份引导里的配置片段
+#: 真的 ``json.loads`` 一遍**再断言白名单非空 —— 只对字符串常量做子串匹配的话，
+#: 引导写错了测试照样绿（JSON 片段能解析这件事本身就被守住了）。
 _SETUP_GUIDES = {
     "telegram": """\
 1. 打开 Telegram，找 @BotFather → 发送 /newbot
@@ -127,6 +137,7 @@ _SETUP_GUIDES = {
        "telegram": { "bot_token": "123456789:AA...", "allowed_chat_ids": [123456789] }
      }
    注意 allowed_chat_ids 是数组，数字不要加引号
+   ⚠️ 留空数组 = **全开**：任何能私聊 bot 的人都能驱动它
 5. 执行 opencode service restart
 6. 在 Telegram 给你的 bot 发一句 hi，收到回复即成功""",
     "slack": """\
@@ -141,29 +152,37 @@ _SETUP_GUIDES = {
    注意：之后每改一次 scope，都要回来点一次 Reinstall to Workspace
 6. 左侧 Event Subscriptions → 打开 Enable Events
    → Subscribe to bot events → Add Bot User Event → 添加 message.channels、message.im
-7. 编辑配置文件：
-     "adapters": { "slack": { "bot_token": "xoxb-...", "app_token": "xapp-..." } }
+7. 编辑配置文件（把 C0123456789 换成你频道的真实 ID：频道名右侧「…」→ 复制频道 ID）：
+     "adapters": {
+       "slack": { "bot_token": "xoxb-...", "app_token": "xapp-...", "allowed_chat_ids": ["C0123456789"] }
+     }
+   ⚠️ allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它
 8. 在目标频道输入 /invite @你的bot（私有频道同样用 /invite；私聊可直接发消息）
 9. 执行 opencode service restart
 10. 在频道里发一句普通文字，收到回复即成功
 
 两个常见坑：
 · Event Subscriptions 没打开、或事件没加在 bot events 下，会「静默收不到」且不报错
-· 只填 bot_token 也能启动，但那只发不收（入站必须有 app_token）""",
+· 只填 bot_token 也能启动，但那只发不收（入站必须有 app_token）
+· allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它""",
     "discord": """\
 1. 打开 https://discord.com/developers/applications → New Application → 左侧 Bot
 2. Reset Token → 复制 token
 3. 同一页把 Privileged Gateway Intents 下的 Message Content Intent 打开（必需）
 4. 左侧 OAuth2 → URL Generator → 勾选 scope: bot → Permissions: Send Messages
 5. 用生成的 URL 把 bot 邀请进你的服务器
-6. 编辑配置文件：
-     "adapters": { "discord": { "bot_token": "..." } }
+6. 编辑配置文件（把 123456789012345678 换成你频道的真实 ID：右键频道 → 复制频道 ID）：
+     "adapters": {
+       "discord": { "bot_token": "...", "allowed_chat_ids": ["123456789012345678"] }
+     }
+   ⚠️ allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它
 7. 执行 opencode service restart
 8. 在频道里发一句普通文字，收到回复即成功
 
 两个常见坑：
 · 第 3 步的开关不开，网关会直接拒绝连接（close 4014），日志里会写明原因
-· bot 必须已被邀请进频道，否则发消息报 not_in_channel""",
+· bot 必须已被邀请进频道，否则发消息报 not_in_channel
+· allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它""",
 }
 
 

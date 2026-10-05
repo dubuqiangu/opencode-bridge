@@ -97,6 +97,10 @@ opencode service restart
 
    自举时已有 `config.json` **绝不覆盖**；稳定目录本身是 git clone（脚本装法）时**完全不碰它**；`enabled: false` 时**零副作用**（不自举、不 spawn）。
 
+   ⚠️ **自举新生成的 `config.json` 里，各平台的 `allowed_chat_ids` 是空数组 = 全部放行**：
+   任何能私聊/@ 到 bot 的人都能以你的权限驱动 agent。插件生成完会打一条 `[bridge-plugin]` 警告提醒，
+   但**它不会替你收紧**（改默认值是产品决定，插件无权替用户选）。请自行填上自己的 chat id。
+
 其它配置项（`enabled` / `python` / `args` / `logDir` / `backoffMs` / `lockName`）
 的优先级是：`ctx.options` > 同目录 `config.json` > 内置默认值。
 

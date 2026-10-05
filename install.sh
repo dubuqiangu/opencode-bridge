@@ -195,6 +195,11 @@ if [ ! -f "$BRIDGE_DIR/config.json" ]; then
   fi
   cp "$BRIDGE_DIR/config.example.json" "$BRIDGE_DIR/config.json"
   log "       已从 config.example.json 生成: $BRIDGE_DIR/config.json"
+  # 模板里各平台的 allowed_chat_ids 都是空数组，而空 = 全部放行。这里必须点破：
+  # 照着下一步只填 bot_token 就重启，得到的是一个**任何人都能驱动**的 agent。
+  warn "       ⚠️ 模板里的 allowed_chat_ids 是空数组 = 不限制发件人："
+  warn "          任何能私聊/@ 到 bot 的人都能以你的权限驱动 agent。"
+  warn "          启动前请在第 1 步把 allowed_chat_ids 填上自己的 chat id（数字不要加引号）。"
 else
   log "       config.json 已存在，保持不变: $BRIDGE_DIR/config.json"
 fi
@@ -242,6 +247,9 @@ log "  1. 编辑配置填 token（配置文件）: \${XDG_CONFIG_HOME:-\$HOME/.c
 log "     Telegram: 在 @BotFather 发 /newbot 拿 bot_token；给 @userinfobot 发一句拿纯数字 chat id"
 log "       adapters.telegram.bot_token         ← 形如 123456789:AA..."
 log "       adapters.telegram.allowed_chat_ids   ← 数组，数字不要加引号，如 [123456789]"
+log "       adapters.slack.allowed_chat_ids      ← 数组，填频道 id，如 [\"C0123456789\"]"
+log "       adapters.discord.allowed_chat_ids    ← 数组，填频道 id，如 [\"123456789012345678\"]"
+log "       ⚠️ 这三项留空 = 全部放行（见上面 [2/4] 的警告）"
 log "     Slack / Discord 的 token 获取步骤见 README「接入平台引导」；也可在 bot 内发送 /setup 查看分步引导"
 log "  2. 重启 opencode 服务让插件生效:"
 log "       opencode service restart"

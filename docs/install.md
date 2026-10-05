@@ -141,6 +141,8 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 6. 在 Telegram 给你的 bot 发一句 `hi`，收到回复即成功
 
 > ⚠️ **`allowed_chat_ids` 是安全边界**：留空 = 任何人都能驱动你的 agent（任意能给 bot 发消息的人可以以用户权限执行操作）。务必填入用户自己的纯数字 chat id。
+>
+> 这不是"配错了才出事"：安装脚本从 `config.example.json` 生成的 `config.json` 里，`allowed_chat_ids` **就是空数组**，只填 `bot_token` 就重启的话，你得到的是一个**完全开放**的桥接。三个平台（Telegram / Slack / Discord）都是如此。
 
 #### Slack（支持双向对话 · Socket Mode，无需公网地址）
 

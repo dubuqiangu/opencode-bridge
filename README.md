@@ -685,7 +685,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `bridge.edit_interval_seconds` | `1.5` | 流式增量编辑同一条 IM 消息的最小间隔（秒），用于节流 |
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
-| `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：空数组 = 全部允许；非空则只响应列表内的 chat id |
+| `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：空数组 = 全部允许；非空则只响应列表内的 chat id。⚠️ **默认值 `[]` 就是全放行**（每个平台都一样），任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
 | `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
 | `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
@@ -756,7 +756,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 ## 7. 安全须知
 
 1. **IM 是低信任入口**：`permissions_mode` 默认 `ask`（每次敏感操作都要确认），**不要**轻易改成 `allow`——那等于允许任何能给 bot 发消息的人以你的权限执行任意操作。
-2. **务必配置 `allowed_chat_ids` 白名单**：尤其在群里使用 bot 时，未列入白名单的 chat 的消息会在适配器层被直接丢弃。
+2. **务必配置 `allowed_chat_ids` 白名单**：未列入白名单的 chat 的消息会在适配器层被直接丢弃。⚠️ 反过来更要注意 —— **`[]`（默认值，也是 `config.example.json` 与安装脚本生成的初值）不是"没人能说话"，而是"所有人都能说话"**：`permissions_mode` 默认 `ask` 只在 agent 想做敏感操作时才问你，而**读文件、跑命令、改代码本身不需要你确认**。也就是说把 bot 放进公开群、或让它能被陌生人私聊，就等于把你的 shell 交给了对方。
 3. **`opencode_url` 留空时会自动读取 `~/.local/state/opencode/service.json`**（含密码），因此本桥接**只应在本机 / 可信网络上运行**，不要把端口暴露到公网。
 4. **桥接进程拥有和你一样的文件与 shell 权限**：它驱动的是本机 opencode agent，请只在你信任的目录、你信任的 bot token 下运行；配置文件与 `state.json` 含敏感信息，请妥善保管。
 

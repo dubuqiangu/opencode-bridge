@@ -230,6 +230,16 @@ export function ensureMaterialized(stable: string, pkgRoot: string): Materialize
         fs.copyFileSync(src, dstCfg)
         res.wroteConfig = true
         emit(null, "log", `自举：已生成 config.json（需填写 bot_token）→ ${dstCfg}`)
+        // 模板里各平台的 allowed_chat_ids 都是空数组，而空 = 全部放行。不说这一句，
+        // 就等于默默递了一份「谁都能驱动 agent」的配置 —— 与 a2a.py 拒绝静默开洞同一取舍：
+        // 宁可让用户当场看见这句提醒，也不要事后才发现。**只陈述事实与出路，不改默认**
+        // （默认收紧是产品决定，自举不该替用户做），也不新增配置键。
+        warn(
+          `自举生成的 config.json 里 allowed_chat_ids 是空数组 = 不限制发件人：` +
+            `任何能私聊/@ 到 bot 的人都能以你的权限驱动 agent。` +
+            `请在 ${dstCfg} 里填上自己的 chat id；不确定填什么就先跑 ` +
+            `"python -m opencode_bridge --setup <平台>" 看分步引导。`,
+        )
       }
     }
   } catch (e) {

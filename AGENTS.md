@@ -154,6 +154,15 @@ SLOC 下「达标」，却恰恰是该拆的那个文件。**
 
 可复现的数法（别手数，手数会把这三种口径数成同一个数）：
 
+> ⛔ **在 Windows / PowerShell 里数行数一律不可信。** 实测
+> `Get-Content f.py | Measure-Object -Line` **系统性少算约 13%**：
+> `inbox.py` 报 **412** 而 `splitlines()` 是 **474**；`inbox_states.py` 报 **26** 而实际 **33**。
+> 我据这个数差点**推翻一条正确的记录**（把一条 lane 报的对数当成错的）。
+> ⇒ **落盘成 `.py` 再跑**（`len(io.open(p, encoding="utf-8").read().splitlines())`），
+> 并**两种量法交叉验证**（`splitlines()` 与 `count("\n") + 1`）。
+> 这与下面「PowerShell 里做复杂检查会被反引号吃掉」是同一条纪律的两面：
+> **凡是要复算的量，都不要在 shell 里算。**
+
 ```python
 import ast, io
 src = io.open(path, encoding="utf-8").read(); lines = src.split("\n")

@@ -358,14 +358,16 @@ class RedeliveryIsDeduplicated(InboxWiringTestCase):
 class BusyIsNotAFailure(InboxWiringTestCase):
     """409 只是"还没轮到"，不能算失败、更不能花掉重试预算。
 
-    ⚠️ 关于状态：409 之后那一行停在 ``attempting`` 而不是回到 ``pending``。
-    这不是接线偷懒，而是**已提交的** :class:`InboundInbox` 没有"撤销
-    attempting"这个转换（只有 record / attempting / delivered / failed /
-    abandoned 五个写入口）。而 ``attempting`` 必须紧贴 ``prompt()`` 之前写 ——
-    早写一个字，``create_session`` 期间的崩溃就会被误判成"结果不可知"。
-    409 只有在调用之后才认得出来，所以"退回 pending"在现有 API 下无法表达。
-    代价（窄、且是保守方向）：若恰好在 409 与进程内重投之间崩溃，下次启动按
-    ``attempting`` 告警且不重放，而不是自动重放。绝不重复副作用，仍是首选。
+    ⚠️ 状态：409 之后那一行退回 ``pending``，**不是**停在 ``attempting``。
+    409 只有在 ``prompt()`` **之后**才认得，而 ``mark_attempting`` 必须紧贴那个
+    调用之前写（早写一个字，``create_session`` 期间的崩溃就会被误判成"结果不可知"）
+    —— 所以"服务端明确拒收、agent 没跑过"这个**已知**结果唯一的表达方式就是退回。
+    :meth:`~opencode_bridge.inbox.InboundInbox.mark_pending` 就是这条转移。
+
+    退回 pending 也**不会**削弱 at-most-once：409 意味着服务端拒收，副作用一次都
+    没发生，重放不可能重复。改之前那行会永远停在 ``attempting``，被恢复层按"结果
+    不可知"只告警、绝不重放，**平台重投也被 ``INSERT OR IGNORE`` 挡掉** ——
+    消息永远送不到。代价方向是"从前丢消息"变成"下次启动送达"，不是反过来。
     """
 
     def test_409_keeps_the_write_ahead_obligation_and_retries_after_the_turn(self):
@@ -393,6 +395,87 @@ class BusyIsNotAFailure(InboxWiringTestCase):
         self.assertEqual(
             [(row["state"], row["attempts"]) for row in read_inbox_rows(self.inbox_path)],
             [("delivered", 0)],
+        )
+
+    def test_409_leaves_the_row_pending_so_a_crash_still_delivers_it(self):
+        """409 与重投之间崩溃：这一行必须能被重放，而不是永远搁在 attempting。
+
+        走**真**的 :class:`BridgeCore` + :class:`InboundGateway` + **真**收件箱，
+        断言打的是**盘上的行**。没有 ``mark_pending`` 时那行停在 ``attempting``，
+        下次启动按"结果不可知"只告警不重放 —— 消息永远送不到。
+        """
+        core, client, _adapter, _inbox = self.make_core()
+        client.prompt_errors.append(OpenCodeError("session busy", status=409))
+
+        core.on_inbound(inbound_message("先记着", message_id="6"))
+
+        self.assertEqual(
+            [(row["state"], row["attempts"]) for row in read_inbox_rows(self.inbox_path)],
+            [("pending", 0)],
+            "409 之后必须退回 pending：attempting 只告警不重放，消息就永远送不到",
+        )
+        core.stop()   # 死在 409 与进程内重投之间
+
+        core2, client2, _adapter2, _inbox2 = self.make_core()
+        self.start_bridge(core2, client2)
+
+        self.assertEqual(
+            texts_of(client2.prompts), ["先记着"],
+            "下次启动必须真的把它重放出去 —— 搁死的那一行等于丢消息",
+        )
+        self.assertEqual(
+            [(row["state"], row["attempts"]) for row in read_inbox_rows(self.inbox_path)],
+            [("delivered", 0)],
+        )
+
+        # 再启动一次：已送达的行必须挡住重复投递（at-most-once 的另一半）。
+        core2.stop()
+        core3, client3, _adapter3, _inbox3 = self.make_core()
+        self.start_bridge(core3, client3)
+
+        self.assertEqual(
+            texts_of(client3.prompts), [],
+            "409 退回 pending 只放宽了'送不到'，绝不能顺带制造第二次投递",
+        )
+        self.assertEqual(
+            [(row["state"], row["attempts"]) for row in read_inbox_rows(self.inbox_path)],
+            [("delivered", 0)],
+        )
+
+    def test_409_then_a_real_failure_spends_exactly_one_budget_step(self):
+        """409 不烧预算、之后的真失败烧一级 —— 两次尝试有界，不是无限重试。
+
+        这条是 at-most-once 的另一半：退回 pending 必须**不是**预算的旁路。
+        """
+        with mock.patch.object(inbox_module, "BACKOFF_LADDER_SECONDS", (0.0, 0.0)):
+            core, client, _adapter, _inbox = self.make_core()
+            # 三次投递的结果依次是：409、409、500 —— 队列按顺序取走这些异常。
+            for error in (OpenCodeError("session busy", status=409),
+                          OpenCodeError("session busy", status=409),
+                          OpenCodeError("server said no", status=500)):
+                client.prompt_errors.append(error)
+            core.on_inbound(inbound_message("慢慢来", message_id="7"))
+            self.assertEqual(
+                [row["attempts"] for row in read_inbox_rows(self.inbox_path)], [0],
+                "409 不是失败：一级预算都还没花",
+            )
+
+            # 每一轮结束都刷一次队列：第二次仍被拒，第三次才真的失败
+            core.event_stream.dispatch(turn_finished(client.created_ids[0]))
+            self.assertEqual(
+                [row["attempts"] for row in read_inbox_rows(self.inbox_path)], [0],
+                "又一次 409 仍然不烧预算",
+            )
+            core.event_stream.dispatch(turn_finished(client.created_ids[0]))
+
+        self.assertEqual(
+            [(row["state"], row["attempts"]) for row in read_inbox_rows(self.inbox_path)],
+            [("failed", 1)],
+            "409 之后的那次真失败必须恰好烧掉一级预算，而不是两级",
+        )
+        self.assertEqual(
+            texts_of(client.prompts), ["慢慢来", "慢慢来", "慢慢来"],
+            "三次投递：第一次 409、第二次 409、第三次真失败",
         )
 
 

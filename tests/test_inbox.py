@@ -169,7 +169,7 @@ class TestWriteAheadRecord(InboxTestCase):
 
 
 class TestStateTransitions(InboxTestCase):
-    """四个写入点 ↔ 四个状态，一一对应。"""
+    """写入点 ↔ 状态，一一对应。"""
 
     def test_attempting_moves_the_row_out_of_pending_into_uncertain(self):
         inbox, database_path = self.open_inbox()
@@ -184,6 +184,88 @@ class TestStateTransitions(InboxTestCase):
         self.assertEqual(
             read_inbox_rows(database_path)[0]["state"], DeliveryState.ATTEMPTING
         )
+
+    def test_mark_pending_puts_a_busy_row_back_into_the_replayable_read(self):
+        """409 的落点：退回 ``pending`` —— 从"结果不可知"变回"从未尝试过"。
+
+        断言的是**两个读取方法同时**变了，而不只是盘上那个字符串：留在
+        ``attempting`` 里，恢复层就会走"只告警、绝不重放"那条分支
+        （见 :mod:`tests.test_inbox_recovery`），那一行就成了永远送不到的死行。
+        """
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("slack:C0ABCDEF:7", conversation_id="slack:C0ABCDEF",
+                             platform="slack", message_id="7")
+        inbox.record(prompt)
+        inbox.mark_attempting(prompt.delivery_id)
+
+        inbox.mark_pending(prompt.delivery_id)
+
+        self.assertEqual(inbox.pending_prompts(), [prompt])
+        self.assertEqual(
+            inbox.uncertain_prompts(), [],
+            "这一行必须离开'结果不可知'那档，否则恢复层不会重放它",
+        )
+        self.assertEqual(_only_row(database_path)["state"], DeliveryState.PENDING)
+
+    def test_mark_pending_spends_no_budget_and_keeps_the_recorded_failure(self):
+        """409 不是失败：``attempts`` 不动、``not_before`` 归零、上次失败原因留着。
+
+        刻意**从一行 ``failed`` 直接退回**（不先走 ``mark_attempting``）：那才是这条
+        转移真正要保证的性质 —— 退回待投递意味着**立刻**可重放，而不是继续被上一次
+        失败留下的退避期限挡住。只测"attempting → pending"会漏掉这一点，因为
+        ``mark_attempting`` 自己已经把 ``not_before`` 清零了。
+        """
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("irc:#ops:12", conversation_id="irc:#ops", platform="irc",
+                             message_id="12")
+        inbox.record(prompt)
+        inbox.mark_failed(prompt.delivery_id, "ConnectionResetError: boom")
+        self.assertGreater(
+            _only_row(database_path)["not_before"], 0.0,
+            "前提：真失败确实排了一个未来的期限",
+        )
+
+        inbox.mark_pending(prompt.delivery_id)
+
+        row = _only_row(database_path)
+        self.assertEqual(row["state"], DeliveryState.PENDING)
+        self.assertEqual(row["attempts"], 1, "退回 pending 不得凭空多出一次尝试预算")
+        self.assertEqual(row["not_before"], 0.0,
+                         "退回 pending 必须立刻可重放，不能继续被旧期限挡住")
+        self.assertEqual(row["last_error"], "ConnectionResetError: boom",
+                         "409 本身不是失败，不该覆盖上一次真正失败的原因")
+        self.assertEqual(
+            [queued.delivery_id for queued in inbox.pending_prompts()],
+            [prompt.delivery_id],
+        )
+
+    def test_a_row_put_back_to_pending_is_still_bounded_by_the_retry_budget(self):
+        """退回 pending **不是**预算的旁路：重放再失败照样一级一级烧到终态。
+
+        把 409 插在每一次失败之前，也就是最宽松的读法 —— 每次 409 都"免费"，
+        若这样都能拿到无限次机会，这条转移就是在削弱 at-most-once 的另一半。
+        实际次数由 ``mark_failed`` 的算术决定：``MAX_ATTEMPTS`` 次失败即终态。
+        """
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("matrix:!room:9:4", conversation_id="matrix:!room:9",
+                             platform="matrix", message_id="4")
+        inbox.record(prompt)
+
+        for attempt_number in range(1, MAX_ATTEMPTS + 1):
+            inbox.mark_attempting(prompt.delivery_id)
+            inbox.mark_pending(prompt.delivery_id)
+
+            self.assertEqual(
+                _only_row(database_path)["attempts"], attempt_number - 1,
+                "第 %d 次被拒时花掉的仍只是前 %d 次失败的预算" % (
+                    attempt_number, attempt_number - 1),
+            )
+            inbox.mark_failed(prompt.delivery_id, f"第 {attempt_number} 次真失败")
+
+        self.assertEqual(_only_row(database_path)["state"], DeliveryState.ABANDONED)
+        self.assertEqual(_only_row(database_path)["attempts"], MAX_ATTEMPTS)
+        self.assertEqual(inbox.pending_prompts(), [])
+        self.assertEqual(inbox.due_failed_prompts(1e12), [])
 
     def test_delivered_clears_the_row_out_of_every_replayable_read(self):
         inbox, database_path = self.open_inbox()
@@ -218,6 +300,7 @@ class TestStateTransitions(InboxTestCase):
         inbox, _database_path = self.open_inbox()
 
         inbox.mark_attempting("never-existed")
+        inbox.mark_pending("never-existed")
         inbox.mark_delivered("never-existed")
         inbox.mark_failed("never-existed", "boom")
         inbox.mark_abandoned("never-existed", "boom")
@@ -471,6 +554,7 @@ class TestLifecycleSafety(InboxTestCase):
 
         self.assertFalse(inbox.record(prompt))
         inbox.mark_attempting(prompt.delivery_id)
+        inbox.mark_pending(prompt.delivery_id)
         inbox.mark_delivered(prompt.delivery_id)
         inbox.mark_failed(prompt.delivery_id, "boom")
         inbox.mark_abandoned(prompt.delivery_id, "boom")

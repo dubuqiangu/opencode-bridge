@@ -202,6 +202,11 @@ class RecordingInbox:
         self.attempts[delivery_id] = self.attempts.get(delivery_id, 0) + 1
         self.writes.append((delivery_id, "attempting"))
 
+    def mark_pending(self, delivery_id: str) -> None:
+        """409：服务端拒收 —— 退回可重放，**不**算一次尝试（``attempts`` 不动）。"""
+        self.rows[delivery_id] = DeliveryState.PENDING
+        self.writes.append((delivery_id, "pending"))
+
     def mark_delivered(self, delivery_id: str) -> None:
         self.rows[delivery_id] = DeliveryState.DELIVERED
         self.writes.append((delivery_id, "delivered"))
@@ -1084,13 +1089,36 @@ class QueueTests(InboundGatewayTestCase):
         self.assertEqual([queued.text for queued in
                           self.gateway._queues[CONVERSATION]], ["第一条"])
         self.assertEqual(self.gateway._draining, set())
-        # 409 没有花掉重试预算：收件箱停在 attempting，而不是 failed。
-        self.assertEqual(self.states_of(), {"d1": DeliveryState.ATTEMPTING})
+        # 409 没有花掉重试预算：收件箱退回 pending —— 服务端拒收 = 从未尝试过。
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.PENDING})
         self.assertEqual(self.inbox.failures, {})
+        self.assertEqual(
+            self.inbox.writes, [("d1", "attempting"), ("d1", "pending")],
+            "409 只多这一次写入：不写 failed、不重置任何别的账",
+        )
 
         self.gateway.flush_queue(CONVERSATION)
 
         self.assertEqual(self.states_of(), {"d1": DeliveryState.DELIVERED})
+
+    def test_a_busy_row_on_the_recovery_path_is_a_failure_not_a_pending_rewind(self):
+        """恢复路径上的 409 **不**退回 pending —— 那里没有内存队列可退。
+
+        ``recording_delivery=False`` 时 :meth:`_dispatch_prompt` 手上没有收件箱，
+        所以这条 ``mark_pending`` 压根不该被调用：重放失败要照常冒泡给
+        :func:`~opencode_bridge.inbox_recovery.recover_pending`，由它记 ``failed``。
+        少了那个 ``if inbox is not None`` 守卫，这一行会被悄悄退回 pending ——
+        于是每次启动都重放一次，烧不掉任何预算，正是"无限重试"的形状。
+        """
+        self.client.prompt_errors.append(OpenCodeError("busy", status=409))
+
+        outcome = self.gateway._dispatch_prompt(
+            queued("d1", "重放"), recording_delivery=False
+        )
+
+        self.assertEqual(outcome, "busy")
+        self.assertEqual(self.inbox.rows, {}, "恢复路径上这里必须一行都不写")
+        self.assertEqual(self.inbox.writes, [])
 
     def test_a_busy_message_keeps_its_place_at_the_front_of_the_queue(self):
         """409 退回**队首**：先到的那条还在等，重试不能被后来的挤到后面。"""

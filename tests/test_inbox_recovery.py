@@ -110,6 +110,9 @@ class FakeInbox:
     def mark_attempting(self, delivery_id: str) -> None:
         self._move(delivery_id, DeliveryState.ATTEMPTING)
 
+    def mark_pending(self, delivery_id: str) -> None:
+        self._move(delivery_id, DeliveryState.PENDING)
+
     def mark_delivered(self, delivery_id: str) -> None:
         self._move(delivery_id, DeliveryState.DELIVERED)
 
@@ -395,6 +398,96 @@ class TestRetryBudgetIsExhaustedAgainstARealInbox(unittest.TestCase):
         self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
         self.assertEqual(self.inbox.pending_prompts(), [])
         self.assertEqual(self.inbox.uncertain_prompts(), [])
+
+
+class TestARowRewoundByBusyIsStillBudgetBounded(unittest.TestCase):
+    """409 退回 ``pending`` 之后，重试预算**照旧**收口 —— 退回不是预算的旁路。
+
+    用**真**收件箱：预算是 :meth:`~opencode_bridge.inbox.InboundInbox.mark_failed`
+    的算术，而 :class:`~opencode_bridge.inbox.QueuedPrompt` 刻意**不带** ``attempts``
+    （见它的 docstring），所以拿假收件箱断言这件事等于断言假货。
+
+    形状刻意取最宽松的一种：**每次真失败之前都先被 409 免费退回一次** ``pending``。
+    若这样都能拿到无限次机会，这条转移就是在削弱 at-most-once 的另一半。
+    """
+
+    _DELIVERY_ID = "telegram:100200:10"
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        self.inbox = InboundInbox(self.database_path)
+        self.addCleanup(self.inbox.close)
+        self.inbox.record(make_prompt(self._DELIVERY_ID))
+        # 409 在盘上留下的痕迹：mark_attempting 推到 attempting，再退回 pending。
+        self.inbox.mark_attempting(self._DELIVERY_ID)
+        self.inbox.mark_pending(self._DELIVERY_ID)
+
+    def _rewind_like_a_busy_answer(self) -> None:
+        """一次"免费"的 409 重试：到期 → mark_attempting → 409 → mark_pending。"""
+        self.inbox.mark_attempting(self._DELIVERY_ID)
+        self.inbox.mark_pending(self._DELIVERY_ID)
+
+    def test_a_rewound_row_really_is_replayed_on_the_next_boot(self):
+        """正向对照：退回 pending 的行**确实**被重放 —— 否则下面那条只是"压根没动"。"""
+        dispatch = RecordingDispatcher()
+
+        outcome = recover_pending(
+            self.inbox, dispatch=dispatch, notify=RecordingNotifier()
+        )
+
+        self.assertEqual([prompt.delivery_id for prompt in dispatch.dispatched],
+                         [self._DELIVERY_ID])
+        self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
+        self.assertEqual(_read_column(self.database_path, "attempts"), 0,
+                         "一次就送达不烧预算")
+        self.assertEqual(outcome.uncertain, [],
+                         "409 之后这一行不在'结果不可知'那档里，不必惊动用户")
+
+    def test_free_rewinds_do_not_renew_the_budget(self):
+        """每次真失败之前都免费退回一次，终态仍由真失败的次数决定。"""
+        for expected_failures in range(1, MAX_ATTEMPTS + 1):
+            expire_backoff_deadlines(self.database_path)
+            self.assertEqual(
+                _read_column(self.database_path, "attempts"), expected_failures - 1,
+                "第 %d 轮开始前只该花掉过 %d 级预算（409 不烧）"
+                % (expected_failures, expected_failures - 1),
+            )
+            self._rewind_like_a_busy_answer()
+
+            recover_pending(
+                self.inbox,
+                dispatch=RecordingDispatcher(error=RuntimeError(_ALWAYS_UNREACHABLE)),
+                notify=RecordingNotifier(),
+            )
+
+            self.assertEqual(
+                _read_column(self.database_path, "attempts"), expected_failures,
+                "第 %d 次真失败必须恰好烧掉一级预算" % expected_failures,
+            )
+
+        self.assertEqual(_read_state(self.database_path), DeliveryState.ABANDONED,
+                         "MAX_ATTEMPTS 次真失败后必须转终态，不能被 409 无限续命")
+
+    def test_the_rewound_row_is_never_dispatched_again_once_abandoned(self):
+        """转终态之后连一次都不再试 —— 哪怕这一次投递会成功。"""
+        for _round_number in range(MAX_ATTEMPTS):
+            expire_backoff_deadlines(self.database_path)
+            self._rewind_like_a_busy_answer()
+            recover_pending(
+                self.inbox,
+                dispatch=RecordingDispatcher(error=RuntimeError(_ALWAYS_UNREACHABLE)),
+                notify=RecordingNotifier(),
+            )
+        self.assertEqual(_read_state(self.database_path), DeliveryState.ABANDONED)
+
+        dispatch = RecordingDispatcher()   # 这一次的投递本来会成功
+
+        outcome = recover_pending(self.inbox, dispatch=dispatch, notify=RecordingNotifier())
+
+        self.assertEqual(dispatch.dispatched, [], "终态之后绝不重试")
+        self.assertEqual(outcome.replayed, [])
+        self.assertEqual([prompt.delivery_id for prompt in outcome.abandoned],
+                         [self._DELIVERY_ID])
 
 
 class TestRecoveryNeverRaises(unittest.TestCase):

@@ -18,7 +18,7 @@
 没有任何代码路径跑得到「记一笔」。写前落盘把两类失败统一成同一件事 ——
 磁盘上有一行 ``pending``。
 
-四次写入，一一对应四个状态
+五次写入，一一对应四个状态
 --------------------------
 =========================  ====================  ==========================
 调用                       落盘的状态             为什么在这个位置
@@ -27,11 +27,21 @@
 :meth:`InboundInbox.mark_attempting`  ``attempting``  紧贴 ``prompt()`` 之前
 :meth:`InboundInbox.mark_delivered`  ``delivered``    **仅在成功之后**
 :meth:`InboundInbox.mark_failed`     ``failed``       明确失败（可能自动转终态）
+:meth:`InboundInbox.mark_abandoned`  ``abandoned``    调用方自己判定预算耗尽
 =========================  ====================  ==========================
 
 落在 ``attempting`` 与 ``delivered`` 之间的崩溃是**唯一结果不可知**的窗口 ——
 opencode 可能已经处理了，也可能没有。这类行只告警、绝不重放（用户 2026-10-03 拍板，
 理由：下游是有副作用的 coding agent，重复执行副作用未必比丢一条消息轻）。
+
+``attempting`` 的**第五个**出口：409（会话忙）
+------------------------------------------
+409 只有在 ``prompt()`` **返回之后**才认得，而 ``attempting`` 必须紧贴那个调用
+**之前**写 —— 两个都不可协商。于是"服务端拒收、agent 压根没跑过"这个**已知**的
+结果一度没有任何可落盘的状态：那一行会永远停在 ``attempting``，被恢复层按"结果
+不可知"只告警、绝不重放，而**平台重投也被去重挡掉**（``INSERT OR IGNORE`` 让那一行
+成了一份"已处理"的回执，尽管消息从未送达）。:meth:`InboundInbox.mark_pending`
+就是这条缺失的转移，它把已知的拒收退回"从未尝试过"。
 
 幂等靠 ``INSERT OR IGNORE``
 --------------------------
@@ -262,6 +272,34 @@ class InboundInbox:
                 "UPDATE inbox SET state = ?, not_before = 0, updated_at = ?"
                 " WHERE delivery_id = ?",
                 (DeliveryState.ATTEMPTING, time.time(), delivery_id),
+            )
+
+    def mark_pending(self, delivery_id: str) -> None:
+        """退回 ``pending``：**服务端明确拒收**，agent 没跑过，可以放心重放。
+
+        唯一调用点是 :meth:`~opencode_bridge.inbound_gateway.InboundGateway._dispatch_prompt`
+        的 409 分支，而那里紧跟在 :meth:`mark_attempting` 之后 —— 调用方必须保证
+        这一行当前是 ``attempting``（本方法与既有转移一样**不**带状态守卫，
+        守卫只会让顺序写错的调用方静默什么都没做）。
+
+        规则与既有转移同源，不新造一套：
+
+        * **不碰** ``attempts``：409 不是失败，不烧重试预算。预算只由
+          :meth:`mark_failed` 一处消耗，所以"退回待投递"不会让它凭空多出机会；
+        * ``not_before`` 清零（与 :meth:`mark_attempting` / :meth:`mark_delivered`
+          一样），让这一行立刻可重放；
+        * **不碰** ``last_error``：409 本身不是失败，所以它既不该覆盖上一次真正
+          的失败原因，也不该把它抹掉（同 :meth:`mark_attempting`）。
+
+        ⚠️ at-most-once 不受影响，这是**放宽**不是**削弱**：409 意味着服务端拒收，
+        副作用一次都没发生，重放不可能重复。改之前那条消息**永远送不到**，
+        改之后它在下次启动送达 —— 两边都不存在重复投递。
+        """
+        with self._lock:
+            self._write(
+                "UPDATE inbox SET state = ?, not_before = 0, updated_at = ?"
+                " WHERE delivery_id = ?",
+                (DeliveryState.PENDING, time.time(), delivery_id),
             )
 
     def mark_delivered(self, delivery_id: str) -> None:

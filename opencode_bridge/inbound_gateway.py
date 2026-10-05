@@ -538,9 +538,8 @@ class InboundGateway:
                     queued = queue.pop(0)
                 outcome = self._dispatch_prompt(queued)
                 if outcome == "busy":
-                    # 409 是"还没轮到"，不是失败：不写 failed，重试预算分文未花
-                    # （收件箱也没有"撤销 attempting"的转换，所以那一行停在
-                    # attempting —— 进程内重投成功后就转 delivered）。
+                    # 409 是"还没轮到"，不是失败：不写 failed，重试预算分文未花，
+                    # 收件箱那一行已退回 pending（服务端拒收 = 从未尝试过）。
                     # 这一条退回内存队列，等 :meth:`flush_queue`。
                     with self._lock:
                         queue = self._queues.setdefault(conversation_id, [])
@@ -603,6 +602,12 @@ class InboundGateway:
                     session_id,
                     conversation_id,
                 )
+                # ⚠️ 必须在这里退回 pending：409 是"服务端拒收"，agent **没跑过**，
+                # 所以重放不可能重复副作用。不退回的话那一行会永远停在
+                # attempting，被恢复层按"结果不可知"只告警而不重放 ——
+                # 崩溃若落在 409 与进程内重投之间，这条消息就**永远送不到**。
+                if inbox is not None:
+                    inbox.mark_pending(queued.delivery_id)
                 return "busy"
             logger.warning("prompt failed: %s", exc)
             self._send_text(

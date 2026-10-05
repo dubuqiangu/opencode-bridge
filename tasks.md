@@ -2015,11 +2015,54 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 
 ---
 
-## 阶段 G · 入站闸门翻成默认拒绝（用户已拍板 2026-10-05；**设计复核中，尚未动工**）
+## 阶段 G · 入站闸门翻成默认拒绝（用户已拍板 2026-10-05；✅ **已落地**）
+
+### ✅ 落地记录（2026-10-05，两个 commit）
+
+`b6b4449`（代码 + 测试，29 文件）与 `372e0e9`（文档 + 安装脚本 + 自举路径，9 文件）。
+
+**验证（我独立复核，不采信两条 lane 的自报）**：
+
+- **合并树全量连跑 3 次：2301 OK (skipped=1)**，158.9 / 158.9 / 156.8 秒；compileall 0
+- **变异还原核对**：按变异报告里每条记录的「变异前哈希」逐文件比对 ⇒
+  **停在变异态的文件 = 0**（`base.py` 曾一度停在 `c83b47e85147`，现为 `053b58d08e13`）
+- **BOM 逐字节**（用我自己造已知答案样本验证过的检测器，5 个合成边界全判对）：
+  两个 `.ps1` **均 True**、CR 0
+- **既有断言删除 8 条**，逐条确认都有 replacement，且覆盖**两套语义**
+- `.tmp/` 确认被 `.gitignore:25` 忽略 ⇒ lane 的 scratch 不会被提交
+
+**实现超出我给的规格两处，且都是对的**：
+
+1. **`admits_nobody` 之外另加伴生字段 `admits_any_sender`**。`config_version` 让「空」有
+   **两解** ⇒ 一个字段答不了「**此刻**闸门放不放行」。于是拆成「清单为空」（判定式）与
+   「此配置下的真实行为」两个字段，消费者不必自己推策略。测试
+   `accepts_any_sender 已被 admits_nobody 取代，不许并存` 钉住旧名不得复活。
+2. **配对命令抽成 `PAIRING_COMMAND` 常量 + docstring 约束**「⚠️ **那条命令必须是能
+   敲出来的**」。原先内联写的 `opencode-bridge --pair` **在本仓库不存在**
+   （`pyproject.toml` 无 `[project.scripts]`），且首次配对**必须**带 `--conversation`
+   ⇒ **这条错误在配对回信里最恶劣：它是被困用户唯一的自救出口。**
+   而**文档侧原本 8 处 `--pair` 命令一处都没带 `--conversation`** ⇒ 照文档操作的
+   **每一个人**都会失败。两处都补齐后才闭环。
+
+**⚠️ 判定为一个负载相关抖动、非本次引入**：
+`test_qqbot.py::TestHeartbeatUnit::test_real_server_sees_period_of_400ms_not_400s`
+在我第一次全量跑时失败 1 次。依据三条：全量连绿 3 次 · **隔离连跑 12/12 通过** ·
+本次对 `qqbot.py` 的改动只碰入站闸门那一行、**没碰心跳循环**。
+判据：**先隔离复现 12 次再谈抖动** —— 「看起来像时序问题」不是证据。
+
+**残留（明确记下，未修）**：
+
+- ⚠️ **未配对用户的暴露仍然存在**，且因为没强制，大多数人不会去配
+  ⇒ **暂露只会随时间收窄，不会一天消失**。这是知情取舍。
+- **`irc` / `twitch` 私聊的 principal 是 bot 自己的 nick** —— 单独立项（见下方专节），
+  本次只做到「`pairing_supported = False` + 启动告警」，**失败关闭 + 响亮**。
+- **轮换 `pairing_secret` 不撤销已完成的配对**（授权已物化进 `allowed_chat_ids`）。
+
+---
 
 **决定**：白名单为空从「全放行」翻成「谁都不放行」，并提供一条**不依赖 SSH 改配置**的
 自助出路 —— **极简配对码**（从 `config.json` 里已有的 secret 派生，用户在本机跑
-`--pair <码>`，无签发记录 / 无 TTL / 无锁定；secret 一改则所有旧码立即失效）。
+`--pair <码>`，无签发记录 / 无 TTL / 无锁定；secret 一改则所有**未兑换**的码立即失效）。
 
 ### ⛔ 已被实测否决的方案：**首次接触时自动写入白名单**
 
@@ -2053,26 +2096,49 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 | `/setup` **不写任何配置** | `commands.py:354-372` 三条分支都只发文本，**零写盘**（它本来就是构造性幂等的纯函数） |
 | 命令层**拿不到** `Inbound.raw`，且 `Inbound` **没有** `principal` 字段 | `hooks.py:32-47` 字段清单；`inbound_gateway.py:317` 只传三个标量，`Inbound` 在 `:272` 解包后即丢弃 |
 
-### ⚠️ 14 处 `admits()` 调用点（**本轮实测；行号会漂，落地前需再核一次**）
+### ✅ 14 处闸门调用点（**代码落地后重新现查，2026-10-05**）
 
-⚠️ **台账上方那格列的 13 处行号（`telegram :608`、`discord :885`、`slack :394`、
-`matrix :407`、`email :947`、`mattermost :727`、`ntfy :248`、`a2a :916`、`irc :630`、
-`qqbot :1095`、`nextcloud :881`、`twitch :574`、`homeassistant :1089`）**没有一个与
-当前源码相符** —— **全部漂移**。下表是实测值：
+⚠️ **本节行号换过两轮。** 第一轮「实测」值（`telegram :492`、irc `:629`…）在实现落地后
+**又全部漂了**（+5 到 +39）—— 因为实现给每个调用点加了 `and not self.answer_pairing_request(...)`。
+**下面这份是落地后现查的**，形态统一为
+`if not self.admits(<principal>) and not self.answer_pairing_request(...)`：
 
-`adapters/telegram.py:492`（文本）与 `:530`（按钮回调，经私有包装 `_allowed()`，
-`:616-618` —— **改 telegram 要改两处**）、`slack.py:420`、`discord.py:910`、
-`mattermost.py:866`、`matrix.py:418`、`nextcloud.py:880`、`email.py:950`、`irc.py:629`、
-`twitch.py:683`、`qqbot.py:1093`、`ntfy.py:247`、`a2a.py:919`、`homeassistant.py:1087`。
+`a2a.py:925`、`discord.py:915`、`email.py:955`、`homeassistant.py:1092`、`irc.py:668`、
+`matrix.py:423`、`mattermost.py:871`、`nextcloud.py:887`、`ntfy.py:252`、`qqbot.py:1104`、
+`slack.py:425`、`twitch.py:686`、`telegram.py:495`（文本）与 `:539`（按钮回调）。
 
-### ⚠️ 翻转后会有三处「现状可见」变成**假话**（且被测试逐字钉住）
+**telegram 仍是唯一走私有包装的**（`_allowed()` 在 `:623`，`:625` 委托给 `self.admits`）
+⇒ **改 telegram 要改两处**，其余 12 家直接调 `self.admits`。
 
-对安全功能来说，**用户读到的信息与实际相反比不显示更糟**，而这些串有测试保护，
-容易被当成「文案不许动」而留下来：
+`base.py:400` 是**规范形态**，而 `:404` 的注释写着「那个 `not self.admits(...)`
+**不是**可以省的短路」—— 留了防误删的警告。`irc.py` 那处把 `self._conversation_id(target)`
+提了上来（配对分支也需要它）。
 
-1. `__main__.py:462` 硬编码图例「白名单为空 = 未设 = **全开**」
-2. `__main__.py:483` `wl = f"{allowed} 项" if allowed else "⚠ 未设=全开"`
-3. `__main__.py:154` `not_ready_reasons` 里 `accepts_any_sender and not has_allowlist`
+⚠️ **这份清单现在也已经开始漂**（本仓库的适配器在持续增删行）。**引用时优先用符号名
+`answer_pairing_request` + 平台名**，行号只作定位辅助 —— 这条判据已写进 `AGENTS.md` §7.1。
+
+### ✅ 翻转后曾有三处「现状可见」变成**假话** —— **已全部修好**（2026-10-05）
+
+> 下面三条是**翻转落地前**列的清单。**每一条都已在本次落地中修掉**，
+> 且**都有测试逐字钉住**两套语义（`无 config_version ⇒ 旧语义` / `>= 2 ⇒ 新语义`）。
+> 保留这段是为了记下**它们曾经会被漏掉** —— 对安全功能来说，
+> **用户读到的信息与实际相反比不显示更糟**，而这些串有测试保护，
+> 容易被当成「文案不许动」而留下来。
+
+1. ~~`__main__.py` 硬编码图例「白名单为空 = 未设 = **全开**」~~
+   ✅ 已改：两套语义各一条，旧语义那条**必须预告**下一版起改为全拒、届时用 `/pair`
+   （测试：`assertIn("全拒", legend)` 且 `assertIn("全开", legend)` 分语义各钉一条，
+   外加 `assertNotIn("未设=全拒", row, "旧语义下说全拒是假话")`）
+2. ~~单元格 `⚠ 未设=全开`~~ ✅ 已改为分语义；并加了
+   `assertNotIn("全开", …)` ——「新语义下把那一行标成『全开』是**假话**」
+3. ~~`not_ready_reasons` 里 `accepts_any_sender and not has_allowlist`
+   （语义完全对调）~~ ✅ 已删掉那个恒假参数，判据改成 `elif not has_allowlist`；
+   而 **`_NOT_READY_NO_ALLOWLIST = "no_allowlist"` 这个稳定 token 原样保留** ——
+   它是给**仓库外**的 `bridge_setup` 按值断言的 ⇒ `ready_for_agent` 契约**零断裂**。
+   ⚠️ 另有一处**方向相反**的假话：`admits_nobody` 为真恰恰是**最安全**的状态，
+   所以 `warn_if_wide_open` **必须删掉或整体改造**，不能只改文案 ——
+   ✅ 已改为 `warn_if_no_allowlist`，并有测试断言
+   `空清单 = 全拒 是**最安全**的状态，不许对它发 WARNING`（且实际发的是 INFO）。
    ⇒ **语义完全对调**（今天把「空」列为 `not_ready`，翻转后「空」是最安全配置，
    却会被报成 `not_ready`）
 4. `allowlist.py:148-156` 的 `accepts_any_sender`（判定式 `return not self.entries`）

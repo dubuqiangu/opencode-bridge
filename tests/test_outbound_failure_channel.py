@@ -88,13 +88,38 @@ EXPECTED_VERDICTS = ("ok", "failed", "skipped", "not_started", "does_not_probe")
 #: 时间戳的旧记录读成『现在的状态』」，而**沉默恰好是那个歧义点** —— 读者分不出
 #: 「这条记录没有失败时刻」与「这个视图压根不显示时刻」（后者是假的）。
 #: ⇒ 且这一分支**可达而**非假想：``health.outbound_failure_from_record`` 的 docstring
-#: 明说那份文件**可能被用户手改过**，而读路径在 ``at`` 解析不出来时**不写**那个键
-#: （⛔ 它不补 ``time.time()`` —— 那会把「读的那一刻」当成失败时刻打出来）。
+#: 明说那份文件**可能被用户手改过**，而读路径在 ``at`` 解析不出来时把它置成
+#: ``None``（⛔ 它不补 ``time.time()`` —— 那会把「读的那一刻」当成失败时刻打出来；
+#: ⛔ 它也不 ``pop`` 掉那个键 —— 键恒在、值可空，见同文件里断言 ``entry["at"] is None``
+#: 的那条用例）。
 #:
 #: ⚠️ 措辞里**必须限定「失败」二字**（⛔ 不是笼统的「时刻未知」）：那一行里紧挨着
 #: **另一个**真实时刻（`` · 已恢复于 <…>``），而笼统的说法会被粗扫的人读成
 #: 「这一整行的时间信息都未知」⇒ 歧义的代价高于啰嗦。
 MISSING_FAILURE_TIME_TEXT = "（未记录失败时刻）"
+
+# ======================================================================
+# 「没观测到失败」那句话本身也可能**是假的**（缺陷一 / 缺陷二 / 缺陷四）
+# ======================================================================
+#: 「无记录」那句话里**第二半**免责的**逐字**文案 —— 「观测到失败但一个字都没写下去」
+#: 这件事从盘上**分不出来**（见 :func:`health.OutboundFailureRecorder.note_failure` 的
+#: 写盘失败分支），所以那句必须自带它。
+#: ⛔ 硬编码字面量，⛔ 不许对着 ``opencode_bridge.health`` 的源码算（那恒真）。
+UNWRITTEN_FAILURE_DISCLAIMER_TEXT = "也不代表没有观测到但没写下来的失败"
+
+#: 那一行里**唯一**的事实断言 —— 两种情形（压根没失败 / 失败但没写下去）都带着它。
+#: ⚠️ 判据钉的是它**仍在**，而不是"免责半句在不在"：后者对「正常无失败」那条用例
+#: 会恒真（见 :class:`NoRecordWordingMustNotLie` 的反向对照）。
+NO_RECORD_FACT_CLAIM_TEXT = "未观测到出站失败"
+
+#: :class:`health.OutboundFailureRecorder` 类 docstring 里那段**曾经矛盾**的读法 ——
+#: 它要求「上次没写成」这件事活到用户把磁盘/权限修好为止，而代码不具备这个性质。
+#: ⛔ 硬编码字面量，⛔ **不许**留着旧断言不管（那正是本组要消灭的那类"docstring 承诺
+#: ≠ 代码兑现"）。
+CONTRADICTORY_STREAK_PROMISE_TEXT = "连击的**下一次失败**会重试"
+
+#: 类 docstring 现在**必须**说出、且与代码一致的那半句（硬编码；⛔ 不许对着源码算）。
+UNWRITTEN_DOES_NOT_OUTLIVE_SUCCESS_TEXT = "活不过一次成功发送"
 
 
 class ScriptedAdapter(Adapter):
@@ -607,7 +632,7 @@ class StatusSectionWording(unittest.TestCase):
         盘上这条记录**没有 ``at``**（用户手改过 —— 那段 docstring 说的就是这件事）。
         修好之前读路径复用了**写**路径的 normalizer，而它给 ``at=None`` 补
         ``time.time()`` ⇒ ``--status`` 会打出一个**从未发生**的时刻。
-        ⇒ 判据分两层：读出来的 entry **不许有** ``at``；那一行**不许有**时刻。
+        ⇒ 判据分两层：``at`` **键恒在而值为空**；那一行**不许有**时刻。
         """
         self.hand_write_a_record(
             {"telegram": {"kind": "forbidden", "detail": "bot 被移出群聊"}},
@@ -619,8 +644,13 @@ class StatusSectionWording(unittest.TestCase):
         )
 
         self.assertIsNotNone(entry, "手写的记录读不回来了")
-        self.assertNotIn(
+        self.assertIn(
             "at", entry,
+            "``at`` 键必须恒在（⛔ 不是 pop 掉）—— ``last_outbound_failure`` 进 "
+            "--setup --json，而仓库外的消费者按 entry[\"at\"] 取，缺键会 KeyError",
+        )
+        self.assertIsNone(
+            entry["at"],
             "盘上没有时刻，读出来却有一个 —— 那是「读的那一刻」，不是失败时刻",
         )
         row = self.row_for_telegram(self.section())
@@ -635,6 +665,67 @@ class StatusSectionWording(unittest.TestCase):
             "缺时刻时整段沉默 ⇒ 读者分不出「这条记录没有失败时刻」与"
             "「这个视图压根不显示时刻」（后者是假的：本分支确实会显示）",
         )
+
+    def test_the_missing_timestamp_key_does_not_raise_for_a_by_value_consumer(self):
+        """⭐ **反向于 KeyError** 的那半边：键恒在，所以 ``entry["at"]`` 取得到。
+
+        ⚠️ 这是「让读路径保证键恒在、值可空」这条契约**本身**的判据：上一条断言的是
+        值，这一条断言的是键在（⛔ 不是 ``pop``、⛔ 不是 ``KeyError``）。
+        ⚠️ 必须真的**下标取**而不是 ``.get()``：``.get`` 在缺键时返回 ``None``，
+        而缺键与「值为空」在它眼里同形 ⇒ 用它判就恒真（AGENTS.md §7.1）。
+        """
+        self.hand_write_a_record(
+            {"telegram": {"kind": "forbidden", "detail": "bot 被移出群聊"}},
+            recorded_at=time.time() - 86400,
+        )
+        entry = health.outbound_failure_from_record(
+            health.read_outbound_failures(self.bridge_dir), "telegram"
+        )
+
+        at = entry["at"]        # ⛔ 缺键时这一行就是 KeyError（用例 ERROR = 红）
+
+        self.assertIsNone(at)
+
+    def test_an_unreadable_timestamp_value_is_read_as_absent_not_passed_through(self):
+        """⭐⭐ **值为空 = 读不出来**：盘上 ``at`` 坏掉时读出来必须是 ``None``。
+
+        ⚠️ **这条是判据反退化的那一半**：把读路径写成 ``normalized["at"] = entry.get("at")``
+        时，键确实恒在了（上面两条照样绿）—— 但一个**读不出来的时刻**会**原样穿过**
+        读路径（``"at": "不是数字"`` / ``"at": true`` ⇒ 读出来是那个字符串 / 布尔）。
+        ⇒ 而 ``--setup --json`` 会把 ``"at": "不是数字"`` 交给**按值取键**的仓库外
+        消费者，它拿到的既不是时刻也不是"读不出来" —— 那正是本模块要消灭的第三种
+        形态：**信息产生出来了，却被说成了另一件事**。
+        ⇒ 判据：坏 ``at`` 一律读成 ``None``（与 :func:`health.recorded_at` /
+        :func:`health._normalize_epoch` 的 ``None`` 语义一致）。
+        """
+        for label, malformed in (
+            ("非数字字符串", "不是数字"),
+            ("布尔（bool 是 int 的子类）", True),
+            ("空串", ""),
+        ):
+            with self.subTest(at=label):
+                self.hand_write_a_record(
+                    {"telegram": {"at": malformed, "kind": "forbidden",
+                                  "detail": "banned"}},
+                    recorded_at=time.time() - 86400,
+                )
+
+                entry = health.outbound_failure_from_record(
+                    health.read_outbound_failures(self.bridge_dir), "telegram"
+                )
+
+                self.assertIn("at", entry)
+                self.assertIsNone(
+                    entry["at"],
+                    "盘上这个 at 读不出来，而读路径把它**原样传了出去** ⇒ "
+                    "消费方拿到的既不是时刻也不是「读不出来」（--setup --json 里会是 "
+                    "%r）" % (entry["at"],),
+                )
+                self.assertIn(
+                    MISSING_FAILURE_TIME_TEXT,
+                    self.row_for_telegram(self.section()),
+                    "at 读不出来时 ``--status`` 那一行仍显示了一个时刻",
+                )
 
     def test_a_record_with_a_real_timestamp_still_shows_it(self):
         """⚠️ **反向对照**：修掉「不许编时刻」不该把真的时刻也一起抹掉。"""
@@ -1617,6 +1708,376 @@ class NeverFabricatesAFailure(RecorderInstalled):
         self.assertEqual(self.count_writes_while(
             lambda: self.recorder.note_success("irc")
         ), 1, "盘上真的有记录时，恢复那一次必须写盘")
+
+
+# ======================================================================
+# ⑫ ⛔ 缺陷三的另一半：**假的否定观测**（"没观测到出站失败"这句话本身是假的）
+# ======================================================================
+class NoRecordWordingMustNotLie(RecorderInstalled):
+    """⭐⭐ 缺陷一：写盘失败时那句「未观测到出站失败」**在事实上是假的**。
+
+    ⚠️ 这一组与 :class:`NeverFabricatesAFailure` **方向相反**：那边消灭的是**假阳性**
+    （凭空造出一条从未发生的失败），这边消灭的是**假阴性**（明明观测到失败了，
+    视图却说「未观测到」）。同一个模块的**全部意义**是消灭假话，两个方向都是。
+
+    ## 机制
+
+    :meth:`health.OutboundFailureRecorder.note_failure` 写盘失败时（磁盘满 / 目录只读
+    / 杀软锁 / 路径过长）返回 ``False``，而那次失败观测**只**进了内存里的
+    :attr:`~health.OutboundFailureRecorder._unwritten` —— 盘上什么都没有。
+    ⇒ :data:`health.NO_OUTBOUND_FAILURE_TEXT` 对那个平台打的那句
+    「自该记录建立以来**未观测到**出站失败」，**事实断言在这个情形下是假的**：
+    失败被观测到了，只是没写下去。
+
+    ## 为什么**不许**为此另造机制
+
+    那次观测跨进程**真的不可恢复**：``outbound-failures.json`` 是它**唯一**的载体，
+    而它刚刚写失败 ⇒ 按 AGENTS.md §8 第 3 条（"恢复没记录过的信息"的方案必然在某些
+    情况下猜错），加一个新文件 / 新状态都是**猜**。
+    ⇒ **残留由措辞承担**：免责半句必须**同时免责「写不下去」**。
+    ⛔ 而它因此**必然出现在正常无失败的情形里**（``--status`` 是另一个进程，只读得到
+    盘上那份，**分不出**上面两种）—— 那不是过度承诺，那是不猜的代价。
+    """
+
+    def render_section(self) -> str:
+        """只取出站失败那一段（到下一个 ``== `` 段为止）。
+
+        ⚠️ 必须逐段取：``--status`` 的其它段（含运行态、授权键冲突、渠道配置表）本来
+        就会出现"失败"与"Telegram"字样，整段断言会把那些混进来（与
+        :meth:`StatusSectionWording.section` 同一个理由）。
+        """
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.run_status(Config(adapters={"telegram": {"bot_token": "t"}}))
+        lines = buffer.getvalue().splitlines()
+        start = next(
+            index for index, line in enumerate(lines)
+            if cli._OUTBOUND_SECTION_HEADER in line
+        )
+        tail = lines[start + 1:]
+        end = next(
+            (index for index, line in enumerate(tail) if line.startswith("== ")),
+            len(tail),
+        )
+        return "\n".join(tail[:end])
+
+    def render_row_for(self, platform: str = "telegram") -> str:
+        for line in self.render_section().splitlines():
+            if line.strip().startswith("Telegram"):
+                return line
+        raise AssertionError("那一段里找不到 Telegram 那一行")
+
+    def test_a_failure_that_never_reached_disk_is_not_reported_as_never_seen(self):
+        """⭐⭐ **写盘失败 + 此后无成功发送** ⇒ 那行**必须**免责「没写下来」。
+
+        ⚠️ 这条与「无记录就是无记录」不矛盾：那句话答的是「**观测**到没有」，
+        而这里观测到了 —— 观测只是没落到唯一那个载体上。
+        """
+        with mock.patch.object(
+            health, "write_config_atomically",
+            mock.Mock(side_effect=OSError("磁盘只读")),
+        ):
+            with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                written = self.recorder.note_failure(
+                    "telegram", SendError.FORBIDDEN, "bot 被移出群聊"
+                )
+
+        self.assertFalse(written, "这一步写成功了 ⇒ 下面钉的不是写盘失败这条路")
+        self.assertEqual(self.on_disk(), "", "写盘失败了盘上却有内容")
+        self.assertEqual(
+            self.recorder.failing_platforms(), ("telegram",),
+            "故障本身发生了（哪怕一个字都没落盘）⇒ 诊断里不该消失",
+        )
+
+        row = self.render_row_for()
+
+        self.assertIn(
+            UNWRITTEN_FAILURE_DISCLAIMER_TEXT, row,
+            "失败被观测到了、只是没写下去，而这一行说「未观测到出站失败」"
+            "⇒ 那是一条假的否定观测，与本模块消灭的假阳性是同一个病",
+        )
+        self.assertIn(NO_RECORD_FACT_CLAIM_TEXT, row, "判据认错了行（事实断言该在）")
+
+    def test_the_wording_still_carries_its_own_liveness_disclaimer(self):
+        """⚠️ 两半免责都承重：修「写不下去」不许把「此刻可达」那半句挤掉。
+
+        ⚠️ 这是上一条的**反向对照**（判据反退化）：只留新半句的话，"没记录"
+        又会被读成"现在可达"，而那正是本模块在模块 docstring 里点名的那个代价。
+        """
+        with mock.patch.object(
+            health, "write_config_atomically",
+            mock.Mock(side_effect=OSError("磁盘只读")),
+        ):
+            with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                self.recorder.note_failure(
+                    "telegram", SendError.FORBIDDEN, "bot 被移出群聊"
+                )
+
+        row = self.render_row_for()
+
+        self.assertIn(
+            "不代表此刻可达", row,
+            "「不代表此刻可达」那半句被换掉了 ⇒ 没记录又被读成现在可达",
+        )
+        self.assertIn(UNWRITTEN_FAILURE_DISCLAIMER_TEXT, row)
+
+    def test_it_still_does_not_say_ok_and_still_does_not_say_failed(self):
+        """⭐ **反向对照**：正常无失败时，那行**仍不许**变成「正常」或「失败」。
+
+        ⚠️ 加免责半句是**加一截限定**，不是换掉那个「两者都不是」的读法 ——
+        而本文件 §③ 的纪律是双向的：既不许说"正常"，也不许说"失败"。
+        """
+        row = self.render_row_for()
+
+        self.assertIn(health.NO_OUTBOUND_FAILURE_TEXT, row)
+        self.assertNotIn("正常", row, "「无记录」被说成了「正常」")
+        self.assertNotIn("上次出站失败", row, "「无记录」被说成了「失败」")
+        # ⚠️ 正常无失败时**也会**带上「没写下来」那半句，而这是**不猜的代价**不是缺陷：
+        # ``--status`` 是另一个进程，只读得到盘上那份，而盘上压根没有"这次有没有失败
+        # 但没写下去"这个信息（AGENTS.md §8 第 3 条）⇒ 那半句对两种情形都必须说。
+        self.assertIn(
+            UNWRITTEN_FAILURE_DISCLAIMER_TEXT, row,
+            "正常情形下这半句**也**必须在（--status 分不出两种情形）—— "
+            "它缺席说明措辞按情形分叉了，而分叉的那个判据在盘上不存在",
+        )
+
+    def test_a_record_that_really_is_on_disk_does_not_get_that_disclaimer(self):
+        """⭐⭐ **双向可分辨**：真有一条记录时，那行**不许**说「没写下来」。
+
+        ⚠️ 这是本组最重要的**反向对照**：免责半句若无条件跟着记录走，它就成了新的
+        静默 —— 用户读到一句"可能有失败没记下来"，却看到上面明明写着失败时刻 ⇒
+        那是在**制造**不确定性去掩盖真实记录（与"沉默掩盖缺信息"同一个错误的镜像）。
+        """
+        self.recorder.note_failure("telegram", SendError.FORBIDDEN, "bot 被移出群聊")
+
+        row = self.render_row_for()
+
+        self.assertIn("上次出站失败", row)
+        self.assertNotIn(
+            UNWRITTEN_FAILURE_DISCLAIMER_TEXT, row,
+            "盘上明明有这条记录，却还说「没写下来」⇒ 真实观测被一句免责糊掉了",
+        )
+        self.assertNotIn(health.NO_OUTBOUND_FAILURE_TEXT, row)
+
+    def test_the_two_situations_are_byte_identical_so_no_wording_can_split_them(self):
+        """⭐⭐ **为什么那半句必须无条件出现**（不是过度承诺，是**分不出来**）。
+
+        ⚠️ 这一条是本组全部用例的**前提**，钉的是**不可能**而不是行为：把
+        「压根没失败过」与「失败过但没写下去」两种情形各造一遍，两者的 ``--status``
+        输出必须**逐字节相同**。
+        ⇒ 因此**任何**按情形分叉的措辞都在**猜**（AGENTS.md §8 第 3 条：恢复没记录过
+        的信息的方案必然在某些情况下猜错）⇒ 免责半句只能对**两种**情形都说。
+        ⚠️ 反过来说：这条红 ⇒ 要么两种情形真的被区分了（那时本组其余用例的
+        「无条件」前提失效，⛔ 别顺手把它改绿），要么渲染不再只依赖盘上那份。
+        """
+        # 情形一：压根没失败过 —— 盘上**压根没有那个文件**。
+        never_failed_row = self.render_row_for()
+        never_failed_disk = self.on_disk()
+
+        # 情形二：失败**被观测到了**，而写盘失败 ⇒ 盘上同样是空的。
+        with mock.patch.object(
+            health, "write_config_atomically",
+            mock.Mock(side_effect=OSError("磁盘只读")),
+        ):
+            with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                self.recorder.note_failure(
+                    "telegram", SendError.FORBIDDEN, "bot 被移出群聊"
+                )
+
+        unwritable_row = self.render_row_for()
+
+        self.assertEqual(
+            never_failed_disk, "", "情形一的前提：盘上本来什么都没有")
+        self.assertEqual(
+            self.on_disk(), "", "情形二的前提：写盘失败了盘上却有内容")
+        self.assertEqual(
+            never_failed_row, unwritable_row,
+            "两种情形渲染出了不同的一行 ⇒ 说明渲染不再只依赖盘上那份。"
+            "若这个判据真的红了：要么出现了盘上分不出的新状态（本组其余用例的"
+            "「无条件」前提失效），要么措辞改成了按情形分叉（那就是猜）—— "
+            "两种都要先弄清楚，别直接把它改绿",
+        )
+        # ⇒ 既然分不出来，那半句对两种情形都必须说。
+        self.assertIn(UNWRITTEN_FAILURE_DISCLAIMER_TEXT, unwritable_row)
+
+
+# ======================================================================
+# ⑬ ⛔ 缺陷二：类 docstring **两句话互相矛盾**，而强的那句代码不兑现
+# ======================================================================
+class StreakBoundaryDocstringMatchesTheCode(RecorderInstalled):
+    """⭐⭐ 缺陷二：同一个 ``__doc__`` 里两句话讲**同一件事**却互相矛盾。
+
+    ## 那两句矛盾的话
+
+    * 一处（类 docstring「写盘失败时内存态怎么办」）：「⛔ 连击的**下一次失败**会重试
+      （记着"上次没写成"的是故障本身，用户改完磁盘/权限就该立刻能记上）」——
+      **那个括号里的理由要求标记活到用户把磁盘修好为止**。
+    * 另一处（:attr:`~health.OutboundFailureRecorder._unwritten` 的注释）：「下一次
+      成功发送会把它清掉，于是**下一次**失败连击会重新尝试写」—— 也就是它
+      **活不过一次成功发送**。
+
+    ## 实测
+
+    写盘失败 → 磁盘恢复 → **一次成功发送** ⇒ 两个集合都空、盘上读回来是 ``None``
+    ⇒ 那条失败观测**永久丢失**。
+
+    ## 为什么这一组是合法的断言形态
+
+    ⛔ 本仓库把 docstring 当**承重契约**测（本文件 §⑥ 与
+    ``tests/test_platform_health.py`` 都是这个形态），所以「docstring 不得承诺代码
+    不兑现的性质」是一条真判据 —— **别因为"docstring 不是被测物"就不写它**。
+    ⚠️ 而只读 docstring 文本的判据有个典型失效方式：它认不出"那半句被换成了另一句
+    同样读起来自洽的话" ⇒ 所以下面配一条**自守**用例（喂它一段坏 docstring）。
+    """
+
+    def test_the_docstring_does_not_promise_the_flag_outlives_a_success(self):
+        """⭐⭐ 那句**假的**承诺不许回来（把矛盾的原样放回去 ⇒ 必须变红）。"""
+        docstring = health.OutboundFailureRecorder.__doc__
+
+        self.assertIsNotNone(docstring, "类 docstring 没了 ⇒ 判据无从判起")
+        self.assertNotIn(
+            CONTRADICTORY_STREAK_PROMISE_TEXT, docstring,
+            "类 docstring 又承诺「连击的下一次失败会重试」—— 而那个括号里的理由"
+            "（用户改完磁盘/权限就该立刻能记上）要求标记活到用户修好为止，"
+            "代码不具备这个性质（note_success 会把它清掉）⇒ docstring 承诺 ≠ 代码兑现",
+        )
+        self.assertIn(
+            UNWRITTEN_DOES_NOT_OUTLIVE_SUCCESS_TEXT, docstring,
+            "删掉那句假承诺还不够：必须**说出**唯一为真的那半句，"
+            "否则读者会以为删掉就等于没这条边界",
+        )
+
+    def test_the_code_really_does_lose_the_observation_after_one_success(self):
+        """⭐⭐ **代码侧**的同一条事实：一次成功发送之后，那条观测**永久丢失**。
+
+        ⚠️ 这条是上一条的**证据**：它证明那句承诺**不可能**兑现（而 docstring 若再次
+        承诺它，说的就是一件代码做不到的事）。
+        ⚠️ 它同时钉住"删掉 docstring 那半句"**不是**把行为改好了 —— 行为本来就如此。
+        """
+        with mock.patch.object(
+            health, "write_config_atomically",
+            mock.Mock(side_effect=OSError("磁盘只读")),
+        ):
+            with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                for _ in range(5):
+                    self.recorder.note_failure(
+                        "irc", SendError.FORBIDDEN, "banned"
+                    )
+        self.assertEqual(
+            sorted(self.recorder._unwritten), ["irc"],
+            "标记没被记住 ⇒ 下面钉的不是那条清空路径",
+        )
+        self.assertEqual(sorted(self.recorder._failing), [])
+
+        with mock.patch("opencode_bridge.health.logger"):
+            self.recorder.note_success("irc")      # 磁盘恢复 + 一次成功发送
+
+        self.assertEqual(
+            (sorted(self.recorder._failing), sorted(self.recorder._unwritten)), ([], []),
+            "一次成功发送之后标记竟还在 ⇒ docstring 那半句与代码对不上（反方向）",
+        )
+        self.assertIsNone(
+            self.recorded_entry("irc"),
+            "盘上凭空多出一条失败记录 —— 那是被编出来的（观察到的失败确实没落盘）",
+        )
+        self.assertEqual(self.on_disk(), "", "盘上凭空多出了内容")
+        self.assertEqual(
+            self.recorder.failing_platforms(), (),
+            "那条失败观测从诊断里彻底消失了 ⇒ 没人能再看见它发生过",
+        )
+
+    def test_the_criterion_rejects_a_docstring_carrying_the_false_promise(self):
+        """⚠️ **自守**：判据被喂那段矛盾的原样 docstring 时必须**拒绝**它。
+
+        ⛔ 没有这一条，上面那条可能是「判据恒空」的副产品：一份**任何** docstring
+        都通不过的判据也能"正确地"拒绝矛盾的那份。两个方向都要卡。
+        """
+        contradictory_docstring = (
+            '类 docstring 的一段。\n'
+            '\n'
+            '    ⚠️ 边界是按连击划的：⛔ %s（记着"上次没写成"的是故障本身，'
+            '用户改完磁盘/权限就该立刻能记上）。\n'
+            % CONTRADICTORY_STREAK_PROMISE_TEXT
+        )
+        truthful_docstring = (
+            '类 docstring 的一段。\n'
+            '\n'
+            '    ⚠️ 但「上次没写成」这件事%s（`_unwritten` 会被清掉）。\n'
+            % UNWRITTEN_DOES_NOT_OUTLIVE_SUCCESS_TEXT
+        )
+
+        def contradicts_the_code(docstring: str) -> str:
+            if CONTRADICTORY_STREAK_PROMISE_TEXT in (docstring or ""):
+                return "docstring 承诺 _unwritten 活过成功发送，而 note_success 会清掉它"
+            if UNWRITTEN_DOES_NOT_OUTLIVE_SUCCESS_TEXT not in (docstring or ""):
+                return "docstring 没说清 _unwritten 活不过一次成功发送"
+            return ""
+
+        self.assertTrue(
+            contradicts_the_code(contradictory_docstring),
+            "判据在 docstring 承诺了代码兑现不了的那半句时竟然说通过 —— 判据坏了",
+        )
+        self.assertEqual(
+            contradicts_the_code(truthful_docstring), "",
+            "判据把与代码一致的那份 docstring 也拒了 —— 它认的不是那句承诺",
+        )
+        self.assertEqual(
+            contradicts_the_code(health.OutboundFailureRecorder.__doc__), "",
+            "真实的类 docstring 没通过判据：",
+        )
+
+
+# ======================================================================
+# ⑭ 缺陷四：``failing_platforms`` 的 docstring 第一行与实现不符
+# ======================================================================
+class FailingPlatformsDocstringMatchesItsUnion(unittest.TestCase):
+    """``failing_platforms`` 返回的是**并集**，而第一行原本只说其中一半。
+
+    ⚠️ :attr:`~health.OutboundFailureRecorder._unwritten` 里的平台**严格说不是连击**
+    （该函数自己的注释就是这么区分的）⇒ 第一行说"当前处于失败连击中的平台"是**错的**：
+    一个盘上一个字都没记下的平台照样会被列进来，而它压根没进过连击。
+    """
+
+    def test_the_first_line_names_the_union_rather_than_only_the_streaks(self):
+        """那半句必须对齐成「观测到失败、其中盘上记着一部分」。"""
+        docstring = health.OutboundFailureRecorder.failing_platforms.__doc__
+
+        self.assertIsNotNone(docstring, "docstring 没了 ⇒ 判据无从判起")
+        first_line = docstring.strip().splitlines()[0]
+        self.assertNotIn(
+            "失败连击", first_line,
+            "第一行还只说「失败连击」—— 而 _unwritten 里的平台压根没进过连击，"
+            "只报连击就是少报了观测到失败的那些（一个假的**部分**否定观测）",
+        )
+        self.assertIn("观测到失败", first_line, "第一行没说出它答的是「观测到失败」")
+        self.assertIn("盘上", first_line, "第一行没说出盘上只记着一部分")
+
+    def test_the_union_really_does_contain_a_platform_that_never_streaked(self):
+        """⭐ **反"判据恒空"**：上面那条钉的那半句得有一个真的落点。
+
+        ⚠️ 判据只读 docstring，所以它绿着不说明实现真是并集 ⇒ 用一个**只写盘失败**
+        的平台把这条钉在行为上：它既不在 ``_failing``，又必须出现在返回值里。
+        """
+        import tempfile as tempfile_module
+
+        with tempfile_module.TemporaryDirectory() as directory:
+            recorder = health.OutboundFailureRecorder(directory)
+            with mock.patch.object(
+                health, "write_config_atomically",
+                mock.Mock(side_effect=OSError("磁盘只读")),
+            ):
+                with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                    recorder.note_failure("irc", SendError.FORBIDDEN, "banned")
+
+            self.assertEqual(
+                sorted(recorder._failing), [],
+                "写盘失败了却进了连击 ⇒ 那条连击没有任何可盖戳的观测",
+            )
+            self.assertEqual(
+                recorder.failing_platforms(), ("irc",),
+                "它压根没进过连击，却必须出现在诊断里 —— "
+                "所以 docstring 第一行不能只说「失败连击」",
+            )
 
 
 if __name__ == "__main__":

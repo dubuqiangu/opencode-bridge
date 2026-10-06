@@ -236,7 +236,26 @@ class SubscriptionSupervisor:
             try:
                 self._drain_one_subscription()
             except Exception as error:  # noqa: BLE001 - 订阅坏掉不许带走线程
-                self._back_off_and_announce(error)
+                # ⛔⛔ 收尾通道【自己】也必须被兜住 —— 本模块存在的唯一理由就是
+                # 「线程不许死」，而 `_back_off_and_announce` 里有四个可能抛的东西
+                # （``take`` / ``_update`` / ``logger.warning`` / ``_stop.wait``）
+                # ⇒ 它们任何一个抛出，异常就会逃出 ``run``、**永久带走线程**，
+                # 那正是本模块要修的那个缺陷本身。
+                #
+                # ⚠️ **这不是「把真错误藏起来」**：订阅为什么坏已经由
+                # ``_back_off_and_announce`` 的那一行 warning 记过了；这里兜的只是
+                # 「记完账之后的那几步又失败」⇒ 而那种情况下**仍然必须重试**
+                # （不重试就是静默停摆，比抛出去更坏）。
+                try:
+                    self._back_off_and_announce(error)
+                except Exception:  # noqa: BLE001 - 连记账失败也不许带走线程
+                    logger.exception(
+                        "reconnect bookkeeping failed after %s; retrying anyway "
+                        "in %.1fs",
+                        error,
+                        FIRST_RECONNECT_DELAY_SECONDS,
+                    )
+                    self._stop.wait(FIRST_RECONNECT_DELAY_SECONDS)
                 continue
             self._update(
                 phase=PHASE_ENDED_WITHOUT_STOP,

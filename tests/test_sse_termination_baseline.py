@@ -372,6 +372,76 @@ class SubscribePropagatesTheNon200Tests(unittest.TestCase):
         )
 
 
+class ReconnectBookkeepingFailureTests(unittest.TestCase):
+    """⛔ **收尾通道自己抛**时，线程仍然不许死。
+
+    ⚠️ **这条路径此前完全没有测试**：``SubscriptionSupervisor.run`` 里
+    ``except Exception as error: self._back_off_and_announce(error)``
+    的那一句**自己没有被保护** ⇒ 而那个方法里有四个可能抛的东西
+    （``take`` / ``_update`` / ``logger.warning`` / ``_stop.wait``）
+    ⇒ 它们任何一个抛出，异常就逃出 ``run``、**永久带走线程** ——
+    而「线程永久死亡」正是本模块存在的理由。
+
+    ⇒ 所以这一条断言的是**模块自己的不变量**，不是某个函数的行为。
+    """
+
+    def test_bookkeeping_that_raises_does_not_take_the_thread_down(self):
+        """"记完账之后那几步又失败" ⇒ 仍然必须重试，而不是把线程带走。"""
+        subscribe_calls: list[int] = []
+        escaped: list[BaseException] = []
+        #: 同步点（⛔ 不用 sleep：本机计时分辨率 16 ms，时序断言不可信）
+        saw_three_attempts = threading.Event()
+
+        def always_refuses() -> Iterator[dict]:
+            subscribe_calls.append(1)
+            if len(subscribe_calls) >= 3:
+                saw_three_attempts.set()
+            raise RuntimeError("503 from the event endpoint")
+            yield {}  # 让它是个生成器；⛔ 这一行永不执行
+
+        supervisor = SubscriptionSupervisor(
+            subscribe=always_refuses, on_frame=lambda event: None,
+            # 退避缩到 10ms：本测试要的是【重试次数】而不是【等了很久】⇒
+            # ⛔ 不许拿「等了 0.5 秒」当证据（那是计时断言）
+            first_delay=0.01, max_delay=0.01,
+        )
+
+        def broken_bookkeeping(error: Exception) -> None:
+            raise OSError("the bookkeeping channel is broken too")
+
+        # 换掉「记账」这一步 —— 它是这条路径上唯一能被外力弄坏的东西
+        supervisor._back_off_and_announce = broken_bookkeeping  # type: ignore[method-assign]
+
+        def run_it() -> None:
+            try:
+                supervisor.run()
+            except BaseException as error:  # noqa: BLE001 - 这里就是要看它有没有逃出来
+                escaped.append(error)
+
+        worker = threading.Thread(target=run_it, name="supervise-escaping-bookkeeping")
+        worker.start()
+        try:
+            self.assertTrue(
+                saw_three_attempts.wait(timeout=5.0),
+                "记账失败之后仍必须继续重试；实际重试次数："
+                f"{len(subscribe_calls)} 逃出来的异常：{escaped!r}",
+            )
+        finally:
+            supervisor.request_stop()
+            worker.join(timeout=5.0)
+
+        self.assertEqual(
+            escaped, [],
+            "记账失败【不许】把异常逃出 run —— 逃出去就是线程永久死亡，"
+            "而那正是本模块要修的缺陷",
+        )
+        self.assertFalse(worker.is_alive(), "run 必须能正常返回")
+        self.assertGreaterEqual(
+            len(subscribe_calls), 3,
+            "至少重试到第三次 —— 少于三次说明「记账失败」把它打断了",
+        )
+
+
 class ReconnectBackoffTests(unittest.TestCase):
     """退避的数列 —— 「不许空转」与「第一次要快」的那份**可逐项断言**的证据。
 

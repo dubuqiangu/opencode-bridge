@@ -774,20 +774,46 @@ def _print_last_start_probes(
     实例写下的好结论，比留着一条旧的更坏。那条例外必须**在下面说出来**，
     否则「上一次启动尝试」这句话就会在这一种情形下说假话。
 
+    ⚠️⚠️ **本段必须能看见盘上**任何**平台级结论 —— 包括未注册键的**
+    （实测缺陷，2026-10-06）。用户把 ``telegram`` 拼成 ``telegramm`` 时，桥在构造
+    循环里抛 ``KeyError`` 并以**那个键**把「不是已注册的适配器键」落盘，而上面那张
+    「渠道配置与能力」表**只列注册表里的平台**、压根没有它那一行 ⇒ 而本段存在的
+    **唯一理由**就是回答"桥为什么没起来"。⇒ 记在未注册键下的结论一律**自己成行**
+    （⛔ 不折进下面那条全局 ⚠ 行 —— 那条行的"逐平台复读是噪音"的理由只对已注册的键
+    成立），且本段**不许**在盘上真有结论时说出「没有得到任何平台的结论」。
+
     :param rows: :func:`_channel_config_rows` 的行，**复用**它而不重算平台清单与
         ``configured``（同一份判定只能有一处）。
     :param bridge_dir: :func:`_bridge_dir` 的推导结果 —— 记录就落在那里。
     """
     record = health.read_platform_health(bridge_dir)
     recorded = health.recorded_at(record)
+    recorded_platform_keys = tuple(health.platforms_in_record(record))
     # 只列**已配置**或**上次探测过**的平台：把十三个平台各写一行「无记录」既吵
     # 又是废话（没配的平台压根不该被启动过）。而"上次探测过"的那些必须留着 ——
     # 用户把它移出配置之后，正是最需要看见"上次启动时说它是好的"。
-    probed = set(health.platforms_in_record(record))
+    probed = set(recorded_platform_keys)
+    #: 注册表里那些键（``rows`` 是**唯一**的平台清单，这里不重算一份）。
+    registered_keys = {key for key, _label, _cfg, _inbound, _caps in rows}
     listed = [
         (key, label)
         for key, label, configured, _inbound_ready, _caps in rows
         if configured or key in probed
+    ]
+    # ⚠️⚠️ **盘上的键不限于已注册的平台名**（实测缺陷，2026-10-06）：配置里把平台键
+    # 拼错（``telegram`` → ``telegramm``）时，桥走「有像凭据的字段就别凭空拦住用户」
+    # 那条分支过了预检（见 :func:`_has_configured_adapter`），随后在构造循环里抛
+    # ``KeyError`` ⇒ ``unusable_reasons["telegramm"] = "不是已注册的适配器键"`` ⇒
+    # :func:`_record_bridge_refusal` 以**那个键**把它写进盘。
+    # ⇒ 它**不在** ``rows`` 里，而上面那张「渠道配置与能力」表也压根没有它那一行 ⇒
+    # 不并进来的话，「不是已注册的适配器键」这句话在这个视图里**一个字都显示不出来**
+    # —— 而这一段存在的**唯一理由**正是回答「桥为什么没起来」。
+    # ⇒ 实测（2026-10-06）那时的输出要么是一句「无记录」，要么是一句**假的**
+    # 「盘上有记录，但这次启动没有得到任何平台的结论」（盘上恰好有一条平台级结论，
+    # 而且它就是唯一能解释桥为什么没起来的那条）。
+    # label 取**键本身**：没有适配器类可以问 label，而用户要认的恰恰是自己敲错的那串。
+    listed += [
+        (key, key) for key in recorded_platform_keys if key not in registered_keys
     ]
     # 「桥这一轮没起来」是**全局**的一件事（不是某个平台的结论）⇒ 由下面那条 ⚠ 行
     # 说一次，并且**不带平台行**：空模板那种 13 个平台全被拒的情况，逐平台再写一遍
@@ -796,9 +822,19 @@ def _print_last_start_probes(
     platform_rows = []
     for key, label in listed:
         probe = health.probe_from_record(record, key)
-        if probe is not None and probe["verdict"] == health.VERDICT_NOT_STARTED:
+        if (
+            probe is not None
+            and probe["verdict"] == health.VERDICT_NOT_STARTED
+            and key in registered_keys
+        ):
             # ⚠️ 记**第一个**（注册表顺序 = 上面那张表的顺序）：13 个平台各说一遍是
             # 复读，而它们各自的「缺什么」上面那张表已经在说了。
+            #
+            # ⚠️⚠️ 而「复读」这个理由**只对已注册的键成立**：上面那张表列的是注册表
+            # 里的平台，一个**未注册**的键在那里一个字都没有 ⇒ 把它折进这条全局 ⚠ 行
+            # 等于把「不是已注册的适配器键」连同它的键一起吞掉（先到的那条已注册键
+            # 还会把它挤掉，于是那一轮它连 ⚠ 行都上不了）⇒ 所以未注册的键**一律自己
+            # 成行**，⛔ 不参与这个「记第一个」。
             if refused is None:
                 refused = probe
             continue
@@ -822,7 +858,16 @@ def _print_last_start_probes(
         # ⛔ 区别「压根没有记录」与「有记录、但里面没有平台级结论」：后者是桥刚
         # 拒绝启动、或它启动了一个都不上报结论的适配器 —— 说成"没有任何探测记录"
         # 会让用户以为盘上是空的，而它其实刚被写过。
-        if not listed:
+        #
+        # ⚠️⚠️ **判据是「盘上真的有平台级结论」，⛔ 不是「有没有已注册平台」**
+        # （实测缺陷，2026-10-06）。这两件事在缺陷现场是**反的**：文件存在、
+        # 而它的键未注册（``telegramm``）时，旧判据（``listed`` 为空 ⇒ 走这一支）
+        # 恰好落进「没有得到任何平台的结论」—— **而盘上有一条**，并且它是唯一能解释
+        # 「桥为什么没起来」的那条。⇒ 改问 ``recorded_platform_keys``（记录自己说了
+        # 什么），而不是 ``listed``（它混进了"这个平台配没配"这一层与记录无关的过滤）。
+        # 上面那个 ``listed`` 现在并入了未注册的键，所以这条分支**只在盘上真的没有
+        # 任何平台级结论时**才走得到 —— 也就是说那句话不再是一句断言，而是**事实**。
+        if not recorded_platform_keys:
             print(
                 "  （没有已配置的平台，也没有任何探测记录）" if record is None
                 else "  （盘上有记录，但这次启动没有得到任何平台的结论）"

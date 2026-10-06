@@ -31,6 +31,7 @@ import logging
 import os
 import pathlib
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -2078,6 +2079,298 @@ class FailingPlatformsDocstringMatchesItsUnion(unittest.TestCase):
                 "它压根没进过连击，却必须出现在诊断里 —— "
                 "所以 docstring 第一行不能只说「失败连击」",
             )
+
+
+# ======================================================================
+# ⑮ ⛔ 缺陷五：`_write` 的读改写**没锁** ⇒ 两个平台各记一次失败时丢一条
+# ======================================================================
+class ConcurrentNotesMustNotLoseEachOther(RecorderInstalled):
+    """⭐⭐ 两个线程对**不同平台**各记一次失败时，两条**都必须**落到盘上。
+
+    ## 机制
+
+    :meth:`health.OutboundFailureRecorder._write` 是**读改写**：读整份文件 → 在内存里
+    合并 → 整份写回。⇒ 读与写之间只要没有锁，两个线程就能在同一个 read→write 窗口里
+    各自基于**同一份旧读**合并一次，而后写的把先写的**整份**覆盖掉。
+
+    ⚠️ 生产里**至少**有三个线程走这条路：``opencode-sse`` 线程
+    （:class:`~opencode_bridge.core.EventStream` 的进度与收尾 →
+    :class:`~opencode_bridge.outbound.OutboundSender.send_text` → 记失败）、
+    **每个**适配器的轮询线程（``∘ 处理中∘`` 那条回复也走 ``send_text``），
+    以及 homeassistant / nextcloud / qqbot 各自的 worker。
+
+    ## 为什么这条比"少记一条"严重得多
+
+    丢掉的那一半**无声无息**：``note_failure`` 返回 ``True``、
+    :attr:`~health.OutboundFailureRecorder._failing` 里有它，而 ``--status`` 是
+    **另一个进程、只读盘** ⇒ 它对那个平台打出的正是
+    :data:`health.NO_OUTBOUND_FAILURE_TEXT`（「自该记录建立以来**未观测到**出站失败」）
+    —— **那正是本模块存在的理由要消灭的「假的否定观测」，而它自己成了那个假观测。**
+    ⇒ 它同时破了类 docstring 写死的那条不变式「``_failing`` ⊆ 盘上真的有这条记录」。
+    """
+
+    #: 两个线程记的**不同**平台键 —— 同键会被状态机短路（``key in self._failing``），
+    #: 压根到不了 :meth:`_write`。
+    FIRST_PLATFORM = "slack"
+    SECOND_PLATFORM = "telegram"
+
+    #: 线程名只用来**认门**（把第一个线程停在它自己的 read→write 之间），⛔ 不影响
+    #: 任何行为 —— 生产里的线程名是什么与这条缺陷无关。
+    FIRST_THREAD_NAME = "opencode-sse"
+    SECOND_THREAD_NAME = "adapter-polling"
+
+    #: 编排窗口：没有锁的话，第二个线程在这段时间里就能整轮跑完并落盘。
+    #: ⚠️ 这段时间量的是「本机一次 ``mkstemp`` + ``fsync`` + ``os.replace``」
+    #: （本机实测中位数 **6.6ms**、最大 **7.1ms**）⇒ 它比真写慢三个数量级，
+    #: 而**判据只在这一侧不成立**（见 :meth:`test_the_second_thread_cannot_...`），
+    #: 机器再慢也只会让"被挡住"更容易成立。
+    INTERLEAVING_WINDOW_SECONDS = 0.5
+
+    #: 线程编排的上界；只作为死锁保护（正常一次落盘是毫秒级）。
+    THREAD_TIMEOUT_SECONDS = 30.0
+
+    @contextlib.contextmanager
+    def park_the_first_thread_inside_its_own_write(self):
+        """把**第一个**线程停在它 read 完、write 之前的那道缝里。
+
+        :return: ``(reached, release)`` 两个 :class:`threading.Event`。
+            ``reached`` = 那个线程确实停在那道缝里了（编排本身的自守）；
+            ``release`` = 放它继续。
+
+        ⚠️ 用**替换**而不是打补丁，是为了**留下**真的那一次落盘（断言要读盘上内容）。
+        """
+        from opencode_bridge.pairing_cli import write_config_atomically as real_write
+
+        reached = threading.Event()
+        release = threading.Event()
+
+        def parking_write(path, document):
+            if threading.current_thread().name == self.FIRST_THREAD_NAME:
+                reached.set()                       # 此刻它已经读完盘、正要写
+                release.wait(self.THREAD_TIMEOUT_SECONDS)
+            return real_write(path, document)
+
+        with mock.patch.object(health, "write_config_atomically", parking_write):
+            yield reached, release
+
+    def run_two_threads_noting_different_platforms(self):
+        """两个线程各记一次失败（**不同平台**）；返回 ``(返回值表, 第二个线程被挡住了吗)``。"""
+        results: dict[str, object] = {}
+
+        def note(platform: str) -> None:
+            results[platform] = self.recorder.note_failure(
+                platform, SendError.TRANSIENT, "%s 那条" % platform
+            )
+
+        with self.park_the_first_thread_inside_its_own_write() as (reached, release):
+            first = threading.Thread(
+                target=note, args=(self.FIRST_PLATFORM,), name=self.FIRST_THREAD_NAME
+            )
+            first.start()
+            self.assertTrue(
+                reached.wait(self.THREAD_TIMEOUT_SECONDS),
+                "第一个线程压根没进到落盘这一步 ⇒ 下面钉的不是 read→write 那道缝",
+            )
+            second = threading.Thread(
+                target=note, args=(self.SECOND_PLATFORM,), name=self.SECOND_THREAD_NAME
+            )
+            second.start()
+            second.join(self.INTERLEAVING_WINDOW_SECONDS)
+            # ⚠️ 判据必须用 ``is_alive()``：``Thread.join()`` **恒返回 None**（它根本
+            # 没有返回值），拿 ``join(...) is None`` 当「还在跑」会**恒真** ——
+            # 而这一栏正是「整段读改写被串行化」的证据，恒真就等于没有判据。
+            second_was_blocked = second.is_alive()
+            release.set()
+            for thread in (first, second):
+                thread.join(self.THREAD_TIMEOUT_SECONDS)
+                self.assertFalse(
+                    thread.is_alive(),
+                    "线程 %s 没能在 %.0f 秒内结束 ⇒ 编排坏了（可能死锁）"
+                    % (thread.name, self.THREAD_TIMEOUT_SECONDS),
+                )
+        return results, second_was_blocked
+
+    def platforms_on_disk(self) -> tuple:
+        """盘上那份里的平台键（⛔ 不断言在**内存态**上 —— 那正是丢更新的受害者之一）。"""
+        return tuple(sorted(
+            health.outbound_failures_in_record(
+                health.read_outbound_failures(self.bridge_dir)
+            )
+        ))
+
+    def test_two_threads_noting_different_platforms_both_reach_the_file(self):
+        """⭐⭐ **判据钉的是盘上的内容** —— 两个平台都得在。
+
+        ⚠️ 这条判据不许退化成「没抛异常」或「返回 ``True``」：丢更新发生时
+        **两个** ``note_failure`` 都返回 ``True``、内存态里**两个**平台都在，
+        只有**盘上**少了一条（后者正是 ``--status`` 唯一看得到的东西）⇒
+        判据必须读盘。
+        """
+        results, _ = self.run_two_threads_noting_different_platforms()
+
+        self.assertEqual(
+            results, {self.FIRST_PLATFORM: True, self.SECOND_PLATFORM: True},
+            "两次观测里有一条**没**真写到盘上 ⇒ 下面那个「盘上应该有两条」量的"
+            "就不是这条缺陷",
+        )
+        self.assertEqual(
+            sorted(self.recorder._failing),
+            sorted((self.FIRST_PLATFORM, self.SECOND_PLATFORM)),
+            "内存态只记住了一个平台 ⇒ 另一个平台的失败连击压根没被看见",
+        )
+        self.assertEqual(
+            self.platforms_on_disk(),
+            tuple(sorted((self.FIRST_PLATFORM, self.SECOND_PLATFORM))),
+            "两个线程各记一次的失败只剩一条在盘上 ⇒ 读改写不是原子的，后写的把先写的"
+            "整份覆盖掉了。--status 是另一个进程、只读盘，于是它会对少掉的那个平台"
+            "打出「未观测到出站失败」—— 那正是本模块要消灭的「假的否定观测」，"
+            "而它自己成了那个假观测（盘上原文：%s）" % self.on_disk(),
+        )
+        for platform in (self.FIRST_PLATFORM, self.SECOND_PLATFORM):
+            with self.subTest(platform=platform):
+                entry = self.recorded_entry(platform)
+                self.assertIsNotNone(entry, "%s 那条记录盘上读不回来" % platform)
+                self.assertIn("%s 那条" % platform, entry["detail"])
+
+    def test_the_second_thread_cannot_get_past_the_first_ones_read(self):
+        """⭐⭐ **上面那条的反向对照**：那道缝必须真的被锁住。
+
+        ⚠️ 只断言「两条都在盘上」是不够的：GIL 下也可能碰上「第二个线程恰好没挤进
+        那个窗口」而侥幸不丢更新 ⇒ 那条判据会是**概率性**的。这条把窗口**撑开**
+        （第一个线程明确停在 read 与 write 之间）并断言第二个线程**进不来**
+        ⇒ 丢更新那个窗口在物理上就不存在，而不是「这次没碰上」。
+        """
+        results, second_was_blocked = self.run_two_threads_noting_different_platforms()
+
+        self.assertTrue(
+            second_was_blocked,
+            "第一个线程停在它的 read→write 之间时，第二个线程仍然整轮跑完并落盘了 ⇒ "
+            "这段窗口没被锁住，两个线程各自基于同一份旧读合并、后写的把先写的整份盖掉",
+        )
+        self.assertEqual(
+            self.platforms_on_disk(),
+            tuple(sorted((self.FIRST_PLATFORM, self.SECOND_PLATFORM))),
+            "被挡住之后两条都该在盘上；只剩一条说明「挡住了」是假象：%s" % self.on_disk(),
+        )
+        self.assertEqual(len(results), 2, "有一个线程压根没跑到 note_failure")
+
+
+# ======================================================================
+# ⑯ ⛔ 缺陷六：`_write` 的合并段在 `try` **之外** ⇒ 形状错乱时抛出去
+# ======================================================================
+class MalformedRecordMustBeReportedRatherThanThrown(RecorderInstalled):
+    """⭐ `_write` 的读、合并、落盘**整段**都在 ``try`` 里。
+
+    ## 机制
+
+    盘上那份 ``platforms`` 若不是 JSON 对象（例如
+    ``{"recorded_at": 1, "platforms": ["telegram"]}``），
+    ``dict(document.get("platforms") or {})`` 抛 ``ValueError`` —— 而那个结果被用在
+    **合并段**上，合并段当时**在 ``try`` 之前**。
+
+    ## 后果（实测）
+
+    ``note_failure`` 直接抛 ``ValueError``，:attr:`~health.OutboundFailureRecorder._failing`
+    与 :attr:`~health.OutboundFailureRecorder._unwritten` **都保持空** ⇒ 那次观测
+    一个字没落盘、那个平台没被标记 ⇒ 下一次失败**再抛一次** ⇒ 在用户手工修好那个文件
+    之前，这条记录通道对该平台**永久失效**。唯一幸存原因是调用方自己套了 blanket
+    ``except Exception``，只打一行日志。
+
+    ⚠️ 触发需要手改或第三方写者（本仓库唯一的写者就是 :meth:`_write` 自己）⇒
+    **所以这不是生产缺陷**。但它让 ``_write`` docstring 里那句「任何异常都在这里兜住，
+    返回是否真写到盘上」**变成假的** —— 而 ``_unwritten`` 那套设计的立足点正是这句
+    ⇒ 修法是**让代码与那句话一致**，⛔ 不是把那句话改弱。
+    """
+
+    #: 被记的那个平台键 —— 与盘上那个**形状错乱**的值刻意取同一个词，
+    #: 这样「形状错乱的那份恰好也提到了这个平台」不会让人误读成两条平台。
+    PLATFORM = "slack"
+
+    def hand_write_platforms_as(self, platforms: object) -> None:
+        """**像用户那样**直接写盘上那份（不经过记录器，写路径会把形状补齐）。
+
+        ⚠️ 这正是 ``read_outbound_failures`` 那段 docstring 说的现实输入：
+        "这份文件可能被用户手改过"。走记录器的话，合并段永远拿到一个 dict。
+        """
+        with io.open(self.failure_file_path(), "w", encoding="utf-8") as handle:
+            json.dump({"recorded_at": 1, "platforms": platforms}, handle)
+
+    def platforms_read_back_raw(self) -> object:
+        """盘上那份的 ``platforms`` **原样**（不解析成人读的结构）。"""
+        with io.open(self.failure_file_path(), encoding="utf-8") as handle:
+            return json.load(handle).get("platforms")
+
+    def test_a_platforms_that_is_not_an_object_is_reported_as_not_written(self):
+        """⭐⭐ **不许抛**，且返回值必须是「没真写到盘上」那一个。
+
+        ⚠️ 返回值是**承重**的：``True`` 的含义是「真写到盘上了」，而这次一个字都没写
+        ⇒ 报 ``True`` 就是让 ``--status`` 对着空的那一半说「未观测到出站失败」。
+        ⛔ 而"把形状错乱一律当成空 dict 然后照写"**也不对**：那是拿一份**猜出来的**
+        内容覆盖掉用户手上的那份（AGENTS.md §8：猜出来的方案必然在某些输入上错）。
+        """
+        self.hand_write_platforms_as(["telegram"])
+
+        with self.assertLogs("opencode_bridge.health", level="WARNING"):
+            written = self.recorder.note_failure(
+                self.PLATFORM, SendError.TRANSIENT, "slack 那条"
+            )
+
+        self.assertFalse(
+            written,
+            "note_failure 返回 True ＝「真写到盘上了」，而这次一个字都没写下去 ⇒ "
+            "调用方（含 --status 的那一半免责）会以为这次失败已经被记下来",
+        )
+        self.assertEqual(
+            sorted(self.recorder._failing), [],
+            "写不下去却进了连击 ⇒ 那条连击没有任何可盖戳的观测（反方向同一个病）",
+        )
+        self.assertEqual(
+            sorted(self.recorder._unwritten), [self.PLATFORM],
+            "这次失败一个字都没落下盘，而内存态里也没记 ⇒ 它彻底消失了，"
+            "连诊断里都看不见（那也是一条假的否定观测）",
+        )
+        self.assertEqual(
+            self.recorder.failing_platforms(), (self.PLATFORM,),
+            "写不下去的那次观测从诊断里消失了 ⇒ --status 那一段会以为没失败过",
+        )
+
+    def test_the_malformed_file_is_left_alone_and_the_channel_recovers(self):
+        """⭐⭐ 形状错乱**不许**抹掉盘上那份，而用户修好之后这条通道必须自己恢复。
+
+        ⚠️ 「永久失效」是这里最要紧的那半句：合并段每次都抛 ⇒ 同一个平台**每一次**
+        失败都重抛 ⇒ 在用户手工修好那个文件之前，这条排障记录通道对它**完全静默**。
+        """
+        self.hand_write_platforms_as(["telegram"])
+
+        with mock.patch.object(health, "logger"):
+            self.assertFalse(self.recorder.note_failure(
+                self.PLATFORM, SendError.TRANSIENT, "slack 那条"
+            ))
+            # 同一次连击的第二次观测按状态机**不重试写盘**（这是有意的节流）——
+            # 它一样不许抛。
+            self.assertFalse(self.recorder.note_failure(
+                self.PLATFORM, SendError.TRANSIENT, "slack 那条"
+            ))
+
+        self.assertEqual(
+            self.platforms_read_back_raw(), ["telegram"],
+            "盘上那份被一次**没写下去**的观测覆盖掉了 —— 那不是「记录」，那是抹掉",
+        )
+
+        self.recorder.note_success(self.PLATFORM)   # 磁盘/文件恢复 + 一次成功发送
+
+        self.hand_write_platforms_as({})
+        self.assertTrue(
+            self.recorder.note_failure(
+                self.PLATFORM, SendError.TRANSIENT, "slack 那条"
+            ),
+            "用户把那个文件修好之后，这条通道对**同一个平台**仍然失效 ⇒ "
+            "它每次失败都抛一次，而抛出来的那次观测全部丢失",
+        )
+        self.assertIsNotNone(
+            self.recorded_entry(self.PLATFORM),
+            "恢复之后仍然没记上（盘上原文：%s）" % self.on_disk(),
+        )
 
 
 if __name__ == "__main__":

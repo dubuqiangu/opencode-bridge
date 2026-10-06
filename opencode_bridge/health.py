@@ -159,6 +159,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Iterable, Mapping, Optional
 
@@ -833,6 +834,12 @@ class OutboundFailureRecorder:
         #: 观测到失败、但那一次写盘**没成功**的平台（同一次连击内不再重试写盘；
         #: 下一次成功发送会把它清掉，于是**下一次**失败连击会重新尝试写）。
         self._unwritten: set[str] = set()
+        #: 把 :meth:`_write` 的**整个读改写**串行化的进程内锁。
+        #:
+        #: ⚠️ 名字是「锁住那个文件」而不是「锁住写这一步」—— 它覆盖的是
+        #: **读 → 合并 → 写整段**；只包住写那一段的话，两次合并仍然基于同一份旧读，
+        #: 后写的照样把先写的整份覆盖掉（理由见 :meth:`_write` 的 docstring）。
+        self._file_lock = threading.Lock()
 
     # --- 观测入口 -----------------------------------------------------
     def note_failure(
@@ -917,29 +924,76 @@ class OutboundFailureRecorder:
         :func:`~opencode_bridge.pairing_cli.write_config_atomically`，不复制函数体：
         截断一半的 JSON 会让下次 ``--status`` 读不到记录，而读不到记录正是本任务
         想消灭的那种"零线索"。
+
+        ## 承重：整个读改写**必须**在 :attr:`_file_lock` 里
+
+        ⚠️ **缺陷（实测过）**：读与写之间没有锁时，两个线程各自基于**同一份旧读**
+        合并一次，后写的把先写的整份覆盖掉 —— 而生产里**至少**有三个线程走这条路：
+        ``opencode-sse`` 线程（:class:`~opencode_bridge.core.EventStream` 的进度与
+        收尾 → :class:`~opencode_bridge.outbound.OutboundSender.send_text` → 记失败）、
+        **每个**适配器的轮询线程（``∘ 处理中∘`` 那条回复也走 ``send_text``），
+        以及 homeassistant / nextcloud / qqbot 各自的 worker。
+
+        ⇒ 实测形态：线程 A 记 ``slack`` 读完盘，线程 B 记 ``telegram`` 整轮跑完并落盘，
+        A 再落盘 ⇒ **盘上只剩 ``telegram``**，而 A 的 ``note_failure`` 返回了 ``True``、
+        ``slack`` 也在 :attr:`_failing` 里 ⇒ 那个「``_failing`` ⊆ 盘上真的有这条记录」
+        的不变式破了。
+
+        ⚠️ **为什么这条比"少记一条"严重得多**：``--status`` 是**另一个进程、只读盘**，
+        它对那个平台打出的正是 :data:`NO_OUTBOUND_FAILURE_TEXT`
+        （「自该记录建立以来**未观测到**出站失败」）—— **那正是本模块要消灭的
+        「假的否定观测」，而它自己成了那个假观测。**
+
+        ⛔ **进程内的锁就够，不要引入跨进程机制**：那个文件在这条链路上只有**一个**
+        写者（本方法），另一个读者 ``--status`` 是独立进程且**只读盘、不写** ⇒
+        文件锁 / ``fcntl`` / ``msvcrt`` 在这个形状下没有第二个写者要协调。
+
+        ⚠️ 边界（说清它**没**保证什么）：锁是**本实例**的 —— 同一进程里若有人为同一个
+        目录再造一个记录器，那两个实例之间仍会丢更新（生产里记录器是**进程级装配**的，
+        全程只有一个）。同样地，:meth:`note_success` 在进 :meth:`_write` **之前**那次
+        :meth:`_entry_of` 读盘**不在**锁内 ⇒ 同平台的「恢复」与「失败」之间那道缝
+        （``_failing.discard`` 之后、落盘之前）仍不由这把锁关；⛔ 关它要动
+        :meth:`note_success` 的顺序（那是另一条被独立钉住的契约），不在本次范围。
+
+        ⚠️ 与「任何异常都在这里兜住」那句话配对：**读、合并、落盘整段都在 ``try`` 里**。
+        合并段曾经落在 ``try`` **之外** ⇒ 盘上 ``platforms`` 不是 JSON 对象
+        （``{"recorded_at": 1, "platforms": ["telegram"]}``）时
+        ``dict(document.get("platforms") or {})`` 抛的 ``ValueError`` 会**穿透**
+        :meth:`note_failure` ⇒ 那次观测一个字没落盘、:attr:`_failing` 与
+        :attr:`_unwritten` 都空 ⇒ 在用户手工修好那个文件之前，这条通道对该平台
+        **永久失效**（下一次失败再抛一次）。唯一幸存原因是调用方自己套了
+        blanket ``except Exception`` ⇒ 那句话当时**是假的**，而 :attr:`_unwritten`
+        那套设计的立足点正是它。
         """
-        document = self._read()
-        if not isinstance(document, dict):
-            document = {}
-        # 只留别的平台 —— 本平台那条由本方法**整体替换**，否则残留的
-        # ``recovered_at`` 会挂在一次全新的失败上（说"这次失败已恢复"）。
-        platforms = {
-            name: value
-            for name, value in dict(document.get("platforms") or {}).items()
-            if str(name) != key and isinstance(value, Mapping)
-        }
-        platforms[key] = dict(entry)
-        payload = {"recorded_at": time.time(), "platforms": platforms}
         path = os.path.join(self._bridge_dir, OUTBOUND_FAILURES_FILE_NAME)
-        try:
-            write_config_atomically(
-                path, default_redactor().scrub_persisted_value(payload)
-            )
-        except Exception as exc:  # noqa: BLE001 - 落盘失败绝不打断发送
-            logger.warning(
-                "outbound-failures: 写入 %s 失败（%s）—— 不影响桥的发送", path, exc
-            )
-            return False
+        with self._file_lock:
+            try:
+                document = self._read()
+                if not isinstance(document, dict):
+                    document = {}
+                # 只留别的平台 —— 本平台那条由本方法**整体替换**，否则残留的
+                # ``recovered_at`` 会挂在一次全新的失败上（说"这次失败已恢复"）。
+                platforms = {
+                    name: value
+                    for name, value in dict(document.get("platforms") or {}).items()
+                    if str(name) != key and isinstance(value, Mapping)
+                }
+                platforms[key] = dict(entry)
+                payload = {"recorded_at": time.time(), "platforms": platforms}
+                write_config_atomically(
+                    path, default_redactor().scrub_persisted_value(payload)
+                )
+            except Exception as exc:  # noqa: BLE001 - 这条观测写不下去绝不该打断发送
+                # ⚠️ 措辞覆盖的是「这次观测**没落下去**」而不只是「写失败」：现在
+                # 读盘与合并也在这个 ``try`` 里，而那句「哪个平台失败却什么都没写下
+                # 去」正是 ``--status`` 那半句免责要交代的事 —— 它唯一的诊断来源
+                # 就是这一行，所以这里不许说一件没发生的事（没尝试写盘时说「写入失败」
+                # 是假的）。
+                logger.warning(
+                    "outbound-failures: %s 写不下去（%s: %s）—— 不影响桥的发送",
+                    path, type(exc).__name__, exc,
+                )
+                return False
         return True
 
     # --- 测试与诊断 ---------------------------------------------------

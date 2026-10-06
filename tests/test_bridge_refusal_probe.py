@@ -679,5 +679,217 @@ class TestTheVerdictVocabularyOnlyGrew(unittest.TestCase):
         return directory.name
 
 
+#: 配置里把 ``telegram`` 拼错成的那一个键 —— ⛔ **必须是一个注册表里没有的名字**，
+#: 整条缺陷就长在这个事实上（见 :class:`TestAnUnregisteredConfigKeyStaysVisible`）。
+#: ⚠️ 断言它真的不在注册表里，否则这条护栏会在有人给它注册了同名适配器那天
+#: **静默地**失去它要守的性质（判据本身先失效，且零红灯）。
+TYPO_PLATFORM_KEY = "telegramm"
+
+#: :func:`opencode_bridge.__main__._run_bridge_locked` 在 ``build()`` 抛 ``KeyError``
+#: 时写进 ``unusable_reasons`` 的那句话。⚠️ 硬编码成字面量：它是**本视图存在的
+#: 理由**（用户要看见的就是这句话），而它一旦被改措辞，下面的断言就该红。
+UNREGISTERED_KEY_REASON = "不是已注册的适配器键"
+
+#: ``--status`` 在「有记录、但里面没有平台级结论」时说的话。⚠️ 硬编码：这条视图
+#: 唯一能给出的**错误肯定断言**就是它（见本文件顶部那个缺陷）。
+NO_PLATFORM_CONCLUSION_TEXT = "盘上有记录，但这次启动没有得到任何平台的结论"
+
+
+class TestAnUnregisteredConfigKeyStaysVisible(_RefusalHarness):
+    """⭐ 键**未注册**时，「桥为什么没起来」那句话必须看得见（实测缺陷，2026-10-06）。
+
+    它钉的缺陷（实测，不是推断）
+    ===========================
+
+    配置里把平台键拼错（``telegram`` → ``telegramm``）时：
+
+    1. ``_has_configured_adapter`` 走「有像凭据的字段就别凭空拦住用户」那条分支
+       ⇒ **过了预检**；
+    2. ``_run_bridge_locked`` 的构造循环 ``build()`` 抛 ``KeyError`` ⇒
+       ``unusable_reasons["telegramm"] = "不是已注册的适配器键"``；
+    3. ``_record_bridge_refusal`` 以**那个键**把它写进 ``platforms``。
+
+    ⇒ 而 ``_print_last_start_probes`` 的行集合来自 ``_channel_config_rows``
+    ⇒ **只有已注册的平台名** ⇒ ``telegramm`` 永不进 ``listed`` ⇒ ``refused`` 恒为
+    ``None`` ⇒ **那句原因一个字都不显示**。实测那时的输出：
+
+    * ``cfg`` 里另有一个**已配置**的 telegram ⇒ 只剩「无记录」一行，原因消失；
+    * ``cfg`` 里只有那个未注册键 ⇒ 打印「（盘上有记录，但这次启动没有得到任何平台的
+      结论）」—— **这句是假的**：盘上恰好有一条平台级结论，而且它就是唯一能解释
+      「桥为什么没起来」的那条。
+
+    ⚠️ 注意这两件事在缺陷现场是**反的**（文件存在、键未注册 ⇒ 旧判据说「没有结论」）
+    ⇒ 所以判据必须问**盘上有什么**，⛔ 不能问「有没有已注册平台」。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # ⚠️ 判据**自己**先站得住：那个键必须真的不在注册表里，否则下面每一条都在
+        # 测一件已经不存在的事（恒真，且零红灯 —— AGENTS.md §7.1 第一条）。
+        from opencode_bridge.adapters import registered_names
+
+        self.assertNotIn(
+            TYPO_PLATFORM_KEY, set(registered_names()),
+            "拼错的那个键已经变成已注册的了 —— 本类守的缺陷不复存在，"
+            "请换一个新的未注册键（并同步核对本类的用例名）",
+        )
+
+    @staticmethod
+    def typo_config() -> Config:
+        """一个**只含未注册键**的配置：那个键有像凭据的字段（否则预检就拦下了）。"""
+        return Config(adapters={TYPO_PLATFORM_KEY: {"bot_token": "token-not-real"}})
+
+    def seed_a_refusal_record_for_the_unregistered_key(self) -> None:
+        """盘上放一份「以未注册键为键的 not_started」—— 缺陷现场就是这个状态。
+
+        ⚠️ 直接调 :func:`health.record_startup_probes` 落盘，而**不**走真的
+        ``run_bridge``：本类要守的是**读那一侧**，而落盘那一侧由
+        :class:`TestNoUsableAdapterRefusalIsRecorded` 的端到端用例守着。
+        """
+        self.seed_records_with({
+            TYPO_PLATFORM_KEY: {
+                "verdict": health.VERDICT_NOT_STARTED,
+                "detail": "没有任何适配器构造成功，桥因此没起来"
+                          "（%s：%s）" % (TYPO_PLATFORM_KEY, UNREGISTERED_KEY_REASON),
+            },
+        })
+
+    def seed_records_with(self, probes: dict) -> None:
+        """⚠️ **一次**调用写完 —— :func:`health.record_startup_probes` 是**整份替换**
+        （见它的 docstring「整份写一次，且只在这一处写」）。
+
+        ⇒ 分两次调用的话第二次会把第一次那份**整个盖掉**，于是"两个键都被记录过"
+        这个前提悄悄不成立，而依赖它的判据变成恒真（⚠️ 我第一版就是这么写的，
+        它当场以"未注册键一行都找不到"红给我 —— 而那时候错的是用例，不是被测代码）。
+        """
+        self.assertIsNotNone(health.record_startup_probes(self.bridge_dir, probes))
+
+    def test_the_reason_stays_visible_when_no_registered_platform_is_configured(self):
+        """⭐ 盘上只有那个未注册键时，原因必须显示，且**不许**说「没有结论」。
+
+        ⚠️ 这两条**同一个断言里**：`refused` 恒为 ``None`` 的旧实现会同时踩中两个
+        —— 原因一个字都不显示，而收尾那句**假的**「没有得到任何平台的结论」照说不误。
+        """
+        self.seed_a_refusal_record_for_the_unregistered_key()
+        body = self.status_section(self.typo_config())
+
+        self.assertIn(
+            UNREGISTERED_KEY_REASON, body,
+            "盘上写着「不是已注册的适配器键」，而这一段一个字都没显示它 —— "
+            "它存在的唯一理由就是回答「桥为什么没起来」",
+        )
+        self.assertNotIn(
+            NO_PLATFORM_CONCLUSION_TEXT, body,
+            "**盘上明明有一条平台级结论**（就是 %r 这条），却断言「没有得到任何平台的"
+            "结论」—— 这是一句错误的肯定断言。" % TYPO_PLATFORM_KEY,
+        )
+
+    def test_the_reason_stays_visible_next_to_a_configured_registered_platform(self):
+        """⚠️ 另一半现场：``cfg`` 里另有一个**已配置**的 telegram。
+
+        ⇒ ``listed`` 非空（telegram 那一行在），所以旧实现走的是「只剩『无记录』一行」
+        那条路 —— **症状不同，但原因同样一个字都不显示**。两条症状都要钉住，
+        否则只修一条就会在另一条上复发。
+        """
+        self.seed_a_refusal_record_for_the_unregistered_key()
+        body = self.status_section(Config(adapters={
+            "telegram": {"bot_token": "token-not-real"},
+            TYPO_PLATFORM_KEY: {"bot_token": "token-not-real"},
+        }))
+
+        self.assertIn(UNREGISTERED_KEY_REASON, body)
+        self.assertNotIn(NO_PLATFORM_CONCLUSION_TEXT, body)
+        # 已配置但盘上没有它自己的记录 ⇒ 那一行仍然是「无记录」，⛔ 不许被改成别的。
+        self.assertIn(cli.NO_START_PROBE_TEXT, body)
+
+    def test_the_unregistered_key_gets_its_own_row_and_is_not_folded_away(self):
+        """⭐ 它必须**自己成行**，⛔ 不许被折进「桥这一轮没起来」那条全局 ⚠ 行。
+
+        ⚠️ 折进去就等于**连原因一起吞掉**：那条 ⚠ 行只带**第一个** not_started 的
+        ``detail``（13 个平台全被拒时省掉一屏复读），而先到的是注册表里的键 ⇒
+        拼错的那个键连那一行都轮不上。
+        """
+        # 再加一个**已注册**键的 not_started：它按注册表顺序排在前面，正是"抢走"
+        # 那条全局 ⚠ 行的那个。⚠️ 两个键**一起**写（整份替换，见 :meth:`seed_records_with`）。
+        self.seed_records_with({
+            "telegram": {
+                "verdict": health.VERDICT_NOT_STARTED,
+                "detail": "预检未通过：配置里没有任何适配器此刻够跑（telegram：缺 bot_token）",
+            },
+            TYPO_PLATFORM_KEY: {
+                "verdict": health.VERDICT_NOT_STARTED,
+                "detail": "没有任何适配器构造成功，桥因此没起来"
+                          "（%s：%s）" % (TYPO_PLATFORM_KEY, UNREGISTERED_KEY_REASON),
+            },
+        })
+        body = self.status_section(Config(adapters={
+            "telegram": {"bot_token": ""},
+            TYPO_PLATFORM_KEY: {"bot_token": "token-not-real"},
+        }))
+
+        rows = [
+            line for line in body.splitlines()
+            if line.strip().startswith(TYPO_PLATFORM_KEY)
+        ]
+        self.assertEqual(
+            len(rows), 1,
+            "未注册键必须自己成一行（找到了 %d 行）：\n%s" % (len(rows), body),
+        )
+        self.assertIn(UNREGISTERED_KEY_REASON, rows[0])
+
+    def test_the_section_header_promise_now_matches_what_is_printed(self):
+        """⛔ 段头写着「桥**拒绝启动**就写『桥未启动』并说明原因」⇒ 输出必须对得上。"""
+        self.seed_a_refusal_record_for_the_unregistered_key()
+        body = self.status_section(self.typo_config())
+
+        self.assertIn("桥未启动", body, "拒绝启动了，那一段却没有说「桥未启动」")
+        self.assertIn(UNREGISTERED_KEY_REASON, body)
+
+    def test_the_untouched_normal_paths_keep_their_own_wording(self):
+        """⛔ 这次修复**不许**顺手蹭到正常路径的措辞。
+
+        ⚠️ 逐档硬编码（⛔ 不许对着实现算）：``does_not_probe`` / ``ok`` / ``failed``
+        三档的行必须与修复前**逐字**一致 —— 缺陷只关于"未注册键看不见"，
+        而把这一条写进回归测试是防"下次顺手改文案"的护栏。
+        """
+        self.seed_records_with({
+            "telegram": {"verdict": "ok", "detail": "getMe 通过"},
+            "slack": {
+                "verdict": health.VERDICT_DOES_NOT_PROBE,
+                "detail": health.DOES_NOT_PROBE_DETAIL,
+            },
+            "matrix": {"verdict": "failed", "code": 401, "detail": "Unauthorized"},
+        })
+        body = self.status_section(Config(adapters={
+            "telegram": {"bot_token": "token-not-real"},
+            "slack": {"bot_token": "t", "app_token": "xapp-not-real"},
+            "matrix": {"homeserver": "https://example.invalid", "access_token": "t"},
+        }))
+        rows = {
+            line.split()[0]: line
+            for line in body.splitlines() if line.startswith("  ")
+        }
+        self.assertIn("上次启动 正常", rows["Telegram"])
+        self.assertIn("不探测", rows["Slack"])
+        self.assertIn("code=401", rows["Matrix"])
+        self.assertIn("Unauthorized", rows["Matrix"])
+        self.assertNotIn(NO_PLATFORM_CONCLUSION_TEXT, body)
+
+    def test_the_no_record_branch_still_says_it_says_nothing_is_recorded(self):
+        """⛔ 修复**不许**把那两句无记录的文案互相对调（它们各自仍然为真）。
+
+        ⚠️ 判据是**盘上真的没有文件**（:meth:`_RefusalHarness` 的 ``setUp`` 给了
+        一个空目录），⛔ 不是"配置里有没有平台" —— 后者会走另一条路。
+        """
+        self.assertIsNone(health.read_platform_health(self.bridge_dir))
+        body = self.status_section(
+            Config(adapters={"telegram": {"bot_token": "token-not-real"}})
+        )
+
+        self.assertIn(cli.NO_START_PROBE_TEXT, body)
+        self.assertNotIn(NO_PLATFORM_CONCLUSION_TEXT, body)
+        self.assertNotIn("记录时间", body)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

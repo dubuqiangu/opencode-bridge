@@ -480,7 +480,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > 桥接会**回落回环并告警** —— 绝不因为"方便调试"就开一个无鉴权的局域网端口。
 >
 > 其它要点：
-> - **不需要配任何凭据就能用**（`config_optional`），所以只配 a2a（含上面那个必填的 `bind_port`）时桥接**能正常启动**。
+> - **没有凭据可填**（`config_optional` 说的是「我是这一类」），但**端口是必填的**：`bind_port` 缺失时 `start()` 会明确报错并拒绝绑定。⚠️ 「这份配置此刻能不能跑」由适配器**自己**回答（`config_runnable`），**不是**看 `config_optional` —— 所以只配 a2a（含上面那个必填的 `bind_port`）时桥接**能正常启动**，而**留空 `bind_port` 则不会**。
 > - 端点：`/rpc`（另接受 `/` 作别名）、`/health`、`/.well-known/agent-card.json`。
 > - 只实现 `SendMessage`/`GetTask`/`ListTasks`/`CancelTask`；**流式与推送如实声明为
 >   不支持**（Agent Card 里写 `false`，调用时返回规范错误码），**不做半成品接口**。

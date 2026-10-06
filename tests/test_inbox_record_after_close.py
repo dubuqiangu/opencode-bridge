@@ -28,12 +28,11 @@
 :class:`TestTheDedupPathIsUntouched` 钉「真去重」那条既有路径**逐字照旧** ——
 没有它，把两条路径合成一条的改法（返回同一个值、打同一条日志）也会让上面全绿。
 
-⚠️ 本文件只断言 ``opencode_bridge.inbox`` 这一个 logger。唯一生产调用点
-:func:`opencode_bridge.inbound_gateway._record_inbound` 的 ``else`` 分支**仍然**会打
-「duplicate ignored」（它只按真假分流，**没有第三个分支**）⇒ 那是本缺陷**残留**的
-另一半。⛔ 但 ``inbound_gateway.py`` 不在本 lane 的可写范围里。
-返回值改成三态之后那半个落点已经**可判别**：``record(...) is RecordOutcome.CLOSED``。
-
+⚠️ 本文件断言**两个** logger：收件箱自己那档（``opencode_bridge.inbox``）与唯一生产调用点
+:func:`opencode_bridge.inbound_gateway._record_inbound`（``opencode_bridge.inbound_gateway``）。
+缺陷的**两半**都在里面 —— 收件箱这一侧记的是「没落盘因为已关」，调用方那一侧曾经把同一件事
+报成「duplicate ignored（平台重投了一条我们已有的消息）」。两半都钉住，缺一半的话
+:mod:`tests.test_inbox_wiring` 里那条走真接线的用例也照样会绿。
 ⚠️ 局部 import :class:`RecordOutcome`：顶层 import 会让**整个模块**在没有它的旧实现上
 报 ImportError，于是「日志方向」那条用例的失败原因被掩盖掉 —— 而那条才是本缺陷本体。
 """
@@ -59,6 +58,14 @@ _INBOX_LOGGER = "opencode_bridge.inbox"
 
 #: 唯一生产调用点那个 logger（它那两句去重 info 在这里）。
 _CALLER_LOGGER = "opencode_bridge.inbound_gateway"
+
+#: 走真调用方那几条用例造的那条入站消息。delivery_id 由
+#: :func:`opencode_bridge.inbound_gateway._queued_prompt_for` 拼成
+#: ``platform:conversation_id:message_id`` ⇒ 日志里的点名要能逐字对上这一串。
+_PLATFORM = "telegram"
+_CONVERSATION = "chat:100200"
+_MESSAGE_ID = "41"
+_DELIVERY_ID = "telegram:chat:100200:41"
 
 
 def make_prompt(
@@ -268,6 +275,150 @@ class TestTheDedupPathIsUntouched(RecordAfterCloseTestCase):
             "(platform re-delivered a known message)",
             "真去重时这句 info 必须逐字不变 —— 它是本缺陷**不该**改的那条路径",
         )
+
+
+class TestTheCallerSaysWhatActuallyHappened(RecordAfterCloseTestCase):
+    """读侧那条分支：调用方必须说「收件箱已关」，⛔ 不得说「平台重投」。
+
+    这是本缺陷**残留**的另一半 —— :class:`RecordOutcome` 早就给了三态，而唯一生产调用点
+    :func:`opencode_bridge.inbound_gateway._record_inbound` 只按真假分流
+    ⇒ ``CLOSED`` 落进了那两句 ``duplicate ignored`` 的 info。
+
+    ⚠️ 下面每一条都断言**两头**：那句假话**不再出现**，且对应的那句真话**出现**。
+    只断言「日志里出现了新那句」是 ``AGENTS.md`` §9 讲的半真断言 ——
+    把整个分支连同它的日志一起删掉，它照样过。
+
+    ⛔ 投递侧一个字都没改：``CLOSED`` 仍是假值，所以关掉之后**仍然不投递**
+    （``assertIsNone`` 钉住这一半）。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        #: 这次调用**决定要投递**的那一行；``None`` = 什么都不投递。
+        #: 预置成 ``None``（而不是等 helper 里赋值）⇒ 忘了调 helper 的用例会红在
+        #: ``assertIsNone`` 上（一句能读的失败），而不是红在 AttributeError 上。
+        self.row_to_deliver = None
+
+    def _closed_inbox_caller_view(self) -> str:
+        """走**真**的调用方（收件箱已关），返回它那个 logger 抓到的一条正文。
+
+        结果写进 :attr:`row_to_deliver`。
+        """
+        from opencode_bridge.inbound_gateway import _record_inbound
+        from opencode_bridge.hooks import Inbound
+
+        inbox = self.open_inbox()
+        inbox.close()
+        inbound = Inbound(
+            conversation_id=_CONVERSATION,
+            text="关停期间掉下来的消息",
+            platform=_PLATFORM,
+            message_id=_MESSAGE_ID,
+        )
+
+        with self.assertLogs(_CALLER_LOGGER, level="INFO") as captured:
+            self.row_to_deliver = _record_inbound(inbox, inbound, inbound.text)
+
+        self.assertEqual(
+            len(captured.records), 1,
+            "这一段里调用方只该说一句话；多出来的说明又混进了别的 info，"
+            "下面的断言就不知道在钉谁了：%r"
+            % [record.getMessage() for record in captured.records],
+        )
+        return captured.records[0].getMessage()
+
+    def test_a_write_refused_because_closed_is_never_reported_as_a_redelivery(self):
+        """⚠️ 会红的情形：读侧退回「只按 ``False`` 分流」。
+
+        症状就是本缺陷本体 —— 日志说「平台重投了一条我们已有的消息」，而事实是
+        连接已经关了、这条压根没落盘。同一处改动若把 ``CLOSED`` 改成真值，
+        :meth:`~unittest.TestCase.assertIsNone` 那一条会红（投递行为被改坏）。
+        """
+        message = self._closed_inbox_caller_view()
+
+        for reversed_wording in ("duplicate ignored", "re-delivered", "content hash", "已知消息"):
+            self.assertNotIn(
+                reversed_wording, message,
+                "把原因说反的文案必须不出现：读者会照着「平台重投」去查，"
+                "而事实是收件箱已经关了。实际打出来的是：%r" % message,
+            )
+        self.assertIsNone(
+            self.row_to_deliver,
+            "关掉之后仍然不投递 —— 关停侧行为是设计，本缺陷只修误报的方向",
+        )
+
+    def test_the_truthful_line_names_the_delivery_and_says_why_it_is_not_delivered(self):
+        """⚠️ 会红的情形：真话那句被改写、漏掉点名，或 ``already closed`` 被换成别的理由。
+
+        点名是必需的：关停窗口里掉了好几条时，没有 delivery_id 就无从对账
+        （而它由 :func:`_queued_prompt_for` 拼出，值在这一行里钉死）。
+        """
+        message = self._closed_inbox_caller_view()
+
+        self.assertIn(
+            "already closed", message,
+            "必须说真话：连接已关。实际打出来的是：%r" % message,
+        )
+        self.assertIn(_DELIVERY_ID, message, "必须点名是哪一条，否则无从对账")
+        self.assertIn(
+            "not delivered", message,
+            "调用方唯一比收件箱多知道的一件事就是「因此没有投递」——"
+            "不说它，读者会以为这条已经交给 agent 了",
+        )
+
+    def test_the_truthful_line_promises_a_consequence_that_is_actually_true(self):
+        """⚠️ 会红的情形：文案宣称的后果变成假的（例如改成「下次启动会重放」）。
+
+        方向对而内容假，比方向错更难查（本仓库在 ``health.py`` 上刚吃过一次：
+        「没尝试写盘却说写入失败」）⇒ 后果与盘上的事实一起钉。
+        """
+        message = self._closed_inbox_caller_view()
+
+        self.assertIn(
+            "replay", message,
+            "关停窗口里掉的消息**永远不会被重放**（盘上没它）—— 这正是它该被听见的原因",
+        )
+        self.assertEqual(
+            read_inbox_rows(self.database_path), [],
+            "文案宣称没落盘，那就真的没有这行；宣称反了就是又一条方向错的日志",
+        )
+
+    def test_the_caller_stays_at_info_because_the_inbox_keeps_the_warning(self):
+        """⚠️ 会红的情形：调用方升到 warning（一次丢失被数两遍），或收件箱不再 warning
+        （关停窗口里的丢失彻底无声）。
+
+        级别判据：严重性归收件箱那一档 —— 它**每拒一条**都 warning（它掌握路径与
+        「不可重放」这个后果），而关停期间每个还活着的适配器线程都会走到这里，
+        调用方再 warning 一次只是把同一次丢失数两遍。调用方补的是**投递侧**那句结论，
+        info 刚好；而它把读者指到那档 warning 上，所以默认级别下这件事不会被漏掉。
+        """
+        from opencode_bridge.inbound_gateway import _record_inbound
+        from opencode_bridge.hooks import Inbound
+
+        inbox = self.open_inbox()
+        inbox.close()
+        inbound = Inbound(
+            conversation_id=_CONVERSATION,
+            text="关停期间掉下来的消息",
+            platform=_PLATFORM,
+            message_id=_MESSAGE_ID,
+        )
+
+        with self.assertLogs(_CALLER_LOGGER, level="INFO") as caller_view:
+            with self.assertLogs(_INBOX_LOGGER, level="WARNING") as inbox_view:
+                _record_inbound(inbox, inbound, inbound.text)
+
+        self.assertEqual(len(caller_view.records), 1)
+        self.assertEqual(
+            caller_view.records[0].levelno, logging.INFO,
+            "调用方是投递侧的补充说明，严重性归收件箱那一档（实际 %s）"
+            % caller_view.records[0].levelname,
+        )
+        self.assertEqual(
+            len(inbox_view.records), 1,
+            "这条丢失在默认级别下必须仍然响亮：收件箱那条 warning 才是它的严重性来源",
+        )
+        self.assertEqual(inbox_view.records[0].levelno, logging.WARNING)
 
 
 if __name__ == "__main__":  # pragma: no cover

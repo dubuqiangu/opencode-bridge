@@ -41,7 +41,7 @@ from .inbound_merge import (
     IGNORED,
     ConversationMerger,
 )
-from .inbox import InboundInbox, QueuedPrompt
+from .inbox import InboundInbox, QueuedPrompt, RecordOutcome
 from .inbox_recovery import recover_pending
 from .normalize import _clean, trim_outer_whitespace
 from .opencode_client import OpenCodeClient, OpenCodeError
@@ -175,9 +175,23 @@ def _record_inbound(
     """Write-ahead one inbound prompt. Returns the row to deliver, or ``None``
     to deliver nothing.
 
-    ``None`` means **dedup hit**: the same ``delivery_id`` is already in the
-    inbox, so the platform re-delivered something we have a receipt for. Running
-    the agent again on it is exactly what at-most-once is for.
+    ``None`` has **two** reasons, and conflating them misdirects whoever reads the log:
+
+    * **dedup hit** (:attr:`~opencode_bridge.inbox.RecordOutcome.DUPLICATE`) — the same
+      ``delivery_id`` is already in the inbox, so the platform re-delivered something we
+      have a receipt for. Running the agent again on it is exactly what at-most-once is for.
+    * **the inbox is already closed** (:attr:`~opencode_bridge.inbox.RecordOutcome.CLOSED`)
+      — ``close()`` has run, so **nothing was written** for this message and
+      :mod:`opencode_bridge.inbox_recovery` can never replay it.
+
+    ⛔ Before :class:`~opencode_bridge.inbox.RecordOutcome` existed, both were just
+    ``False`` and this function logged the closed one as "duplicate ignored (platform
+    re-delivered a known message)" — **backwards**: it points the reader at the platform
+    when the truth is "we closed". ⇒ The closed case gets its own branch, and delivery
+    is unchanged in both: not written ⇒ not delivered. That half is deliberate
+    (``RecordOutcome.__bool__`` keeps both "not recorded" outcomes falsy), because
+    delivering with no receipt on disk is precisely what the write-ahead inbox exists
+    to prevent.
 
     ``inbox is None`` means the inbox is switched off; delivery proceeds
     unchanged, just without a receipt.
@@ -185,8 +199,30 @@ def _record_inbound(
     queued = _queued_prompt_for(inbound, text)
     if inbox is None:
         return queued
-    if inbox.record(queued):
+    record_outcome = inbox.record(queued)
+    if record_outcome is RecordOutcome.CLOSED:
+        # Level is info, and that is the judgement: the severity for "nothing reached
+        # the disk" belongs to the inbox, which warns per refused message (it owns the
+        # facts — the path and the unreplayable consequence). A second warning here would
+        # just double-count one loss once per still-running adapter thread, and shutdown
+        # guarantees those threads. What only this frame knows is the delivery decision,
+        # so say that, and say it truthfully.
+        logger.info(
+            "inbox %s: not delivered; the write-ahead inbox is already closed"
+            " (shutdown in progress), so nothing was written for this message and"
+            " opencode_bridge.inbox_recovery can never replay it - not deduplicated,"
+            " lost. The refusal itself is logged at warning level by opencode_bridge.inbox",
+            queued.delivery_id,
+        )
+        return None
+    if record_outcome:
+        # RECORDED (truthy). Kept as truthiness, not identity: test doubles across the
+        # suite hand this frame a plain ``bool``, and the published contract of
+        # ``record()`` is "true means a receipt exists".
         return queued
+    # ⛔ Only DUPLICATE can land here: both "not recorded" outcomes are falsy and
+    # CLOSED was branched off above. Adding a fourth falsy member would silently turn
+    # into a dedup report again.
     if queued.message_id is None:
         # The hash-fallback collapse is the one dedup the user cannot predict
         # from the platform side, so it gets spelled out rather than left as a
@@ -380,7 +416,8 @@ class InboundGateway:
         """
         self._acknowledge_long_input(conversation_id, adapter, text)
         queued = _record_inbound(self._inbox, inbound, text)
-        if queued is not None:  # None = 去重命中，已投递过
+        if queued is not None:
+            # None = 去重命中（已投递过）**或**收件箱已关（没落盘，见 _record_inbound）
             self._enqueue(queued)
 
     def _acknowledge_long_input(

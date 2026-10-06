@@ -87,6 +87,60 @@ function warn(msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// 凭据脱敏：写入日志**之前**过一道
+// ---------------------------------------------------------------------------
+
+/** 遮蔽标记。与 Python 侧 `redaction.py` 的 `_MASK_TEMPLATE` 同形，于是子进程
+ *  stderr 落进日志后与它自己过滤过的行看起来是同一种东西，排障时不用先分辨这行
+ *  是谁写的。 */
+function redactionMarker(label: string): string {
+  return `[REDACTED:${label}]`
+}
+
+/** 凭据形状 → 标签，逐条对应 AGENTS.md §2.1 的表格（即 `redaction.py` 的
+ *  `_CREDENTIAL_RULES` 前六条）。正则里不出现任何凭据实例。
+ *
+ *  为什么插件侧还需要一道：Python 那道 `install_redaction_filter()` 只挂在**它自己
+ *  的 logging handler** 上，子进程里绕过 logging 直接写 stderr 的路径（traceback、
+ *  `print(..., file=sys.stderr)`）不保证被覆盖 —— 而 stderr 现在会被本文件落进日志。
+ *
+ *  ⚠️ Slack 一条刻意写成 `x(?:ox[bp]|app)-` 而非 `xox[bp]-`/`xapp-`：形状表不该匹配
+ *  它自己（AGENTS.md §2.4）。本文件任何地方都**不得**出现凭据的完整形状字面量 ——
+ *  推送保护会拦掉整个 push。 */
+const CREDENTIAL_SHAPES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----/g, "private-key"],
+  [/\d{8,10}:[A-Za-z0-9_-]{35}/g, "telegram-bot-token"],
+  [/x(?:ox[bp]|app)-[A-Za-z0-9-]{10,}/g, "slack-bot-token"],
+  [/gh[pousr]_[A-Za-z0-9]{20,}/g, "github-token"],
+  [/sk-[A-Za-z0-9]{20,}/g, "openai-key"],
+  [/AKIA[0-9A-Z]{16}/g, "aws-access-key-id"],
+  [/(?<![A-Za-z0-9])Bearer\s+[A-Za-z0-9._~+/=-]{16,}/g, "bearer-token"],
+]
+
+/** `token=xxx` 这类赋值：键名不是秘密，保留；值整段遮蔽。名字前用否定环视而不是
+ *  `\b`（`_` 是单词字符，`\b` 在 `bot_token` 里反而匹配不到），与 `redaction.py` 的
+ *  `secret-assignment-unquoted` 同判据。值字符类排除 `[` / `]` ⇒ 已经遮蔽过的
+ *  `[REDACTED:...]` 不会被二次遮蔽，标签也就不会退化成更泛的那个。 */
+const SECRET_ASSIGNMENT_SHAPE =
+  /(?<![A-Za-z0-9])((?:token|secret|password|passwd|api[_-]?key|app[_-]?secret|access[_-]?token|client[_-]?secret)["']?\s*[=:]\s*)([^\s\[\]&"',;)\]}<>]{16,})/gi
+
+/** 把文本里的凭据形状换成遮蔽标记。幂等：遮蔽标记自身不含任何形状，同一段文本过
+ *  两道与过一道结果相同。
+ *
+ *  只用 `replace`、不用 `test`：带 `g` 的正则在 `test` 里会推进 `lastIndex`，而上面
+ *  这些是模块级共享常量，复用同一个对象做第二次匹配会从半路开始。 */
+function redactCredentials(text: string): string {
+  let scrubbed = text
+  for (const [shape, label] of CREDENTIAL_SHAPES) {
+    scrubbed = scrubbed.replace(shape, redactionMarker(label))
+  }
+  return scrubbed.replace(
+    SECRET_ASSIGNMENT_SHAPE,
+    (_matched, keyName: string) => keyName + redactionMarker("secret-assignment"),
+  )
+}
+
+// ---------------------------------------------------------------------------
 // 配置
 // ---------------------------------------------------------------------------
 
@@ -373,19 +427,52 @@ function resolveConfig(options: unknown): ResolvedConfig {
 
 const SETUP_PLATFORMS = ["telegram", "slack", "discord"] as const
 
-/** 跑一次 `python -m opencode_bridge --setup [platform] [--json]` 并拿 stdout。 */
-function runSetup(cfg: ResolvedConfig, platform: string | null, asJson: boolean): Promise<string> {
+/** 跑一次 `python -m opencode_bridge --setup [platform] [--json]`，拿 stdout，
+ *  同时收集 stderr（逐行脱敏后进插件日志）。
+ *
+ *  ⛔ stderr **只进日志与返回值**，绝不 `console.log`：插件的 stdout 是宿主消费的
+ *  协议通道，子进程的告警混进去会污染它。下面的 `log(..., "error")` 走
+ *  console.error，那条不是协议通道（见 emit）。 */
+function runSetup(
+  cfg: ResolvedConfig,
+  platform: string | null,
+  asJson: boolean,
+  log: (msg: string, level?: LogLevel) => void,
+): Promise<string> {
   return new Promise((resolve) => {
     const args = [...cfg.setupCommand]
     if (asJson) args.push("--json")
     if (platform) args.push(platform)
     let out = ""
+    let errRaw = ""
+    // chunk 边界不保证落在 \n 上 ⇒ 未成行的尾巴留到下一块，close 时再补一次。
+    let stderrTail = ""
+    /** 一行 stderr 进插件日志（写入前脱敏）。纯空白行跳过：Python 的 logging 基本
+     *  不产空白行，留着只会给日志添噪。 */
+    const logStderrLine = (line: string): void => {
+      const scrubbed = redactCredentials(line)
+      if (scrubbed.trim().length > 0) log(`setup 子进程 stderr: ${scrubbed}`, "error")
+    }
     let c: ChildProcess
     try {
-      c = spawn(cfg.python, args, { cwd: cfg.bridgeDir, stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
+      // 第三管道由 "ignore" 改 "pipe"：以前 stderr 被直接丢掉，而引导命令的失败原因
+      // （例如 telegram 凭据校验失败）**只**写在 stderr 上 —— 丢掉它，这条路就只剩
+      // 一句「无输出」。这是本条修复的全部起因。
+      c = spawn(cfg.python, args, { cwd: cfg.bridgeDir, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     } catch (e) {
       resolve(`[bridge-plugin] 无法启动引导命令(${cfg.python} ${args.join(" ")}): ${String(e)}`)
       return
+    }
+    /** 补上最后那一块未成行的 stderr（子进程可能不带末尾换行就退出）。 */
+    const flushStderrTail = (): void => {
+      if (stderrTail.trim().length > 0) logStderrLine(stderrTail)
+      stderrTail = ""
+    }
+    /** 超时/非零退出时把 stderr 附在返回值后面：挂住或失败的引导命令，原因往往已经
+     *  写在 stderr 上了。已脱敏。 */
+    const stderrExcerpt = (): string => {
+      const scrubbed = redactCredentials(errRaw).trim()
+      return scrubbed.length > 0 ? `\n[bridge-plugin] 它的 stderr：\n${scrubbed}` : ""
     }
     const timer = setTimeout(() => {
       try {
@@ -393,21 +480,36 @@ function runSetup(cfg: ResolvedConfig, platform: string | null, asJson: boolean)
       } catch {
         /* ignore */
       }
-      resolve(out.trim() || "[bridge-plugin] 引导命令超时无输出")
+      resolve(out.trim() || `[bridge-plugin] 引导命令超时无输出${stderrExcerpt()}`)
     }, 20000)
-    c.stdout?.on("data", (d: Buffer) => {
-      out += d.toString("utf8")
+    c.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString("utf8")
+    })
+    c.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8")
+      errRaw += text
+      // **逐行**写，不能把整块丢给 log：emit() 自己补一个换行，整块里已有的 \n 会让
+      // 两行日志粘成一行（末尾那个 \n 则变成多余空行）。
+      const parts = (stderrTail + text).split(/\r?\n/)
+      stderrTail = parts.pop() ?? "" // 末段可能只有半行，留给下一块
+      for (const part of parts) logStderrLine(part)
     })
     c.on("error", (err) => {
       clearTimeout(timer)
       resolve(`[bridge-plugin] 引导命令失败：${err.message}`)
     })
+    // 用 'close' 而不是 'exit'：Node 保证 close 在子进程结束**且** stdio 流都关闭之后
+    // 才发，所以 errRaw 一定是完整的（否则会缺尾部那一半，凭证校验失败那行就断在这里）。
     c.on("close", (code) => {
       clearTimeout(timer)
+      flushStderrTail()
       const text = out.trim()
-      if (!text) resolve(`[bridge-plugin] 引导命令无输出 (code=${String(code)})`)
-      else if (code === 0) resolve(text)
-      else resolve(`${text}\n[bridge-plugin] 引导命令返回 code=${String(code)}`)
+      // 「无输出」原来只查 stdout、stderr 又被丢掉，于是异常只表现为「没输出」，用户会
+      // 以为命令压根没跑。现在 stderr 也读了，所以：① 文案点明是 **stdout** 空
+      // （不点明就仍然误导 —— 子进程明明有输出）；② 附上 stderr，那才是真正的原因。
+      if (!text) resolve(`[bridge-plugin] 引导命令无 stdout 输出 (code=${String(code)})${stderrExcerpt()}`)
+      else if (code === 0) resolve(text) // 正常路径：stderr 已在日志里，不往引导正文里混
+      else resolve(`${text}\n[bridge-plugin] 引导命令返回 code=${String(code)}${stderrExcerpt()}`)
     })
   })
 }
@@ -481,8 +583,8 @@ async function registerSetupSurfaces(
           execute: async (input) => {
             const key = norm((input as { platform?: unknown }).platform)
             const platform = key ?? null
-            const text = await runSetup(cfg, platform, false)
-            const status = await runSetup(cfg, null, true)
+            const text = await runSetup(cfg, platform, false, log)
+            const status = await runSetup(cfg, null, true, log)
             const head = platform
               ? `opencode-bridge 接入引导（${platform}）`
               : "opencode-bridge 接入引导（平台菜单）"
@@ -510,7 +612,7 @@ async function registerSetupSurfaces(
             const raw = String((input as { prompt?: unknown }).prompt ?? "")
             const m = raw.match(/bridge-setup\s+(\S+)/i)
             const key = m ? norm(m[1]) : null
-            const text = await runSetup(cfg, key, false)
+            const text = await runSetup(cfg, key, false, log)
             await c.session!.prompt({
               sessionID: input.sessionID,
               text:
@@ -707,7 +809,14 @@ export default {
           return noop
         }
 
-        // 4) spawn：stdout/stderr 都重定向到同一个输出日志
+        // 4) spawn：stdout/stderr 都重定向到同一个输出日志（**已经是 pipe 到 fd，不是
+        //    ignore** —— 与 runSetup 那处不同，这里 stderr 一直是被记下来的）
+        // ⚠️ 已知残留（明说，不假装解决）：fd 直写绕过了本文件的 redactCredentials，
+        //    所以这条路的脱敏**只有** Python 侧那道 install_redaction_filter()。
+        //    不改成「pipe + 逐行脱敏」是刻意的：fd 直写不占本进程事件循环、也不会因
+        //    插件侧异常丢输出，而这正是零容错关键路径最想要的两点。代价就是这条路上
+        //    子进程绕过 logging 直写 stderr 时可能漏出凭据片段 —— 修它要先解决
+        //    「插件挂了就丢日志」，那是另一个改动。
         const outPath = path.join(cfg.logDir, "bridge-output.log")
         let fd: number
         try {

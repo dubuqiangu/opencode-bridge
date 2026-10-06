@@ -40,6 +40,8 @@ from .pairing import empty_allowlist_is_open
 from .pairing_cli import run_pair
 from .redaction import install_redaction_filter
 from .state import StateStore
+from .subscription_status_view import render_subscription_status
+from .subscription_supervisor import SubscriptionStatus
 
 __all__ = ["main"]
 
@@ -895,6 +897,21 @@ NO_OUTBOUND_FAILURE_TEXT = health.NO_OUTBOUND_FAILURE_TEXT
 _OUTBOUND_SECTION_HEADER = "== 上次出站失败（运行期记录） =="
 
 
+def _print_event_subscription(subscription_status: SubscriptionStatus | None) -> None:
+    """打印「``/api/event`` 那条线程此刻怎么样」那一段。
+
+    ⚠️ 渲染**不在**本函数里：措辞、判别与那一对判别属性的用法都在
+    :mod:`opencode_bridge.subscription_status_view`（AGENTS.md §5「视图渲染」不是入口
+    文件的职责）。本函数只做装配：调一次渲染器、逐行 ``print``。
+
+    ⚠️ **传进来的可能是 ``None``，而那不是「正常」**：``--status`` 是独立进程，
+    拿不到桥进程内的 :class:`~opencode_bridge.core.BridgeCore` ⇒ 渲染器在那种情形
+    下输出「本进程读不到」，⛔ 而不是「一切正常」。
+    """
+    for line in render_subscription_status(subscription_status):
+        print(line)
+
+
 def _print_last_outbound_failures(
     rows: list[tuple[str, str, bool, bool, dict]],
     bridge_dir: str,
@@ -1031,8 +1048,21 @@ def _print_last_outbound_failures(
         print("  " + _pad(label, name_w) + line)
 
 
-def run_status(cfg: Config) -> int:
-    """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。"""
+def run_status(
+    cfg: Config,
+    *,
+    subscription_status: SubscriptionStatus | None = None,
+) -> int:
+    """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。
+
+    ⚠️ ``subscription_status`` 是「事件流订阅」那一段的**唯一**输入，默认 ``None``
+    ⇔ 「本进程拿不到那条线程」。⚠️ **今天的生产情形正是 ``None``**：``--status`` 是
+    独立进程，而 :class:`~opencode_bridge.core.BridgeCore` 活在另一个进程里
+    ⇒ 它只拿得到**落盘**的东西。
+    ⇒ 拿得到就把它说成人话，拿不到就**明说拿不到**（⛔ 不许拿「没读到」当「正常」，
+    那正是本段要消灭的那类假话）—— 见
+    :mod:`opencode_bridge.subscription_status_view`。
+    """
     bridge_dir = _bridge_dir()
     print("== opencode 服务 ==")
     try:
@@ -1111,6 +1141,7 @@ def run_status(cfg: Config) -> int:
 
     _print_last_start_probes(rows, bridge_dir)
     _print_last_outbound_failures(rows, bridge_dir)
+    _print_event_subscription(subscription_status)
 
     print("")
     print("== bridge 运行态 ==")

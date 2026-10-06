@@ -15,6 +15,29 @@ from opencode_bridge.status import (
     render_table,
     summarize,
 )
+from opencode_bridge.subscription_status_view import (
+    NO_LIVE_SNAPSHOT_TEXT,
+    NO_SNAPSHOT_MISSING_ERROR_TEXT,
+    RECONNECTING_CLAUSE,
+    STREAMING_CLAUSE,
+    SUBSCRIPTION_DISPLAY_NOT_STARTED,
+    SUBSCRIPTION_DISPLAY_RECOVERING,
+    SUBSCRIPTION_DISPLAY_STOPPED_BY_REQUEST,
+    SUBSCRIPTION_DISPLAY_STREAMING,
+    SUBSCRIPTION_DISPLAY_TERMINATED,
+    SUBSCRIPTION_DISPLAY_UNRECOGNISED,
+    TERMINATED_CLAUSE,
+    render_subscription_status,
+    subscription_display_state,
+)
+from opencode_bridge.subscription_supervisor import (
+    PHASE_ENDED_WITHOUT_STOP,
+    PHASE_IDLE,
+    PHASE_RECONNECTING,
+    PHASE_STOPPED_BY_REQUEST,
+    PHASE_STREAMING,
+    SubscriptionStatus,
+)
 
 
 class TestStateSemantics(unittest.TestCase):
@@ -372,6 +395,219 @@ class TestRenderTable(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("渠道", lines[0])
         self.assertTrue(set(lines[1]) == {"-"})
+
+
+def a_subscription_snapshot(**changes) -> SubscriptionStatus:
+    """一份「已经跑过一阵子」的订阅快照（只改用例真正关心的那几个字段）。
+
+    ⚠️ 刻意把 ``last_error`` 设成**非空**：它证明判别**没有**拿 ``last_error`` 当信号 ——
+    「上一次为什么坏」是档案，而「此刻怎么样」是 :attr:`phase`。⇒ 于是这一份快照
+    在 ``streaming`` 与 ``reconnecting`` 两相下有**同样**的 ``last_error``，只靠档案
+    是分不出来的。
+    """
+    fields = {
+        "phase": PHASE_STREAMING,
+        "subscriptions_started": 9,
+        "reconnect_attempts": 7,
+        "frames_received": 3,
+        "last_error": "OpenCodeError: event stream 503",
+    }
+    fields.update(changes)
+    return SubscriptionStatus(**fields)
+
+
+class TestSubscriptionDisplayStateIsAClosedMapping(unittest.TestCase):
+    """五个 phase → 五档显示，外加一档「认不出来」的兜底。"""
+
+    def test_each_known_phase_maps_to_its_own_display_state(self):
+        """⚠️ 会红的条件：任何一相被归到**另一相**的档位 —— 特别是两个坏相
+        （``reconnecting`` / ``ended_without_stop``）塌进同一档 ⇒ 用户就无从分辨
+        「在自愈」与「已经死了」。
+        """
+        self.assertEqual(
+            {
+                phase: subscription_display_state(a_subscription_snapshot(phase=phase))
+                for phase in (
+                    PHASE_IDLE,
+                    PHASE_STREAMING,
+                    PHASE_RECONNECTING,
+                    PHASE_STOPPED_BY_REQUEST,
+                    PHASE_ENDED_WITHOUT_STOP,
+                )
+            },
+            {
+                PHASE_IDLE: SUBSCRIPTION_DISPLAY_NOT_STARTED,
+                PHASE_STREAMING: SUBSCRIPTION_DISPLAY_STREAMING,
+                PHASE_RECONNECTING: SUBSCRIPTION_DISPLAY_RECOVERING,
+                PHASE_STOPPED_BY_REQUEST: SUBSCRIPTION_DISPLAY_STOPPED_BY_REQUEST,
+                PHASE_ENDED_WITHOUT_STOP: SUBSCRIPTION_DISPLAY_TERMINATED,
+            },
+        )
+
+    def test_an_unrecognised_phase_lands_in_the_fallback_not_in_healthy(self):
+        """⚠️ 「读不懂」必须有自己的档位。
+
+        ⛔ 它落进 :data:`SUBSCRIPTION_DISPLAY_STREAMING` 就是本视图存在的理由本身
+        （把「不知道」显示成「正常」）。会红的条件：兜底那一支被删掉 / 默认值改成
+        ``SUBSCRIPTION_DISPLAY_STREAMING``。
+        """
+        self.assertEqual(
+            subscription_display_state(a_subscription_snapshot(phase="half-open")),
+            SUBSCRIPTION_DISPLAY_UNRECOGNISED,
+        )
+
+
+class TestTheTwoBadPhasesAreToldApart(unittest.TestCase):
+    """⭐ 本任务的正身：**「正在重连」与「线程已经死了」在视图里必须可区分。**
+
+    这两条用例各钉一个方向 ⇒ 只钉一个方向等于没钉（缺陷的形状正是这两者原本
+    分不开）。每条都断言**三句**：本相那一句在、另两相那两句都不在。
+    """
+
+    def test_a_reconnecting_subscription_never_reads_as_normal_or_as_dead(self):
+        body = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(
+                    phase=PHASE_RECONNECTING, reconnect_attempts=7
+                )
+            )
+        )
+        self.assertIn(RECONNECTING_CLAUSE, body)
+        self.assertNotIn(
+            STREAMING_CLAUSE, body,
+            "「正在重连」被显示成「订阅正常」⇒ 用户以为答复还在回来，"
+            "而此刻这条线程**不在收任何事件**",
+        )
+        self.assertNotIn(
+            TERMINATED_CLAUSE, body,
+            "「正在重连」被显示成「线程已经死了」⇒ 用户会去重启一个"
+            "**自己正在恢复**的桥",
+        )
+
+    def test_a_subscription_that_ended_on_its_own_never_reads_as_normal(self):
+        """⭐ 反向证明的靶心：**线程已死而视图说正常。**
+
+        会红的条件：这一相被归到 ``streaming`` / ``recovering``（两个都试过）。
+        """
+        body = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(phase=PHASE_ENDED_WITHOUT_STOP)
+            )
+        )
+        self.assertIn(TERMINATED_CLAUSE, body)
+        self.assertNotIn(
+            STREAMING_CLAUSE, body,
+            "线程已经死了而视图说「订阅正常」—— 这正是本条要消灭的静默失效",
+        )
+        self.assertNotIn(
+            RECONNECTING_CLAUSE, body,
+            "线程已经死了而视图说「正在重连」⇒ 它不会自己回来，"
+            "说成自愈中就是在骗用户（两种坏必须分开）",
+        )
+
+    def test_the_two_phases_render_different_wording(self):
+        """⚠️ 不只「一档 ≠ 另一档」：**逐字不同**才是用户看得见的那个区别。
+
+        会红的条件：两相共用一句措辞（于是映射分开、界面却分不开）。
+        """
+        recovering = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(phase=PHASE_RECONNECTING)
+            )
+        )
+        ended = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(phase=PHASE_ENDED_WITHOUT_STOP)
+            )
+        )
+        self.assertNotEqual(recovering, ended)
+
+
+class TestSubscriptionSectionNeverFakesHealth(unittest.TestCase):
+    """其余几相 + 「拿不到快照」：⛔ 都不许显示成「正常」。"""
+
+    def test_no_live_snapshot_says_so_instead_of_saying_normal(self):
+        body = "\n".join(render_subscription_status(None))
+        self.assertIn(NO_LIVE_SNAPSHOT_TEXT, body)
+        self.assertNotIn(
+            STREAMING_CLAUSE, body,
+            "「读不到」被说成「订阅正常」⇒ 那正是本段要消灭的那类假话",
+        )
+        # ⛔ 也不能编一个「订阅 0 次 / 收到 0 帧」出来（伪造观测，AGENTS.md §8）。
+        self.assertNotIn("累计", body)
+
+    def test_an_unrecognised_phase_is_not_worded_as_healthy(self):
+        """会红的条件：兜底那一支被删掉，或默认落到
+        :data:`SUBSCRIPTION_DISPLAY_STREAMING` ⇒ 「读不懂」显示成「订阅正常」。
+        """
+        body = "\n".join(
+            render_subscription_status(a_subscription_snapshot(phase="half-open"))
+        )
+        self.assertNotIn(STREAMING_CLAUSE, body)
+        self.assertIn("认不出", body)
+
+    def test_the_stopped_path_is_not_worded_as_a_failure(self):
+        """⛔ 反方向也要钉：**正常关机不许被说成需要人管**（否则用户去重启一个
+        刚停好的桥）。会红的条件：这一相被归到 ``terminated`` / ``recovering``。
+        """
+        body = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(phase=PHASE_STOPPED_BY_REQUEST)
+            )
+        )
+        self.assertNotIn(TERMINATED_CLAUSE, body)
+        self.assertNotIn(RECONNECTING_CLAUSE, body)
+        self.assertNotIn(STREAMING_CLAUSE, body)
+
+    def test_a_streaming_subscription_is_the_only_phase_worded_as_normal(self):
+        """把「只有哪一相**可以**说正常」钉住：⭐ 上面那两条反证才是有意义的
+        （否则一个「对所有相都说正常」的实现也能过它们）。
+
+        会红的条件：给 ``idle`` / 兜底档也加上「正常」那句。
+        """
+        streaming = "\n".join(
+            render_subscription_status(a_subscription_snapshot(phase=PHASE_STREAMING))
+        )
+        self.assertIn(STREAMING_CLAUSE, streaming)
+        for phase in (PHASE_IDLE, "half-open"):
+            with self.subTest(phase=phase):
+                self.assertNotIn(
+                    STREAMING_CLAUSE,
+                    "\n".join(
+                        render_subscription_status(
+                            a_subscription_snapshot(phase=phase)
+                        )
+                    ),
+                )
+
+    def test_the_last_failure_is_labelled_as_an_archive_not_as_now(self):
+        """⚠️ 一次**早已恢复**的失败不许被读成「此刻还坏着」—— 那与把死线程读成
+        正常是同一个错误的镜像（AGENTS.md §8：没有记录就分不出「还在失败」与
+        「没人再发消息」）。会红的条件：去掉那句限定词。
+        """
+        body = "\n".join(
+            render_subscription_status(a_subscription_snapshot(phase=PHASE_STREAMING))
+        )
+        self.assertIn("OpenCodeError: event stream 503", body)
+        self.assertIn("上一次", body)
+
+    def test_a_snapshot_without_any_failure_is_not_worded_as_never_failed(self):
+        """⚠️ ``last_error`` 为空时**不许**说「没失败过」—— 分不出「没失败过」
+        与「这次没记下来」。会红的条件：那一支改成「无失败」。
+        """
+        body = "\n".join(
+            render_subscription_status(
+                a_subscription_snapshot(phase=PHASE_IDLE, last_error=None)
+            )
+        )
+        self.assertIn(NO_SNAPSHOT_MISSING_ERROR_TEXT, body)
+
+    def test_the_section_states_that_the_capability_table_covers_something_else(self):
+        """⚠️ 钉住**为什么**另起一段：能力表**刻意**不看这条线程（那是它的职责，
+        ⛔ 不许改）。会红的条件：那句解释被删（于是读者会以为「表全绿 = 流健康」）。
+        """
+        body = "\n".join(render_subscription_status(None))
+        self.assertIn("能力与健康是两件事", body)
 
 
 if __name__ == "__main__":

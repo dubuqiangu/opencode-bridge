@@ -28,11 +28,17 @@ from unittest import mock
 
 from opencode_bridge import __main__ as cli
 from opencode_bridge import health
+from opencode_bridge import subscription_status_view
 from opencode_bridge.adapters.base import Adapter
 from opencode_bridge.config import Config
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.state import StateStore
+from opencode_bridge.subscription_supervisor import (
+    PHASE_ENDED_WITHOUT_STOP,
+    PHASE_RECONNECTING,
+    SubscriptionStatus,
+)
 
 # 期望的 warning 不刷屏；``assertLogs`` 自己换 handler，不受影响。
 logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
@@ -1007,6 +1013,104 @@ class StartupSurvivesProbeRecordingFailure(unittest.TestCase):
             "探测记录这条路无论怎么坏，都不许把已经 start() 成功的桥带走",
         )
         self.assertIn("不影响桥的运行", warnings)
+
+
+class TestStatusSectionReportsTheEventStream(_BridgeDirIsolated):
+    """⚠️ 「事件流订阅」那一段的**端到端**护栏：真跑 ``run_status``、看真输出。
+
+    为什么不复用 :class:`TestStatusTableShowsTheProbe` 那个类：那一段钉的是
+    「上次启动时的探测结论」，⛔ 与事件流订阅**不是同一个问题** ⇒ 混进同一个类里，
+    「这一段不许说正常」就会被那一段自己的字眼（启动探测里就有「不探测」）污染成恒真。
+
+    ⛔ **刻意不整段相等**：``--status`` 是纯文本，一句措辞调整就会让整段相等全红
+    ⇒ 只钉「那一句关键信息」在/不在。
+    """
+
+    SECTION_HEADER = subscription_status_view.EVENT_SUBSCRIPTION_SECTION_HEADER
+
+    def configured(self) -> Config:
+        return Config(adapters={"telegram": {"bot_token": SHAPE_TOKEN}})
+
+    def render(self, cfg: Config, subscription_status) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.run_status(cfg, subscription_status=subscription_status)
+        return buffer.getvalue()
+
+    def section(self, rendered: str) -> str:
+        """只取「事件流订阅」那一段（到下一个 ``==`` 段为止）。
+
+        ⚠️ 必须切段：整份输出里「上次出站失败」那段**本来就**会出现「失败」字样，
+        而「bridge 运行态」那段会说「已连接」⇒ 整段断言会把无关行混进来，
+        「这一段不许说正常」那条就恒真了（AGENTS.md §7.1）。
+        """
+        lines = rendered.splitlines()
+        start = next(
+            index for index, line in enumerate(lines) if self.SECTION_HEADER in line
+        )
+        tail = lines[start + 1:]
+        end = next(
+            (index for index, line in enumerate(tail) if line.startswith("== ")), len(tail)
+        )
+        return "\n".join(tail[:end])
+
+    def test_a_thread_that_ended_on_its_own_is_not_reported_as_normal(self):
+        """⭐ **线程已经死了而视图说正常** —— 本条要消灭的那个静默失效。"""
+        body = self.section(self.render(
+            self.configured(),
+            SubscriptionStatus(
+                phase=PHASE_ENDED_WITHOUT_STOP,
+                subscriptions_started=9,
+                reconnect_attempts=7,
+                frames_received=3,
+                last_error="OpenCodeError: event stream 503",
+            ),
+        ))
+        self.assertIn(subscription_status_view.TERMINATED_CLAUSE, body)
+        self.assertNotIn(
+            subscription_status_view.STREAMING_CLAUSE, body,
+            "线程已经死了而视图说「订阅正常」",
+        )
+
+    def test_a_reconnecting_subscription_is_not_reported_as_normal(self):
+        """⭐ 另一个方向：**正在自愈**也不许报成正常（用户在等，得知道在等）。"""
+        body = self.section(self.render(
+            self.configured(),
+            SubscriptionStatus(
+                phase=PHASE_RECONNECTING,
+                subscriptions_started=8,
+                reconnect_attempts=7,
+                frames_received=3,
+                last_error="OpenCodeError: event stream 503",
+            ),
+        ))
+        self.assertIn(subscription_status_view.RECONNECTING_CLAUSE, body)
+        self.assertNotIn(
+            subscription_status_view.STREAMING_CLAUSE, body,
+            "「正在重连」报成「订阅正常」⇒ 用户以为答复还在回来",
+        )
+        self.assertNotIn(
+            subscription_status_view.TERMINATED_CLAUSE, body,
+            "「正在重连」报成「线程已经死了」⇒ 用户会去重启一个自己正在恢复的桥",
+        )
+
+    def test_the_standalone_status_process_does_not_claim_the_stream_is_healthy(self):
+        """⚠️ ``--status`` 是**独立进程** ⇒ 今天的生产情形就是「拿不到快照」。
+
+        ⛔ 那种情形下这一段**不许**说正常（也不许编「订阅 0 次」出来）。
+        会红的条件：把 ``None`` 当成 ``idle`` 顺手当作「一切正常」。
+        """
+        body = self.section(self.render(self.configured(), None))
+        self.assertIn(subscription_status_view.NO_LIVE_SNAPSHOT_TEXT, body)
+        self.assertNotIn(subscription_status_view.STREAMING_CLAUSE, body)
+
+    def test_the_capability_table_and_this_section_do_not_borrow_each_other(self):
+        """⚠️ **不是**去改 ``Adapter.capabilities()`` 的语义（⛔ 能力 ≠ 健康）——
+        而这一段必须**明说**它答的是另一个问题，否则读者会把「表全绿」读成
+        「事件流健康」。会红的条件：那句解释被删。
+        """
+        body = self.section(self.render(self.configured(), None))
+        self.assertIn("能力与健康是两件事", body)
 
 
 if __name__ == "__main__":  # pragma: no cover

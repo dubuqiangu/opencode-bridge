@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from opencode_bridge import health
+from opencode_bridge import health, subscription_health
 from tests.bridge_dir_isolation_scan import RUNTIME_ARTIFACT_NAMES
 
 REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,16 +61,23 @@ class TestTheRepositoryRootHoldsNoRuntimeArtifact(unittest.TestCase):
         )
 
     def test_the_two_names_are_really_the_ones_health_writes(self):
-        """⭐ 反「判据本身坏了」：断言用的文件名必须**就是**生产代码那两个。
+        """⭐ 反「判据本身坏了」：断言用的文件名必须**就是**生产代码那几个。
 
         ⚠️ 这不是多此一举：判据写错了名字就会**恒真**（去查一个没人写的文件）
         —— 本项目因此踩过「空集被当成不存在」（AGENTS.md §7.1）。
         """
         self.assertEqual(
             RUNTIME_ARTIFACT_NAMES,
-            ("platform-health.json", "outbound-failures.json"),
-            "这两个文件名变了的话，本文件的判据就在查没人写的文件 —— "
-            "恒真。请连同 :mod:`opencode_bridge.health` 一起改。",
+            (
+                "platform-health.json",
+                "outbound-failures.json",
+                # ⚠️ 第三份（2026-10-08 加）：「/api/event 订阅线程此刻怎么样」那条
+                # 运行期通道。⛔ 少了它，这个文件就会**没人查** —— 而它在
+                # ``.gitignore`` 里 ⇒ 污染照样隐形（这正是本文件钉的那个缺陷）。
+                "subscription-health.json",
+            ),
+            "这几个文件名变了的话，本文件的判据就在查没人写的文件 —— "
+            "恒真。请连同生产代码那两个模块一起改。",
         )
         self.assertEqual(
             health.PLATFORM_HEALTH_FILE_NAME, RUNTIME_ARTIFACT_NAMES[0],
@@ -79,6 +86,12 @@ class TestTheRepositoryRootHoldsNoRuntimeArtifact(unittest.TestCase):
         self.assertEqual(
             health.OUTBOUND_FAILURES_FILE_NAME, RUNTIME_ARTIFACT_NAMES[1],
             "判据用的名字与 health 的常量脱钩了 —— 护栏会去查一个没人写的文件。",
+        )
+        self.assertEqual(
+            subscription_health.SUBSCRIPTION_HEALTH_FILE_NAME,
+            RUNTIME_ARTIFACT_NAMES[2],
+            "判据用的名字与 subscription_health 的常量脱钩了 —— "
+            "护栏会去查一个没人写的文件。",
         )
 
 

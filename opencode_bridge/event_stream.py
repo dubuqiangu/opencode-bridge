@@ -39,6 +39,10 @@ from .state import StateStore
 # ``/api/event`` 订阅的**看护者**：重连状态机与退避策略归它（见该模块的 docstring
 # 为什么这件事必须住在另一个文件里）。这里只做装配。
 from .subscription_supervisor import SubscriptionStatus, SubscriptionSupervisor
+# 订阅状态的**运行期通道**（落盘给 ``--status`` 那个独立进程读）。⛔ 只取那个
+# 进程级装好的记录器，不自己推 ``bridge_dir`` —— 那只有运行器知道
+# （与 outbound 的 ``install_outbound_failure_recorder`` 同一个理由）。
+from .subscription_health import installed_subscription_health_recorder
 
 __all__ = ["EventStream", "Turn"]
 
@@ -296,9 +300,17 @@ class EventStream:
         #: ``/api/event`` 订阅的**看护者**。它拥有重连状态机、退避策略与那份
         #: 「正在重连 / 线程已经死了」的状态记录（AGENTS.md §5.1：新机制进新模块，
         #: 本模块已经 800 多行、在 §5.0 的待拆名单上，不该继续加厚）。
+        #:
+        #: ⚠️ ``on_status_change`` 取的是**进程级装好的**那条运行期通道，而它必须在
+        #: 本构造函数**之前**装上（:func:`~opencode_bridge.__main__._run_bridge_locked`
+        #: 那一处）⇒ 晚一步装上这条路就整个不存在，而**没有任何东西会报错** ——
+        #: 只是「订阅状态永不落盘」，``--status`` 那一段于是永远说「读不到」。
+        #: 那仍然比「说正常」好（视图层不会把读不到当成正常），但用户拿不到状态。
+        #: 未装时是 ``None`` ⇒ 看护者照旧工作，只是不落盘。
         self._supervisor = SubscriptionSupervisor(
             subscribe=lambda: self._client.subscribe(),
             on_frame=self._consume_frame,
+            on_status_change=installed_subscription_health_recorder(),
         )
 
         #: Set once the event stream has delivered its first frame, i.e. the

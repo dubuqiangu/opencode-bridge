@@ -35,7 +35,7 @@ import ast
 import pathlib
 import unittest
 
-from opencode_bridge import health
+from opencode_bridge import health, subscription_health
 from tests.bridge_dir_isolation_scan import (
     ARTIFACT_WRITING_CALLS,
     RUNTIME_ARTIFACT_NAMES,
@@ -324,4 +324,14 @@ class TestTheScannedNamesAreRealHealthEntrypoints(unittest.TestCase):
             ["OutboundFailureRecorder", "record_startup_probes"],
             "ARTIFACT_WRITING_CALLS 里有一个不是 health 真正导出的落盘入口 —— "
             "判据扫了一个没人调用的名字（恒真）。",
+        )
+        # ⚠️ 第三份（2026-10-08 加）：订阅那条通道的入口住在**另一个**模块里
+        # （`health` 管的是「凭据齐不齐 / 发送有没有失败」，订阅线程的健康不是
+        # 那两件事）⇒ 判据必须对**两个**模块验一遍，否则新加的两个名字会被算成
+        # 「没人调用的名字」而恒空（AGENTS.md §7.1）。
+        self.assertEqual(
+            sorted(set(subscription_health.__all__) & ARTIFACT_WRITING_CALLS),
+            ["SubscriptionHealthRecorder", "install_subscription_health_recorder"],
+            "ARTIFACT_WRITING_CALLS 里的订阅通道入口不是 subscription_health "
+            "真正导出的 —— 判据扫了一个没人调用的名字（恒真）。",
         )

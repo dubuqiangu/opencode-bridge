@@ -20,6 +20,11 @@ platform-health.json
 # 「上一次发送失败是什么时候、为什么」）。含平台回的错误描述 —— detail 已脱敏，
 # 但仍是**运行态产物**，绝不提交。
 outbound-failures.json
+# 「/api/event 订阅线程此刻怎么样」（subscription_health.py 写的**第三份**运行期记录，
+# 与上面那两份**各答各的**：那两份答「上次启动那一刻认不认凭据」与「上次发送失败
+# 是什么时候、为什么」，这一份答**此刻那条线程还活着没有**）。它带 last_error
+# （上游响应体）—— 已脱敏，但仍是**运行态产物**，绝不提交。
+subscription-health.json
 
 # Python
 __pycache__/

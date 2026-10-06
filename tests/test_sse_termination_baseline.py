@@ -62,10 +62,12 @@ from opencode_bridge.subscription_supervisor import (
     FIRST_RECONNECT_DELAY_SECONDS,
     MAX_RECONNECT_DELAY_SECONDS,
     PHASE_ENDED_WITHOUT_STOP,
+    PHASE_IDLE,
     PHASE_RECONNECTING,
     PHASE_STOPPED_BY_REQUEST,
     PHASE_STREAMING,
     ReconnectBackoff,
+    SubscriptionStatus,
     SubscriptionSupervisor,
 )
 from tests.bridge_dir_isolation_scan import (
@@ -695,6 +697,240 @@ class SubscriptionStateIsReadableTests(unittest.TestCase):
 
         self.assertEqual(supervisor.status().phase, PHASE_ENDED_WITHOUT_STOP)
         self.assertTrue(handler.messages, "结束这件事一个字都没说。")
+
+
+class RecordingStatusObserver:
+    """一个 ``on_status_change`` 观察者：把每次收到的**相位**记成一条离散顺序日志。
+
+    ⚠️ **只记相位的变化、不记次数** —— 因为这份日志是给「相位走过哪几格」用的，
+    而「回调被调了几次」是**另一件事**（它每帧一次，见下面那条用例）。
+
+    ⚠️ 它天然线程安全：``list.append`` 在 CPython 里是原子的，而本文件其它地方
+    记顺序日志时也是靠这一条 + :class:`threading.Event` 当同步点。
+    """
+
+    def __init__(self) -> None:
+        self.phases_seen: list[str] = []
+
+    def __call__(self, status: SubscriptionStatus) -> None:
+        if not self.phases_seen or self.phases_seen[-1] != status.phase:
+            self.phases_seen.append(status.phase)
+
+    def distinct_phase_edges(self) -> list[str]:
+        return list(self.phases_seen)
+
+
+class TheStatusObserverSeesEveryPhaseChange(unittest.TestCase):
+    """⭐ ``on_status_change`` 是「运行期通道」的唯一入口 ⇒ 它必须看得见相位翻转。
+
+    ⚠️ **判据是离散顺序日志 + 同步点**，⛔ 没有一处计时：本机
+    ``time.monotonic()`` 只有 16 ms 分辨率（AGENTS.md §7.1）。
+    """
+
+    def test_a_subscription_that_keeps_failing_walks_through_both_bad_phases(self):
+        """⭐ 两个方向都在这一条里：**正在重连**与**线程已经死了**都被观察到。"""
+        # ⚠️ 剧本**最后一项必须是 ``("frames", …)``**：用尽之后它会重复最后一项，
+        # 而 ``SubscriptionScript`` 的 docstring 明写「中途任何一次正常结束都会被
+        # 看护者记成线程结束」⇒ 若最后一项还在失败，这条会**永远转下去**。
+        # 这里要的是「先坏一次（⇒ reconnecting），再一次自己走完（⇒ ended）」。
+        script = SubscriptionScript([
+            ("frames_then_fail", [{"type": "noise"}], OpenCodeError("HTTP 503")),
+            ("frames", []),
+        ])
+        observer = RecordingStatusObserver()
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.0,
+            max_delay=0.0,
+            on_status_change=observer,
+        )
+
+        supervisor.run()
+
+        self.assertEqual(
+            observer.distinct_phase_edges(),
+            [PHASE_STREAMING, PHASE_RECONNECTING, PHASE_STREAMING,
+             PHASE_ENDED_WITHOUT_STOP],
+            "观察者没看到相位的完整轨迹 ⇒ 运行期通道只能读到其中一部分，"
+            "而「正在重连」与「已死」正是这个缺陷的两个方向。",
+        )
+        self.assertEqual(supervisor.status().phase, PHASE_ENDED_WITHOUT_STOP)
+
+    def test_the_observer_is_told_a_snapshot_that_already_reflects_the_change(self):
+        """⚠️ 承重：观察者读到的必须是**已经生效**的那一份，不是半路的状态。
+
+        ⇒ 判据是「回调里读回来的那份 == 回调实参那份」，⛔ 不是「下一瞬间的 status()」
+        （那在并发下可能已经变了）。
+        会红的条件：把 ``_announce_status_change`` 挪到 ``replace`` **之前**。
+        """
+        seen: list[tuple] = []
+
+        def observer(status: SubscriptionStatus) -> None:
+            seen.append((status, status.phase))
+
+        script = SubscriptionScript([("frames", [])])
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.0,
+            max_delay=0.0,
+            on_status_change=observer,
+        )
+
+        supervisor.run()
+
+        self.assertEqual([phase for _status, phase in seen][-1],
+                         PHASE_ENDED_WITHOUT_STOP)
+        self.assertEqual(
+            seen[-1][0], supervisor.status(),
+            "回调拿到的实参与回调内部读到的自洽记录对不上 ⇒ 通知与状态不原子",
+        )
+
+    def test_the_observer_is_called_once_per_frame_and_that_is_the_callers_problem(self):
+        """⭐ 钉住「回调**每帧**都会来」这条事实 ⇔ 所以节流**必须**在调用方。
+
+        ⚠️ 它是「写爆磁盘」那个反向证明的**前提**：若这条不成立，落盘节流就是多余的。
+
+        ⚠️ ⛔ **不用计时**：这里数的是**回调被调了几次**，一个确定值，与时钟无关。
+        会红的条件：把 ``frames_received`` 从每次 ``_update`` 里去掉（那会同时让
+        :attr:`SubscriptionStatus.frames_received` 失去意义）。
+
+        ⚠️ 那个 ``+2`` 里的两项是「订阅开始」与「线程收工」两次**相位**写；
+        每帧只贡献一次。
+        """
+        frames = [{"type": "noise", "n": index} for index in range(12)]
+        script = SubscriptionScript([("frames", frames)])
+        frame_counts_seen: list[int] = []
+
+        def counting_observer(status: SubscriptionStatus) -> None:
+            frame_counts_seen.append(status.frames_received)
+
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.0,
+            max_delay=0.0,
+            on_status_change=counting_observer,
+        )
+
+        supervisor.run()
+
+        self.assertEqual(
+            len(frame_counts_seen), len(frames) + 2,
+            "观察者没有每帧都被叫一次 ⇒ 「回调每帧来」这条前提没了，"
+            "而落盘节流就是照着它设计的。",
+        )
+        self.assertEqual(supervisor.status().frames_received, len(frames))
+
+    def test_a_raising_observer_cannot_kill_the_subscription_thread(self):
+        """⛔⛔ 承重：一个**观察者**不许推翻「线程不许死」这条不变量。
+
+        ⇒ 那是本模块存在的唯一理由；观察者抛异常就把它推翻的话，
+        「落盘这条路坏了」会变成「桥收不到任何事件」—— 那比不落盘坏得多。
+
+        会红的条件：从 :meth:`SubscriptionSupervisor._announce_status_change` 里
+        去掉那个 ``except``。
+        """
+        script = SubscriptionScript([
+            ("frames_then_fail", [{"type": "noise"}], OpenCodeError("HTTP 503")),
+            ("frames", []),
+        ])
+
+        def exploding_observer(status: SubscriptionStatus) -> None:
+            raise RuntimeError("落盘这条路自己坏了")
+
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.0,
+            max_delay=0.0,
+            on_status_change=exploding_observer,
+        )
+
+        supervisor.run()
+
+        self.assertEqual(
+            supervisor.status().phase, PHASE_ENDED_WITHOUT_STOP,
+            "观察者抛异常把线程带走了 ⇒ 落盘故障升级成了静默停摆。",
+        )
+
+    def test_a_raising_observer_does_not_stop_the_reconnect_loop(self):
+        """⚠️ 上一条的另一半：⛔ 观察者坏了不许**连退避重试一起**停掉。
+
+        会红的条件：把 ``_announce_status_change`` 的兜底放在 ``_back_off_and_announce``
+        **之前**（于是重试循环被一次抛异常打断）。
+        """
+        script = SubscriptionScript([("fail", OpenCodeError("HTTP 503"))])
+
+        def exploding_observer(status: SubscriptionStatus) -> None:
+            raise RuntimeError("观察者坏了")
+
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.005,
+            max_delay=0.005,
+            on_status_change=exploding_observer,
+        )
+        worker = threading.Thread(target=supervisor.run, daemon=True)
+        worker.start()
+        self.addCleanup(worker.join, RENDEZVOUS_TIMEOUT_SECONDS)
+        self.addCleanup(supervisor.request_stop)
+
+        # 同步点：等它**至少**重新订阅过一次（⛔ 不用 sleep —— 见 _wait_until 的
+        # docstring；谓词是「一个整数变大」，与时钟无关）。
+        self.assertTrue(
+            _wait_until(lambda: script.subscriptions_started >= 2,
+                        timeout=RENDEZVOUS_TIMEOUT_SECONDS),
+            "观察者抛异常把重连循环也带走了 ⇒ 只订阅了一次就再也不试了。"
+            "（本条跑到时只订阅了 %d 次）" % script.subscriptions_started,
+        )
+
+    def test_no_observer_is_the_default_and_changes_nothing(self):
+        """⚠️ 单向可加：没给回调时行为与给回调前**逐字相同**。
+
+        会红的条件：让 ``on_status_change=None`` 走成「记日志」或「记一条默认记录」。
+
+        ⚠️ 顺带钉住 :attr:`SubscriptionStatus.frames_received` **收工后不再被加一次**
+        （它逐帧加过；此前 ``run()`` 在收工那次又加了一遍 ⇒ 一次收到 1 帧的订阅
+        会报成 2 帧，而那个数现在**显示在 ``--status`` 里**）。
+        会红的条件：把收工那次 ``_update`` 的 ``frames_received=...`` 加回去。
+        """
+        script = SubscriptionScript([("frames", [{"type": "noise"}])])
+        supervisor = SubscriptionSupervisor(
+            subscribe=script.subscribe,
+            on_frame=lambda event: None,
+            first_delay=0.0,
+            max_delay=0.0,
+        )
+
+        with watch_subscription_supervisor("will not come back") as (_handler, _fired):
+            supervisor.run()
+
+        self.assertEqual(supervisor.status().phase, PHASE_ENDED_WITHOUT_STOP)
+        self.assertEqual(
+            supervisor.status().frames_received, 1,
+            "收工那一刻又把这个订阅收到的帧加了一遍 ⇒ 「--status」上那个"
+            "「收到 N 帧」是双重计数。",
+        )
+
+
+def _wait_until(predicate, *, timeout: float) -> bool:
+    """轮询一个**离散**谓词，带死锁守卫超时。
+
+    ⚠️ 这是**唯一**一处带轮询的等待，而它等的是「一个整数变大」而不是「过了多久」
+    ⇒ ⛔ 不构成时序断言（本机 16 ms 分辨率的坑在这里碰不到：谓词本身不依赖时钟）。
+    ⛔ 超时只当**死锁守卫**，且失败时会响亮地报出来。
+    """
+    waiter = threading.Event()
+    while not predicate():
+        if waiter.wait(timeout=min(0.05, timeout)):
+            return bool(predicate())
+        timeout -= 0.05
+        if timeout <= 0:
+            return False
+    return True
 
 
 class TheStreamThreadRecoversTests(unittest.TestCase):

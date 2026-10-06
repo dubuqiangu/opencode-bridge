@@ -28,7 +28,7 @@ from unittest import mock
 
 from opencode_bridge import __main__ as cli
 from opencode_bridge import health
-from opencode_bridge import subscription_status_view
+from opencode_bridge import subscription_health, subscription_status_view
 from opencode_bridge.adapters.base import Adapter
 from opencode_bridge.config import Config
 from opencode_bridge.core import BridgeCore
@@ -37,6 +37,7 @@ from opencode_bridge.state import StateStore
 from opencode_bridge.subscription_supervisor import (
     PHASE_ENDED_WITHOUT_STOP,
     PHASE_RECONNECTING,
+    PHASE_STREAMING,
     SubscriptionStatus,
 )
 
@@ -1031,7 +1032,13 @@ class TestStatusSectionReportsTheEventStream(_BridgeDirIsolated):
     def configured(self) -> Config:
         return Config(adapters={"telegram": {"bot_token": SHAPE_TOKEN}})
 
-    def render(self, cfg: Config, subscription_status) -> str:
+    def render(self, cfg: Config, subscription_status=None) -> str:
+        """跑一次 ``--status``。
+
+        ⚠️ ``subscription_status`` **默认不给** ⇒ 走的是 ``run_status`` 自己
+        「去盘上读那份运行期记录」那条默认路径 —— 那才是生产走的那条。
+        传进来只是**覆盖**它（用来钉「给定一份快照时那一段说什么」）。
+        """
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             cli.run_status(cfg, subscription_status=subscription_status)
@@ -1094,23 +1101,142 @@ class TestStatusSectionReportsTheEventStream(_BridgeDirIsolated):
             "「正在重连」报成「线程已经死了」⇒ 用户会去重启一个自己正在恢复的桥",
         )
 
-    def test_the_standalone_status_process_does_not_claim_the_stream_is_healthy(self):
-        """⚠️ ``--status`` 是**独立进程** ⇒ 今天的生产情形就是「拿不到快照」。
+    def test_the_standalone_status_process_reads_the_stream_status_off_the_disk(self):
+        """⭐⭐ **运行期通道的读侧整条链路**：真记录 → 真 ``--status`` → 真输出。
 
-        ⛔ 那种情形下这一段**不许**说正常（也不许编「订阅 0 次」出来）。
-        会红的条件：把 ``None`` 当成 ``idle`` 顺手当作「一切正常」。
+        ⚠️ **不传** ``subscription_status``（走的是 ``run_status`` 自己去盘上读那条
+        默认路径）⇒ 这条用例量的是「那条通道真的接上了」，而不是「传进去什么就显示
+        什么」—— 后者上一轮就钉过了，而它**绕过了整条跨进程链路**。
+
+        ⚠️ 会红的条件：从 :func:`opencode_bridge.subscription_health.read_subscription_status`
+        里去掉调用（那一段于是永远说「读不到」）。
         """
-        body = self.section(self.render(self.configured(), None))
-        self.assertIn(subscription_status_view.NO_LIVE_SNAPSHOT_TEXT, body)
+        recorder = subscription_health.SubscriptionHealthRecorder(self.bridge_dir)
+        recorder.note(
+            SubscriptionStatus(
+                phase=PHASE_RECONNECTING,
+                subscriptions_started=8,
+                reconnect_attempts=7,
+                frames_received=3,
+                last_error="OpenCodeError: event stream 503",
+            )
+        )
+
+        body = self.section(self.render(self.configured()))
+
+        self.assertIn(
+            subscription_status_view.RECONNECTING_CLAUSE, body,
+            "盘上明明有「正在重连」的记录，而 ``--status`` 说读不到 ⇒ "
+            "运行期通道的读侧没接上。",
+        )
+        self.assertNotIn(
+            subscription_status_view.STREAMING_CLAUSE, body,
+            "「正在重连」被显示成「订阅正常」",
+        )
+
+    def test_a_dead_thread_is_read_off_the_disk_as_needing_a_human(self):
+        """⭐⭐ 另一个方向：**线程已经死了**经由盘上那份记录被读到。
+
+        ⚠️ 只钉一个方向等于没钉 —— 这正是本缺陷的形状（两者原本分不开）。
+        """
+        recorder = subscription_health.SubscriptionHealthRecorder(self.bridge_dir)
+        recorder.note(
+            SubscriptionStatus(
+                phase=PHASE_ENDED_WITHOUT_STOP,
+                subscriptions_started=9,
+                reconnect_attempts=7,
+                frames_received=3,
+            )
+        )
+
+        body = self.section(self.render(self.configured()))
+
+        self.assertIn(
+            subscription_status_view.TERMINATED_CLAUSE, body,
+            "盘上明明有「线程已经结束了」的记录，而 ``--status`` 没说需要人管。",
+        )
         self.assertNotIn(subscription_status_view.STREAMING_CLAUSE, body)
+
+    def test_a_record_from_a_bridge_that_is_no_longer_running_is_not_shown(self):
+        """⭐⚠️ 挡一个**新造出来的**静默失效。
+
+        ⚠️ 桥崩了、盘上留着它最后一句「订阅正常」⇒ 若照样显示，用户会以为收得到回信。
+
+        会红的条件：从 :func:`read_subscription_status` 里去掉 pid 存活判据。
+        """
+        with io.open(
+            os.path.join(self.bridge_dir,
+                         subscription_health.SUBSCRIPTION_HEALTH_FILE_NAME),
+            "w", encoding="utf-8",
+        ) as handle:
+            json.dump({
+                "recorded_at": 1000.0,
+                "pid": _a_pid_that_is_not_running(),
+                "subscription": {"phase": PHASE_STREAMING},
+            }, handle)
+
+        body = self.section(self.render(self.configured()))
+
+        self.assertIn(subscription_status_view.NO_LIVE_SNAPSHOT_TEXT, body)
+        self.assertNotIn(
+            subscription_status_view.STREAMING_CLAUSE, body,
+            "写那份记录的桥早就不在了，而视图说「订阅正常，正在收事件」",
+        )
 
     def test_the_capability_table_and_this_section_do_not_borrow_each_other(self):
         """⚠️ **不是**去改 ``Adapter.capabilities()`` 的语义（⛔ 能力 ≠ 健康）——
         而这一段必须**明说**它答的是另一个问题，否则读者会把「表全绿」读成
         「事件流健康」。会红的条件：那句解释被删。
         """
-        body = self.section(self.render(self.configured(), None))
+        body = self.section(self.render(self.configured()))
         self.assertIn("能力与健康是两件事", body)
+
+
+def _a_pid_that_is_not_running() -> int:
+    """一个**确定不在**的 pid。
+
+    ⚠️ ⛔ 不写死一个数：写死的那个可能**恰好**是活着的 ⇒ 那条断言就恒绿了
+    （AGENTS.md §7.1：判据恒真比没有判据更危险）。
+    """
+    from opencode_bridge.instance_lock import pid_is_alive
+
+    for candidate in range(61_000, 61_400):
+        if not pid_is_alive(candidate):
+            return candidate
+    raise AssertionError("这一段 pid 区间里找不到一个确定已经退出的 pid。")
+
+
+class TheBridgeStartupInstallsTheSubscriptionChannel(_RunBridgeWithStubCore,
+                                                     _BridgeDirIsolated):
+    """⭐ 反「那条路径一条测试都不经过」：真实启动路径**真的**装上了那条通道。
+
+    ⚠️ 这类断言本仓库吃过亏（改完既有用例照样全绿、而新路径无人经过）。
+    ⇒ 这里走**真的** :func:`opencode_bridge.__main__.run_bridge`，只把网络、
+    适配器构造与 core 换成替身，然后问那个**进程级**的记录器在不在。
+
+    ⚠️ 会红的条件：把 ``install_subscription_health_recorder(...)`` 从
+    :func:`~opencode_bridge.__main__._run_bridge_locked` 里删掉。
+    """
+
+    def test_run_bridge_leaves_the_recorder_installed_for_that_bridge_directory(self):
+        subscription_health.install_subscription_health_recorder(None)
+        self.addCleanup(
+            subscription_health.install_subscription_health_recorder, None
+        )
+
+        self.run_bridge_reporting(
+            Config(adapters={"telegram": {"bot_token": SHAPE_TOKEN}}),
+            {},
+        )
+
+        installed = subscription_health.installed_subscription_health_recorder()
+        self.assertIsNotNone(
+            installed,
+            "真启动路径跑完了，而那条运行期通道**没有**装上 ⇒ "
+            "订阅状态永不落盘，`--status` 那一段永远说「读不到」，"
+            "而没有任何东西会报错。",
+        )
+        self.assertEqual(installed._bridge_dir, os.path.abspath(self.bridge_dir))
 
 
 if __name__ == "__main__":  # pragma: no cover

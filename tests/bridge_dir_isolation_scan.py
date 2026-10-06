@@ -55,19 +55,35 @@ import pathlib
 import re
 
 import opencode_bridge
-from opencode_bridge import health
+from opencode_bridge import health, subscription_health
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 
-#: 这两个文件名**不写死**：它们是 :mod:`opencode_bridge.health` 的契约常量，
-#: 那边改名的话这里必须跟着变 —— 写死字符串会让改名悄悄绕过这条护栏。
+#: 这几个文件名**不写死**：它们是 :mod:`opencode_bridge.health` 与
+#: :mod:`opencode_bridge.subscription_health` 的契约常量，那边改名的话这里必须跟着变
+#: —— 写死字符串会让改名悄悄绕过这条护栏。
+#:
+#: ⚠️ **三份**，不是两份（2026-10-08 加）：第三份是「/api/event 订阅线程此刻怎么样」
+#: 那条运行期通道，它与前两份同样落在 ``__bridge_dir`` 下。
 RUNTIME_ARTIFACT_NAMES = (
     health.PLATFORM_HEALTH_FILE_NAME,
     health.OUTBOUND_FAILURES_FILE_NAME,
+    subscription_health.SUBSCRIPTION_HEALTH_FILE_NAME,
 )
 
-#: 直接落盘的两个入口（名字取自 :data:`opencode_bridge.health.__all__`）。
-ARTIFACT_WRITING_CALLS = frozenset({"record_startup_probes", "OutboundFailureRecorder"})
+#: 直接落盘的那些入口（名字取自 :data:`opencode_bridge.health.__all__` 与
+#: :data:`opencode_bridge.subscription_health.__all__`）。
+#
+#: ⚠️ 装订阅那条通道的那两个名字**本身不落盘**（一个只 ``open``、一个只赋值），
+#: 而它们⛔ **必须**一起算进来 —— 一条用例只走「装配」那一路（像
+#: :class:`~tests.test_inbox_wiring.CliWiresTheInbox`）时**症状层抓不到**
+#: （没有观测就没有产物），而本层抓的正是那一路。
+ARTIFACT_WRITING_CALLS = frozenset({
+    "record_startup_probes",
+    "OutboundFailureRecorder",
+    "SubscriptionHealthRecorder",
+    "install_subscription_health_recorder",
+})
 
 #: 本仓库 CLI 模块在包内的**名字**（:mod:`opencode_bridge.__main__` 那个 ``__main__``）。
 #: ⚠️ 它只是**模块名**，不是导入时绑定的名字 —— 那件事由 :data:`CLI_MODULE_ALIAS` 管。

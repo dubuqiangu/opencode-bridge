@@ -40,6 +40,11 @@ from .pairing import empty_allowlist_is_open
 from .pairing_cli import run_pair
 from .redaction import install_redaction_filter
 from .state import StateStore
+from .subscription_health import (
+    SubscriptionHealthRecorder,
+    install_subscription_health_recorder,
+    read_subscription_status,
+)
 from .subscription_status_view import render_subscription_status
 from .subscription_supervisor import SubscriptionStatus
 
@@ -1055,15 +1060,18 @@ def run_status(
 ) -> int:
     """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。
 
-    ⚠️ ``subscription_status`` 是「事件流订阅」那一段的**唯一**输入，默认 ``None``
-    ⇔ 「本进程拿不到那条线程」。⚠️ **今天的生产情形正是 ``None``**：``--status`` 是
-    独立进程，而 :class:`~opencode_bridge.core.BridgeCore` 活在另一个进程里
-    ⇒ 它只拿得到**落盘**的东西。
-    ⇒ 拿得到就把它说成人话，拿不到就**明说拿不到**（⛔ 不许拿「没读到」当「正常」，
-    那正是本段要消灭的那类假话）—— 见
-    :mod:`opencode_bridge.subscription_status_view`。
+    ⚠️ ``subscription_status`` 是「事件流订阅」那一段的**直接**输入；
+    ``None``（默认）⇒ **从盘上那份记录读**
+    （:func:`~opencode_bridge.subscription_health.read_subscription_status`）。
+    给一份快照 ⇒ 覆盖盘上那份（进程内调用与测试用）。
+
+    ⚠️ **读不到不是正常**：写那份记录的进程已经不在了、或文件不存在/坏了
+    ⇒ 那一段会说「读不到」，⛔ 不说正常（见
+    :mod:`opencode_bridge.subscription_status_view`）。
     """
     bridge_dir = _bridge_dir()
+    if subscription_status is None:
+        subscription_status = read_subscription_status(bridge_dir)
     print("== opencode 服务 ==")
     try:
         endpoint = discover_endpoint(cfg.opencode_url, cfg.opencode_password)
@@ -1226,6 +1234,20 @@ def _run_bridge_locked(cfg: Config) -> int:
         )
     else:
         logger.info("写前收件箱：已启用（%s）", inbox_path)
+    # ⚠️ **装在 ``BridgeCore(...)`` 构造【之前】**（不是 ``start()`` 之前）：看护者是在
+    # :class:`~opencode_bridge.event_stream.EventStream` 的构造里建的，它当场把记录器
+    # 取成 ``on_status_change`` ⇒ 晚一步装上，那条通道整个不存在而**没有任何东西会
+    # 报错**。⛔ 装不上不许阻断启动（排障通道不该决定桥的生死）；退化行为就是
+    # 「不落盘」，而 ``--status`` 那一段会说「读不到」（⛔ 不是「正常」）。
+    try:
+        install_subscription_health_recorder(
+            SubscriptionHealthRecorder(_bridge_dir())
+        )
+    except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+        logger.warning(
+            "subscription-health: 记录器未装配（%s: %s）—— 不影响桥的订阅",
+            type(exc).__name__, exc,
+        )
     core = BridgeCore(cfg, client, state, inbox)
 
     usable = 0

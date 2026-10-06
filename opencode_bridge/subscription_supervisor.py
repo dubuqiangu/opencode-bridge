@@ -73,7 +73,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Optional
 
 __all__ = [
     "FIRST_RECONNECT_DELAY_SECONDS",
@@ -177,6 +177,13 @@ class SubscriptionSupervisor:
     :param first_delay: 第一次重试等几秒；``None`` 用
         :data:`FIRST_RECONNECT_DELAY_SECONDS`。
     :param max_delay: 退避上限；``None`` 用 :data:`MAX_RECONNECT_DELAY_SECONDS`。
+    :param on_status_change: 每写出一份**新**快照就调它（实参就是那份新快照）；
+        ``None`` = **没人观察**（测试、单进程工具）。
+
+        ⚠️ **它每帧都会被调一次**（:meth:`_drain_one_subscription` 每收到一帧就
+        ``frames_received + 1``）⇒ 所以⛔**「回调来了就落盘」会写爆磁盘**。
+        ⇒ 「值不值得写」是**调用方**的判据，本类一概不替它做 ——
+        见 :meth:`_announce_status_change` 的 docstring。
     """
 
     def __init__(
@@ -186,6 +193,7 @@ class SubscriptionSupervisor:
         on_frame: Callable[[Any], None],
         first_delay: float | None = None,
         max_delay: float | None = None,
+        on_status_change: Optional[Callable[[SubscriptionStatus], None]] = None,
     ) -> None:
         self._subscribe = subscribe
         self._on_frame = on_frame
@@ -193,6 +201,7 @@ class SubscriptionSupervisor:
             FIRST_RECONNECT_DELAY_SECONDS if first_delay is None else first_delay,
             MAX_RECONNECT_DELAY_SECONDS if max_delay is None else max_delay,
         )
+        self._on_status_change = on_status_change
         #: 退避等待与 :meth:`request_stop` 共用这一个事件 —— 于是"退避中"也能被立刻
         #: 打断（``Event.wait``，不是 ``sleep``）。
         self._stop = threading.Event()
@@ -221,6 +230,31 @@ class SubscriptionSupervisor:
         （新对象造好之后才做一次属性赋值）。
         """
         self._status = replace(self._status, **changes)
+        self._announce_status_change()
+
+    def _announce_status_change(self) -> None:
+        """把刚写出的那份新快照交给 :attr:`_on_status_change`。
+
+        ⛔⛔ **回调抛异常绝不许带走线程** —— 那正是本模块存在的唯一理由
+        （「线程不许死」）被一个观察者推翻。⇒ 兜住、记一行 ``debug``、继续。
+
+        ⚠️ **状态先写、日志后发**：这里在 :meth:`_update` 换掉 ``self._status``
+        **之后**才被调 ⇒ 回调读到的必然是**已经生效**的那一份，而不是半路的状态。
+
+        ⚠️ **本方法不做任何节流**：它对每一份新快照都调一次，包括**每帧**一次。
+        ⇒ 「这一次变化值不值得写进持久介质」是**调用方**的判据（磁盘压力的账在
+        调用方那边算，本类看不见它）⇒ 生产侧那条通道按**相位 / 重连次数**抖动，
+        见 :class:`opencode_bridge.subscription_health.SubscriptionHealthRecorder`。
+        """
+        observer = self._on_status_change
+        if observer is None:
+            return
+        try:
+            observer(self._status)
+        except Exception:  # noqa: BLE001 - 观察者不许决定订阅线程的生死
+            logger.debug(
+                "the subscription status observer raised (ignored)", exc_info=True
+            )
 
     # ------------------------------------------------------------------
     # 线程主体
@@ -259,9 +293,13 @@ class SubscriptionSupervisor:
                 continue
             self._update(
                 phase=PHASE_ENDED_WITHOUT_STOP,
-                frames_received=(
-                    self._status.frames_received + self._frames_this_subscription
-                ),
+                # ⛔⛔ **只改相位**：``frames_received`` 已经在
+                # :meth:`_drain_one_subscription` 里**逐帧**加过了。
+                # ⚠️ 此前这里**又**加了一遍 ``_frames_this_subscription``
+                # （落库时就带着，实测：一次收到 1 帧的订阅收工后报成 2 帧）
+                # ⇒ 双重计数。它一直没人看见，是因为那个数**只有 ``--status``
+                # 的运行期通道**会显示它，而那一段当时根本不存在。
+                # ⇒ 「没人断言过」不是「它是对的」。
             )
             logger.warning(
                 "event subscription ended on its own (%d frame(s) in it); "

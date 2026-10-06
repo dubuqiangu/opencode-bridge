@@ -313,6 +313,29 @@ class TestNoNewThread(unittest.TestCase):
 
         这是"根本没有新线程"的**另一半**：不 park 的实现（``time.sleep``）会让
         ``stop()`` 白等满一整档，生产里那就是关桥时多等一分钟。
+
+        ✅ **本条是 A 类（合法地测墙钟），余量的算法写在这里**（⛔ 不是 15 倍）：
+
+        ⚠️ **初判说的「退避 30 s 而断言 < 2 s ⇒ 15 倍余量」那个算术不成立。**
+        失败态的耗时上界**不是退避档位**，而是
+        :meth:`~opencode_bridge.transport.base.Transport.stop` 里那次
+        ``thread.join(timeout=5.0)`` —— park 退化成 ``time.sleep(30.0)`` 时，
+        ``stop()`` 会在 **join 超时 5.0 s** 处返回（线程随后自然退出），等不到 30 s。
+        ⇒ **真正的余量 = 失败态耗时 ÷ 断言带宽 = 5.0 / 2.0 = 2.5×**，比 15× 紧一个数量级。
+
+        实测（`.tmp/fix-timing-census/probe_a_class_margin.py`，本机）：
+        现状 12 次 ``elapsed`` 全为 **0.0000 s**（正常态余量 ≈ 无上限）；
+        把 park 换成 ``time.sleep`` 后 3 次为 **5.00 ~ 5.02 s**（失败态余量 **2.5×**）
+        ⇒ 两个方向都分得开，判据有辨别力。
+
+        ⛔ **为什么这一条不许改成假时钟**：它守的就是「``stop()`` 必须在有界时间内
+        打断一次**真**的等待」这件事 —— 换成假时钟会把要守的东西一起拿掉
+        （AGENTS.md §8：治根因）。⇒ 处置是**保留墙钟断言 + 把余量算法写下来**，
+        而不是把它删掉或换成同步点。
+
+        下一条
+        :meth:`TestProbeLadder.test_retries_land_on_the_laddered_moments_not_merely_repeated`
+        是同一族里**可以**换成同步点的那一条（它守的是「阶梯是哪几档」，那是纯函数输出）。
         """
         adapter = make_adapter()
         adapter.credential_probe_initial_backoff = 30.0   # 故意设很大
@@ -327,7 +350,8 @@ class TestNoNewThread(unittest.TestCase):
         adapter.stop()
         self.assertLess(
             time.monotonic() - began, 2.0,
-            "stop() 必须立刻打断阶梯等待（不许退化成 time.sleep）",
+            "stop() 必须立刻打断阶梯等待（不许退化成 time.sleep）—— "
+            f"实测耗时 {time.monotonic() - began:.2f}s；失败态会落在 join 超时 5.0s 那一档",
         )
         self.assertFalse(adapter.running)
 

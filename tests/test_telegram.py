@@ -66,6 +66,47 @@ def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
     return bool(predicate())
 
 
+#: 记账用例里把节流档位缩放到这个值。**只**缩这一个旋钮，且理由是
+#: 「可打断性与档位大小无关，而离散判据要能区分『等满』与『被唤醒』，
+#: 档位就必须远大于本机 16 ms 的时钟分辨率」（见
+#: :meth:`TestTelegramMigrationInvariants.test_stop_interrupts_the_empty_round_pacing`）。
+PACING_LEDGER_SECONDS = 30.0
+
+
+class RecordingWaitEvent(threading.Event):
+    """一个**记账版**的 ``_stop_event``：记下每次 ``wait()`` 的请求与结局。
+
+    ⛔ **为什么记「被请求的秒数 + 是否被置位唤醒」，而不是「实测量」**：
+    ``Event.wait(x)`` 的 ``x`` 是生产侧那个等待的**入参**（纯函数输出），
+    而**实测量**在机器有负载时会被调度放大（本机实测一次 ``wait(0.2)``
+    在全量并发下回来是 1.25s，差 6 倍）⇒ 任何「观察到的间隔要落在某个区间里」
+    的判据在负载下必然时红时绿。**逐项等值 / 离散布尔断言对机器负载免疫**
+    （AGENTS.md §7.1：时序判据只能用同步点，⛔ 不要拿计时当时序断言）。
+
+    ⚠️ **必须先记账、再转交真正的等待**（与
+    ``tests/test_telegram_credential_gate.py::RecordingStopEvent`` 同一条纪律）：
+    在 ``super().wait()`` **返回之后**才记账的话，**正在 park 的那一次看不见**
+    ⇒ 而「park 正在发生」正是调用方要等的同步点 ⇒ 那样写会让同步点永远等不到。
+
+    ⚠️ 它是 ``threading.Event`` 的**子类**而不是代理：``set()`` / ``clear()`` /
+    ``is_set()`` 全部照原样可用 ⇒ **``stop()`` 仍然立刻能打断节流等待**；
+    换成只实现 ``wait`` 的代理就会把它悄悄弄坏。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: ``(被请求的秒数, 返回时是否是被 set() 唤醒的)``，按请求先后排列。
+        #: 第二列在等待**进行中**时是 ``None``（已记账、结局未写）。
+        self.requested_waits: list[tuple[float, bool | None]] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """先记账，再**原样**转交真正的等待（返回值语义一个字没变）。"""
+        self.requested_waits.append((timeout, None))       # 先记「请求了」
+        released = super().wait(timeout)
+        self.requested_waits[-1] = (timeout, released)     # 再补「是否被唤醒」
+        return released
+
+
 class RecordingHooks:
     """Minimal ``Hooks`` implementation that records every call."""
 
@@ -427,22 +468,63 @@ class TestTelegramMigrationInvariants(unittest.TestCase):
         self.assertFalse(adapter.running)
 
     def test_stop_interrupts_the_empty_round_pacing(self):
-        """空轮的 0.05s 节流也必须可被打断（迁移前是 ``Event.wait``，不是 sleep）。"""
+        """空轮的节流也必须可被打断（迁移前是 ``Event.wait``，不是 sleep）。
+
+        ⛔ **判据是「park 真的发生过、且是被 ``stop()`` 释放的」这个离散事实**，
+        ⛔ **不是**「``stop()`` 耗时 < 某个数」：
+
+        ⚠️ **原形态是恒真的**（实测：把 park 换成 ``time.sleep`` 它照样绿）。
+        原因是算术：被 park 的那一档是 :data:`EMPTY_ROUND_INTERVAL` = **0.05s**，
+        而原断言带宽是 **2.0s** —— **40 倍**。park 就算**整个等满**也只花 0.05s
+        ⇒ 「等满」与「被立刻唤醒」在墙钟上根本分不开。而本机
+        ``time.monotonic()`` 的分辨率是 16 ms（连采 20 万次只有 2 个不同值），
+        与 0.05s 同量级 ⇒ 任何 0.05s 附近的时刻判据都是掷硬币。
+        ⇒ 修法是**换同步点 + 换离散记账**（AGENTS.md §8：治根因，不治症状），
+        ⛔ **不是**把带宽调大 —— 调到 30s 只能抓住「join 超时」，
+        而抓不住「park 退化成 sleep」这个本用例点名要防的缺陷。
+
+        ⇒ 因此把节流档位缩放到 :data:`PACING_LEDGER_SECONDS`：可打断性与档位大小
+        **无关**，而记账判据要能区分「等满」与「被唤醒」，档位就必须远大于分辨率。
+        """
         adapter, _ = make_telegram()
-        seen: list[float] = []
+        ledger = RecordingWaitEvent()
+        inner_make_transport = adapter._make_transport
+
+        def make_transport_with_recorded_pacing():
+            transport = inner_make_transport()
+            transport._idle_sleep = PACING_LEDGER_SECONDS
+            transport._stop_event = ledger      # 换掉的是「谁在看等待」，不是「谁能打断它」
+            return transport
+
+        adapter._make_transport = make_transport_with_recorded_pacing
         script_transport(
             adapter,
             get_me=lambda: {"ok": True, "result": {"id": 1}},
-            get_updates=lambda off: (seen.append(time.monotonic()) or
-                                     {"ok": True, "result": []}),
+            get_updates=lambda off: {"ok": True, "result": []},   # 永远空轮 ⇒ 一直走节流
         )
         adapter.start()
         self.addCleanup(adapter.stop)
-        self.assertTrue(wait_until(lambda: len(seen) >= 2))
-        began = time.monotonic()
+
+        # 下面这条**只是死锁守卫**（park 从不发生时要 fail 得响亮），⛔ 不是时刻判据：
+        # 它回答「节流真的 park 过吗」，「是不是被 stop() 打断的」由后面那条回答。
+        self.assertTrue(
+            wait_until(lambda: len(ledger.requested_waits) >= 1, timeout=5.0),
+            f"空轮节流必须真的 park 过。实际记账：{ledger.requested_waits!r}",
+        )
         adapter.stop()
-        # 上界给得宽松（Windows 定时器分辨率差），只为抓住"退化成 sleep / join 超时"
-        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual(
+            [seconds for seconds, _released in ledger.requested_waits],
+            [PACING_LEDGER_SECONDS],
+            f"节流必须逐项等于 :data:`PACING_LEDGER_SECONDS`（实际记账："
+            f"{ledger.requested_waits!r}）",
+        )
+        self.assertEqual(
+            [released for _seconds, released in ledger.requested_waits],
+            [True],
+            "⛔ park 必须是被 stop() 唤醒的（``wait`` 返回 True），不是自己等满的档位 —— "
+            "退化成 ``time.sleep`` 时这里会是 False 或干脆没有这次记账。"
+            f"实际记账：{ledger.requested_waits!r}",
+        )
         self.assertFalse(adapter.running)
 
     def test_stop_during_inflight_get_updates_does_not_leak_the_thread(self):

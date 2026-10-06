@@ -419,7 +419,18 @@ class TestWebSocketTransport(TransportTestCase):
         self.assertEqual(ws_transport.stats()["connects"], 1)   # 连接没被换掉
 
     def test_reconnect_now_skips_backoff(self):
-        """on_message 抛 ReconnectNow → 立刻重连（min_backoff=5s 也无所谓）。"""
+        """on_message 抛 ReconnectNow → 立刻重连（min_backoff=5s 也无所谓）。
+
+        ⛔ **判据是「5 次连接在 3s 内发生」这一个事实，由 ``wait_until`` 的
+        ``timeout`` 承担**；⛔ 这里原来还有一条 ``assertLess(monotonic()-started, 3.0)``，
+        已删除 —— 它与紧邻的 ``wait_until(timeout=3.0)`` **同值同源**，
+        所以能红的唯一路径是「``wait_until`` 恰好在边界那一圈返回 True」（竞态），
+        ⛔ **不是**「ReconnectNow 没生效」这个被测行为。
+        实测（12 次）：``elapsed`` 恒为 0.000s，而把**被测行为**改坏
+        （``on_message`` 不抛 ReconnectNow ⇒ 每轮等满 ``min_backoff=5.0s``）时
+        ``wait_until`` 自己就超时返回 False ⇒ **辨别力全部来自 wait_until**。
+        ⇒ 删掉的是**重复表达**，不是判据（AGENTS.md §9：恒真的断言比没有断言更危险）。
+        """
         made: list[FakeWs] = []
 
         def connect():
@@ -435,9 +446,11 @@ class TestWebSocketTransport(TransportTestCase):
             name=uniq_name("ws"),
         )
         self.start_transport(ws_transport)
-        started = time.monotonic()
-        self.assertTrue(wait_until(lambda: len(made) >= 5, timeout=3.0))
-        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertTrue(
+            wait_until(lambda: len(made) >= 5, timeout=3.0),
+            f"ReconnectNow 必须跳过 5.0s 的退避（5 次连接 3s 内就该发生）。"
+            f"实际只连上 {len(made)} 次：{ws_transport.stats()}",
+        )
         self.assertGreaterEqual(ws_transport.stats()["sessions"], 4)
 
     def test_close_code_from_peer_is_reported(self):

@@ -270,6 +270,8 @@ class TestTheArtifactNamesAreNotHardCodedAnywhere(unittest.TestCase):
         pathlib.Path(__file__).resolve(),
         TESTS_DIR / "bridge_dir_isolation_scan.py",
         TESTS_DIR / "test_artifact_isolation_defect_regressions.py",
+        TESTS_DIR / "test_cli_module_alias_guard_reporting_regressions.py",
+        TESTS_DIR / "test_cli_module_alias_guard_stays_quiet_regressions.py",
         TESTS_DIR / "test_repository_root_artifacts.py",
     )
 

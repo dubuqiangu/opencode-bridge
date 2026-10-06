@@ -579,7 +579,7 @@ def _dynamic_import_of_cli_module_violations(tree: ast.AST, filename: str) -> li
     ``'opencode_bridge.' + '__main__'`` / ``'opencode_bridge.%s' % '__main__'`` 拼得出
     全名，而 ``f'opencode_bridge.__main__'`` 在没有占位符时也解析成 ``JoinedStr`` ——
     这几种都要算命中（用例见 :attr:`DYNAMIC_MODULE_NAME_VARIANTS
-    <tests.test_artifact_isolation_defect_regressions.TestTheCliModuleAliasGuardSeesEverySecondaryPath.DYNAMIC_MODULE_NAME_VARIANTS>`）。
+    <tests.test_cli_module_alias_guard_reporting_regressions.TestTheCliModuleAliasGuardSeesEverySecondaryPath.DYNAMIC_MODULE_NAME_VARIANTS>`）。
 
     ⛔ 静态**拼不出来**的那些（``f'opencode_bridge.{name}'`` / ``... % platform`` /
     ``import_module(常量名)``）一律**不报** —— 本仓库

@@ -32,6 +32,78 @@
 > `email.py:814/913/958`、`telegram.py:492`）指向了不存在的行或已漂移的行。
 > 引用本文件的行号前**先确认它还成立**；本轮实测的行号都在订正段里标了实测日期。
 
+### ⚠️⚠️ 第二次发作（2026-10-06）：**🔴 标记改完不消**，而它这次造成了实际损失
+
+2026-10-05 那次清的是 `☐`/`◐`/`✅`。**这次是 `🔴`**：
+`🔴` 写在**标题**里，而标题在缺陷修好之后**不会自己变** ⇒ 标题继续声称「这条还开着」。
+
+⇒ **代价（实测，不是假设）**：我在做任务梳理时把
+`:1854` 那条「**从偶发泄露升级为系统性泄露**」当成本轮**最危未修项**排进了计划，
+并准备派整条 lane 去修。**它早已闭合**：
+
+- 5 家 `_drop_inbound`（discord / homeassistant / mattermost / nextcloud / qqbot）
+  **全部**已走 `redactable_id`，38 个调用点靠「修封装那一层」一次覆盖；
+- 而 `:819-839` 的 docstring 把「为什么必须脱敏」「为什么补前缀后仍可跨行关联」
+  写得很完整；
+- 还有一道**专属护栏**：`test_no_rejection_log_takes_a_bare_id`
+  （`tests/test_inbound_log_structure.py`）。
+
+⚠️ 我差点派出去的，是一个**几天前就修完的凭据级泄露**（nextcloud 那条记的是
+OCS room token + actor，而 room token 是**能进 URL 的那一种**）。
+
+### ⛔ 我自己写错的一条判据：「看护栏的测试名」**不成立**
+
+⚠️ **本节前半段曾是这么写的**：「标记不可信时唯一能定案的办法是回到代码找那道护栏，
+而**测试名是对『这道护栏到底在验什么』的自我陈述**，比通读断言便宜得多」。
+
+⇒ **这句话被当天自己的执行者证伪了**（`fix-271` 逐条读断言体 + 做变异实测后）：
+
+| 我指的那道「护栏」 | 实际断言的是 | 判定 |
+|---|---|---|
+| `test_no_adapter_message_mentions_every_platform_credential`（我给 `:3745`）| 只有一句「`NO_ADAPTER_MESSAGE` 的文案提到每家的凭据键名」 | ❌ **与该缺陷毫无关系** |
+| `test_a_topic_that_is_pure_chinese_is_digested_whole`（我给 `:3824`）| `scrub("ntfy:我的话题")` 整条摘要 —— 而**修复前它也绿**（没有尾注，本来就被整条吞）| ❌ **反向闸 + 恒绿** |
+| `test_drop_reason_only_quotes_declared_safe_values`（我给 `:4063`）| 钉 `_drop_inbound` 的 `reason` 形参 | ❌ **无关**，而 `:4063` **压根没有对口护栏** |
+
+⇒ **6 条里我只有 3 条指对了。**
+
+**⇒ 正确的判据（三级，按代价递增）：**
+
+1. **测试名只能用来【定位候选】**，⛔ 不能用来判定 —— 名字会**同名不同义**，
+   也会**在缺陷修复前就绿**（反向闸）。
+2. **判定必须读断言体**：它断言的**那个值**是不是就是缺陷里的那个值？
+3. **金标准是变异实测**：把被验物**改回缺陷形态**，护栏必须红。
+   `fix-271` 对 3 条做了（裸 id 回退 / 撤掉 CJK 排除集 / 恢复修复前名单）——
+   这也是今天唯一一次**证明护栏不是空转**的做法。
+   （我今天也栽过一道空护栏：`test_short_circuiting_the_persist_step_makes_that_signal_vanish`
+   钉的是记录器自身，真实接线零覆盖。）
+
+⇒ **订正后的对照表**（护栏名以逐条核实后的为准，`fix-271` 写的）：
+
+| 台账标记 | 缺陷 | 对口护栏（**核实过**） |
+|---|---|---|
+| `:1854` | 裸 id 进日志（凭据级）| `test_no_rejection_log_takes_a_bare_id` ✅ |
+| `:3824` | 脱敏吞掉 id 紧跟的中文尾注 | `test_redaction_cjk_tail.py::test_the_tail_note_survives_verbatim`（逐字节等式）✅ |
+| `:4312` | `config_optional` 前提过期 | `test_all_three_call_sites_actually_call_the_verdict`（**数调用次数**）✅ |
+| `:3745` | CLI 缺陷（doc 与行为对不上）| **`tests/test_cli_config_view.py`**（端到端真跑 + `json.loads`）✅ |
+| `:1844` | 凭据形状的键名进读取器 | `test_no_credential_shaped_key_reaches_a_config_reader` + **阳性对照** ✅ |
+| `:4063` | 文档-代码交叉核对 | ⛔ **没有对口护栏**（文档改动无测试）⇒ 只能人复核 + `git diff --numstat` |
+
+⇒ 结论不变：**5 条已闭合、`:4063` 部分闭合**，而**标题仍是 🔴** ⇒ **标记是假的**。
+
+### ⛔ 两条不能省的判据（今天各栽过一次）
+
+1. **「有护栏测试」⛔ 不等于「缺陷已修」。**
+   今天抓到一道**空护栏**：`test_short_circuiting_the_persist_step_makes_that_signal_vanish`
+   名字上像在钉「记录器真的装上了吗」，实际钉的是**记录器自身**那一层，
+   而真正的接线**零覆盖** ⇒ 把 `__main__.py` 那行删掉，37 条用例全绿。
+   ⇒ **判据是「改了被验物，护栏会不会红」**，不是「护栏文件在不在」。
+
+2. **⚠️ 关闭一个 🔴 时，必须同时改标记。**
+   不改的后果**不是「标记不准」这么轻** —— 它会让下一个人（或下一次的我）
+   把已经修好的东西**重新排进计划**，而重新做一遍已完成的修法，
+   在这个项目里恰好是最贵的一种浪费（要重跑全量、要重测、要重新验证）。
+   ⇒ **关闭动作 = 改代码 + 改标记**，缺一不可。
+
 ## 实现铁律：先查参考项目，不要靠推测（用户定，2026-10-03）
 
 > **能抄就抄，能借鉴就直接复刻，不要重复造轮子、从头踩坑。**
@@ -1846,6 +1918,20 @@ adapters/telegram.py:327     self._pending.clear()
   `capabilities … chat.max-length %r`。**后两条会把 conversation_id / handle 整个打出来**
   ⇒ **同类问题、不同位置**。单列，不混进上面两笔。
 
+  > ✅ **已闭合（2026-10-06 核实）**：这 5 处 `%r` **不是靠改代码关掉的** ——
+  > 本文件「`ac0499b` 记的『nextcloud 另有 5 处 `%r`』需要**撤销并重判**」那一节已按 AST
+  > 逐处裁定：`bad conversation_id %r` / `bad handle %r`（**仍在源码里，且是有意的** ——
+  > 它们记的就是**被拒的畸形值**，套 `redactable_id()` 会既误标成 `conv#`、又毁掉唯一能修掉
+  > 它的信息）、`capabilities … chat.max-length %r`（记的是服务端返回值）、`bind_host=%r`
+  > （已查清关闭）—— **一处都不是缺陷**；唯一真实的隐患是「凭据形状的键名被喂进会 `%r`
+  > 的类型化读取器」，它现在被**机械强制**——
+  > 护栏 `test_no_credential_shaped_key_reaches_a_config_reader`
+  > （`tests/test_config_reader_no_credential_key.py`，判据做在**调用侧**，四个签名形态全
+  > 覆盖）；活性对照 `test_a_credential_shaped_key_at_a_shared_call_site_is_caught`
+  > （合成的 `coerce_int(config, "bot_token", 0)` **必须**被抓到，否则主断言绿着而判据已死）、
+  > 反向对照 `test_a_benign_key_at_a_shared_call_site_is_not_flagged`（`imap_port` 不许被报）。
+  > ⚠️ 标题上的 🔴 是**改完没消**的标记，不是当前状态 —— 而那两处 `%r` 仍在源码里，是**有意**的。
+
   📌 **`email.py:948/943` 仍未处理**（唯一剩下的那笔）：记的是**用户自己写的邮件主题**
   与第三方 `Message-ID`（`<localpart@domain>` 形态，与本仓库邮箱规则半重叠）。
   **它不属于任何「拒绝时记裸 id」的定义** —— 要不要改取决于「主题算不算用户隐私」，
@@ -1871,6 +1957,19 @@ adapters/telegram.py:327     self._pending.clear()
   ⚠️ **可运维性不丢**：`conversation_id` 被 C2 洗成 `platform:conv#<摘要>`，
   而 C2 的设计意图**正是**让被脱敏的行仍能跨行关联到同一会话 ⇒
   换过去**两样都成立**（隐私 + 可关联），不是拿可运维性换隐私。
+
+> ✅ **已闭合（2026-10-06 核实）**：5 家自有 `_drop_inbound` 的平台（discord /
+> homeassistant / mattermost / nextcloud / qqbot）**全部**把 id 实参改走
+> `redactable_id`，实测 **38 个调用点**靠「修封装那一层」一次覆盖 ⇒ 本条点名的
+> nextcloud OCS room `token` + `actorId`（**凭据级**、能进 `/call/<token>` 的那一种）
+> 就在这一层里；真实代码里那 5 个 `_drop_inbound` **各只剩一行**日志，实参是 `reason` +
+> `redactable_id(...)`（逐个用 AST 取过，不是读名字）——
+> 护栏 `test_no_rejection_log_takes_a_bare_id`（`tests/test_inbound_log_structure.py`）：
+> 它判的是**数据流**（实参有没有过 `redactable_id`），给变量改名骗不过；
+> ⚠️ 变异实测（把 nextcloud 那两个 `redactable_id(...)` 换回裸 `token`/`actor`）⇒
+> offenders 立刻变成 `['token', 'actor']`，**不是空护栏**；另有
+> `test_the_harness_actually_found_something_to_judge` 先证明 13 个平台各自都找到了
+> 调用点（空集 ≠ 不存在）。⚠️ 标题上的 🔴 是**改完没消**的标记，不是当前状态。
 
 - **装好之后再挂的 handler 不会被覆盖** —— 原文照录于
   `redaction.py:531-534`（`:531`「⚠️ 未知文本边界：**之后**再挂的 handler 不会被
@@ -3744,6 +3843,23 @@ app_token · access_token · token ×4 …）⇒ **全部在读取器之外**，
 
 ## 🔴🔴 实测确认两个 CLI 缺陷（doc 与行为对不上，用户会踩）
 
+> ✅ **已闭合（2026-10-06 核实）**：① `--setup --json` 的 `platforms[].capabilities`
+> 现在真的透出 `capabilities()`（**只在已配置时**构造适配器）⇒ 三处文档让用户去读的
+> `inbound_accepts_anything` 从此读得到；② `Config.load` 把**实际加载**的那个文件记在
+> `cfg.source_path` 上，`_config_file_in_use` 改读它（不再自己重写一遍 env/cwd 搜索链）
+> ⇒ 传 `--config <X> --setup --json` 报的与加载的同一个文件 ——
+> 护栏 `test_setup_json_output_contains_the_field` +
+> `test_it_prefers_the_recorded_path_over_the_cwd_search`
+> （`tests/test_cli_config_view.py`）：**端到端**真跑一次 `run_setup(cfg, "", True)` 并
+> `json.loads` 它的输出，断言 `payload["config_path"] == cfg.source_path` 且
+> `platforms[homeassistant].capabilities.inbound_accepts_anything` 在场；
+> `test_the_signal_actually_distinguishes_the_two_failure_modes` 另钉它**真的**区分
+> 「收得到 / 收不到」，而不是「字段存在」（两个配置的 `inbound_ready` 都是 `True`）。
+> ⚠️ **与文件开头那张表的出入**：`tests/test_cli.py` 那 26 条（含
+> `test_no_adapter_message_mentions_every_platform_credential`）**不**是这两条的护栏 ——
+> 那条只断言 `NO_ADAPTER_MESSAGE` 的文案提到每家的凭据键名，与两条 CLI 缺陷无关。
+> ⚠️ 标题上的 🔴 是**改完没消**的标记，不是当前状态。
+
 ### ① 三处文档让用户去读一个**任何 CLI 路径都不输出**的字段
 
 ```
@@ -3822,6 +3938,24 @@ docs/install.md:411  判据是 `--status --json` 里的 `inbound_accepts_anythin
 ④ `tests/test_platform_pairing.py` **一个字都不许动**（上一笔刚改过它一条夹具）。
 
 ## 🔴🔴 生产缺陷：脱敏规则会**吞掉 id 紧跟的中文尾注**（2026-10-05 实测）
+
+> ✅ **已闭合（2026-10-06 核实）**：`redaction.py` 把 9 段全角 / CJK 标点码位区间
+> （`_CJK_PUNCTUATION_RANGES`，`U+2018-2019` … `U+FF5B-FF65`）并进
+> `_CONVERSATION_ID_PATTERN` 的 local-id 排除集 ⇒ 紧跟 id 的全角尾注不再被一起摘要，
+> 「半吞」那一类也修好（`a2a:local:127.0.0.1（来源 peer）` 现在产出
+> `a2a:conv#<摘要>（来源 peer）` 整条，而不是 `… peer）`）——
+> 护栏 `test_the_tail_note_survives_verbatim` + `test_the_whole_parenthetical_survives`
+> （`tests/test_redaction_cjk_tail.py`）：21 条尾注形态**逐字节**等于
+> 「平台 + `conv#<6 位>-<6 位>` + 尾注」，半角形态另有回归闸不许被这次改动动到；
+> `test_every_template_character_survives_scrubging`
+> （`tests/test_redaction_cjk_exclusion_set.py`）再把仓库里 ≥20 个「实参是平台前缀 id」
+> 的日志调用点的**模板字符逐个守恒**（含本节点名的 `（可能重复投递）`）。
+> ⚠️ 变异实测（按 `redaction.py` 的拼法**重建修复前规则**、只撤掉排除集）⇒ 尾注表
+> **19/21 红**，`a2a` 那条产出 `a2a:conv#… peer）`。
+> ⚠️ **与文件开头那张表的出入**：`test_a_topic_that_is_pure_chinese_is_digested_whole`
+> （`tests/test_redaction_cjk_id_integrity.py`）**不是**本条的护栏 —— 它钉的是**反向闸**
+> （不许把真含 CJK 的 id 切碎），实测在**修复前也绿**（`ntfy:我的话题` 本来就被整条摘要）。
+> ⚠️ 标题上的 🔴 是**改完没消**的标记，不是当前状态。
 
 **严重度高于同批的测试顺序依赖**：那个只烦开发者，**这个伤生产日志的可观测性**。
 
@@ -4061,6 +4195,30 @@ qqbot.py:1063        homeassistant.py:1047
 ---
 
 ## 🔴 配置键的文档-代码交叉核对（`exp-89`）：**8 条「文档说错了」+ 10 条「该写没写」**
+
+> ⚠️ **部分闭合（2026-10-06 核实）——⛔ 不要把这一条整条当已闭合**：
+> **A 类** 8 条里 **7 条真实存在**（D6 经复核**不成立**）已全部改完，README 现读可查：
+> `bind_port`「必填、无默认值」+「别照抄 0」、`a2a.max_turns`「默认 5 / 硬顶 20 / 超顶下调告警」、
+> 死键 `homeassistant.poll_interval` 已从 6 表**消失**、`adapters.twitch.nick` 已收录 +
+> 「两个都不配会无限重连」、`/setup` 排除的 10 个平台**列全**、`a2a.bind_host` 的凭据条件
+> 含 `peer_tokens`、Slack 那句改成「**默认不 @ 也会响应**」；
+> **B 类**里 N1 / N2 / N3 / N4 / N5 / N7 / N8 / N10 随同一批落地
+> （N4 那两个键的真实行为由 `32516d6` 的共享助手兑现，README 写的是「回落 + 告警」）。
+> **⛔ 这一条没有任何机械护栏**：全仓库只有两处测试读 `README.md`，都不碰配置键；
+> 它的「已闭合」依据是本文件那一节里**人**逐条复核 + `git diff --numstat` 的数字。
+
+> ⚠️ **2026-10-06 核实未果（本条还有三件没闭合 / 核不实）**：
+> ① **N6 在本文件里从未被列出** —— 全文扫 `N1`…`N10`，只有 `N6` **一次都没出现** ⇒
+> 「10 条该写没写」里有一条**连内容都没有记录**，我无从核实它改没改，不替它背书；
+> ② N9（`config.example.json` 只有 3 个平台）**不在** `fix-184` 的逐条复核表里 ——
+> 我只能报**事实现状**：模板现在**13 个平台**、每个都带上了自己的凭据键（实测列出），
+> 但台账没有一条记录说这是谁改的；
+> ③ 「指导分散在 4 个文件、彼此会再次不一致」这个**结构性**成因没有任何东西在守。
+> ⚠️ 另外：文件开头那张表把 `test_drop_reason_only_quotes_declared_safe_values`
+> （`tests/test_inbound_log_structure.py`）列为本条的对口护栏 —— **与事实不符**：
+> 那道断言钉的是 `_drop_inbound` 的 `reason` 形参只许插值申报过的那几项，
+> 与配置键的文档核对毫无关系。
+> ⚠️ 标题上的 🔴 在「A 类 7 条 + B 类 8 条已改」这一半上是**改完没消**的标记，不是当前状态。
 
 **来源**：`exp-89`（explorer，只读）。键的「代码侧清单」取自 `exp-82`，
 `exp-89` 只核了文档侧。我**独立复核了承重的四条，全部成立**。
@@ -4310,6 +4468,21 @@ docstring 明写「⛔ 不许对着实现算一遍期望集合 —— 那恒真�
 ---
 
 ## 🔴 `config_optional` 是一个**前提已过期**的声明，被 4 处无条件信任（`fix-191` 撞出来的）
+
+> ✅ **已闭合（2026-10-06 核实）**：`config_optional` 现在只承担**分类**
+> （「我是没有凭据可填的那一类」），「这份配置此刻能不能跑」改由
+> `Adapter.config_runnable` 作答 —— `A2aAdapter` 如实覆写成「`bind_port` 强制成 int 后
+> `>= 0`」，空串 ⇒ `UNCONFIGURED_PORT`（-1）⇒ 说**不能跑**（`0` 仍算能跑，那条测试用法
+> 没被弄坏）；而 `__main` 的**三处**判定（`_has_configured_adapter` /
+> `_platform_status` / `_channel_config_rows`）**全部**改问唯一入口
+> `_readiness_verdict`，`base.capabilities()` 那个机器可读面也还在 ——
+> 护栏 `test_all_three_call_sites_actually_call_the_verdict`
+> （`tests/test_config_runnable_verdict.py`）**数调用次数**（三个视图各 +1）而不是
+> 比对答案 ⇒「只改一处」必红（注释里写明：a2a 那两条路在 `bind_port` 填对时同向，
+> 比对答案的写法恒真）；`test_a_truthy_declaration_alone_does_not_make_a_platform_configured`
+> 钉住「属性为真、判定说否 ⇒ 预检 / 状态行 / 闸门行**三处**都得说否」，
+> `test_returning_none_means_abstain_not_refusing` 另钉 `None` 态不被压成 `False`。
+> ⚠️ 标题上的 🔴 是**改完没消**的标记，不是当前状态。
 
 ### 现象（实测，非推断）
 

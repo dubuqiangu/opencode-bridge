@@ -155,6 +155,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >    **去日志搜**：`telegram: getMe failed` —— ⚠️ 它有**两种形态，两个都要认**：
 >    - `telegram: getMe failed (code=401): ...; adapter not started` —— token 被 Telegram **拒绝**（无效 / 已吊销）。
 >    - `telegram: getMe failed (<异常文字>); adapter not started` —— **压根没连上**（网络被墙、代理没配、DNS 不通）。**这一条里没有 `code=`**，只按 `code=` 去搜会**什么都搜不到**。
+>    **不用翻日志也能看到这条结论**：`--status` 的「上次启动时的探测结论」段与 `--setup --json` 的 `last_start_probe` 带着同一句话（Telegram 的 `code=401` 也在里面）。⚠️ 它记的是**上一次启动尝试**那一刻的结果：桥**拒绝启动**（配置里没有任何可用适配器）时那里会写成「**桥未启动**」并写明是哪个平台、为什么，**不会**留下一条上一轮的好消息让你以为现在还是好的。
 >    **处理**：回 **@BotFather** 重新 `/newbot` 拿一枚 token，逐字复制（别连空格/换行一起复制）填进 `config.json`，再 `opencode service restart`。
 > 2. **同一个 bot token 有第二个 `getUpdates` 消费者** —— 你自己写的脚本、另一个 bot 程序，或上一个实例没退干净。Telegram 对"同一 bot 有两个长轮询消费者"返回 **409**，桥会**恒定每 2 秒**重试一次，日志因此反复刷同一行。**症状同样是静默**：消息被那个第二消费者吃掉了。
 >    **去日志搜**：`transport[telegram]: 会话出错: ...`，且这一行里含 `code=409`。

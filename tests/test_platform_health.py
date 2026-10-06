@@ -456,11 +456,30 @@ class TestStatusTableShowsTheProbe(_BridgeDirIsolated):
         self.assertNotIn(cli.NO_START_PROBE_TEXT, row)
 
     def test_the_section_says_the_conclusion_is_from_the_last_start(self):
-        """⚠️ 时效性：这一段必须说清那是「上次启动时」的结论，不是实时探测。"""
+        """⚠️ 时效性：这一段必须说清那是「上次**启动尝试**」的结论，不是实时探测。
+
+        ⚠️ **措辞必须含「尝试」**：拒绝启动的两条路现在也落记录了（见
+        ``tests/test_bridge_refusal_probe.py``），所以这一段覆盖的是**每一次启动尝试**
+        —— 若措辞退回成「上次启动」（读起来像"上次成功启动"），读者就会把
+        「桥没起来」那条记录误当成一次成功启动的结论。
+        """
         rendered = self.render(Config(adapters={"telegram": {"bot_token": "t"}}))
         body = "\n".join(self.section(rendered))
-        self.assertIn("上次启动", body)
+        self.assertIn("上一次启动尝试", body)
         self.assertIn("不是实时探测", body)
+
+    def test_the_section_says_a_refusal_is_recorded_too(self):
+        """这一段必须说清「桥拒绝启动时也会记一条」。
+
+        不说的话，"上一次启动尝试"会与"盘上那条 ``ok`` 来自上一次成功启动"混成一句
+        —— 而这正是本任务要消灭的那个缺陷的**措辞**那一半。
+        """
+        rendered = self.render(Config(adapters={"telegram": {"bot_token": "t"}}))
+        body = "\n".join(self.section(rendered))
+        self.assertIn("拒绝启动", body)
+        self.assertIn("桥未启动", body)
+        # 唯一的例外必须说出来：「已有另一个实例在运行」那次不写记录。
+        self.assertIn("已有另一个实例在运行", body)
 
 
 class StartupSurvivesProbeRecordingFailure(unittest.TestCase):

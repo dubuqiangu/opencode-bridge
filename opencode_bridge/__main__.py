@@ -24,7 +24,7 @@ import os
 import sys
 import threading
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .adapters import build
 from .allowlist import resolve_allowlist
@@ -176,7 +176,16 @@ def _readiness_verdict(cls: object | None, entry: dict) -> bool | None:
     judge = getattr(cls, "config_runnable", None)
     # ⛔ 刻意不写 ``bool(getattr(...))``（见上面）：非可调用 ⇒ 失败关闭（"没配好"），
     # 而不是把一个布尔属性/方法对象当成答案。
-    return bool(judge(entry)) if callable(judge) else False
+    if not callable(judge):
+        return False
+    answered = judge(entry)
+    # ⚠️⚠️ **``None`` 必须表示「我不自答」，不是「没配好」**（实测确认的潜在缺陷）：
+    # 本函数自己的 docstring 写着「别把 ``None`` 当成 ``False``」，
+    # 而一句 ``bool(...)`` 恰恰把它压成了 ``False`` ⇒ 一个「自答但此刻没意见」的
+    # 平台**无法表达**这件事，只能撒谎说「没配好」、再也回不到通用规则。
+    # ⚠️ 现有平台无人返回 ``None``（基类默认返 ``False``）⇒ **今天零行为变化**，
+    # 这条是**给下一个覆写者**留的路；且对任何非 ``None`` 的返回值行为逐字不变。
+    return None if answered is None else bool(answered)
 
 
 def _missing_required_keys(cls: object | None, entry: dict) -> list[str]:
@@ -365,6 +374,13 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 # ⛔ **``None`` 的含义是「没有记录」，不是「没问题」**：桥还没以
                 # 当前配置启动过、或从没启动过，两者都是 ``None``。把它显示成
                 # "ok"就是把"没验"说成"验过了"。
+                #
+                # ⚠️ **取值域多了一档 :data:`health.VERDICT_NOT_STARTED`**（``not_started``）：
+                # 它答的是「**桥这一轮压根没起来**」，不是「这个平台起不来」——
+                # 拒绝启动的两条路径（见 :func:`_record_bridge_refusal`）现在也落
+                # 这样的记录，所以消费方读它就知道**别**把它当成平台级线索去
+                # 建议用户改凭据。⛔ 既有三档（``ok`` / ``failed`` / ``skipped``）
+                # **一个字没改**：本函数对 ``platforms`` 的其它 key 也一样，只增不改。
                 "last_start_probe": health.probe_from_record(probe_record, key),
             }
         )
@@ -462,6 +478,87 @@ def _bridge_dir() -> str:
     if env_path and os.path.isfile(env_path):
         return os.path.dirname(os.path.abspath(env_path)) or os.getcwd()
     return os.getcwd()
+
+
+#: 桥**拒绝启动**的两条路径。⚠️ 它们都**必须**落一条
+#: :data:`~opencode_bridge.health.VERDICT_NOT_STARTED` 的结论 —— 不落的话，盘上留下的
+#: 就是上一次**成功启动**的那条 ``ok``（内容与 mtime 都不变），而 ``--status`` 会
+#: 把它与「未配置」并排显示 ⇒ 用户刚把配置改坏时，看到的仍是上一轮的好消息。
+#: ``_has_configured_adapter`` 为否的那条在 ``discover_endpoint`` **之前**，
+#: ``usable == 0`` 的那条在它**之后**、``core.start()`` **之前**。
+REFUSAL_STAGE_PREFLIGHT = "preflight_no_configured_adapter"
+REFUSAL_STAGE_NO_USABLE_ADAPTER = "no_usable_adapter"
+
+#: 每条拒绝路径的**一句话原因**（全局的）。⚠️ 只说"是什么"；具体"哪些平台缺什么"
+#: 由 :func:`_record_bridge_refusal` 逐平台算出来交给
+#: :func:`~opencode_bridge.health.bridge_refusal_probes` 拼在后面。
+_REFUSAL_REASON_BY_STAGE = {
+    REFUSAL_STAGE_PREFLIGHT: "预检未通过：配置里没有任何适配器此刻够跑",
+    REFUSAL_STAGE_NO_USABLE_ADAPTER: "没有任何适配器构造成功，桥因此没起来",
+}
+
+
+def _record_bridge_refusal(
+    cfg: Config,
+    stage: str,
+    platform_reasons: Mapping[str, str] | None = None,
+) -> None:
+    """把「桥拒绝启动」这条结论写进**同一份** ``platform-health.json``。
+
+    ⚠️ **为什么必须写**：不写的话，这条路上盘上留下的就是上一次成功启动的结论，
+    而那正是用户最需要线索的时刻（他刚把配置改坏了）——状态视图在那一刻显示上一轮
+    的好消息，等于在最关键的时候说假话。
+
+    ⚠️ **落盘只有 :func:`~opencode_bridge.health.record_startup_probes` 那一个入口**：
+    本函数只**造**出 ``{平台键: 结论}``（由
+    :func:`~opencode_bridge.health.bridge_refusal_probes` 按
+    :data:`~opencode_bridge.health.VERDICT_NOT_STARTED` 成形），不自己写文件。
+
+    ⚠️ **保护必须包住「实参求值」，不只是那次调用** —— 与
+    :func:`_run_bridge_locked` 里那次调用是**同一条**纪律、**同一个**理由：
+    ``adapter_class`` 的 import 与 :func:`_missing_required_keys` 的逐平台判定都在
+    这个 ``try`` 里面求值，它们抛了的话，这条**排障辅助**通路就有权把
+    「拒绝启动 + 一条明明白白的提示」变成「拒绝启动 + 一个堆栈」。
+    ⇒ 退化行为是「记一条 warning + 不写记录」，**不是**崩。
+
+    ⚠️ 预检那条路**在 ``discover_endpoint`` 之前**，判断不依赖网络 ⇒ opencode 服务
+    不可达也照样写。
+
+    :param stage: :data:`REFUSAL_STAGE_PREFLIGHT` / :data:`REFUSAL_STAGE_NO_USABLE_ADAPTER`。
+    :param platform_reasons: 只有 ``usable == 0`` 那条路需要 —— 「为什么构造不出来」
+        只有那个构造循环知道（未注册 / ``build()`` 抛错 / ``bot_token`` 为空）。
+    """
+    try:
+        reasons = {str(key): str(text) for key, text in (platform_reasons or {}).items()}
+        if not reasons:
+            # 预检那条路没有「循环」可问：缺什么只能由缺失键清单回答，而它走的是
+            # **唯一**那个判定入口（``--status`` 的「配置」列也是用它）。
+            from .adapters import adapter_class
+
+            for key, entry in (cfg.adapters or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                missing = _missing_required_keys(adapter_class(str(key)), entry)
+                reasons[str(key)] = (
+                    "缺 " + "、".join(missing) if missing else "未配置"
+                )
+        detail = _REFUSAL_REASON_BY_STAGE.get(stage, "桥拒绝启动")
+        probes = health.bridge_refusal_probes(detail, reasons)
+        written = health.record_startup_probes(_bridge_dir(), probes)
+        # ⚠️ **别在写盘失败时还说"已记"** —— 那是把一条失败的排障记录报成成功的，
+        # 与本模块「没有记录 ≠ 成功」是同一条纪律（失败时那条 warning 由
+        # record_startup_probes 自己打）。
+        logger.warning(
+            "platform-health: %s —— %s",
+            detail,
+            "已记「桥未启动」" if written else "未落盘",
+        )
+    except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+        logger.warning(
+            "platform-health: 「拒绝启动」这条结论未落盘（%s: %s）—— 不影响桥的退出",
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _pid_alive(pid: int) -> bool:
@@ -637,6 +734,11 @@ def _print_last_start_probes(
     的那条路）。结论由 :mod:`opencode_bridge.health` 在启动那一刻写好。
 
     ⚠️ **措辞必须带时效性**：这是「**上次启动时**」的结论，不是实时探测。
+    ⚠️ 「启动」指的是**尝试启动**（两条拒绝启动的路也会记一条
+    :data:`~opencode_bridge.health.VERDICT_NOT_STARTED`，见 :func:`_record_bridge_refusal`）。
+    **唯一的例外**是「已有另一个实例在运行」：那次**不写**记录 —— 覆盖掉运行中那个
+    实例写下的好结论，比留着一条旧的更坏。那条例外必须**在下面说出来**，
+    否则「上一次启动尝试」这句话就会在这一种情形下说假话。
 
     :param rows: :func:`_channel_config_rows` 的行，**复用**它而不重算平台清单与
         ``configured``（同一份判定只能有一处）。
@@ -653,27 +755,53 @@ def _print_last_start_probes(
         for key, label, configured, _inbound_ready, _caps in rows
         if configured or key in probed
     ]
+    # 「桥这一轮没起来」是**全局**的一件事（不是某个平台的结论）⇒ 由下面那条 ⚠ 行
+    # 说一次，并且**不带平台行**：空模板那种 13 个平台全被拒的情况，逐平台再写一遍
+    # 就是一屏复读，而它们各自的「缺什么」上面那张「渠道配置与能力」表已经在说了。
+    refused = None
+    platform_rows = []
+    for key, label in listed:
+        probe = health.probe_from_record(record, key)
+        if probe is not None and probe["verdict"] == health.VERDICT_NOT_STARTED:
+            # ⚠️ 记**第一个**（注册表顺序 = 上面那张表的顺序）：13 个平台各说一遍是
+            # 复读，而它们各自的「缺什么」上面那张表已经在说了。
+            if refused is None:
+                refused = probe
+            continue
+        platform_rows.append((label, probe))
     print("")
     print("== 上次启动时的探测结论 ==")
-    print("  说明：以下结论取自**桥上次启动那一刻**向平台要到的答复（落盘在")
-    print("        platform-health.json），**不是现在的连接状态，也不是实时探测**。")
+    print("  说明：以下结论取自**桥上一次启动尝试那一刻**的结果（落盘在")
+    print("        platform-health.json）：桥起来了就写平台探测的答复；桥**拒绝启动**")
+    print("        就写「桥未启动」并说明原因，**不会**留下一条上一轮的好消息。")
+    print("        仅「已有另一个实例在运行」这一次**不写**记录（那种情况下盘上仍是")
+    print("        那个运行中的实例启动时写下的结论）。")
+    print("        **不是现在的连接状态，也不是实时探测**。")
     if recorded is not None:
         print(
             "  记录时间 : "
             + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded))
         )
-    if not listed:
-        print("  （没有已配置的平台，也没有任何探测记录）")
+    if refused is not None:
+        print("  ⚠ " + health.describe_verdict(refused))
+    if not platform_rows:
+        # ⛔ 区别「压根没有记录」与「有记录、但里面没有平台级结论」：后者是桥刚
+        # 拒绝启动、或它启动了一个都不上报结论的适配器 —— 说成"没有任何探测记录"
+        # 会让用户以为盘上是空的，而它其实刚被写过。
+        if not listed:
+            print(
+                "  （没有已配置的平台，也没有任何探测记录）" if record is None
+                else "  （盘上有记录，但这次启动没有得到任何平台的结论）"
+            )
         return
-    name_w = max(_dwidth("平台"), max(_dwidth(label) for _key, label in listed)) + 2
-    for key, label in listed:
-        probe = health.probe_from_record(record, key)
+    name_w = max(_dwidth("平台"), max(_dwidth(label) for label, _p in platform_rows)) + 2
+    for label, probe in platform_rows:
         if probe is None:
             print("  " + _pad(label, name_w) + NO_START_PROBE_TEXT)
             continue
         line = "上次启动 " + health.describe_verdict(probe)
         if probe["verdict"] == health.VERDICT_OK and recorded is not None:
-            # 只给「正常」配时间戳：它是**唯一**可能被误读成"现在也是好的"的那一行。
+            # 只给「正常」配时间戳：它是**唯一**可能被误读成"现在是好的"的那一行。
             line += "（%s）" % time.strftime("%m-%d %H:%M", time.localtime(recorded))
         print("  " + _pad(label, name_w) + line)
 
@@ -790,6 +918,9 @@ def run_check(cfg: Config) -> int:
 
 def run_bridge(cfg: Config) -> int:
     if not _has_configured_adapter(cfg):
+        # ⚠️ 这条路在 discover_endpoint **之前**返回 ⇒ 「桥没起来」这件事曾经
+        # 完全不落盘，而判断**不依赖网络**，所以写记录也不会被"服务不可达"影响。
+        _record_bridge_refusal(cfg, REFUSAL_STAGE_PREFLIGHT)
         print(NO_ADAPTER_MESSAGE, file=sys.stderr)
         print(
             "提示：配置完成后下次启动自动生效；也可在 bot 内发送 /setup 查看分平台接入引导。",
@@ -841,6 +972,10 @@ def _run_bridge_locked(cfg: Config) -> int:
     core = BridgeCore(cfg, client, state, inbox)
 
     usable = 0
+    #: 「这个平台为什么没能进来」—— ``usable == 0`` 时它就是那条记录的 ``detail`` 来源。
+    #: ⚠️ **只在那些 ``continue`` 分支里写** ⇒ 而能 attach 的早就把 ``usable`` 加上去
+    #: 了 ⇒ 所以 ``usable == 0`` 时它**必然覆盖了配置里的每一个平台**。
+    unusable_reasons: dict[str, str] = {}
     for name, entry in list((cfg.adapters or {}).items()):
         try:
             # ⚠️ **必须过** ``adapter_scoped_config``：适配器只看得到自己的子树，
@@ -849,18 +984,28 @@ def _run_bridge_locked(cfg: Config) -> int:
             adapter = build(name, adapter_scoped_config(cfg, entry), core)
         except KeyError:
             logger.warning("unknown adapter %r in config; skipped", name)
+            unusable_reasons[str(name)] = "不是已注册的适配器键"
             continue
-        except Exception:
+        except Exception as exc:
             logger.exception("failed to build adapter %r; skipped", name)
+            unusable_reasons[str(name)] = "构造失败（%s: %s）" % (
+                type(exc).__name__, exc,
+            )
             continue
         token = getattr(adapter, "bot_token", None)
         if token is not None and not str(token).strip():
             logger.warning("%s: bot_token missing; adapter skipped", name)
+            unusable_reasons[str(name)] = "bot_token 为空"
             continue
         core.attach(adapter)
         usable += 1
 
     if usable == 0:
+        # ⚠️ 这条路在 discover_endpoint **之后**、``core.start()`` **之前** ⇒ 它同样
+        # 曾经完全不写记录，而盘上留下的是上一次**成功启动**的结论（见
+        # :func:`_record_bridge_refusal` 的 docstring）。注意此处预检**已经过了**：
+        # 凭据是齐的，只是构造不出来 ⇒ 结论绝不能写成"未探测／你没填 token"。
+        _record_bridge_refusal(cfg, REFUSAL_STAGE_NO_USABLE_ADAPTER, unusable_reasons)
         print(NO_ADAPTER_MESSAGE, file=sys.stderr)
         client.close()
         if inbox is not None:

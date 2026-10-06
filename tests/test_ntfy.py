@@ -409,5 +409,66 @@ class TestEditAndAnswer(unittest.TestCase):
         self.assertIsNone(adapter.answer("q1", "text"))
 
 
+class TestPollIntervalCoercion(unittest.TestCase):
+    """⚠️ ``poll_interval`` 原来在 ``start()`` 里是**裸** ``float(self.config.get(...) or ...)``。
+
+    那一行的两个坏法（都已修）：
+
+    1. **填非数字** ⇒ ``ValueError`` 打断 ``start()`` ⇒ 被 ``BridgeCore.start`` 的
+       except 接住 ⇒ **ntfy 这个适配器从此不启动**，而日志只有一条栈、
+       **不说「是哪个键配错了」**。
+    2. **填负数更糟** ⇒ 会被传输层夹成 ``0.0`` ⇒ **每轮空转立刻重问**，
+       **本地毫无异常**，故障体现在服务端。
+
+    ⇒ 现在走共享助手 ``coerce_float``，下界是**开区间**（``0`` 不是「很短的轮询」
+    是「不等待」）。
+    """
+
+    def _start_and_read_idle(self, **cfg):
+        """起一次适配器并读**真拿到的**空闲间隔（⛔ 不读类属性、不读配置）。"""
+        from opencode_bridge.transport import PollingTransport
+
+        adapter, _ = make_ntfy(**cfg)
+        original_start = PollingTransport.start
+        PollingTransport.start = lambda self, *a, **k: None   # 不起线程 ⇒ 零网络
+        try:
+            adapter.start()
+        finally:
+            PollingTransport.start = original_start
+        return adapter._transport._idle_delay()
+
+    def test_legal_values_are_used_verbatim_and_stay_silent(self):
+        for raw in (2.5, "2.5", " 2.5 ", 0.01):
+            with self.subTest(raw=raw):
+                with self.assertNoLogs("opencode_bridge.config_coerce", level="WARNING"):
+                    self.assertEqual(self._start_and_read_idle(poll_interval=raw), float(raw))
+
+    def test_a_non_numeric_value_falls_back_and_names_the_key(self):
+        with self.assertLogs("opencode_bridge.config_coerce", level="WARNING") as caught:
+            idle = self._start_and_read_idle(poll_interval="abc")
+        self.assertEqual(idle, DEFAULT_POLL_INTERVAL, "非法值必须回落到默认，而不是打断 start()")
+        self.assertIn("poll_interval", "\n".join(caught.output))
+
+    def test_a_negative_value_never_becomes_an_empty_loop(self):
+        """⚠️ 反向断言：退回裸 ``float()`` 就会红 —— 负数会被传输层夹成 ``0.0``。"""
+        with self.assertLogs("opencode_bridge.config_coerce", level="WARNING"):
+            idle = self._start_and_read_idle(poll_interval=-5)
+        self.assertEqual(idle, DEFAULT_POLL_INTERVAL)
+        self.assertGreater(idle, 0.0, "0.0 = 每轮空转立刻重问")
+
+    def test_a_boolean_is_not_read_as_a_number_of_seconds(self):
+        with self.assertLogs("opencode_bridge.config_coerce", level="WARNING"):
+            self.assertEqual(self._start_and_read_idle(poll_interval=True), DEFAULT_POLL_INTERVAL)
+
+    def test_zero_is_refused_rather_than_silently_accepted(self):
+        """``0`` 不是「很短的轮询」是「不等待」⇒ 开区间，不是闭区间。"""
+        with self.assertLogs("opencode_bridge.config_coerce", level="WARNING"):
+            self.assertEqual(self._start_and_read_idle(poll_interval=0), DEFAULT_POLL_INTERVAL)
+
+    def test_an_absent_value_is_still_silent(self):
+        with self.assertNoLogs("opencode_bridge.config_coerce", level="WARNING"):
+            self.assertEqual(self._start_and_read_idle(), DEFAULT_POLL_INTERVAL)
+
+
 if __name__ == "__main__":
     unittest.main()

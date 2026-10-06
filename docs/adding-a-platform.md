@@ -9,13 +9,13 @@
 
 | 项 | 行数 |
 |---|---|
-| 适配器本体（`adapters/<name>.py`） | 150~380 行（上限看平台有多少协议特例） |
+| 适配器本体（`adapters/<name>.py`） | 390~1200 行（上限看平台有多少协议特例） |
 | 单元测试（`tests/test_<name>.py`） | 40~110 个用例 |
 | **连接/ 重连 / 线程 / `stop()` 代码** | **0 行** —— 来自 `transport/` |
 | 要改的核心文件（`core.py` / `__main__.py` / 注册表） | **0 行** —— 注册表动态发现 |
 
-参考量级：`ntfy.py` 365 行（最干净的一家）、`telegram.py` 553 行、
-`email.py` 1015 行（IMAP+SMTP+MIME，本质上更重）。
+参考量级：`ntfy.py` 388 行（最干净的一家）、`telegram.py` 831 行、
+`email.py` 1169 行（IMAP+SMTP+MIME，本质上更重）。
 
 ## 筛选：先判断这个平台值不值得接
 
@@ -72,24 +72,71 @@ outbound_tokens  = ("address", "password")                 # ⊆ required_tokens
 ### 3b. 如果你的平台**没有凭据可填**（陷阱，务必读完）
 
 守卫测试要求两个列表**都非空**，所以你**不能**把它们留空。但如果你像 a2a 那样
-**根本没有 token**（本机服务，bind `127.0.0.1` + 端口由系统分配，空配置就能跑），
-随便填一个键会**直接造成一个 P0**：
+**根本没有 token**（本机服务，bind `127.0.0.1`，而能不能跑取决于**你配没配
+`bind_port`**），随便填一个键会**直接造成一个 P0**：
 
 > a2a 当初填了 `bind_port`，于是**只配了 a2a 的用户被桥接拒绝启动**
 > （preflight 报"没配任何适配器"），而它本来完全能用 ——
 > 与当年 Matrix / IRC / Mattermost 被拒启动是同一类 bug。
 
-正确做法是声明 **`config_optional = True`**：
+正确做法是**两件事一起做**：声明分类 **`config_optional = True`**，
+**并**覆写判定 **`config_runnable`**。
+
+| | 问题 | 形状 |
+|---|---|---|
+| `config_optional` | **分类**：我是没有凭据可填的那一类吗？ | **静态 `bool`**，默认 `False`，随 `capabilities()` 进 JSON。⛔ **永远不要改成方法** |
+| `config_runnable(entry)` | **判定**：**这一份** `entry` 此刻够不够跑？ | `@classmethod`，**读配置**，默认返回 `False` |
 
 ```python
 required_tokens = ("bind_port",)   # 仍须非空（声明义务）
 outbound_tokens = ("bind_port",)
-config_optional = True             # 但"无需显式配置即可运行，且默认值安全"
+config_optional = True             # 分类："我没有凭据可填，判定由我自己给"
+
+@classmethod
+def config_runnable(cls, entry: dict) -> bool:
+    """分类之外的那一半判定：这份 entry 此刻够不够跑起来。"""
+    ...
 ```
 
-它**只豁免"必须显式配置才能跑"**（preflight 与两个状态视图判定点），
-**不豁免"必须声明配置面"**。别自己实现这套逻辑——直接用这个开关，
-并给它补一条"默认必须为 False"的守卫（防止有人顺手默认成 True 而拆掉所有门槛）。
+⚠️ **`config_optional = True` 并不意味着"不用配任何东西也能跑"。**
+它只意味着"**运行判定的答案由我自己给**" —— 具体能不能跑，要问
+`config_runnable(entry)`。仓里曾把它注释成"无需显式配置即可运行，且默认值
+安全"，**那句已经不成立**：a2a 的空 `bind_port` 会被判为未配置、`start()`
+**拒绝绑定**（`bind_port: 0` 才是合法配置：绑回环临时端口）。
+
+⚠️ **`config_runnable` 的默认值是「否」，而这个默认是承重的** ⇒ **只置
+`config_optional = True` 而不覆写它的平台，在配好之前预检一律说「未配置」**
+（缺哪些键会被如实报出来）。这是**失败关闭**，不是 bug。
+反过来只覆写 `config_runnable` 而不置 `config_optional` ⇒ **那段代码一次都不会
+被执行**。
+
+它**不豁免任何配置声明义务**：`required_tokens` / `outbound_tokens` 仍须非空
+（守那条不变量的测试照样通过）。
+
+#### 覆写 `config_runnable` 的契约（四条，逐条都有代码依据）
+
+1. **它吃原始配置子树 `entry`**，不是构造好的适配器 —— 三条判定路径拿到的都是
+   `cfg.adapters.<你的平台>` 那棵**原始条目**（**不是** `adapter_scoped_config`
+   的投影结果）。
+2. **不许要求构造适配器实例、不许联网。** 它在 endpoint discovery **之前**被问到，
+   而 `run_check` 的契约是「no sessions, **no adapters**」——
+   任何"我得先连上才知道"的判据都不能写在这里。
+3. **`True` / `False` 都是权威答案，没有"弃权"这个返回值。** 只有
+   **`config_optional` 不为真**时才会落回通用的 `required_tokens` 规则
+   （"键逐个非空"）⇒ **回落与否由 `config_optional` 决定，`config_runnable` 的
+   返回值决定不了。** 而一旦生效就**不再**落回通用规则 —— 否则
+   `bind_port: "nope"` 这种"键非空、但起不来"的配置会被通用规则重新判成
+   "配好了"。
+4. **判定要与你自己的 `start()` 用同一份解析。** a2a 是范例：它复用
+   `config_coerce.coerce_int`（区间 `[0, 65535]`）并**先挡掉 `bool` / `float`**
+   ——`coerce_int` 会把 `True` 读成 `1`、把 `9900.7` **截断**成 `9900`，而
+   `start()` 把两者都判成未配置；放过它们就会出现"判定说能跑、`start()` 拒绝
+   启动"的同一种谎。
+
+⚠️ **别自己实现这套判定。** 三处视图（**预检** / **`--setup --json`** /
+**`--status`** 表格）都问**同一个**入口 `__main__._readiness_verdict`，
+"还差哪些键"则由同源的 `_missing_required_keys` 回答 —— 所以三处不可能各说
+一套。
 
 ### 4. 接线传输层（不变量 10、11）
 
@@ -178,8 +225,9 @@ def send(self, out: Outbound) -> MsgHandle | None:
 - **`README.md`**：配置项表+ 逐平台接入小节（写上该平台最容易踩的坑）+ 能力表
 - **`docs/install.md`**：镜像上面那节
 - **`plugin/README.md`**：凭据键一句话
-- **`--setup` 引导**：**默认不要动。** `/setup` 菜单是`core.py` 里**刻意维护的冻结文案**
-  （`_SETUP_GUIDES` / `SETUP_MENU_TEXT`），只列三平台；配置齐全一律用 `--status` 核对。
+- **`--setup` 引导**：**默认不要动。** `/setup` 菜单是 `commands.py` 里**刻意维护的
+  冻结文案**（`_SETUP_GUIDES` / `SETUP_MENU_TEXT`），只列三平台；配置齐全一律用
+  `--status` 核对。
 
 > 历史教训：曾有 **9 处**文档在 T2.1 落地后仍写着"仅支持主动发送"，用户照着走会以为
 > 入站不可用、也不知道要配 `app_token`。**新增平台时请顺手核对旧说法是否已被证伪。**

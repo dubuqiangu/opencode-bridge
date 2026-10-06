@@ -25,22 +25,46 @@
 ::
 
     {"recorded_at": <epoch float>,
-     "platforms": {"<平台键>": {"verdict": "ok"|"failed"|"skipped",
+     "platforms": {"<平台键>": {"verdict": "ok"|"failed"|"skipped"|"not_started",
                                "code": <int|str|省略>,
                                "detail": "<脱敏后的一行>"}}}
 
-**三档 verdict**（:data:`VERDICT_OK` / :data:`VERDICT_FAILED` /
-:data:`VERDICT_SKIPPED`）：
+**四档 verdict**（:data:`VERDICT_OK` / :data:`VERDICT_FAILED` /
+:data:`VERDICT_SKIPPED` / :data:`VERDICT_NOT_STARTED`）：
 
 * ``ok`` —— 探测通过（Telegram 的 ``getMe`` 返回 ``ok``）。
 * ``failed`` —— 探测失败，且**平台给了原因**（Telegram 的 ``error_code`` /
   ``description``）或传输层压根没拿到状态码。
-* ``skipped`` —— **压根没探测**（连要验的东西都没有，比如 bot_token 没填）。
+* ``skipped`` —— **这个平台压根没探测**（连要验的东西都没有，比如 bot_token 没填）。
   ⛔ 它**不是** ``ok``：状态视图必须能把"没验"与"验过了、没问题"分开说，
   否则"没验"就会被读成"没问题"。
+* ``not_started`` —— **桥这一轮压根没起来**（配置里没有任何可用适配器），
+  于是**一条探测都没发生过**。见下面「拒绝启动也要落一条结论」。
 
 ⚠️ **没有记录 ≠ 成功**：读不到文件、或某个平台不在 ``platforms`` 里，返回的
 都是 ``None`` —— 调用方必须把它显示成"无记录"，而**不是**"正常"。
+
+拒绝启动也要落一条结论
+======================
+
+⚠️ 桥有两条**拒绝启动**的路径，而它们**曾经完全不写记录**：预检
+（:func:`opencode_bridge.__main__._has_configured_adapter` 为否，在
+``discover_endpoint`` **之前**）与 ``usable == 0``（在 ``discover_endpoint``
+**之后**、``core.start()`` **之前**）。⇒ 盘上留下的就是**上一次成功启动**的
+那条 ``ok``（内容与 mtime 都不变），而 ``--status`` 会把它与「未配置」并排显示
+——**用户刚把配置改坏、桥拒绝启动时，看到的仍是上一轮的好消息**。
+
+⇒ 两条路径现在都落一条 :data:`VERDICT_NOT_STARTED`（那份结论由
+:func:`bridge_refusal_probes` 造出，而**落盘仍然只有**
+:func:`record_startup_probes` 这一个入口）。
+
+⚠️ **为什么不给它复用 ``skipped``**：那是两件不同的事，而 ``skipped`` 的语义是
+"**这个平台**没东西可验"。在 ``usable == 0`` 那条路上预检**已经过了**（凭据是齐的，
+只是构造不出来）⇒ 说"未探测"会把用户引到"你没填 token"这个**错的**方向上去。
+⇒ 新增一档，让 ``--status`` 与 ``--setup --json`` **自带**「桥没起来」这个语义，
+消费方不必去解析 ``detail`` 才知道那条不是平台级结论。
+⛔ 既有三档**一个字没改**（只是多了一档）：仓库外的 ``bridge_setup`` 按**值**
+断言现有取值。
 
 安全红线
 ========
@@ -79,7 +103,9 @@ __all__ = [
     "VERDICT_OK",
     "VERDICT_FAILED",
     "VERDICT_SKIPPED",
+    "VERDICT_NOT_STARTED",
     "VERDICTS",
+    "bridge_refusal_probes",
     "describe_verdict",
     "normalize_verdict",
     "platform_key",
@@ -96,11 +122,14 @@ logger = logging.getLogger("opencode_bridge.health")
 #: 本模块不自己再写一遍，否则"状态视图读的"与"启动时写的"会指向两个目录）。
 PLATFORM_HEALTH_FILE_NAME = "platform-health.json"
 
-#: 三档 verdict。名字用完整单词而不是 ``OK`` / ``FAIL`` —— 见名知意。
+#: 四档 verdict。名字用完整单词而不是 ``OK`` / ``FAIL`` —— 见名知意。
+#: ⚠️ :data:`VERDICT_NOT_STARTED` 答的是**桥**（这一轮压根没起来），
+#: 而前三档答的是**某个适配器** —— 混用会把用户引到错的方向上（见模块 docstring）。
 VERDICT_OK = "ok"
 VERDICT_FAILED = "failed"
 VERDICT_SKIPPED = "skipped"
-VERDICTS = (VERDICT_OK, VERDICT_FAILED, VERDICT_SKIPPED)
+VERDICT_NOT_STARTED = "not_started"
+VERDICTS = (VERDICT_OK, VERDICT_FAILED, VERDICT_SKIPPED, VERDICT_NOT_STARTED)
 
 #: ``detail`` 是**一行**说明（:attr:`~opencode_bridge.adapters.base.Adapter.startup_verdict`
 #: 的 ``detail`` 键）。上限截断的理由：Telegram 的 ``description`` 由服务端决定
@@ -178,6 +207,11 @@ def describe_verdict(entry: Mapping) -> str:
         return "正常"
     if verdict == VERDICT_SKIPPED:
         return f"未探测 —— {detail}" if detail else "未探测"
+    if verdict == VERDICT_NOT_STARTED:
+        # ⚠️ 措辞里必须自带「**桥**没起来」这个主语：``skipped`` 那行说的是
+        # 「这个平台没验」，而这一行说的是「这一轮压根没有桥在跑」。
+        # 两者指向的排查方向完全不同（前者去看凭据，后者去看配置有没有适配器）。
+        return f"桥未启动 —— {detail}" if detail else "桥未启动"
     code = (entry or {}).get("code")
     # 没有平台错误码时**不硬凑一个括号**，而是留一个空格 ——
     # ``失败 —— <detail>`` 比 ``失败（无错误码）—— <detail>`` 短，
@@ -236,6 +270,30 @@ def probe_after_start(
     if start_result is False:
         return normalize_verdict(VERDICT_FAILED, detail="start() 返回 False")
     return None
+
+
+def bridge_refusal_probes(reason: str, platform_reasons: Mapping[str, str]) -> dict:
+    """「桥拒绝启动」这一轮要落盘的那份结论（**每个平台一条**）。
+
+    :param reason: 这一轮**为什么**没起来（一句话，全局的）：预检没过 /
+        没有任何适配器构造成功。
+    :param platform_reasons: ``{平台键: 该平台自己的原因}``（缺什么 / 为什么构造不出来）。
+    :return: 可直接交给 :func:`record_startup_probes` 的 ``{平台键: 结论}``。
+
+    ⚠️ **每个平台的 ``detail`` 是「全局原因 + 它自己的那一条」，而不是把整个清单
+    抄一遍**：:data:`MAX_DETAIL_CHARS` 会截断，一份 13 平台的清单抄 13 遍的结果是
+    **靠后的平台整条被截掉**（实测：``a2a`` 的 ``bind_port`` 就这么消失了），
+    而用户恰恰是照着**自己那一行**去找该填哪个键的。
+
+    ⛔ 本函数**不落盘**：落盘只有 :func:`record_startup_probes` 那一个入口。
+    """
+    return {
+        str(key): {
+            "verdict": VERDICT_NOT_STARTED,
+            "detail": "%s（%s：%s）" % (reason, key, text),
+        }
+        for key, text in (platform_reasons or {}).items()
+    }
 
 
 def record_startup_probes(bridge_dir: str, probes: Mapping) -> Optional[str]:

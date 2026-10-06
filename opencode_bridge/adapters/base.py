@@ -552,8 +552,12 @@ class Adapter(abc.ABC):
         ``<bridge_dir>/platform-health.json`` 由**运行器**在**全部**适配器都试过
         之后统一做一次（:func:`opencode_bridge.health.record_startup_probes`）。
 
-        :param verdict: :mod:`opencode_bridge.health` 的三档取值（``ok`` /
-            ``failed`` / ``skipped``）。**认不出来的值按 ``failed`` 记** ——
+        :param verdict: :mod:`opencode_bridge.health` 的取值。**适配器能上报的是三档**
+            （``ok`` / ``failed`` / ``skipped``）；第四档 ``not_started`` 答的是
+            「**整个桥**没起来」，只有运行器会写它（见
+            :func:`opencode_bridge.health.bridge_refusal_probes`）
+            —— ⛔ **适配器不要上报它**：你在平台里，管不到别的平台，也管不到桥起没起来。
+            **认不出来的值按 ``failed`` 记** ——
             上报方说了句读不懂的话时，绝不能默认成"好"。
         :param code: 平台自己的错误码（Telegram 的 ``error_code``）。
             ⛔ 没有就传 ``None``（该键会**被省略**），别用 ``0`` 顶替 ——

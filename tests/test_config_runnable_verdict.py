@@ -579,5 +579,87 @@ class TestShippedTemplateStaysUnconfigured(unittest.TestCase):
                 self.assertFalse(row["configured"], f"{platform}: {row['missing']}")
 
 
+class TestAbstainingIsNotTheSameAsRefusing(unittest.TestCase):
+    """⚠️⚠️ ``config_runnable`` 返回 ``None`` 必须表示「我不自答」，**不是**「没配好」。
+
+    这个区分是**存在**的，且只有一行的判据：:func:`_readiness_verdict` 自己的
+    docstring 写着「返回值三态，含义各不相同，**别把 ``None`` 当成 ``False````」，
+    而紧挨着的实现曾是一句 ``bool(judge(entry))`` —— 恰恰把它压成了 ``False``。
+
+    ⇒ 后果：一个「会自答、但此刻还没意见」的平台**无法表达**这件事，
+    只能撒谎说「没配好」，也就**永远回不到** ``required_tokens`` 通用规则。
+
+    ⚠️ **今天零行为变化**（基类默认返 ``False``、a2a 返真 bool，没有平台返回 ``None``），
+    本类钉的是**给下一个覆写者留的那条路**确实通。
+    """
+
+    @staticmethod
+    def _platform(name, *, optional, answer, required=("only_key",)):
+        """造一个鸭子类型平台：``config_optional`` 是静态 bool，``config_runnable`` 自答。"""
+        return type(
+            name,
+            (adapters_base.Adapter,),
+            {
+                "name": name,
+                "label": name,
+                "config_optional": optional,
+                "required_tokens": required,
+                "config_runnable": classmethod(lambda cls, entry: answer),
+                "__doc__": "仅供测试的探针平台",
+            },
+        )
+
+    def test_returning_none_means_abstain_not_refusing(self):
+        platform = self._platform("abstainer", optional=True, answer=None)
+        self.assertIsNone(
+            cli._readiness_verdict(platform, {"only_key": "x"}),
+            "返回 None = 「我不自答，请走通用规则」。被压成 False 就是"
+            "「权威地说没配好」—— 两者在用户看到的界面上完全不是一回事",
+        )
+
+    def test_an_abstainer_falls_back_to_the_generic_required_tokens_rule(self):
+        """⚠️ 这才是那条路存在的意义：通用规则说配齐了，就该算配齐了。
+
+        ⛔ 刻意**不**走 :func:`_platform_status` —— 它只遍历**已注册**的平台，
+        探针平台不在注册表里就永远不出现在结果里（那是设计如此，不是缺陷）。
+        """
+        platform = self._platform("abstainer2", optional=True, answer=None)
+        filled = {"only_key": "x"}
+        self.assertIsNone(cli._readiness_verdict(platform, filled), "不自答 ⇒ 交回通用规则")
+        self.assertEqual(
+            cli._missing_required_keys(platform, filled), [],
+            "回落后由通用规则判定，而通用规则看到键齐全 ⇒ 不缺任何键。"
+            "若这里报缺键，就是 None 被当成了 False、通用规则根本没被问到",
+        )
+        self.assertEqual(
+            cli._missing_required_keys(platform, {}), ["only_key"],
+            "回落只是换一个判据，不是绕过判据 —— 键真缺时仍必须被拒",
+        )
+
+    def test_a_missing_key_still_blocks_an_abstainer(self):
+        """⚠️ 回落**不等于**放行：通用规则该拒的仍要拒。"""
+        platform = self._platform("abstainer3", optional=True, answer=None)
+        self.assertFalse(
+            cli._has_configured_adapter(Config(adapters={"abstainer3": {}})),
+            "回落只是换一个判据，不是绕过判据",
+        )
+
+    def test_real_answers_are_passed_through_unchanged(self):
+        for answer, expected in ((True, True), (False, False)):
+            with self.subTest(answer=answer):
+                platform = self._platform("answerer", optional=True, answer=answer)
+                self.assertIs(
+                    cli._readiness_verdict(platform, {"only_key": "x"}), expected
+                )
+
+    def test_the_declaration_alone_decides_whether_it_may_abstain(self):
+        """⛔ ``config_optional`` 为假时，返回什么都一律回落（它的答案不作数）。"""
+        platform = self._platform("notoptional", optional=False, answer=True)
+        self.assertIsNone(
+            cli._readiness_verdict(platform, {"only_key": "x"}),
+            "没声明「答案由我给」的平台，它的 config_runnable 根本不该被采信",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

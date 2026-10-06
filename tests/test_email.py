@@ -26,6 +26,10 @@ import unittest
 
 from opencode_bridge.adapters.base import adapter_class, registered_names
 from opencode_bridge.adapters.email import (
+    DEFAULT_IMAP_PORT_SSL,
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_SMTP_PORT_SSL,
+    DEFAULT_SOCKET_TIMEOUT,
     DEDUPE_CAPACITY,
     ECHO_PREFIX,
     MESSAGE_LIMIT,
@@ -193,18 +197,33 @@ def make_mail(
     return msg.as_bytes()
 
 
+#: 最小可用配置（``required_tokens`` 配齐）。缺口②那几组测试直接
+#: :class:`EmailAdapter` 而不是走 :func:`make_email`，因为它们要**只**看配置解析的
+#: 效果，而 :func:`make_email` 会顺手把 ``min_interval`` 改成 0。
+EMAIL_MINIMAL = {
+    "address": "bot@example.com",
+    "password": "app-password",
+    "imap_host": "imap.example.com",
+    "smtp_host": "smtp.example.com",
+}
+#: ⚠️ 迁移到共享助手之后，**告警的 logger 换了**：从
+#: ``opencode_bridge.adapters.email`` 变成 ``opencode_bridge.config_coerce``。
+#: 消息文本的前缀（``email: ``）由 ``platform=self.name`` 保住，所以**日志内容不变**，
+#: 只是发出方变了 —— 顺带让"这一条是纪律 2 打的"变得可查。
+EMAIL_LOGGER = "opencode_bridge.adapters.email"
+COERCE_LOGGER = "opencode_bridge.config_coerce"
+
+#: 告警**内容**的前缀（logger 换了，但 ``platform=self.name`` 把它保住了）。
+EMAIL_LOG_PREFIX = "email: "
+
+
 def make_email(*, hooks=None, **cfg) -> tuple[EmailAdapter, RecordingHooks]:
     """造一个不发真实网络的适配器。
 
     ``hooks`` 默认用 :class:`RecordingHooks`（它**不**实现游标钩子，正好代表
     "没有落盘通道"那种配置）；传入别的实现即可测游标持久化那条路。
     """
-    base = {
-        "address": "bot@example.com",
-        "password": "app-password",
-        "imap_host": "imap.example.com",
-        "smtp_host": "smtp.example.com",
-    }
+    base = dict(EMAIL_MINIMAL)
     base.update(cfg)
     if hooks is None:
         hooks = RecordingHooks()
@@ -322,6 +341,370 @@ class TestConfig(unittest.TestCase):
     def test_socket_timeout_has_a_default(self):
         adapter, _ = make_email()
         self.assertGreater(adapter.socket_timeout, 0)
+
+
+# ----------------------------------------------------------------------
+# ⚛️ 缺口②：``_timeout`` / ``_port`` / ``start()`` 里的裸转换（共享助手接手后）
+# ----------------------------------------------------------------------
+#: 参照实现 = **改动前工作树**里那三个表达式，逐字节抄在这里（⛔ 不用 ``git stash``
+#: 取基线 —— 那会把别的 lane 的在制品一起收走，AGENTS.md §9）。
+def pre_change_socket_timeout(config: dict) -> float:
+    """改动前的 ``EmailAdapter._timeout()``（逐字抄）。"""
+    raw = config.get("socket_timeout")
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_SOCKET_TIMEOUT
+
+
+def pre_change_port(config: dict, key: str, security: str, is_imap: bool) -> int:
+    """改动前的 ``EmailAdapter._port()``（逐字抄，含它自己的告警分支）。"""
+    raw = config.get(key)
+    try:
+        if raw not in (None, "") and not isinstance(raw, bool):
+            port = int(raw)
+            if 0 < port < 65536:
+                return port
+            raise ValueError(port)
+    except (TypeError, ValueError):
+        pass                                    # 告警由调用方断言，不在这里
+    if security == "starttls":
+        return DEFAULT_IMAP_PORT_STARTTLS if is_imap else DEFAULT_SMTP_PORT_STARTTLS
+    return DEFAULT_IMAP_PORT_SSL if is_imap else DEFAULT_SMTP_PORT_SSL
+
+
+def pre_change_poll_interval(config: dict, default: float) -> float:
+    """改动前 ``start()`` 里的 ``float(cfg.get('poll_interval') or default)``。"""
+    return float(config.get("poll_interval") or default)
+
+
+class TestSocketTimeoutCoercion(unittest.TestCase):
+    """``socket_timeout`` 迁到 ``coerce_float`` 之后的前后对照。
+
+    ⚠️ **日志行为变了，这是有意的**：旧的 ``_timeout()`` 对非法值**静默**回落
+    （``except: pass``），而同一文件里的 ``_port()`` **告警** —— 同一个文件里两套
+    规矩，用户看到一个键报了警、另一个没报，只能推断出"这个不重要"。统一到纪律 2
+    之后**两种键都会告警**。
+    """
+
+    LEGAL_VALUES = (30, "30", " 30 ", "\t30\n", 30.5, "30.5")
+
+    def test_legal_socket_timeouts_are_byte_identical_to_the_old_expression(self):
+        for value in self.LEGAL_VALUES:
+            with self.subTest(socket_timeout=value):
+                config = dict(EMAIL_MINIMAL, socket_timeout=value)
+                expected = pre_change_socket_timeout(config)
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter = EmailAdapter(dict(config), RecordingHooks())
+                self.assertEqual(adapter.socket_timeout, expected)
+
+    def test_an_unset_socket_timeout_is_still_silent(self):
+        for blank in ({}, {"socket_timeout": None}, {"socket_timeout": ""},
+                      {"socket_timeout": "   "}):
+            with self.subTest(blank=blank):
+                config = {**EMAIL_MINIMAL, **blank}
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter = EmailAdapter(dict(config), RecordingHooks())
+                self.assertEqual(
+                    adapter.socket_timeout, DEFAULT_SOCKET_TIMEOUT
+                )
+
+    #: ``(值, 改前 _timeout() 给的数, 改后应当给的数)``；改前一列是**实测**的。
+    #: ⚠️ 最后三个是**有意的分岔**，不是抄错：它们各自曾静默给出一个"能跑但错"的数。
+    ILLEGAL_SOCKET_TIMEOUTS = [
+        ("abc", DEFAULT_SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT),
+        (0, DEFAULT_SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT),
+        (-5, DEFAULT_SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT),
+        (True, 1.0, DEFAULT_SOCKET_TIMEOUT),        # ⚠️ 改前是**1 秒**超时
+        (False, DEFAULT_SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT),
+        (float("nan"), DEFAULT_SOCKET_TIMEOUT, DEFAULT_SOCKET_TIMEOUT),
+        (float("inf"), float("inf"), DEFAULT_SOCKET_TIMEOUT),   # ⚠️ 改前**永不超时**
+    ]
+
+    def test_illegal_socket_timeouts_now_warn_instead_of_falling_back_in_silence(self):
+        """改前静默、**改后告警**（纪律 2）—— 这是本次唯一一处"日志变吵"。
+
+        每个值都同时断言改前 / 改后两个数，所以"只是变吵"与"顺手改了取值"能分开看。
+        """
+        for value, before, after in self.ILLEGAL_SOCKET_TIMEOUTS:
+            with self.subTest(socket_timeout=value):
+                config = dict(EMAIL_MINIMAL, socket_timeout=value)
+                self.assertEqual(
+                    pre_change_socket_timeout(config), before,
+                    "参照实现的改前取值与实测记录不符（抄错了）",
+                )
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    adapter = EmailAdapter(dict(config), RecordingHooks())
+                self.assertEqual(adapter.socket_timeout, after)
+                joined = "\n".join(logs.output)
+                self.assertIn(EMAIL_LOG_PREFIX, joined)
+                self.assertIn("socket_timeout", joined)
+                self.assertIn(repr(value), joined)
+                self.assertIn(repr(DEFAULT_SOCKET_TIMEOUT), joined)
+
+    def test_an_infinite_socket_timeout_no_longer_silently_disables_the_timeout(self):
+        """⛔ 反向断言：改前 ``float("inf") > 0`` 成立 ⇒ **真的设成了永不超时**。
+
+        这与 :data:`DEFAULT_SOCKET_TIMEOUT` 存在理由（"没有它，一次卡住的 ``select``
+        会让 ``stop()`` 白等满 join 超时"）**正好相反** —— 而它是静默发生的。
+        """
+        self.assertEqual(
+            pre_change_socket_timeout({"socket_timeout": float("inf")}), float("inf")
+        )
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter = EmailAdapter(
+                dict(EMAIL_MINIMAL, socket_timeout=float("inf")), RecordingHooks()
+            )
+        self.assertEqual(adapter.socket_timeout, DEFAULT_SOCKET_TIMEOUT)
+
+    def test_a_boolean_socket_timeout_is_not_silently_one_second(self):
+        """⛔ 反向断言：``True`` 曾被 ``float(True)`` 读成 **1.0 秒**。
+
+        1 秒的 socket 超时不是"很短"，而是每次 ``select`` 都超时 ⇒ 收信静默失效。
+        而用户配的是一个 ``true``，**没有任何东西会告诉他**。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter = EmailAdapter(
+                dict(EMAIL_MINIMAL, socket_timeout=True), RecordingHooks()
+            )
+        self.assertEqual(adapter.socket_timeout, DEFAULT_SOCKET_TIMEOUT)
+
+    def test_zero_is_rejected_because_zero_means_no_timeout_at_all(self):
+        """``0`` 不是"很短的超时"，是 ``socket.settimeout(0)`` = 非阻塞 socket。
+
+        改前的 ``if value > 0`` 也会拒它，所以**取值不变**（仍是 30.0）；这条钉的是
+        区间必须是**开**下界 —— 若用 ``minimum=0``，``0`` 会被静默收下。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            adapter = EmailAdapter(dict(EMAIL_MINIMAL, socket_timeout=0), RecordingHooks())
+        self.assertEqual(adapter.socket_timeout, DEFAULT_SOCKET_TIMEOUT)
+        self.assertIn("> 0", "\n".join(logs.output))
+
+    def test_the_timeout_reaches_imaplib_unchanged(self):
+        """合法值必须真的送到 ``imaplib``（不是只落在字段上）。
+
+        ⚠️ 替换的是 :meth:`EmailAdapter._imap_connect` **内部**用的
+        ``imaplib.IMAP4_SSL``，而不是替换 ``_imap_connect`` 本身 —— 后者会把被测逻辑
+        一起替换掉，等于什么都没测（同文件里既有的做法）。
+        """
+        import opencode_bridge.adapters.email as email_mod
+
+        adapter, _ = make_email(socket_timeout="12.5")
+        captured: dict = {}
+
+        class _RecordingIMAP:
+            def __init__(self, host, port, ssl_context=None, timeout=None):
+                captured.update(host=host, port=port, timeout=timeout)
+
+            def login(self, user, password):
+                return ("OK", [])
+
+            def select(self, mailbox, readonly=False):
+                return ("OK", [])
+
+        original = email_mod.imaplib.IMAP4_SSL
+        email_mod.imaplib.IMAP4_SSL = _RecordingIMAP
+        try:
+            adapter._imap_connect()
+        finally:
+            email_mod.imaplib.IMAP4_SSL = original
+        self.assertEqual(captured["timeout"], 12.5)
+        self.assertEqual(captured["timeout"], adapter.socket_timeout)
+
+
+class TestPortCoercion(unittest.TestCase):
+    """``_port()`` 迁到 ``coerce_int`` 之后的前后对照（它本来就告警，改的是判据）。"""
+
+    LEGAL_PORT_VALUES = (2525, "2525", " 2525 ", "\t2525\n", 1, 65535)
+
+    def test_legal_imap_ports_are_byte_identical_to_the_old_expression(self):
+        for security in ("ssl", "starttls"):
+            for value in self.LEGAL_PORT_VALUES:
+                with self.subTest(imap_port=value, security=security):
+                    config = dict(
+                        EMAIL_MINIMAL,
+                        imap_security=security,
+                        imap_port=value,
+                    )
+                    expected = pre_change_port(config, "imap_port", security, True)
+                    with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                        adapter = EmailAdapter(dict(config), RecordingHooks())
+                    self.assertEqual(adapter.imap_port, expected)
+
+    def test_legal_smtp_ports_are_byte_identical_to_the_old_expression(self):
+        for security in ("ssl", "starttls"):
+            for value in self.LEGAL_PORT_VALUES:
+                with self.subTest(smtp_port=value, security=security):
+                    config = dict(
+                        EMAIL_MINIMAL,
+                        smtp_security=security,
+                        smtp_port=value,
+                    )
+                    expected = pre_change_port(config, "smtp_port", security, False)
+                    with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                        adapter = EmailAdapter(dict(config), RecordingHooks())
+                    self.assertEqual(adapter.smtp_port, expected)
+
+    def test_an_unset_port_is_still_silent_and_follows_the_tls_mode(self):
+        for blank in ({}, {"imap_port": None}, {"imap_port": ""}):
+            with self.subTest(blank=blank):
+                config = {**EMAIL_MINIMAL, **blank}
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter = EmailAdapter(dict(config), RecordingHooks())
+                self.assertEqual(adapter.imap_port, DEFAULT_IMAP_PORT_SSL)
+                self.assertEqual(adapter.smtp_port, DEFAULT_SMTP_PORT_SSL)
+
+    #: ``(值, 改前 _port() 给的数, 改后应当给的数)``。改前一列是**实测**的
+    #: （跑改动前那个方法本体），逐条写在这里是为了让"改了什么"可核对。
+    ILLEGAL_PORTS = [
+        ("abc", DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        (0, DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        (-1, DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        (65536, DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        ([], DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        # ⚠️ 下面三个是**有意的分岔**（共享层拒 bool / float），不是笔误：
+        (True, DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),   # 改前靠方法内的 isinstance 挡
+        (False, DEFAULT_IMAP_PORT_SSL, DEFAULT_IMAP_PORT_SSL),
+        (2525.9, 2525, DEFAULT_IMAP_PORT_SSL),                 # ⚠️ 改前**截断成了 2525**
+    ]
+
+    def test_illegal_ports_keep_the_same_fallback_and_still_warn(self):
+        for value, before, after in self.ILLEGAL_PORTS:
+            with self.subTest(imap_port=value):
+                config = dict(EMAIL_MINIMAL, imap_port=value)
+                self.assertEqual(
+                    pre_change_port(config, "imap_port", "ssl", True), before,
+                    "参照实现的改前取值与实测记录不符（抄错了）",
+                )
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    adapter = EmailAdapter(dict(config), RecordingHooks())
+                self.assertEqual(adapter.imap_port, after)
+                joined = "\n".join(logs.output)
+                self.assertIn(EMAIL_LOG_PREFIX, joined)
+                self.assertIn("imap_port", joined)
+                self.assertIn(repr(value), joined)
+
+    def test_a_fractional_port_no_longer_gets_silently_truncated(self):
+        """⛔ 反向断言：改前 ``int(2525.9) == 2525`` ⇒ **静默连到了一个别的端口**。
+
+        而 ``2525`` 是一个**完全可用**的端口（测试替身就在用它），所以用户配了
+        2525.9 之后桥**看起来一切正常**，日志里一个字都没有。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_email(imap_port=2525.9)
+        self.assertEqual(adapter.imap_port, DEFAULT_IMAP_PORT_SSL)
+        self.assertNotEqual(adapter.imap_port, 2525)
+
+    def test_a_boolean_port_is_not_silently_becoming_port_one(self):
+        """⛔ 反向断言：改前的 ``not isinstance(raw, bool)`` 挡了 ``True``，
+        但那只是**本方法内**的挡板 —— 换成共享助手后这条语义必须由共享层承担。"""
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            adapter = EmailAdapter(dict(EMAIL_MINIMAL, imap_port=True), RecordingHooks())
+        self.assertEqual(adapter.imap_port, DEFAULT_IMAP_PORT_SSL)
+        self.assertIn("bool", "\n".join(logs.output))
+
+
+class TestPollIntervalCoercion(unittest.TestCase):
+    """``start()`` 里那处裸 ``float(...)``（缺口②3）。
+
+    ⚠️ 它**在** ``start()`` 而非 ``__init__`` ⇒ :meth:`BridgeCore.start` 的
+    try/except 会兜住，所以它**不是致命缺陷**（不会打死整个桥）。但它仍要迁：
+    ① 一致性；② 非法值让**这个适配器**从此不启动且只留一条 exception 栈；
+    ③ 负数会被 :class:`~opencode_bridge.transport.PollingTransport` 夹成 0
+    ⇒ **空转打死 IMAP**（比"起不来"更难被发现）。
+    """
+
+    LEGAL_POLL_INTERVALS = (0.01, "0.01", " 0.01 ", 60, "60", 60.5)
+
+    def test_legal_poll_intervals_are_byte_identical_to_the_old_expression(self):
+        for value in self.LEGAL_POLL_INTERVALS:
+            with self.subTest(poll_interval=value):
+                adapter, _ = make_email(poll_interval=value)
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    observed = self._start_and_read_idle_sleep(adapter)
+                self.assertEqual(
+                    observed, pre_change_poll_interval({"poll_interval": value}, 60.0)
+                )
+
+    def test_a_missing_poll_interval_is_still_silent(self):
+        adapter, _ = make_email()
+        with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+            observed = self._start_and_read_idle_sleep(adapter)
+        self.assertEqual(observed, 60.0)
+
+    def test_an_unparsable_poll_interval_no_longer_breaks_start(self):
+        """⭐ 本任务在 ``start()`` 这一处**唯一**的"起不来 → 起得来"。
+
+        改前 ``float("abc")`` 抛 ``ValueError``，从 :meth:`EmailAdapter.start` 冒出去
+        ⇒ 被 :meth:`BridgeCore.start` 的 except 接住 ⇒ **email 这个适配器不启动**，
+        而日志里只有一条 exception 栈，不说"是 poll_interval 配错了"。
+        """
+        adapter, _ = make_email(poll_interval="abc")
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            observed = self._start_and_read_idle_sleep(adapter)
+        self.assertEqual(observed, 60.0)
+        joined = "\n".join(logs.output)
+        self.assertIn("poll_interval", joined)
+        self.assertIn(repr("abc"), joined)
+        self.assertIsNotNone(adapter._transport, "start() 必须真的把适配器起起来")
+
+    def test_a_negative_poll_interval_no_longer_becomes_a_hot_loop(self):
+        """⚠️ 改前 ``float(-5) == -5.0`` 会被 ``PollingTransport`` 夹成 ``0.0``
+        ⇒ 每轮空转立即重问 ⇒ **打死 IMAP 服务端**（而本地看不出任何异常）。
+
+        参照实现那一栏记着这个改前的值：``-5.0``。改后是默认值 60.0 + 告警。
+        """
+        self.assertEqual(pre_change_poll_interval({"poll_interval": -5}, 60.0), -5.0)
+        adapter, _ = make_email(poll_interval=-5)
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            observed = self._start_and_read_idle_sleep(adapter)
+        self.assertEqual(observed, 60.0)
+        self.assertIn("poll_interval", "\n".join(logs.output))
+
+    def test_zero_is_rejected_because_zero_is_a_hot_loop(self):
+        """``0`` 曾被 ``or`` 当成"没配"而静默回落到 60.0；取值不变，但**现在告警**。
+
+        ⚠️ 这是"静默"变"告警"的一处：用户写 ``0`` 本意可能是"尽快轮询"，而那正是
+        空转。告警说清键名与回落到什么，比静默改掉他的意图可查。
+        """
+        self.assertEqual(pre_change_poll_interval({"poll_interval": 0}, 60.0), 60.0)
+        adapter, _ = make_email(poll_interval=0)
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            observed = self._start_and_read_idle_sleep(adapter)
+        self.assertEqual(observed, 60.0)
+        self.assertIn("poll_interval", "\n".join(logs.output))
+
+    @staticmethod
+    def _start_and_read_idle_sleep(adapter: EmailAdapter) -> float:
+        """起一次适配器并把真正交给 :class:`PollingTransport` 的 ``idle_sleep`` 读回来。
+
+        ⛔ 必须读**传输层真的拿到的那个数**，不能读 ``adapter.poll_interval`` ——
+        后者是类属性，与配置无关，读它等于什么都没测。
+        """
+        captured: dict = {}
+
+        class _CapturingTransport:
+            def __init__(self, fetch, idle_sleep=0.0, name=""):
+                captured["idle_sleep"] = idle_sleep
+
+            def start(self, dispatch):
+                return None
+
+            def stop(self, timeout=5.0):
+                return None
+
+        import opencode_bridge.adapters.email as email_module
+
+        original = email_module.PollingTransport
+        email_module.PollingTransport = _CapturingTransport
+        try:
+            adapter.start()
+        finally:
+            email_module.PollingTransport = original
+        return captured["idle_sleep"]
 
     def test_msgid_domain_survives_idn(self):
         """make_msgid 要求域匹配 [A-Za-z0-9.-]+，IDN 域必须被过滤掉。"""

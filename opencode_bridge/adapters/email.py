@@ -83,7 +83,7 @@ from typing import Any, Optional
 import imaplib
 import smtplib
 
-from ..config_coerce import coerce_int
+from ..config_coerce import coerce_float, coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..transport import NOTHING, EventQueue, PollingTransport
@@ -155,6 +155,8 @@ THREAD_CACHE_CAPACITY = 256
 DEFAULT_POLL_INTERVAL = 60.0
 #: 每个 socket 操作的超时。**必须有** —— 没有它，一次卡住的 ``select`` 会让
 #: ``stop()`` 白等满 join 超时。
+#: ⚠️ 它是 :attr:`EmailAdapter.socket_timeout` 的**缺省值**，而读取走
+#: :func:`~opencode_bridge.config_coerce.coerce_float`（区间 ``> 0``，开下界）。
 DEFAULT_SOCKET_TIMEOUT = 30.0
 #: 出站最小发送间隔：防止"每条回复都等 0 秒"把收件箱刷爆（同一封线程里 agent 可能
 #: 连发多条进度/最终消息）。
@@ -464,7 +466,16 @@ class EmailAdapter(Adapter):
 
         #: 是否校验证书链与主机名。默认 True；关掉必须显式配置（自建/实验环境）。
         self.verify_tls: bool = self._config_verify_tls()
-        self.socket_timeout: float = self._timeout()
+
+        #: 每个 socket 操作的超时。**必须有** —— 没有它，一次卡住的 ``select`` 会让
+        #: ``stop()`` 白等满 join 超时。
+        #: ⚠️ 下界是**开**的 ``0``：``0`` 不是"很短的超时"，而是"这个 socket 永不超时"
+        #: （``socket.settimeout(0)`` = 非阻塞），那正是本平台最致命的那种失效。
+        #: 非法值一律告警回落（旧的 ``_timeout()`` 静默回落 ⇒ 写错旋钮时无迹可寻）。
+        self.socket_timeout: float = coerce_float(
+            self.config, "socket_timeout", DEFAULT_SOCKET_TIMEOUT,
+            exclusive_minimum=0.0, platform=self.name,
+        )
 
         #: 回环标记前缀（出站写进 Subject，入站见到就丢）。
         #: **刻意不允许配成空串** —— 空前缀等于关掉防回环，那是本平台最致命的保护。
@@ -536,19 +547,24 @@ class EmailAdapter(Adapter):
         return default
 
     def _port(self, key: str, security: str, is_imap: bool) -> int:
-        """端口：显式配置优先，否则按 TLS 方式取该协议的默认端口。"""
-        raw = self.config.get(key)
-        try:
-            if raw not in (None, "") and not isinstance(raw, bool):
-                port = int(raw)
-                if 0 < port < 65536:
-                    return port
-                raise ValueError(port)
-        except (TypeError, ValueError):
-            logger.warning("email: %s=%r 不是合法端口，按协议默认端口处理", key, raw)
+        """端口：显式配置优先，否则按 TLS 方式取该协议的默认端口。
+
+        ⚠️ **"默认端口"是本方法的活**（starttls 与隐式 TLS 的端口不同），所以先把它
+        算出来、再交给共享助手当 ``default`` —— 区间是 ``[1, 65535]``，⛔ 不要在调用点
+        外面再套一层夹取（那会把 ``0`` 静默改成 1，用户以为配了别的数）。
+        """
         if security == "starttls":
-            return DEFAULT_IMAP_PORT_STARTTLS if is_imap else DEFAULT_SMTP_PORT_STARTTLS
-        return DEFAULT_IMAP_PORT_SSL if is_imap else DEFAULT_SMTP_PORT_SSL
+            protocol_default = (
+                DEFAULT_IMAP_PORT_STARTTLS if is_imap else DEFAULT_SMTP_PORT_STARTTLS
+            )
+        else:
+            protocol_default = (
+                DEFAULT_IMAP_PORT_SSL if is_imap else DEFAULT_SMTP_PORT_SSL
+            )
+        return coerce_int(
+            self.config, key, protocol_default,
+            minimum=1, maximum=65535, platform=self.name,
+        )
 
     def _config_verify_tls(self) -> bool:
         """读 ``verify_tls``（默认 ``True``）；非法值按 ``True`` 处理而不是静默降级。"""
@@ -566,16 +582,6 @@ class EmailAdapter(Adapter):
             "email: verify_tls 配置非法 %r，按 True（校验证书）处理", raw
         )
         return True
-
-    def _timeout(self) -> float:
-        raw = self.config.get("socket_timeout")
-        try:
-            value = float(raw)
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            pass
-        return DEFAULT_SOCKET_TIMEOUT
 
     def _tls_context(self) -> Any:
         """造 SSL context。``verify_tls=False`` 时显式降级并**大声告警**。"""
@@ -628,9 +634,17 @@ class EmailAdapter(Adapter):
             )
         self._stop_event.clear()
         if self._transport is None:
+            # ⚠️ 旧的裸 `float(cfg.get("poll_interval") or self.poll_interval)`：
+            #: `"abc"` 会把 **ValueError 抛到 `BridgeCore.start()`**（那里有 try/except
+            #: ⇒ 不致命，但这个适配器**从此不启动**且只有一条 exception 栈），
+            #: 负数则被 `PollingTransport` 夹成 0 ⇒ **空转打死 IMAP**。
+            #: 现在两者都回落默认值 + 告警。下界是**开**的 ``0``（0 同样是空转）。
             self._transport = PollingTransport(
                 self._fetch_one,
-                idle_sleep=float(self.config.get("poll_interval") or self.poll_interval),
+                idle_sleep=coerce_float(
+                    self.config, "poll_interval", self.poll_interval,
+                    exclusive_minimum=0.0, platform=self.name,
+                ),
                 name=self.name,
             )
         self._transport.start(self._on_raw)

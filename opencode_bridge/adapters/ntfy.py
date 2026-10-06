@@ -45,6 +45,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional, Tuple
 
+from ..config_coerce import coerce_float
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
@@ -296,7 +297,16 @@ class NtfyAdapter(Adapter):
         if self._transport is None:
             self._transport = PollingTransport(
                 self._fetch_one,
-                idle_sleep=float(self.config.get("poll_interval") or self.poll_interval),
+                # ⚠️ 原来这里是裸 ``float(self.config.get(...) or ...)``：填非数字会抛
+                # ``ValueError`` 打断 ``start()``（被 :meth:`BridgeCore.start` 兜住 ⇒
+                # 该适配器从此不启动，而日志只有一条栈、不说「是哪个键」），
+                # 填**负数**更糟 —— 会被传输层夹成 ``0.0`` ⇒ 每轮空转立刻重问，
+                # **本地毫无异常**，故障体现在服务端。
+                # ⇒ 走共享助手；下界是**开区间**：``0`` 不是「很短的轮询」是「不等待」。
+                idle_sleep=coerce_float(
+                    self.config, "poll_interval", self.poll_interval,
+                    exclusive_minimum=0.0, platform=self.name,
+                ),
                 name=self.name,
             )
         self._transport.start(self._on_raw)

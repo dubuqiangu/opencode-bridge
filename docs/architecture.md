@@ -4,7 +4,8 @@
 > 要查"某个平台怎么配"看 [`install.md`](install.md)；要查"为什么这样选"看
 > [`platform-design-reference.md`](platform-design-reference.md)。
 >
-> 本文描述的是**已提交**的状态。a2a 与 Telegram 迁移正在并行进行中，未包含在内。
+> 本文描述的是**已提交**的状态。a2a 已在其中（见不变量 17 与
+> [`a2a.md`](a2a.md)）。
 
 ## 立身约束（决定了很多设计取舍）
 
@@ -12,7 +13,7 @@
 |---|---|
 | **Python 3.10+，仅标准库** | WebSocket 必须自研（`ws.py`）；没有 `httpx`/`websockets` 可用 |
 | **纯本机运行** | 7 个 webhook-only 平台（WhatsApp官方/LINE/Teams/SMS/Synology/Zalo/Google Chat）接不进来 —— 它们需要一个可达的公网回调地址 |
-| **不要求公网回调地址** | 十个平台全部走"我们主动连出去"（长轮询 / WebSocket 客户端 / IMAP 轮询） |
+| **不要求公网回调地址** | 12 个平台走"我们主动连出去"（长轮询 / WebSocket 客户端 / IMAP 轮询），外加 a2a 这个反方向的例外（**我们是被调方**） |
 
 **这三条不是技术偏好，是筛选平台时的第一道闸门。** 违反其中任何一条的平台，
 即使协议再简单也不进B 组 —— 理由见 [`../tasks.md`](../tasks.md) 的阶段 E。
@@ -23,7 +24,9 @@
 ┌──────────────────────────────────────────────────────────────┐
 │ __main__.py    CLI：--setup / --status / --check              │
 ├──────────────────────────────────────────────────────────────┤
-│ core.py        编排：消息进出的主循环、会话映射、冻结文案真源│
+│ core.py        编排：消息进出的主循环、会话映射              │
+├──────────────────────────────────────────────────────────────┤
+│ commands.py    斜杠命令 + /setup 引导（冻结文案真源）        │
 ├──────────────────────────────────────────────────────────────┤
 │ opencode_client.py  与 opencode 服务通信（会话 id 传递）     │
 ├──────────────────────────────────────────────────────────────┤
@@ -47,8 +50,9 @@
 是十份重复逻辑。于是 `stop()` 的正确顺序（先关连接再 join）要在每个文件里各写对一次——
 而它恰恰是最容易写错的那一处（关一个卡在 `read()` 上的 socket 不保证唤醒那次读）。
 
-搬进传输层之后，**这类错误从"十处机会"变成"零处机会"**。迁移是逐步进行的
-（IRC → Matrix → Telegram → …），`tasks.md` 的阶段 A 记录了进度。
+搬进传输层之后，**这类错误从"十处机会"变成"零处机会"**。迁移已完成：13 个平台里
+除 a2a 外**全部**走 `transport/`（a2a 是本机 HTTP server，用共用模块 `httpsrv.py`），
+`tasks.md` 的阶段 A 记录了进度。
 
 **这不是"抽象洁癖"。** 迁移的实测收益是**概念性**的，不是行数：IRC 那家真实代码净减
 42 行，Matrix 那家**反而多了 8 行**（多线程接缝与游标拆分的成本吃掉了省下的样板）。
@@ -82,27 +86,29 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 ```
 
 `edit()` 返回 `False` 表示**该平台没有编辑能力**，core 会退化成"再发一条新消息"。
-这是诚实降级，不是失败 —— 十平台里IRC / Twitch / ntfy / email 都没有编辑能力。
+这是诚实降级，不是失败 —— 13 个平台里有 7 个没有：`a2a` / `email` /
+`homeassistant` / `irc` / `ntfy` / `qqbot` / `twitch`。
 
 ## 模块职责
 
 | 文件 | 行数 | 职责 | 不该出现在这里的东西 |
 |---|---|---|---|
-| `hooks.py` | 122 | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
+| `hooks.py` | 152 | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
 | `identity.py` | 241 | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
-| `split.py` | 294 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
-| `state.py` | 488 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
+| `split.py` | 320 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
+| `state.py` | 560 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
 | `conversation_keys.py` | 207 | 会话级状态读写门面 + **歧义旧前缀的归属划分**（`channel:` 键按各家 local id 文法认领） | 在多家之间仲裁（= 猜）、改盘上的歧义键 |
 | `status.py` | 436 | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
-| `transport/base.py` | 395 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
+| `transport/base.py` | 554 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
 | `transport/polling.py` | 94 | HTTP 短轮询/长轮询 | — |
-| `transport/websocket.py` | 119 | WebSocket 事件流 | — |
+| `transport/websocket.py` | 164 | WebSocket 事件流 | — |
 | `transport/tcp_lines.py` | 200 | TCP 行协议 | — |
 | `transport/queue.py` | 112 | `EventQueue`（批量 fetch → 一次一条）+ `NOTHING` | — |
-| `ws.py` | 534 | RFC 6455 客户端：握手三重校验、客户端掩码、分片、控制帧 | 平台知识 |
-| `adapters/base.py` | 341 | 注册表、`capabilities()`、`admits()`、`classify_http`、`send_result()` | 循环/线程 |
-| `core.py` | 1299 | 编排、会话映射、`_SETUP_GUIDES`/`SETUP_MENU_TEXT`（**冻结文案真源**） | 平台协议细节 |
-| `__main__.py` | 483 | CLI | — |
+| `ws.py` | 563 | RFC 6455 客户端：握手三重校验、客户端掩码、分片、控制帧 | 平台知识 |
+| `adapters/base.py` | 766 | 注册表、`capabilities()`、`admits()`、`classify_http`、`send_result()`、**`config_optional` / `config_runnable`** | 循环/线程 |
+| `commands.py` | 596 | 斜杠命令 + **`_SETUP_GUIDES`/`SETUP_MENU_TEXT`（冻结文案真源）** | 平台协议细节 |
+| `core.py` | 484 | 编排、会话映射（七个职责簇已按 `AGENTS.md` §5.1 拆出并**注入**） | 平台协议细节 |
+| `__main__.py` | 958 | CLI（**唯一**的判定入口 `_readiness_verdict` / `_missing_required_keys` 在这里） | — |
 
 ## 关键不变量
 
@@ -117,12 +123,42 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 3. **`admits()` 必须在产生 `Inbound` 之前** —— 被拒绝的消息不得有任何副作用。
 4. **`edit()` 诚实返回 `bool`** —— `False` = 该平台无此能力，core 退化成发新消息。
    不许假装成功。
-5. **"必须声明配置面" ≠ "必须显式配置才能跑"** —— 前者由"`required_tokens` /
-   `outbound_tokens` 非空"这条守卫强制（抓到过 Matrix 忘声明的真bug），
-   后者由 preflight 与两个状态视图判定点使用。两者此前混为一谈，于是 a2a 被迫把
-   `bind_port` 填进 `required_tokens`，**结果只配 a2a 的用户被桥接拒绝启动**。
-   无凭据可填且默认值安全的平台声明 **`config_optional = True`** 来分开这两件事 ——
-   它豁免"必须显式配置"，**不豁免"必须声明"**。见 `adapters/base.py` 里的说明。
+5. **"必须声明配置面" ≠ "必须显式配置才能跑"，而后者还要区分「分类」与「判定」**
+   —— 前者由"`required_tokens` / `outbound_tokens` 非空"这条守卫强制（抓到过
+   Matrix 忘声明的真bug）。后者此前与它混为一谈，于是 a2a 被迫把 `bind_port` 填进
+   `required_tokens`，**结果只配 a2a 的用户被桥接拒绝启动**。
+
+   现在由**两个不同的问题**回答，缺一不可：
+
+   | | 问题 | 形状 | 谁作答 |
+   |---|---|---|---|
+   | `config_optional` | **分类**：我是没有凭据可填的那一类吗？ | **静态 `bool`**，默认 `False`，作为 JSON 值出现在 `capabilities()` 里 | 平台声明 |
+   | `config_runnable(entry)` | **判定**：**用户手里这一份** `entry` 此刻够不够跑？ | `@classmethod`，**读配置**，默认 `return False` | 平台覆写 |
+
+   ⚠️ **`config_optional = True` 不再意味着"不用配任何东西也能跑"。**
+   它只表示"**我的判定答案由我自己给**"；具体能不能跑要问 `config_runnable(entry)`
+   （同一平台不同配置，答案不同）。仓里曾把它注释成"无需显式配置即可运行，且默认值
+   安全"，**那句前提已不成立** —— a2a 的空 `bind_port` 会被判为未配置、`start()`
+   **拒绝绑定**。
+
+   ⛔ **`config_runnable` 的默认答案是「否」，而这个默认是承重的**：其余十二个平台的
+   「够不够跑」走 `required_tokens` 那条通用规则（逐键看值非空），默认 `False` 让它们
+   **一个字都不用改**地继续走那条路。⇒ **不覆写它的新平台，配好之前预检一律说
+   「未配置」**（缺哪些键会被如实报出来）—— 这是**失败关闭**，不是 bug。
+
+   **判定入口只有一处**：`__main__._readiness_verdict(cls, entry)`，**三处视图
+   （preflight / `--setup --json` / `--status` 表格）都问它**，"还差哪些键"由同源的
+   `_missing_required_keys` 回答 ⇒ 三处不可能各说一套。它返回**三态**：`None` = 走
+   通用规则；`True` / `False` = **该平台自答，权威**，**不再**落回通用规则 ——
+   否则 `bind_port: "nope"` 这种"键非空、但起不来"的配置会被通用规则重新判成
+   "配好了"。
+
+   ⚠️ **因此"回落与否"由 `config_optional` 决定，不由 `config_runnable` 的返回值
+   决定。** `True` / `False` **都是**权威答案，没有"弃权"这个返回值；`config_optional`
+   不为真时才走 `required_tokens` 通用规则。覆写契约（吃**原始**配置子树 `entry`、
+   **不许构造适配器、不许联网** —— 它在 endpoint discovery 之前被问到，而 `run_check`
+   的契约是「no sessions, **no adapters**」）写在 `adapters/base.py` 里。
+   新平台怎么声明见 [`adding-a-platform.md`](adding-a-platform.md) 的第 3b 步。
 6. **入站归属靠 `Inbound.platform` 记住，不靠猜** —— `_adapter_for` 的主路径是
    入站时种下的映射（**准确**信息），前缀猜测只是兜底。A1 迁移打掉了"按调用线程判断"
    那层保护后，前缀路由若只认一两种前缀，多平台用户会把回复发到**错误的平台**，
@@ -218,5 +254,6 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 
 ## 加一个平台有多贵
 
-见 [`adding-a-platform.md`](adding-a-platform.md)。结论：适配器本体约 150~380 行，
+见 [`adding-a-platform.md`](adding-a-platform.md)。结论：适配器本体量级见那里
+（最干净的 `ntfy` 约 390 行，协议特例多的平台会高一倍），
 其中**零行**是连接/重连/线程/停止代码。

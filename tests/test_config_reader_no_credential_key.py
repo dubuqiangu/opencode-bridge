@@ -51,6 +51,24 @@ CREDENTIAL_KEY = re.compile(
 
 SENSITIVE_READERS = ("debug", "info", "warning", "error", "exception")
 
+#: 共享类型强制助手里的四个函数 —— **它们才是现在真正的「读取器」**。
+#:
+#: ⚠️⚠️ **它们无法被下面那个「函数体里有 ``%r`` 日志」的启发式发现**，
+#: 而这正是 :func:`reader_names_in` 的全部判据。原因（实测，2026-10-06）：
+#:
+#: * 它们**确实**会用 ``%r`` 记日志，但那条日志在 :mod:`opencode_bridge.config_coerce`
+#:   的一个**私有助手里**，而那个助手把**键名当参数接收** ⇒ 它内部**没有任何字符串字面量**；
+#: * 于是按启发式只会认出一个不含字面量的私有助手名，**认不出 ``coerce_int`` 这些真读取器**。
+#:
+#: ⇒ 后果（**今天真实发生过**）：``email._port`` 把手写告警删掉、改调
+#: ``coerce_int(self.config, "imap_port", …)`` 之后，
+#: **这个调用点上的字面量对判据彻底隐形** —— 而它正是这道护栏要守的东西
+#: （「凭据形状的键名不得进读取器」）。
+#:
+#: ⇒ 所以这里**按构造**列出它们，而不是指望启发式重新发现。
+#: ⛔ 改名时这条会静默失效 ⇒ :func:`test_the_shared_readers_are_all_real` 钉住它们。
+SHARED_CONFIG_READERS = ("coerce_int", "coerce_float", "coerce_bool", "coerce_text")
+
 
 def _parent_map(tree: ast.AST) -> dict:
     parent = {}
@@ -146,6 +164,19 @@ def reader_names_in(src: str) -> set:
     return readers
 
 
+def _all_reader_names(sources: dict) -> set:
+    """**全部**读取器 = 启发式发现的 ∪ :data:`SHARED_CONFIG_READERS`。
+
+    不要只取启发式那一半 —— 见 :data:`SHARED_CONFIG_READERS` 的说明：
+    共享助手的四个函数是真读取器，但启发式**认不出它们**
+    （它们的 ``%r`` 日志在把键名当参数接收的私有助手里，内部没有字面量）。
+    """
+    readers = set()
+    for src in sources.values():
+        readers |= reader_names_in(src)
+    return readers | set(SHARED_CONFIG_READERS)
+
+
 def _all_sources() -> dict:
     return {
         path: io.open(path, encoding="utf-8").read()
@@ -153,12 +184,16 @@ def _all_sources() -> dict:
     }
 
 
-def violations() -> list:
-    """扫全部适配器，返回 [(文件, 行号, 读取器名, 键名)]。"""
-    sources = _all_sources()
-    readers = set()
-    for src in sources.values():
-        readers |= reader_names_in(src)
+def violations(sources: dict | None = None) -> list:
+    """扫全部适配器，返回 ``[(文件, 行号, 读取器名, 键名)]``。
+
+    :param sources: 可选的 ``{文件名: 源码}``；默认读磁盘。
+        ⚠️ 存在的理由：主断言只证明「真代码里没有违规」，**证明不了判据还活着** ——
+        而「判据已失效」正是这道护栏最可能的死法（实测发生过，见
+        :data:`SHARED_CONFIG_READERS`）。⇒ 用它喂**合成样本**证明判据仍会红。
+    """
+    sources = _all_sources() if sources is None else sources
+    readers = _all_reader_names(sources)
 
     found = []
     for path, src in sources.items():
@@ -179,9 +214,7 @@ class ConfigReaderCredentialKeyTests(unittest.TestCase):
 
     def test_the_criterion_finds_readers_without_blowing_up(self):
         """前提断言：名单**非空、且不泛化** —— 两个方向都要卡。"""
-        readers = set()
-        for src in _all_sources().values():
-            readers |= reader_names_in(src)
+        readers = _all_reader_names(_all_sources())
         self.assertGreater(
             len(readers), 5, "名单异常地小 ⇒ 判据坏了（空集不等于不存在）"
         )
@@ -195,14 +228,13 @@ class ConfigReaderCredentialKeyTests(unittest.TestCase):
         ⚠️ 这条正是为了钉住「过窄」那个坑：文案匹配的版本漏掉了英文的
         ``_resolve_port``（``irc: bad port %r``）与 ``_port``（文案是「合法」）。
         """
-        readers = set()
-        for src in _all_sources().values():
-            readers |= reader_names_in(src)
+        readers = _all_reader_names(_all_sources())
         for expected in (
             "_config_int_value",     # nextcloud，形态 A
             "_config_float",         # nextcloud
             "_security",             # email，形态 A
-            "_port",                 # email
+            "coerce_int",            # 共享助手；email._port 的告警搬到了它里面
+            "coerce_float",          # 共享助手；email._timeout / ntfy.poll_interval
             "_config_verify_tls",    # email / mattermost
             "_config_intents",       # discord / qqbot
             "_config_shard",         # qqbot
@@ -223,6 +255,59 @@ class ConfigReaderCredentialKeyTests(unittest.TestCase):
         )
         self.assertEqual(
             found, [], "凭据形状的键名被喂进了配置读取器（会被 %%r 明文打出来）：\n" + detail
+        )
+
+
+    def test_the_shared_readers_are_all_real(self):
+        """⚠️ :data:`SHARED_CONFIG_READERS` 是**手写**的名字清单 ⇒ 改名会静默失效。
+
+        而它失效的后果是**隐形**的：主断言照样绿（真代码里确实没有违规），
+        只是护栏已经不守那些键了。⇒ 这条钉住「清单里的每个名字都真的存在」。
+        """
+        coerce_src = io.open(
+            Path(__file__).resolve().parent.parent / "opencode_bridge" / "config_coerce.py",
+            encoding="utf-8",
+        ).read()
+        for name in SHARED_CONFIG_READERS:
+            with self.subTest(name=name):
+                self.assertIn(
+                    "def " + name + "(",
+                    coerce_src,
+                    "config_coerce 里已没有 %s —— 它被改名/删除，而这份手写清单"
+                    "不会自己更新 ⇒ 护栏从此对那些键隐形" % name,
+                )
+
+    def test_a_credential_shaped_key_at_a_shared_call_site_is_caught(self):
+        """判据**活性**证明：合成的违规样本必须被红。
+
+        ⚠️ 主断言（``test_no_credential_shaped_key_reaches_a_config_reader``）
+        只证明「真代码里没有违规」—— 证明不了判据还活着。
+        而「判据已失效」正是这道护栏最可能的死法，且**失效时主断言是绿的**。
+        """
+        sample = (
+            "from opencode_bridge.config_coerce import coerce_int\n"
+            "\n"
+            "def _port(config):\n"
+            "    return coerce_int(config, \"bot_token\", 0)\n"
+        )
+        found = violations({Path("sample_probe.py"): sample})
+        self.assertEqual(
+            [(name, key) for _, _, name, key in found],
+            [("coerce_int", "bot_token")],
+            "共享助手的调用点上出现凭据形状键名，必须被抓到。"
+            "抓不到 ⇒ 判据对 coerce_* 这一形态已经失效（而主断言仍会是绿的）",
+        )
+
+    def test_a_benign_key_at_a_shared_call_site_is_not_flagged(self):
+        """⚠️ 反向对照：判据不能变成「凡是 ``coerce_*`` 就报」。"""
+        sample = (
+            "from opencode_bridge.config_coerce import coerce_int\n"
+            "\n"
+            "def _timeout(config):\n"
+            "    return coerce_int(config, \"imap_port\", 993)\n"
+        )
+        self.assertEqual(
+            violations({"sample_benign.py": sample}), [], "非凭据形状的键名不该被误报"
         )
 
 

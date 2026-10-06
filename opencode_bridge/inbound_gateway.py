@@ -639,19 +639,43 @@ class InboundGateway:
             if turn is None:
                 turn = Turn(conversation_id=conversation_id)
                 self._turns[session_id] = turn
-            need_progress = turn.progress_handle is None
-        if need_progress:
-            handle = self._send_text(
-                conversation_id,
-                PROGRESS_TEXT,
-                kind="progress",
-                adapter=adapter,
-                session_id=session_id,
+            # ⚠️ 「创建这一轮的那一条进度消息」是一次**跨 send 的归属**：锁内领取、
+            # 锁外发、锁内归还。这个字段与事件流那一侧**共用同一个**
+            # （见 :attr:`~opencode_bridge.event_stream.Turn.progress_message_creating`
+            # 的完整说明）—— 此前两条路径各自的 ``progress_handle is None`` 都在锁内
+            # 读、而**发送与写回都在锁外**，于是「占位消息」与「流式首片」各发一条、
+            # 其中一条的句柄被丢掉（读者把同一段正文读两遍，或看见一个永远停在
+            # 「⏳ 处理中…」的僵尸气泡）。
+            create_progress = (
+                turn.progress_handle is None
+                and not turn.progress_message_creating
             )
-            with self._lock:
-                current = self._turns.get(session_id)
-                if current is not None and current.progress_handle is None:
-                    current.progress_handle = handle
+            if create_progress:
+                turn.progress_message_creating = True
+        # ⚠️ ``create_progress`` 为假（这一轮已经有句柄，或**有人正在创建**它）时这里
+        # **不发**占位消息，而这**不丢任何东西**：占位文案本身没有信息量（正文一直记在
+        # ``turn.parts`` 里），真正在创建的那条消息会承载它；它若发失败，
+        # ``progress_handle`` 仍是 ``None``，收尾那一步照旧整段发出完整答复。
+        # 反过来多发一条的代价则是实打实的：多一条用户看得见、却可能永远不会被答复
+        # 改写的孤儿消息（平台没有「撤回」原语，它清不掉）。
+        if create_progress:
+            handle = None
+            try:
+                handle = self._send_text(
+                    conversation_id,
+                    PROGRESS_TEXT,
+                    kind="progress",
+                    adapter=adapter,
+                    session_id=session_id,
+                )
+            finally:
+                # 成功**和**抛异常都要把创建权还回去（见事件流那一侧的同一段注释）。
+                with self._lock:
+                    current = self._turns.get(session_id)
+                    if current is not None:
+                        current.progress_message_creating = False
+                        if current.progress_handle is None:
+                            current.progress_handle = handle
         return "ok"
 
     # ------------------------------------------------------------------

@@ -266,14 +266,21 @@ class TestTheArtifactNamesAreNotHardCodedAnywhere(unittest.TestCase):
     ALLOWED_HARDCODED_TEST = "test_the_two_names_are_really_the_ones_health_writes"
 
     #: 被扫的那几个文件（判据自己 + 它用的共享件 + 拆出去的缺陷回归层）。
+    #:
+    #: ⚠️ **这是一份显式清单** —— 拆出新文件时**必须**把它加进来，否则覆盖面静悄悄
+    #: 变小（属于「恒空」那一侧，而恒空**不会报警**）。
     SCANNED_FILES = (
         pathlib.Path(__file__).resolve(),
         TESTS_DIR / "bridge_dir_isolation_scan.py",
         TESTS_DIR / "test_artifact_isolation_defect_regressions.py",
         TESTS_DIR / "test_cli_module_alias_guard_reporting_regressions.py",
         TESTS_DIR / "test_cli_module_alias_guard_stays_quiet_regressions.py",
+        TESTS_DIR / "test_concurrent_send_failure_attribution.py",
+        TESTS_DIR / "test_progress_handle_handoff_race.py",
         TESTS_DIR / "test_repository_root_artifacts.py",
+        TESTS_DIR / "test_sse_termination_baseline.py",
         TESTS_DIR / "test_telegram_credential_gate.py",
+        TESTS_DIR / "test_inbox_record_after_close.py",
     )
 
     def test_no_judgment_code_hard_codes_the_runtime_artifact_names(self):

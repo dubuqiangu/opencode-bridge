@@ -413,6 +413,48 @@ class RedeliveryIsDeduplicated(InboxWiringTestCase):
         )
 
 
+class InboundAfterTheInboxIsClosed(InboxWiringTestCase):
+    """⚠️ 关停期间掉下来的消息：必须被说成「收件箱已关」，不得说成「去重命中」。
+
+    这条走**真**的 :class:`BridgeCore` + 真收件箱 + 真
+    :func:`~opencode_bridge.inbound_gateway._record_inbound` ⇒ 它证明的是**前置状态
+    可达**，而不只是"``close()`` 之后调 ``record`` 会这样"：
+    ``__main__._run_bridge_locked`` 的 ``finally`` 在 ``core.stop()`` **之后**才
+    ``inbox.close()``，而 :meth:`BridgeCore.stop` 只给适配器线程 5 秒 join、
+    超时**只记一条 warning 就继续**。
+
+    缺陷本体是"方向说反"：旧实现里 :meth:`InboundInbox.record` 在连接已关时返回
+    ``False``，而 ``False`` 在契约里是**去重命中** ⇒ 日志说成「平台重投了一条
+    我们已有的消息」。返回值 / 文案 / 级别三项的分开断言在
+    :mod:`tests.test_inbox_record_after_close`；这里只钉**接线那一层**。
+    """
+
+    def test_the_refusal_is_logged_as_a_closed_inbox_and_nothing_is_delivered(self):
+        core, client, _adapter, inbox = self.make_core()
+        assert inbox is not None
+        inbox.close()   # 关停走到收尾，而适配器线程还活着（join 超时的那个窗口）
+
+        with self.assertLogs("opencode_bridge.inbox", level="WARNING") as captured:
+            core.on_inbound(inbound_message("关停期间掉下来的消息", message_id="8"))
+
+        self.assertEqual(
+            len(captured.records), 1,
+            "只有一条（收件箱自己说的那句），否则下面的断言不知道在钉谁：%r"
+            % [record.getMessage() for record in captured.records],
+        )
+        message = captured.records[0].getMessage()
+        self.assertIn("closed", message, "必须说真话：连接已关")
+        self.assertIn("telegram:chat:55:8", message, "必须点名是哪一条，否则无从对账")
+        self.assertNotIn(
+            "duplicate ignored", message,
+            "把原因说反的文案会把排查引到「平台重投」，而事实是收件箱已经关了",
+        )
+        self.assertEqual(
+            texts_of(client.prompts), [],
+            "关掉之后仍然不投递 —— 关停侧行为是设计，本缺陷只修误报的方向",
+        )
+
+
 class BusyIsNotAFailure(InboxWiringTestCase):
     """409 只是"还没轮到"，不能算失败、更不能花掉重试预算。
 

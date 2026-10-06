@@ -73,6 +73,31 @@ class Turn:
     tool_trace: list[str] = field(default_factory=list)
     agent: str = ""
     model: str = ""
+    #: 这一轮的进度消息**正在被创建** —— 已经有人（事件流的流式首片，或入站那一侧的
+    #: ``⏳ 处理中…``）决定要发它，而那一次
+    #: :meth:`~opencode_bridge.adapters.base.Adapter.send` **还在飞行中**、句柄尚未写回。
+    #:
+    #: ## 为什么必须有它：那个「空 → 有」的转变**跨一次完整的 send**
+    #:
+    #: 各适配器的 ``send()`` 在分片之间会 sleep（slack / mattermost），所以「读到
+    #: ``progress_handle is None``」与「把句柄写回去」之间隔着一次真实的网络调用，而
+    #: 那一步**在锁外**。⇒ 只靠「锁内读 is None → 锁外发 → 锁外条件式写回」时，
+    #: 两条路径各自的「还是空」会**同时**成立 ⇒ **各发一条消息** ⇒ 其中一条的句柄被
+    #: 丢掉，成了读者看得见、却永远不会被答复改写的**孤儿**（读者于是把同一段正文读两遍，
+    #: 或看见一个停在「⏳ 处理中…」的僵尸气泡 —— 平台没有「撤回」原语，它清不掉）。
+    #:
+    #: ## 它修的是**归属**，不是并发度
+    #:
+    #: 锁内**领取**、锁外发、锁内**归还** ⇒ 「一次 send 造出这一轮的那一条进度消息」
+    #: 这件事**恰好发生一次**。
+    #: ⛔ **绝不**把那次 send 放进锁里：那是在**消除并发**而不是把归属修对，而串行化
+    #: 会把各适配器的分片 sleep 叠成队列（与
+    #: :class:`~opencode_bridge.adapters.base._ThreadOwnedSendFailures` 的同一条纪律
+    #: 一致 —— 那边修的是「这次发送记下的失败归谁」，这边修的是「这条进度消息归谁」）。
+    #:
+    #: ⚠️ :meth:`EventStream._on_execution_started` **刻意不**清它：那一轮换轮时若有
+    #: 一次创建还在飞行中，清掉它等于把同一个缺陷重新打开。
+    progress_message_creating: bool = False
 
     def assemble(self) -> str:
         chunks: list[str] = []
@@ -458,6 +483,10 @@ class EventStream:
             turn.last_edit_ts = 0.0
             turn.agent = ""
             turn.model = ""
+            # ⚠️ **刻意不**碰 ``turn.progress_message_creating``：换轮时若有一次创建还在
+            # 飞行中，把它清掉等于把「两条路径同时认为自己是第一个」这个缺陷重新打开
+            # （见 :attr:`Turn.progress_message_creating` 的说明）。那一轮结束后它会由
+            # 创建它的那条路自己归还。
             self._tool_names = {
                 key: name
                 for key, name in self._tool_names.items()
@@ -525,6 +554,19 @@ class EventStream:
             now = self.clock()
             if (now - turn.last_edit_ts) < self._edit_interval:
                 return  # throttled
+            if handle is None and turn.progress_message_creating:
+                # ⚠️ 另一条路（入站那一侧的 ``⏳ 处理中…``）**正在创建**这一轮的进度
+                # 消息，而它的 send 还在飞行中 ⇒ 这一帧**不另发一条**，把这条消息让
+                # 给它。曾经这里是「也发一条」，于是两条路径各自的 ``is None`` 同时
+                # 成立（检查在锁内、**发送在锁外**）⇒ 正文重复，或首片那条成为孤儿。
+                #
+                # 为什么这样**不丢正文**：每一帧发出去的都不是增量而是
+                # :meth:`Turn.assemble` 拼出的**整段**（正文早已记在 ``turn.parts``
+                # 里）⇒ 下一帧自带到目前为止的全部内容，而收尾那一步永远会把完整
+                # 答复写进 turn 认领的那条消息。
+                # 与上面两道闸门同一个规矩：**不烧节流窗口、不问适配器** ——
+                # 这一帧既然什么都不发，就不该付这两笔代价。
+                return
             # ⚠️ 判据是**平台**真正接受的一条长度，与收尾那一步
             # (:meth:`~opencode_bridge.outbound.OutboundSender.finalize`) 同一个数。
             # 只按 ``bridge.max_message_chars`` 判会让 2001~4000 字的正文过闸：
@@ -542,22 +584,33 @@ class EventStream:
             if len(text) > one_message_budget(self._max_message_chars, adapter):
                 return
             turn.last_edit_ts = now
+            if handle is None:
+                # 锁内**领取**创建权、发在锁外 —— 这就是「归属」被定下来的那一刻。
+                # 不领的人拿到的是**这一轮的唯一一条**进度消息，不会有第二个孤儿。
+                turn.progress_message_creating = True
 
         if handle is None:
-            new_handle = self._send_text(
-                conversation_id,
-                text,
-                kind="progress",
-                adapter=adapter,
-                session_id=session_id,
-            )
-            with self._lock:
-                current = self._turns.get(session_id)
-                if current is not None and current.progress_handle is None:
-                    current.progress_handle = new_handle
-                    # 发成功才记：失败时那条消息并不存在（见 shown_progress_text）
-                    if new_handle is not None:
-                        current.shown_progress_text = text
+            new_handle = None
+            try:
+                new_handle = self._send_text(
+                    conversation_id,
+                    text,
+                    kind="progress",
+                    adapter=adapter,
+                    session_id=session_id,
+                )
+            finally:
+                # 成功**和**抛异常都要把创建权还回去：留在别人身上会让这一轮**再也**
+                # 发不出进度消息（收尾仍会发完整答复，但读者一路看不到流式正文）。
+                with self._lock:
+                    current = self._turns.get(session_id)
+                    if current is not None:
+                        current.progress_message_creating = False
+                        if current.progress_handle is None:
+                            current.progress_handle = new_handle
+                            # 发成功才记：失败时那条消息并不存在（见 shown_progress_text）
+                            if new_handle is not None:
+                                current.shown_progress_text = text
             return
         if self._edit_progress(conversation_id, handle, text, session_id):
             with self._lock:

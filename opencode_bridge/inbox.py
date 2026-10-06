@@ -57,6 +57,21 @@ opencode 可能已经处理了，也可能没有。这类行只告警、绝不�
 **静默的** no-op —— 留下的那行**就是回执**。所以这里是 ``INSERT OR IGNORE``，
 不是 ``INSERT OR REPLACE``：后者会抹掉回执，让重投再跑一遍 agent。
 
+三种结局，不是"成功 / 失败"
+---------------------------
+:meth:`InboundInbox.record` 返回 :class:`RecordOutcome`：**新行** / **去重命中** /
+**收件箱已关**。
+
+⚠️ 第三个曾经与第二个**共用一个返回值**（都是 ``False``）⇒ 关停期间掉下来的消息被报成
+「平台重投了一条我们已有的消息」，**与事实相反**，而唯一生产调用方
+(:func:`opencode_bridge.inbound_gateway._record_inbound`) 只按真假分流、没有第三个分支。
+⇒ 收件箱这一侧现在**可分辨**（:class:`RecordOutcome`），真话由"已关"那一档**自己**记下
+（理由与级别判据见 :meth:`record`）。
+⛔ 调用方那两句 info **仍**会把原因说反 —— 修它要改那个模块，不在本文件的能力范围内。
+
+⚠️ 两个"没落盘"的结局都仍是**假值**：既有调用点只按真假分流，而让"已关"为真会让它在
+**盘上没有任何回执**的情况下把消息投出去 —— 那正是本模块要防的事。
+
 退避阶梯与"还差几次预算"住在 :mod:`opencode_bridge.inbox_retry_budget`
 -------------------------------------------------------------------
 阶梯与次数上限在那个模块里，而 :meth:`InboundInbox.mark_failed` 仍在本文件里**算**它
@@ -73,6 +88,7 @@ opencode 可能已经处理了，也可能没有。这类行只告警、绝不�
 
 from __future__ import annotations
 
+import enum
 import logging
 import os
 import sqlite3
@@ -117,6 +133,7 @@ __all__ = [
     "InboundInbox",
     "MAX_ATTEMPTS",
     "QueuedPrompt",
+    "RecordOutcome",
 ]
 
 logger = logging.getLogger("opencode_bridge.inbox")
@@ -153,6 +170,37 @@ def _prompt_from_row(row: sqlite3.Row) -> QueuedPrompt:
     )
 
 
+class RecordOutcome(enum.Enum):
+    """:meth:`InboundInbox.record` 的三个结局 —— 写前义务履行到哪一步。
+
+    ⚠️ **为什么是三个值而不是一个 ``bool``**：旧实现里「收件箱已关」与「去重命中」
+    **共用**同一个返回值 ``False``，而唯一生产调用方
+    (:func:`opencode_bridge.inbound_gateway._record_inbound`) 只按真假分流
+    ⇒ 关停期间掉下来的消息被报成「平台重投了一条我们已有的消息」，
+    **与事实相反**。让两个"没落盘"的结局可分辨，调用方就不必靠猜。
+
+    :meth:`InboundInbox.record` 是**唯一**返回它的方法 —— 其余写入口都返回 ``None``，
+    没有返回值可误报。
+    """
+
+    #: 新行已落盘。**真值** —— 这条消息带上了回执，可以去投递。
+    RECORDED = "recorded"
+    #: 去重命中：同一个 ``delivery_id`` 已经在收件箱里。**假值**，而**不是**错误。
+    DUPLICATE = "duplicate"
+    #: ``close()`` 已经跑过，**什么都没写**。**假值**（关停侧行为不变），
+    #: 但与 :attr:`DUPLICATE` **可分辨**：这一条没有回执，**永远不会被重放**。
+    CLOSED = "closed"
+
+    def __bool__(self) -> bool:
+        """只有「已落盘」为真 —— 两个「没落盘」的结局都让按真假分流的调用方不投递。
+
+        ⚠️ 这是**向后兼容**那一半，不是"真值即成功"的漂亮说法：
+        :attr:`CLOSED` 必须为假，否则调用方会在**盘上没有任何回执**的情况下把消息
+        投出去，而本模块存在的理由恰恰是"回执先于投递"。
+        """
+        return self is RecordOutcome.RECORDED
+
+
 class InboundInbox:
     """落盘的入站收件箱。**只做持久化，不含投递策略。**
 
@@ -165,6 +213,10 @@ class InboundInbox:
 
     ``close()`` 之后所有公开方法都是**安全的空操作**（不抛、不崩）：
     清理顺序出错不该让桥在退出路径上炸掉。
+
+    ⚠️ 但"空操作"**不等于"沉默"**：:meth:`record` 仍会记一条 ``warning``，因为它有一个
+    **返回值** —— 「没落盘因为收件箱已关」与「没落盘因为去重」必须能被分辨，
+    而关停窗口里的消息丢了就该有人听见（判据见 :meth:`record` 与 :class:`RecordOutcome`）。
     """
 
     def __init__(
@@ -187,16 +239,38 @@ class InboundInbox:
     # ------------------------------------------------------------------
     # 写前义务
     # ------------------------------------------------------------------
-    def record(self, prompt: QueuedPrompt) -> bool:
-        """把一条入站消息**在分发之前**落盘。返回 ``True``=新行，``False``=已存在。
+    def record(self, prompt: QueuedPrompt) -> RecordOutcome:
+        """把一条入站消息**在分发之前**落盘。返回 :class:`RecordOutcome`。
 
-        ``False`` 不是错误，而是**去重命中**：同一个 ``delivery_id`` 已经在收件箱里
-        （可能已经 ``delivered``），这条重投不该再跑一遍 agent。注意这里保留
-        **原来那一行**，包括它的状态与正文 —— 已送达的回执不能被重投覆盖掉。
+        * :attr:`~RecordOutcome.RECORDED` —— 新行（**真值**，既有契约里的 ``True``）；
+        * :attr:`~RecordOutcome.DUPLICATE` —— 去重命中：同一个 ``delivery_id`` 已经在收件箱里
+          （可能已经 ``delivered``），这条重投不该再跑一遍 agent。它**不是错误**
+          （既有契约里的 ``False``）。注意这里保留**原来那一行**，包括它的状态与正文 ——
+          已送达的回执不能被重投覆盖掉；
+        * :attr:`~RecordOutcome.CLOSED` —— ``close()`` 已经跑过，**什么都没写**。
+
+        ⚠️ 后两者都是**假值**：``_record_inbound`` 只按真假分流，而 ``CLOSED`` 若为真，
+        它会在**盘上没有任何回执**的情况下把消息投出去 —— 绕过写前义务正是本模块要防的。
+        「关掉之后不再投递」是**设计**（``close()`` 可重复调用，之后所有公开方法都是空操作），
+        本方法只把**误报的方向**纠正过来。
+
+        ⚠️ 而两个假值**必须可分辨**（旧实现两者都是 ``False``）：``CLOSED`` 这一档现在
+        **自己**记一条 ``warning``，说清真话（连接已关、这条不在盘上、永远不会被重放）。
+        级别判据：不是 ``info``（无失败记录、无告警的一次丢失，且本模块对同型事件
+        ——不可重放的状态被淘汰——用的就是 warning，见 :func:`.inbox_row_cap.report_eviction`）；
+        不是 ``error``（关停是**预期**事件，打 error 会把真错误淹掉）；不是 ``debug``
+        （关停窗口很窄，默认级别下没人会看见）。
         """
         with self._lock:
             if self._connection is None:
-                return False
+                logger.warning(
+                    "inbox %s: refused to record %s because the connection is already"
+                    " closed (shutdown in progress); it is NOT on disk, so"
+                    " opencode_bridge.inbox_recovery can never replay it — a message"
+                    " dropped here is lost, not deduplicated",
+                    self._path, prompt.delivery_id,
+                )
+                return RecordOutcome.CLOSED
             moment = time.time()
             cursor = self._connection.execute(
                 "INSERT OR IGNORE INTO inbox (delivery_id, conversation_id, platform,"
@@ -214,11 +288,11 @@ class InboundInbox:
                     moment,
                 ),
             )
-            inserted = cursor.rowcount == 1
-            if inserted:
-                self._prune_expired_delivered(moment)
-                self._enforce_row_cap()
-            return inserted
+            if cursor.rowcount != 1:
+                return RecordOutcome.DUPLICATE
+            self._prune_expired_delivered(moment)
+            self._enforce_row_cap()
+            return RecordOutcome.RECORDED
 
     def mark_attempting(self, delivery_id: str) -> None:
         """标记"投递已经开始"，紧贴 ``prompt()`` 调用之前。

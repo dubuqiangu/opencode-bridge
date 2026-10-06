@@ -87,6 +87,57 @@ def register(name: str):
     return deco
 
 
+class _ThreadOwnedSendFailures(threading.local):
+    """**按线程分开**的「这次发送记下了什么失败」。
+
+    ⚠️ **它是 :class:`threading.local` 的子类，而这正是它存在的全部理由**：
+    ``threading.local`` 子类的 :meth:`__init__` 在**每个线程**里各跑一次，于是下面
+    两个槽天然各属于各的线程，一次赋值踩不到另一个线程。
+
+    ## 为什么按线程分，而不是加一把锁
+
+    并发是真的（同一个适配器实例上，:meth:`~Adapter.send_observed` 会被 SSE 线程、
+    适配器轮询线程、启动期线程同时调用），而缺陷不是「两个人不能同时写」，是
+    **归属错了**：A 的失败被 B 的 :meth:`~Adapter._clear_send_failure` 抹掉 ⇒ 部分
+    送达被报成 ``ok=True, partial=False``；反向则是一次**完全成功**的发送被记成
+    失败。⇒ 两个方向都是「假的观测」，而这条通道存在的全部意义就是消灭假观测
+    （它落进 ``outbound-failures.json``，由 ``--status`` 报给用户）。
+
+    ⛔ **加一把锁把整个 :meth:`~Adapter.send_observed` 串行化是错的解法**：那是在
+    **消除并发**而不是把**归属**修对；而各适配器的 :meth:`~Adapter.send` 在分片之间
+    会 sleep（slack / mattermost 的节流）⇒ 一次发送能横跨几百毫秒，串行化会把这些
+    延迟叠成队列，并发度越高越糟。
+    ⇒ 所以本类**不加锁**：两次并发发送仍然完全并发，变的只是「这次记下的失败归谁」。
+
+    ## 两个槽的分工
+
+    * :attr:`latest` —— **本线程**最近一次记下的失败。
+      :attr:`Adapter.last_send_error` 与 :attr:`Adapter._last_send_error` 读它；
+      直接调 :meth:`~Adapter.send` / :meth:`~Adapter.edit`（不经 ``send_observed``）
+      记下的失败也落在它里面 —— 那时没有观测在读。
+    * :attr:`in_flight` —— 本线程**正在进行中**的 :meth:`~Adapter.send_observed`
+      观测栈（栈顶 = 最近开始的那一次）。:meth:`~Adapter._note_send_failure` 额外把
+      失败写进栈顶，于是「这一条的结果」只可能来自它自己那一次 ``send()``。
+      ⚠️ 是**栈**而不是单个值：嵌套的 ``send_observed``（内层那次不该抹掉外层那次）
+      因此也被正确归属 —— 仓库里当前没有这种调用，但栈顶只有一份的话，将来某个
+      适配器在 ``send()`` 里调一次 ``send_result()`` 就会把外层的结果改掉，而那正是
+      本类要消灭的同一类假观测。
+
+    ⚠️ **本类不读、也不承诺「别的线程记下的失败」。** 有些适配器在**轮询/连接线程**
+    上调 ``_note_send_failure``（``ntfy`` 的 ``_pull_batch`` 收到 429、
+    ``twitch`` 的 ``_resolve_identity`` 查不到身份）—— 那不是一次出站发送的失败。
+    它落在记下它那个线程的 :attr:`latest` 上，而 :meth:`~Adapter.send_observed`
+    **读不到它**：这与改之前一样（``send_observed`` 入口处那次「先清」本来就会把它
+    抹掉，只有撞上别的线程 clear 与 read 之间那道缝才会被误读），而那道缝里读到的
+    是「别的线程的失败被记成这一条的失败」—— **假的肯定观测**。
+    ⇒ 也就是说这里**没有丢信号**：这一类失败从来没有被这条通道正确报出去过。
+    """
+
+    def __init__(self) -> None:
+        self.latest: tuple[SendError, str, float | None] | None = None
+        self.in_flight: list[tuple[SendError, str, float | None] | None] = []
+
+
 class Adapter(abc.ABC):
     """Base class for messaging platform adapters.
 
@@ -356,7 +407,7 @@ class Adapter(abc.ABC):
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.allowed_chat_ids: set[str] = set()
-        self._last_send_error: tuple[SendError, str, float | None] | None = None
+        self._send_failures = _ThreadOwnedSendFailures()
         self._init_access()
 
     # --- capabilities ----------------------------------------------------
@@ -639,15 +690,43 @@ class Adapter(abc.ABC):
         在 :meth:`~opencode_bridge.outbound.OutboundSender.send_text` 里经
         :meth:`send_observed` 把它读出来，落到 ``outbound-failures.json`` 供
         ``--status`` 读（见 :mod:`opencode_bridge.health`）。**新增适配器不必改
-        任何东西**即可自动获得这条通道。"""
-        self._last_send_error: tuple[SendError, str, float | None] = (
+        任何东西**即可自动获得这条通道。
+
+        ⚠️ **它写的是 :class:`_ThreadOwnedSendFailures` 的两个槽，不是实例属性**：
+        「本线程最近一次」（:attr:`_ThreadOwnedSendFailures.latest`，供
+        :attr:`last_send_error` 读）与「本线程**正在进行的那一次** ``send_observed``」
+        （栈顶，供 :meth:`send_observed` 判 ``partial``）。分两处是因为两个读者要的
+        东西不同：``last_send_error`` 要的是「最近一次」（哪怕那次不经 ``send_observed``），
+        而 ``send_observed`` 要的是「**我这一次**记下的」，混成一个槽就必然串味
+        （缺陷的两个方向都出在混用上）。"""
+        recorded: tuple[SendError, str, float | None] = (
             kind,
             str(detail)[:400],
             retry_after,
         )
+        failures = self._send_failures
+        failures.latest = recorded
+        if failures.in_flight:
+            # 只写**栈顶**那一次 send_observed 的槽 ⇒ 嵌套/并发互不覆盖。
+            failures.in_flight[-1] = recorded
 
     def _clear_send_failure(self) -> None:
-        self._last_send_error = None
+        self._send_failures.latest = None
+
+    @property
+    def _last_send_error(self) -> tuple[SendError, str, float | None] | None:
+        """**本线程**最近一次记下的失败（``None`` = 没有）。
+
+        ⚠️ **是 property，不是实例属性** —— 它要按线程分开取，所以背后是
+        :class:`_ThreadOwnedSendFailures`（见那里的「为什么按线程分，而不是加锁」）。
+        保留这个名字是为了不打碎既有读者：
+        ``tests/test_nextcloud.py`` 就是直接读 ``adapter._last_send_error[1]`` 的。
+
+        ⛔ **写它请用 :meth:`_note_send_failure` / :meth:`_clear_send_failure`**，它们
+        同时维护两个槽；直接赋值只会改到 :attr:`_ThreadOwnedSendFailures.latest`，
+        而 :meth:`send_observed` 读的是另一个槽 ⇒ 结果仍然是错的，且不报错。
+        """
+        return self._send_failures.latest
 
     @property
     def last_send_error(self) -> SendError | None:
@@ -674,29 +753,53 @@ class Adapter(abc.ABC):
         ⚠️ **它先清再读，所以它是「发一条 + 问结果」的**唯一入口**：清在前、读在后，
         调用方就**不可能**忘记清 ⇒「失败 → 成功」不会被显示成"仍在失败"。
 
+        ⚠️ **"这一条"是靠 :attr:`_ThreadOwnedSendFailures.in_flight` 的栈顶保证的，
+        不是靠那个共享的"最近一次"槽。** 入口压一个**只属于本次调用**的空槽，
+        ``send()`` 内部 :meth:`_note_send_failure` 只会写进栈顶，:meth:`finally`
+        弹出并按弹出值判定 ⇒
+
+        * A 的失败不会被并发的 B 在入口那次「清」抹掉（⇒ 部分送达不会被报成
+          ``ok=True, partial=False``）；
+        * B 的失败也不会被记到 A 头上（⇒ 一次**完全成功**的发送不会被写进
+          ``outbound-failures.json``）。
+
+        ⚠️ **这两条都要求「判 partial」读的不是共享槽** —— 改之前两处都读
+        ``self._last_send_error``（一个被所有发送者共用的实例属性，**0 处加锁**），
+        所以两个方向都会串味。而**这里没有加锁**：``send()`` 整段仍然是不受保护的，
+        slack / mattermost 分片之间的节流 sleep 不会因为本方法而被串成队列。
+        判据：两次 ``send_observed`` 必须**仍然并发**（见
+        ``tests/test_concurrent_send_failure_attribution.py`` 里的重叠断言）。
+
         ⚠️ **绝不向上抛**：适配器抛了也不让上层崩，异常从第二个返回值出去，由调用方
         决定要不要留栈。
 
         子类要给出更精确的 ``partial`` / ``retry_after`` 就覆写本方法；只想改结果
         形状（不要那个异常）可以覆写 :meth:`send_result`。
         """
-        self._clear_send_failure()
+        failures = self._send_failures
+        failures.in_flight.append(None)   # 本次调用独占的槽；嵌套也各占一层
         try:
-            handle = self.send(out)
-        except Exception as exc:  # 适配器不应抛出；真抛了也不让上层崩
-            detail = f"send() raised: {exc}"
-            self._note_send_failure(SendError.TRANSIENT, detail)
-            return SendResult(
-                platform=self.name,
-                ok=False,
-                error_kind=SendError.TRANSIENT,
-                error_detail=detail,
-            ), exc
+            self._clear_send_failure()
+            try:
+                handle = self.send(out)
+            except Exception as exc:  # 适配器不应抛出；真抛了也不让上层崩
+                detail = f"send() raised: {exc}"
+                self._note_send_failure(SendError.TRANSIENT, detail)
+                return SendResult(
+                    platform=self.name,
+                    ok=False,
+                    error_kind=SendError.TRANSIENT,
+                    error_detail=detail,
+                ), exc
+        finally:
+            # ⛔ 必须在返回**前**弹出，且只在本次调用期间记下的那些才算数 ——
+            # 这是"归属"的全部实现；读共享槽就等于把别人的结果捡回来。
+            noted = failures.in_flight.pop()
         if handle is not None:
             # 分片发送中"部分成功"：send() 返回了最后一个好句柄，但过程中记过失败。
             # 这种情况必须显式带出 partial，否则调用方会把未送达当成已送达。
-            if self._last_send_error:
-                kind, detail, retry_after = self._last_send_error
+            if noted:
+                kind, detail, retry_after = noted
                 return SendResult(
                     platform=self.name,
                     ok=True,
@@ -707,7 +810,7 @@ class Adapter(abc.ABC):
                     partial=True,
                 ), None
             return SendResult(platform=self.name, ok=True, handle=handle), None
-        kind, detail, retry_after = self._last_send_error or (
+        kind, detail, retry_after = noted or (
             SendError.UNKNOWN,
             "send() returned None",
             None,

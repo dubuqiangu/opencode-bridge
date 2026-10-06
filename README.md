@@ -37,6 +37,7 @@ opencode plugin remove github:dubuqiangu/opencode-bridge
 - **装完只剩两步**：填 bot token → `opencode service restart`（重启会打断当前会话，**需你点头同意**才执行）。
 - 插件**首次启动自动自举**：把包内 Python 源码与 `config.example.json` 铺到稳定 bridge 目录（Windows `%USERPROFILE%\.config\opencode-bridge`，Unix `${XDG_CONFIG_HOME:-$HOME}/.config/opencode-bridge`），已有 `config.json` **绝不覆盖**——无需任何安装脚本。
 - **更新**用 `opencode plugin update github:dubuqiangu/opencode-bridge`（**建议在用户主目录 `~` 下执行**；工作区目录偶发 `Plugin is not configured`，换到 `~` 重试即可）；`plugin list` 显示的 commit 可能落后 update 一拍，再执行一次 update / list 对齐。
+  ⚠️ **它刷的是插件目录，不是「正在跑的那份代码」。** bridge 目录（上面第 38 条那个）若是脚本安装留下的 **git clone**，自举按设计不碰它 ⇒ 跑着的仍是旧代码，还要 `git -C <bridge目录> pull --ff-only`。确认桥跑的是哪一份：`cd <bridge目录>` 后 `python -c "import opencode_bridge, os; print(os.path.abspath(opencode_bridge.__file__))"`。改完还要重启才生效。详见 [`docs/update.md`](docs/update.md)。
 - Python **3.10+ 仍需本机自带**（插件不安装 Python）。
 
 **AI Agent 一行（跨平台，由 Agent 按文档执行）：**

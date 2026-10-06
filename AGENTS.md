@@ -568,6 +568,7 @@ opencode 引用。按权威度查：
 | `print("45% 且 SLOC %s" % v)` | `ValueError: unsupported format character` —— **字面量里的 `%` 被当成格式符**。本项目到处是百分比（文档占比、覆盖率），这条会反复踩。**用字符串拼接或 f-string，别用 `%` 格式化含 `%` 的字面量** |
 | 用正则从源码里提取「CLI 有哪些 flag / 参数」，结果返回**空集** | 正则**匹配不到跨行**的实参、漏了前缀限定，**一个都没匹配上** ⇒ 我据此认定 `--verbose` 是子代理**编造的 flag**，差点从文档里删掉。跑 `python -m opencode_bridge --help` 才定案：**它真实存在**（`build_parser` 里 `"--verbose", action="store_true"`，`main()` 里 `_setup_logging("DEBUG" if args.verbose else cfg.log_level)`）。⇒ **凡是「程序对外暴露的命令面」（flag、命令行、配置键），权威来源是**跑一次它自己**（`--help`、实际调用），**不是正则扫源码**。§7.1 第一条规则在这里的代价是**删掉一个真实存在的功能** |
 | 用**行级**正则去找一个**跨行**的表达式（如 `int(\n    self.config.get("k") or D\n)`） | **行级正则必然漏** —— `int(` 与 `self.config.get(` 不在同一行。实测我据此判定「代码里没有裸 `int()`」，实际有**两处**，而那两处正是**会打死整个适配器**的缺陷。⇒ **知道确切符号名时，直接按名字 `grep` 那个键**，别写通用扫描；真要通用扫描就上 AST，但 **`ast.walk` 会吐出没有位置信息的节点**（`ast.arguments` 等），**别在它的结果上直接取 `.lineno`** |
+| 拿【某处一份拷贝】的内容，去判断【运行中的进程】跑的是哪份代码 | 桥同时存在**两份**同名代码：npm 插件缓存（`plugin update` 刷它）与 bridge 目录里那份 git clone（桥以 `python -m opencode_bridge` + cwd = bridge 目录启动 ⇒ **import 的是后者**）。我查缓存快照里的标记，五个全中 ⇒ 报了「桥已更新到今晚的代码」—— **结论对、对象错**：缓存确实变了，而运行中的桥落后 **129 个 commit**，且已连续 5 小时。⇒ **判据必须问运行中的那一份**：`cd <bridge目录>` 后 `python -c "import opencode_bridge, os; print(os.path.abspath(opencode_bridge.__file__))"`。⚠️ 这是本表的**第三种**失效：匹配器没坏、目标存在、命中也是真的 —— **命中的是另一份同名的东西**。前两种是「没找到」与「找到了别急着下结论」，这一种是「找到的那份不是它」⇒ 症状与正确做法完全一样，所以它不会触发本表任何一条已有规则 |
 
 **三条规则：**
 

@@ -12,6 +12,25 @@ opencode plugin remove github:dubuqiangu/opencode-bridge
 
 `update` / `remove` 与 `add` 使用同一条完整 specifier；`plugin list` 显示的 commit 可能落后一拍，再执行一次 update/list 对齐。
 
+⚠️ **这三条刷的是「插件目录」，不是「正在跑的那份代码」—— bridge 目录若是 git clone，`plugin update` 不动它。**
+
+bridge 是以 `python -m opencode_bridge`、**cwd = bridge 目录**启动的，所以它 import 的是
+**bridge 目录里那份 `opencode_bridge/`**。bridge 目录本身是 git clone 时，
+`plugin update` 只刷新插件缓存，那份被 import 的代码**原地不动**
+（实测：缓存已更新到最新，而 bridge 目录仍停在 129 个 commit 之前）。
+
+⇒ **clone 型安装要真正更新**：改 bridge 目录（`git -C <bridge目录> pull --ff-only`），
+或重跑安装器 —— 见下文「For AI Agents」Step 1~2，那两节本来就写着这件事。
+
+**确认「桥跑的是哪一份」的唯一判据**（⛔ 别拿插件缓存的内容判断运行中的进程）：
+
+```powershell
+cd <bridge目录>
+python -c "import opencode_bridge, os; print(os.path.dirname(os.path.abspath(opencode_bridge.__file__)))"
+```
+
+改完之后还要**重启**才生效：运行中的桥仍持有旧代码（Step 5 有提醒）。
+
 中文（发给 AI Agent）：
 
 ```

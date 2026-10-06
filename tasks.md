@@ -2577,6 +2577,67 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 ④ ⚠️ **改完 §5.0 的代码后要回来重算「生产侧 23 个」那一行** ——
 §5.0 自己的规则是「任何改动都要重算」，而它的数**一个 commit 就会过期**。
 
+## 🔴 部署事故：桥跑的那份代码**不是**插件缓存那份（2026-10-06 晚，已修复 + 已落判据）
+
+### 事实与证据
+
+```
+插件缓存  ~/.cache/opencode/npm/git-opencode-bridge-<hash>\<时间戳>\node_modules\opencode-bridge\
+          ← `opencode plugin update` 刷的是【这里】
+桥目录    %USERPROFILE%\.config\opencode-bridge\opencode_bridge\
+          ← 桥以 `python -m opencode_bridge` + cwd = 桥目录启动 ⇒ import 的是【这里】
+```
+
+`bridge-plugin.log` 里那行 spawn 记录是决定性的：
+
+> `spawned pid=50980 cwd=%USERPROFILE%\.config\opencode-bridge cmd=python -m opencode_bridge`
+
+⇒ **cwd 在 `sys.path` 上**，两份同名代码由 cwd 决胜负，插件缓存根本没参与。
+⇒ 后果：跑着的那份自 **10-03 23:06 起就没再被同步**（≈68 小时），停在 `93b9835`、落后 **129 个 commit**。
+那棵树里**没有 `health.py`** ⇒ 启动探测落盘与出站失败通道整块不存在。
+⇒ **可观测症状**：`platform-health.json` 从不出现（我当时据此以为「桥还在启动途中」）；
+而桥**收发消息一切正常** —— 因为 10-03 那棵树自身自洽，缺的是今晚这些，不是基本功能。
+
+### 修复（预检四项全绿之后才动）
+
+`git -C <桥目录> pull --ff-only`（`93b9835` → `34dccb2`，⛔ 不许产生合并提交）。
+预检：工作树 0 项 · stash 0 · `config.json` 被 `.gitignore` 第 2 行忽略 ·
+本次 diff 碰不到任何运行时产物（`config.json` / `state.json` / `inbox.db` / `*.log` / 锁文件）。
+事后逐一确认全部幸存，telegram 的 `bot_token` 键仍在（⛔ 全程未打印其值）；
+部署位置实跑 `python -m opencode_bridge --check` = `opencode service OK` · `2.0.24` · exit 0。
+
+### 三条判据（第一条已进 `AGENTS.md` §7.1）
+
+① **「桥跑的是哪一份」只能问运行中的那一份** ——
+`cd <桥目录>` 后 `python -c "import opencode_bridge, os; print(os.path.abspath(opencode_bridge.__file__))"`。
+⛔ **别拿插件缓存的内容判断运行中的进程**：那一晚缓存里五个标记**全中**，
+我据此报「桥已更新到今晚的代码」—— **结论对、对象错**，而运行中的那份落后 129 个 commit。
+这是 §7.1 的**第三种**失效：匹配器没坏、目标存在、命中也是真的，**命中的是另一份同名的东西**
+⇒ 症状与正确做法完全一样，所以它**不触发那张表的任何一条已有规则**。
+
+② **判「哪份代码更新了」看 `LastWriteTime`，不看目录名** —— 快照目录名带 hash，每次拉取都变。
+
+③ **PowerShell 的 `Test-Path` 对同一个 `health.py` 两次报「不存在」**，而 git 说它被追踪、
+Python 列出 37 个 `.py` ⇒ 三者矛盾时**必然是探针坏了** ⇒ 换 Python 列文件名。
+（同族：`Set-Content -Encoding UTF8` 写 BOM、`os.datetime` 不存在、inline 脚本累计错六次。）
+
+### ⚠️ `docs/update.md` 早就写着这件事 —— 错的是我
+
+For AI Agents 段 Step 1 第一条就是 `git -C <bridge目录> rev-parse HEAD`；
+Step 2 方式 1 明写「git clone 目录 → 走安装器 / `git pull`」；
+Step 3「稳定目录本身是 git clone 时，自举**不碰它**」；Step 5 已提醒「运行中的 bridge 仍持旧代码」。
+⇒ **我没有读那份文档就叫人跑 `plugin update`。**
+⇒ 已改的只有**一处**：`For Humans` 段把 `plugin update` 叫「更新」，
+却没说它对 clone 型安装**不刷新真正在跑的那份** ⇒ 只读这一段的人必然踩同一个坑（⛔ 包括刚才的我）。
+
+### 无计划 + 为什么
+
+**「插件 spawn 时比对桥目录的 commit 与自身，不一致就报警」** —— **无计划**。
+**代价**：新增行为而非修缺陷，且落在 `plugin/index.ts` 的 spawn 路径（关键路径），需要单独裁决与测试。
+**为什么可接受**：本次根因**不是缺这道检查**，是**我跳过了已有的文档**；
+先加机制会把「文档早就写清楚了」这件事永久掩盖掉。
+⇒ 若将来要加，先确认那时是否已有别的症状要求它，而不是现在顺手加。
+
 ## 📌 §5.0 口径：认错过程与变更史（从 `AGENTS.md` 挪来）
 
 ⚠️ **为什么挪**：三段同款的第一人称认错块留在规则文件里，会让读者学会**跳过 ⚠️ 标记**

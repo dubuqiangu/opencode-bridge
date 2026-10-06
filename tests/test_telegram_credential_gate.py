@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 
 # 期望的 warning 不刷屏；``assertLogs`` 自己换 handler，不受影响。
 logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
@@ -128,6 +129,54 @@ def make_adapter(config: dict | None = None, hooks: RecordingHooks | None = None
     adapter = TelegramAdapter(settings, hooks or RecordingHooks())
     adapter.min_interval = 0            # 测试里不要人为 sleep
     return adapter
+
+
+class RecordingStopEvent(threading.Event):
+    """一个**记账版**的 ``_stop_event``：记下 ``wait()`` 每次**被请求**的秒数。
+
+    ⛔ **为什么记「请求值」而不是「实测量」**：``Event.wait(x)`` 的 ``x`` 是
+    :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter._credential_probe_backoff_for`
+    这个**纯函数**的输出（就是生产侧那处等待的入参），而**实测量**在机器有负载时
+    会被调度放大 —— 本机实测一次 ``wait(0.2)`` 在全量并发下回来是 **1.25s**
+    （差 6 倍，远超 16ms 定时器分辨率能解释的量）⇒ 任何「观察到的间隔要落在某个
+    区间里」的判据在负载下必然时红时绿（全量连跑 3 遍：第一遍红、第二三遍绿）。
+    **逐项等值断言对机器负载免疫**（AGENTS.md §7.1：时序判据只能用同步点，
+    ⛔ 不要拿计时当时序断言）。
+
+    ⚠️ 它是 ``threading.Event`` 的**子类**而不是代理：``set()`` / ``clear()`` /
+    ``is_set()`` 全部照原样可用 ⇒ **``stop()`` 仍然立刻能打断阶梯等待**
+    （:meth:`TestNoNewThread.test_stop_interrupts_the_gate_wait_promptly` 钉的就是
+    那条；换成只实现 ``wait`` 的代理就会把它悄悄弄坏）。
+
+    ⚠️ 第二列是**离散顺序日志**、不是计时：它读 :class:`FakePlatform` 那张**次数**
+    账，而 ``get_me`` 回调收到的 ``attempt`` 本来就是 ``len(get_me_at)``
+    ⇒ 这一列对机器负载免疫，而「交棒那一跳没有先白等一档」这条判据就落在它身上。
+    """
+
+    def __init__(self, attempts_so_far: Callable[[], int]) -> None:
+        super().__init__()
+        #: ``(被请求的秒数, 请求时已经发生过几次 getMe)``，按请求先后排列。
+        self.requested_waits: list[tuple[float, int]] = []
+        self._attempts_so_far = attempts_so_far
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """先记账，再**原样**转交真正的等待（返回值语义一个字没变）。"""
+        self.requested_waits.append((timeout, self._attempts_so_far()))
+        return super().wait(timeout)
+
+
+def record_requested_waits(
+    adapter: TelegramAdapter, platform: FakePlatform
+) -> RecordingStopEvent:
+    """把适配器的 ``_stop_event`` 换成记账版（**必须在** ``start()`` **之前**调）。
+
+    ⚠️ 换掉的是「谁在看等待」，不是「谁能打断它」—— ``RecordingStopEvent`` 仍是
+    真正的 ``threading.Event``，``start()`` 里的 ``clear()`` 与 ``stop()`` 里的
+    ``set()`` 照常作用在它身上。
+    """
+    ledger = RecordingStopEvent(lambda: len(platform.get_me_at))
+    adapter._stop_event = ledger
+    return ledger
 
 
 def fast_ladder(adapter: TelegramAdapter, initial: float, ceiling: float) -> None:
@@ -311,52 +360,57 @@ class TestProbeLadder(unittest.TestCase):
         self.assertEqual(adapter._credential_probe_backoff_for(10 ** 7), 60.0)
 
     def test_retries_land_on_the_laddered_moments_not_merely_repeated(self):
-        """端到端：**次数与时刻**都要对上（钉住"钉住次数"这个要求本身）。"""
+        """端到端：**次数与阶梯**都要对上（钉住"钉住次数"这个要求本身）。
+
+        ⛔ 判据是「**被请求的**延迟」，⛔ **不是「观察到的间隔」**：``Event.wait(x)``
+        的 ``x`` 是 :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter._credential_probe_backoff_for`
+        这个**纯函数**的输出，而**实测量**在机器有负载时会被调度放大（本机实测
+        ``wait(0.2)`` 回来是 **1.25s**，差 6 倍，远超 16ms 定时器分辨率能解释的量）
+        ⇒ 「间隔要落在某个区间里」那种判据在负载下必然时红时绿（全量连跑 3 遍：
+        第一遍红、第二三遍绿），而**逐项等值断言对机器负载免疫**。
+        AGENTS.md §7.1：时序判据只能用同步点（``Event`` / ``Barrier`` / 离散顺序
+        日志），⛔ 不要拿计时当时序断言。
+        """
         adapter = make_adapter()
         fast_ladder(adapter, 0.05, 0.2)
         platform = FakePlatform(
             adapter, get_me=lambda attempt: transient_getme_response()
         )
+        ladder_ledger = record_requested_waits(adapter, platform)
         adapter.start()
         self.addCleanup(adapter.stop)
 
         expected_attempts = 6          # 1 次同步 + 1 次立刻接手 + 4 次阶梯等待之后
+        # ⛔ 下面这两条都是**死线守卫**（死锁时要 fail 得响亮），⛔ **不是时刻判据**：
+        # 它们只回答「阶梯真的重试过这么多吗」，「是哪几档」由后面那条等值断言回答。
         self.assertTrue(
             wait_until(lambda: len(platform.get_me_at) >= expected_attempts, timeout=5.0),
             f"必须重试到第 {expected_attempts} 次。实际：{len(platform.get_me_at)}",
         )
-        # 阶梯被缩到 0.05 / 0.2 ⇒ 传输线程那一侧的相邻间隔应为
-        # [0.05, 0.1, 0.2, 0.2]（初值、×2、封顶、封顶）。
-        # ⚠️ **第一个间隔不是阶梯的一档**：那是「``start()`` 里那次同步失败」交棒给
-        # 「传输线程的第一次尝试」的间隔 —— 失败才过去几毫秒（socket 刚超时 / DNS 刚
-        # 失败），立刻再试一次是对的，先等一档反而是白等。它必须**接近 0**，
-        # 而这恰好让"阶梯整体平移了一档"（初值那一档被跳过、4s 起步）这种错也被抓住。
-        gaps = [
-            later - earlier
-            for earlier, later in zip(platform.get_me_at, platform.get_me_at[1:])
-        ]
-        handoff, ladder_gaps = gaps[0], gaps[1:]
-        self.assertLess(
-            handoff, 0.05,
-            f"交棒那一跳必须立刻发生，不许先白等一档。实际间隔：{gaps!r}",
+        self.assertTrue(
+            wait_until(lambda: len(ladder_ledger.requested_waits) >= 4, timeout=5.0),
+            "阶梯必须真的 park 过 4 次，否则下面断言的是一个空列表（恒真）。"
+            f"实际：{ladder_ledger.requested_waits!r}",
         )
+        # 阶梯被缩到 0.05 / 0.2 ⇒ **被请求的**延迟必须是 [0.05, 0.1, 0.2, 0.2]
+        # （初值、×2、封顶、封顶）—— 逐项**等值**，不是区间。
+        # 第二列（请求时已经发生过几次 ``getMe``）把「交棒那一跳」也钉住了：
+        # 「``start()`` 里那次同步失败」是第 1 次，**交棒**给
+        # :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter._probe_until_credentials_verified`
+        # 里那次（= 它自己的第 1 次尝试，全局第 2 次）之前**一次等待都没有**
+        # ⇒ 第一项的第二列必须是 2；先等一档再交棒会写成 1。
         self.assertEqual(
-            len(ladder_gaps), 4,
-            f"钉住的是次数与时刻，不是「调用了三次」。实际间隔：{gaps!r}",
+            ladder_ledger.requested_waits[:4],
+            [(0.05, 2), (0.1, 3), (0.2, 4), (0.2, 5)],
+            "阶梯必须逐项等于 初值 → ×2 → 封顶 → 封顶（0.05 / 0.1 / 0.2 / 0.2），"
+            "且每一档都在**它自己那次失败之后**才被请求。实际请求序列"
+            "（被请求的秒数, 请求时已发生的 getMe 次数）："
+            f"{ladder_ledger.requested_waits[:6]!r}\n"
+            "读法：① 第一项是**初值**那一档 ⇒「阶梯整体平移了一档 / 4s 起步」"
+            "（初值被跳过）在这里变红；② 第二列连号 2,3,4,5 ⇒ 少一档（阶梯被跳过）"
+            "时第 4 项会落在 6 而不是 5，退化成恒定 0.05 时第一列全是 0.05；"
+            "③ 第一项第二列是 2 ⇒ 交棒那一跳没有先白等一档。",
         )
-        # 判据是**区间**而不是等值：Windows 定时器分辨率差，但"完全没退避"
-        # （≈0.001s）、"跳过初值直接 2×"（≈0.1s 起）与"退化成恒定 0.05s"
-        # 都会落在区间**外面**。
-        for index, (want, got) in enumerate(
-            zip([0.05, 0.1, 0.2, 0.2], ladder_gaps)
-        ):
-            with self.subTest(gap_index=index, want=want, got=got):
-                self.assertGreaterEqual(
-                    got, want * 0.9, f"这一档没退够（×2 没生效？）：{gaps!r}"
-                )
-                self.assertLess(
-                    got, want + 0.15, f"这一档退过头（封顶没生效？）：{gaps!r}"
-                )
 
     def test_giving_up_is_not_an_option_even_after_many_failures(self):
         """③ **永不放弃**：连续失败 9 次之后仍在重试。

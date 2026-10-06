@@ -997,7 +997,14 @@ class SetupCommandTests(unittest.TestCase):
                     body = "\n".join(lines[1:])
                 else:
                     body = out.text
-                self.assertNotIn("D:\\workSpace", body)
+                # ⛔ needle 必须是**通用占位符**，⛔ 不是本机真实的仓库根 ——
+                #   机器专属 needle 有两个害处：① 把本机的目录布局写进公开仓库
+                #   （AGENTS.md §2.2）② **在路径不同的机器上这条断言恒真**，
+                #   测试什么都没测却一直绿。实测曾写成机器专属的仓库根。
+                #   ⚠️ 因此本条的覆盖面只到「那个占位符形状」；真正兜住
+                #   「冻结文案里出现任何机器路径」的是下面那条基于 `$USERNAME`
+                #   的动态断言 —— 它对**任何**用户目录都成立。
+                self.assertNotIn(r"D:\example-workspace", body)
                 # 用**通用占位符**而不是本机真实用户名 —— 这条断言要防的是
                 # "冻结文案硬编码了机器路径"，而把真实用户名写进公开仓库等于
                 # 自己泄漏它，且与被测行为无关。

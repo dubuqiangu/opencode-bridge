@@ -302,10 +302,20 @@ class TheStatedNumberMatchesRealDeliveryTests(unittest.TestCase):
 # ----------------------------------------------------------------------
 # 3. 提示正文不含内部信息
 # ----------------------------------------------------------------------
-#: 真形状但**由片段拼成** —— 推送保护按形状拦整个 push（AGENTS.md §2.5），
+#: 真形状但**由片段拼成** —— 推送保护按形状拦整个 push（AGENTS.md §2.4），
 #: 而脱敏器的测试本质上就需要真形状。运行值逐字节不变。
 SLACK_TOKEN_SHAPED = "xox" + "b-" + "1234567890" + "-" + "AaBbCcDdEeFfGgHh123456"
 TELEGRAM_TOKEN_SHAPED = "123456789" + ":" + "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQq"
+
+#: ⛔ 用户目录**刻意不拆**，与上面两行不同：§2.4 只要求**凭据形状**拼接，
+#:   用户目录按 §2.2 用**通用占位符**即可 —— `example-user` 正是 §2.2 钦定的形式，
+#:   它同时还是下面两条用例 `assertNotIn` 的 **needle**。
+#:   曾把这几行也拆成片段拼接：那是为满足一个**把占位符误判成泄漏**的扫描器，
+#:   而配套注释把「必须拆分」安到了 §2.4 上 —— §2.4 **没有这条规定**，
+#:   它讲的是推送保护按**凭据形状**拦截（见 AGENTS.md §7.1 第 4 条）。
+#: ⛔ 这两个常量只作为 needle 存在，它们的值不许换成别的形状。
+WINDOWS_USER_DIR_SHAPED = r"C:\Users\example-user\state.json"
+POSIX_HOME_SHAPED = "/home/example-user/.opencode"
 
 
 class NothingInternalLeaksTests(unittest.TestCase):
@@ -325,7 +335,7 @@ class NothingInternalLeaksTests(unittest.TestCase):
 
     def test_a_windows_path_shaped_label_and_name_are_dropped_whole(self):
         adapter = DeclaredLimitAdapter(
-            label=r"C:\Users\example-user\state.json", max_message_length=400
+            label=WINDOWS_USER_DIR_SHAPED, max_message_length=400
         )
         adapter.name = r"workSpace\python\aicode"
 
@@ -342,7 +352,7 @@ class NothingInternalLeaksTests(unittest.TestCase):
 
     def test_a_posix_path_shaped_label_and_name_are_dropped_whole(self):
         adapter = DeclaredLimitAdapter(
-            label="/home/example-user/.opencode", max_message_length=400
+            label=POSIX_HOME_SHAPED, max_message_length=400
         )
         adapter.name = "/srv/bridge/state.json"
 

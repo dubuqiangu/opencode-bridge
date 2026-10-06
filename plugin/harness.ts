@@ -647,6 +647,10 @@ async function run() {
   }
 
   await test(16, "deriveStableDir：Windows / Linux(XDG) / Linux(默认) 三分支", () => {
+    // ⛔ `x` / `y` 是**一字母假用户**，不是本机用户名 —— AGENTS.md §2.2 要替换的
+    //   是「这台机器上的真值」，而 §2.2 规定的补救形式是 `example-user` 这类占位符。
+    //   曾把这里拆成片段拼接过一次：那是在满足一个把占位符误判成泄漏的扫描器，
+    //   既无必要，又把一条不存在的规定归给了 §2.4（见 AGENTS.md §7.1「报命中先怀疑判据」）。
     const win = deriveStableDir({ USERPROFILE: "C:\\Users\\x" }, "win32")
     assert(win === path.join("C:\\Users\\x", ".config", "opencode-bridge"), `win32 分支错误: ${win}`)
     const xdg = deriveStableDir({ HOME: "/home/y", XDG_CONFIG_HOME: "/home/y/cfg" }, "linux")

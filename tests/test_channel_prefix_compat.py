@@ -121,7 +121,10 @@ OWNERSHIP_TABLE = (
 def adapter_config_for(platform: str) -> dict:
     """三家各自的最小配置（只用来构造真适配器，不碰网络）。"""
     if platform == "slack":
-        return {"bot_token": "xoxb-token-not-real", "app_token": "xapp-not-real"}
+        # bot_token 由片段拼成：仓库里不得出现连续匹配完整密钥形状的字面量
+        # （推送保护按形状拦整个 push），而**运行值逐字节不变**（AGENTS.md §2.4）。
+        return {"bot_token": "xox" + "b-" + "token-not-real",
+                "app_token": "xapp-not-real"}
     if platform == "discord":
         return {"bot_token": "token-not-real"}
     return {"site_url": "https://example.test", "token": "token-not-real"}

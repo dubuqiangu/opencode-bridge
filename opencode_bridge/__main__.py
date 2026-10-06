@@ -924,6 +924,19 @@ def _print_last_outbound_failures(
         at = failure.get("at")
         if isinstance(at, (int, float)) and not isinstance(at, bool):
             line += "（%s）" % time.strftime("%m-%d %H:%M:%S", time.localtime(at))
+        else:
+            # ⛔ **不许整段沉默** —— 沉默恰好是那个歧义点：读者分不出「这条记录没有
+            # 失败时刻」与「这个视图压根不显示时刻」，而后者是假的（本分支确实会显示）。
+            # ⚠️ 可达而**不是假想场景**：`outbound_failure_from_record` 那段 docstring
+            # 明说那份文件**可能被用户手改过**，而读路径在 ``at`` 解析不出来时**不写**
+            # 那个键（⛔ 它不补 `time.time()` —— 那会把"读的那一刻"当成失败时刻打出来）。
+            # ⇒ 显式说「未记录失败时刻」：缺信息要说出来，不能靠不显示蒙混过去。
+            # ⚠️ 措辞里**必须限定「失败」二字**（⛔ 不是笼统的「时刻未知」）：这一行
+            # 里紧挨着**另一个**真实时刻（` · 已恢复于 <…>`），而「时刻未知」会被
+            # 粗扫的人读成「这一整行的时间信息都未知」⇒ 歧义的代价高于啰嗦。
+            # ⚠️ 「未记录失败时刻」**只在这一处**出现；有真实时刻时仍打真实时刻
+            # （那一支在上面），⛔ 不许让占位盖过真的时刻。
+            line += "（未记录失败时刻）"
         recovered_at = failure.get("recovered_at")
         if isinstance(recovered_at, (int, float)) and not isinstance(recovered_at, bool):
             line += " · 已恢复于 %s" % time.strftime(

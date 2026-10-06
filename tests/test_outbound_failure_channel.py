@@ -31,6 +31,7 @@ import logging
 import os
 import pathlib
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -79,6 +80,21 @@ PLATFORM_STATUS_KEYS_BEFORE_OUTBOUND_FIELD = {
 #: 第五档 ``does_not_probe`` 是 2026-10-06 加的（「本平台压根没有启动期凭据探测这个动作」），
 #: 与 ``skipped`` 的区别是承重的：``skipped`` 说的是「你没配东西」，它说的是「这里没这个动作」。
 EXPECTED_VERDICTS = ("ok", "failed", "skipped", "not_started", "does_not_probe")
+
+#: 盘上那条出站失败记录**没有 ``at``** 时 ``--status`` 那一行必须显示的**逐字**文案。
+#: ⛔ 硬编码字面量，⛔ 不许对着 ``opencode_bridge.__main__`` 的源码算（那恒真）。
+#:
+#: ⚠️ 为什么缺信息必须**说出来**而不是整段不显示：这一段的整个设计是「⛔ 别让缺
+#: 时间戳的旧记录读成『现在的状态』」，而**沉默恰好是那个歧义点** —— 读者分不出
+#: 「这条记录没有失败时刻」与「这个视图压根不显示时刻」（后者是假的）。
+#: ⇒ 且这一分支**可达而**非假想：``health.outbound_failure_from_record`` 的 docstring
+#: 明说那份文件**可能被用户手改过**，而读路径在 ``at`` 解析不出来时**不写**那个键
+#: （⛔ 它不补 ``time.time()`` —— 那会把「读的那一刻」当成失败时刻打出来）。
+#:
+#: ⚠️ 措辞里**必须限定「失败」二字**（⛔ 不是笼统的「时刻未知」）：那一行里紧挨着
+#: **另一个**真实时刻（`` · 已恢复于 <…>``），而笼统的说法会被粗扫的人读成
+#: 「这一整行的时间信息都未知」⇒ 歧义的代价高于啰嗦。
+MISSING_FAILURE_TIME_TEXT = "（未记录失败时刻）"
 
 
 class ScriptedAdapter(Adapter):
@@ -503,6 +519,19 @@ class StatusSectionWording(unittest.TestCase):
         if recovered:
             recorder.note_success("telegram")
 
+    def hand_write_a_record(self, platforms: dict, *, recorded_at: float) -> None:
+        """**像用户那样**直接写盘上那份记录（不经过记录器）。
+
+        ⚠️ 这正是 ``outbound_failure_from_record`` 那段 docstring 说的现实输入：
+        "这份文件可能被用户手改过"。走记录器的话，写路径会把所有字段补齐，
+        于是"盘上缺一个键"这条路径**永远测不到**。
+        """
+        with io.open(
+            os.path.join(self.bridge_dir, health.OUTBOUND_FAILURES_FILE_NAME),
+            "w", encoding="utf-8",
+        ) as handle:
+            json.dump({"recorded_at": recorded_at, "platforms": platforms}, handle)
+
     # --- 双向：两个方向的措辞必须互相不含 --------------------------
     def test_without_a_record_it_neither_says_ok_nor_says_failed(self):
         """⭐ 方向一：**无记录**时既不许显示成「正常」，也不许显示成「失败」。
@@ -571,6 +600,92 @@ class StatusSectionWording(unittest.TestCase):
         self.assertIn("platform-health.json", body)
         self.assertIn("outbound-failures.json", body)
         self.assertIn("各答各的", body)
+
+    def test_a_record_without_a_timestamp_never_gets_one_invented_for_it(self):
+        """⭐ **读路径不许把「读的那一刻」当成失败时刻**（缺陷二）。
+
+        盘上这条记录**没有 ``at``**（用户手改过 —— 那段 docstring 说的就是这件事）。
+        修好之前读路径复用了**写**路径的 normalizer，而它给 ``at=None`` 补
+        ``time.time()`` ⇒ ``--status`` 会打出一个**从未发生**的时刻。
+        ⇒ 判据分两层：读出来的 entry **不许有** ``at``；那一行**不许有**时刻。
+        """
+        self.hand_write_a_record(
+            {"telegram": {"kind": "forbidden", "detail": "bot 被移出群聊"}},
+            recorded_at=time.time() - 86400,
+        )
+
+        entry = health.outbound_failure_from_record(
+            health.read_outbound_failures(self.bridge_dir), "telegram"
+        )
+
+        self.assertIsNotNone(entry, "手写的记录读不回来了")
+        self.assertNotIn(
+            "at", entry,
+            "盘上没有时刻，读出来却有一个 —— 那是「读的那一刻」，不是失败时刻",
+        )
+        row = self.row_for_telegram(self.section())
+        self.assertIn("forbidden", row)
+        self.assertNotIn(
+            "已恢复于", row,
+            "没有时刻的记录不该被显示成「已恢复于 <某个读出来的时刻>」",
+        )
+        self.assertNotRegex(row, r"\d\d-\d\d \d\d:\d\d:\d\d")
+        self.assertIn(
+            MISSING_FAILURE_TIME_TEXT, row,
+            "缺时刻时整段沉默 ⇒ 读者分不出「这条记录没有失败时刻」与"
+            "「这个视图压根不显示时刻」（后者是假的：本分支确实会显示）",
+        )
+
+    def test_a_record_with_a_real_timestamp_still_shows_it(self):
+        """⚠️ **反向对照**：修掉「不许编时刻」不该把真的时刻也一起抹掉。"""
+        failed_at = time.time() - 3600
+        self.hand_write_a_record(
+            {"telegram": {"at": failed_at, "kind": "forbidden", "detail": "被移出群聊"}},
+            recorded_at=failed_at,
+        )
+
+        entry = health.outbound_failure_from_record(
+            health.read_outbound_failures(self.bridge_dir), "telegram"
+        )
+
+        self.assertEqual(entry["at"], failed_at)
+        row = self.row_for_telegram(self.section())
+        self.assertIn(
+            time.strftime("%m-%d %H:%M:%S", time.localtime(failed_at)), row,
+        )
+        self.assertNotIn(
+            MISSING_FAILURE_TIME_TEXT, row,
+            "有真实时刻却被「未记录失败时刻」盖住了 —— 那是把一条真观测换成了缺信息",
+        )
+
+    def test_the_two_record_shapes_are_told_apart_by_their_wording(self):
+        """⭐ **双向可分辨**：有时刻 / 无时刻两种记录读出来**措辞必须可分辨**。
+
+        ⚠️ 钉的是**两个方向**：⛔ 无时刻不许显示成有时刻（那是编造），
+        ⛔ 有时刻也不许被读成「未记录失败时刻」（那是把真观测换成缺信息）。⇒ 两行逐字不同。
+        """
+        self.hand_write_a_record(
+            {"telegram": {"kind": "forbidden", "detail": "bot 被移出群聊"}},
+            recorded_at=time.time() - 86400,
+        )
+        without_a_time = self.row_for_telegram(self.section())
+
+        self.hand_write_a_record(
+            {"telegram": {"at": time.time() - 3600, "kind": "forbidden",
+                          "detail": "bot 被移出群聊"}},
+            recorded_at=time.time() - 86400,
+        )
+        with_a_time = self.row_for_telegram(self.section())
+
+        self.assertNotEqual(
+            without_a_time, with_a_time,
+            "两种记录渲染出同一行 ⇒ 读者无从分辨这一刻有没有时刻",
+        )
+        self.assertIn(MISSING_FAILURE_TIME_TEXT, without_a_time)
+        self.assertNotIn(MISSING_FAILURE_TIME_TEXT, with_a_time)
+        self.assertIn(health.describe_outbound_failure(
+            {"kind": "forbidden", "detail": "bot 被移出群聊"}
+        ), without_a_time, "缺时刻不该顺带把分类与原因也吃掉")
 
 
 # ======================================================================
@@ -1265,6 +1380,243 @@ class WiringCriteriaRejectBadSources(unittest.TestCase):
 
         self.assertFalse(ok, "锚点没了竟然判成通过")
         self.assertIn("core.start()", reason)
+
+
+# ======================================================================
+# ⑪ ⛔ 缺陷一：**不许**造出一条从未被观测到的失败
+# ======================================================================
+class NeverFabricatesAFailure(RecorderInstalled):
+    """⭐ 缺陷一：这条通道自己**制造**了一条假观测。
+
+    ⚠️ 本模块存在的**全部意义**是消灭假话，而它当时自己造了一条：写盘失败之后
+    内存态里还留着"这个平台正在失败连击中"，而盘上压根没有那条记录 ⇒ 下一次成功
+    发送去给它盖 ``recovered_at`` 时，只能**编出**一条失败出来（分类 ``unknown``、
+    时刻取"现在"）—— ``--status`` 照实把它打出来，而「失败发生在那一刻」是假的。
+
+    ⇒ **两条现实触发路径**，两条都要有用例（只测一条的话，另一条仍是零覆盖）：
+
+    1. :meth:`note_failure` 那次写盘失败（磁盘满 / 目录只读 / 杀软锁 / 路径过长），
+       而下一次成功发送就走进那条兜底；
+    2. 桥运行期间用户把 ``outbound-failures.json`` 删掉或改成坏 JSON，而内存态里
+       那个平台还在连击中。
+
+    ⚠️ **零覆盖曾是这里的真实现状**：``（未记录细节）`` 这个字面量在整个 ``tests/``
+    下命中 0 次，而两条**看起来**在守它的用例顺序恰好相反 —— 一条打完写盘补丁就
+    结束（从没补那次成功发送），另一条把 ``note_failure`` 放在补丁**之外**（盘上有
+    记录 ⇒ 兜底压根没走到）。⇒ 所以下面每条都额外钉住**兜底分支真的被走到过**
+    （写盘次数与内存态），而不只是钉盘上的文本。
+    """
+
+    #: 那条编造出来的记录里 ``detail`` 用的字面量。
+    #: ⛔ 硬编码字面量，⛔ 不许对着实现算（那恒真 —— AGENTS.md §9）。
+    FABRICATED_DETAIL = "未记录细节"
+
+    def count_writes_while(self, action, *, write_error: BaseException | None = None) -> int:
+        """跑 ``action``，返回它真的**尝试**了几次写盘。
+
+        ⚠️ 这是**公共缝**上的判据，不是数私有状态：兜底分支一旦恢复，它一定会写一次
+        盘 ⇒ 写盘次数从 0 变成 1，而"盘上文本里有没有那句话"之外还有一道独立的证据。
+
+        :param write_error: 让每一次落盘**抛**它（模拟磁盘只读）—— 计数按**尝试**
+            算，不管成没成：那正是"反复付 mkstemp + fsync 的钱"的量。
+        """
+        calls: list = []
+        from opencode_bridge.pairing_cli import write_config_atomically as real_write
+
+        def counting_write(path, document):
+            calls.append(path)
+            if write_error is not None:
+                raise write_error
+            return real_write(path, document)
+
+        with mock.patch.object(health, "write_config_atomically", counting_write):
+            if write_error is None:
+                action()
+            else:
+                with self.assertLogs("opencode_bridge.health", level="WARNING"):
+                    action()
+        return len(calls)
+
+    def streaks_claiming_a_record_that_is_not_on_disk(self) -> list[str]:
+        """内存态里声称"正在失败连击中"、而**盘上压根没有那条记录**的平台键。
+
+        ⚠️ 这里刻意读**私有**的 ``_failing``：这条不变量**没有任何公开缝** ——
+        :meth:`failing_platforms` 把"写盘失败、连击成立但没记下"也算进去（那是如实的
+        诊断），而 :meth:`note_success` 的守卫会让后果不显形。⇒ 它只能作为
+        「内存态与盘上必须一致」这条契约本身的判据出现（判据反退化：把
+        ``self._failing.add(key)`` 挪回写盘**之前** ⇒ 必须变红）。
+        """
+        recorded = set(
+            health.outbound_failures_in_record(
+                health.read_outbound_failures(self.bridge_dir)
+            )
+        )
+        return sorted(set(self.recorder._failing) - recorded)
+
+    def assert_nothing_was_invented_about(self, platform: str) -> None:
+        """盘上既没有为 ``platform`` 编出来的记录，也没有那句话的字面量。"""
+        raw = self.on_disk()
+        self.assertNotIn(
+            self.FABRICATED_DETAIL, raw,
+            "盘上出现了一条从未被观测到的失败（%s）—— 本模块消灭的就是这个" % raw,
+        )
+        self.assertIsNone(
+            self.recorded_entry(platform),
+            "为 %s 编出了一条出站失败记录：%r" % (platform, raw),
+        )
+
+    # --- 路径 1：写盘失败 -------------------------------------------
+    def test_a_failed_persist_does_not_leave_a_streak_the_next_success_can_stamp(self):
+        """⭐ 路径 1：那次失败**没记下来** ⇒ 就不存在"要结束的连击"。
+
+        ⇒ 补一次成功发送时**一个字都不许写**：写了就是给一条从未观测到的失败
+        盖上"已恢复"，而那份记录的分类与时刻全是编的。
+        """
+        self.assertEqual(
+            self.count_writes_while(
+                lambda: self.recorder.note_failure(
+                    "irc", SendError.FORBIDDEN, "banned"
+                ),
+                write_error=OSError("磁盘只读"),
+            ),
+            1, "这一步压根没去写盘 ⇒ 下面钉的不是写盘失败这条路",
+        )
+        self.assertEqual(self.on_disk(), "", "写盘失败了盘上却有内容")
+        self.assertEqual(
+            self.streaks_claiming_a_record_that_is_not_on_disk(), [],
+            "写盘失败了内存态却还记着「正在失败」—— 那条连击没有任何可盖戳的观测",
+        )
+
+        writes = self.count_writes_while(lambda: self.recorder.note_success("irc"))
+
+        self.assertEqual(
+            writes, 0,
+            "那次成功发送又写了一次盘 —— 它只能是在给一条从未观测到的失败补记录",
+        )
+        self.assert_nothing_was_invented_about("irc")
+
+    def test_the_broken_disk_does_not_turn_every_failure_into_a_write_attempt(self):
+        """⭐ 判据反退化：把「写盘成功才进连击」短路掉（先记内存态）⇒ 必须变红。
+
+        这是「写盘失败 ⇒ 不进连击」那半句**唯一**的行为证据：先记内存态的话，
+        同一次连击里的后续每次失败都会重新付一遍 ``mkstemp`` + ``fsync`` 的钱，
+        而那些钱**必然**买不到任何东西（盘上压根写不进去）⇒ 100 次失败 = 100 次尝试。
+
+        ⚠️ 它同时钉住类 docstring 承诺的那个边界：**写盘一直失败时，每次连击仍然只有
+        ≤ 2 次写盘尝试**，而不是"每次失败一次"。
+        """
+
+        def hundred_failures() -> None:
+            for _ in range(100):
+                self.recorder.note_failure("irc", SendError.RATE_LIMITED, "429")
+
+        self.assertEqual(
+            self.count_writes_while(hundred_failures, write_error=OSError("磁盘只读")),
+            1,
+            "写盘一直失败时仍在反复尝试 ⇒ 节流上界（每连击 ≤ 2 次）已经不成立，"
+            "而每次尝试都在排障通道自己的位置上白付一遍 mkstemp + fsync",
+        )
+        self.assertEqual(self.on_disk(), "", "写盘一直失败，盘上却有内容")
+
+    def test_the_next_failure_streak_retries_the_write_after_the_disk_comes_back(self):
+        """⭐ 边界是**按连击**划的，不是"本进程再也不写"。
+
+        ⇒ 上一次的失败因磁盘写不进去而丢掉之后，**下一次**连击必须重新尝试写 ——
+        用户修好磁盘/权限的那一刻就该能记上，而不是要等到下次重启桥。
+        """
+        self.count_writes_while(
+            lambda: [
+                self.recorder.note_failure("irc", SendError.FORBIDDEN, "banned")
+                for _ in range(5)
+            ],
+            write_error=OSError("磁盘只读"),
+        )
+        self.assertEqual(self.on_disk(), "")
+
+        self.recorder.note_success("irc")           # 磁盘恢复 + 一次成功发送
+        self.assertTrue(
+            self.recorder.note_failure("irc", SendError.FORBIDDEN, "banned"),
+            "写盘恢复之后，下一次失败连击仍然不尝试写 ⇒ 这次排障记录被静默丢掉了",
+        )
+        self.assertIsNotNone(self.recorded_entry("irc"))
+
+    # --- 路径 2：记录被用户删掉 / 坏掉 -------------------------------
+    def test_a_deleted_file_is_never_papered_over_with_an_invented_failure(self):
+        """⭐ 路径 2a：桥跑着，用户把 ``outbound-failures.json`` 删了。
+
+        ⚠️ 这条**必须**先真的写成功过一次（内存态里才有连击）⇒ 兜底分支**确实**被
+        走到 —— 而它唯一的输入是"我这儿记着连击、盘上却没有"，如实上报"没有可盖戳
+        的记录"就是全部答案。
+        """
+        self.assertTrue(
+            self.recorder.note_failure("irc", SendError.FORBIDDEN, "banned"),
+            "这一步没写成功 ⇒ 下面钉的不是那条兜底分支",
+        )
+        os.remove(self.failure_file_path())
+        self.assertEqual(
+            self.streaks_claiming_a_record_that_is_not_on_disk(), ["irc"],
+            "这一步要的就是「内存态记着连击、盘上已经没有」⇒ "
+            "下面那次成功发送必须自己扛住这个不一致，而不是造一条出来",
+        )
+
+        writes = self.count_writes_while(lambda: self.recorder.note_success("irc"))
+
+        self.assertEqual(
+            writes, 0,
+            "盘上那条被删掉之后，一次成功发送又凭空写回了一条失败记录",
+        )
+        self.assert_nothing_was_invented_about("irc")
+
+    def test_a_corrupted_file_is_never_papered_over_with_an_invented_failure(self):
+        """⭐ 路径 2b：同一份文件被改成坏 JSON（``_read()`` 把它当 ``{}``）。"""
+        self.assertTrue(
+            self.recorder.note_failure("irc", SendError.FORBIDDEN, "banned")
+        )
+        with io.open(self.failure_file_path(), "w", encoding="utf-8") as handle:
+            handle.write("{ 这不是 JSON")
+
+        with mock.patch("sys.stderr"):
+            writes = self.count_writes_while(lambda: self.recorder.note_success("irc"))
+
+        self.assertEqual(
+            writes, 0, "坏文件被一次成功发送覆盖成了一条编出来的失败记录",
+        )
+        self.assert_nothing_was_invented_about("irc")
+
+    def test_an_unwritable_failure_is_still_reported_as_a_failure_streak(self):
+        """⚠️ 反「假的**否定**观测」：磁盘写不进去**不许**被说成"没失败过"。
+
+        ⇒ :meth:`failing_platforms` 必须把那次连击算进去 —— 故障本身发生了
+        （哪怕一个字都没落盘），报成"没有失败"与凭空造一条失败是同一个病的两面。
+        ⛔ 而 :meth:`note_success` 那一侧守的是相反方向：那次连击**没有可盖戳的记录**
+        ⇒ 不许造。一正一反，两边都要。
+        """
+        self.count_writes_while(
+            lambda: self.recorder.note_failure(
+                "irc", SendError.FORBIDDEN, "banned"
+            ),
+            write_error=OSError("磁盘只读"),
+        )
+
+        self.assertEqual(
+            self.recorder.failing_platforms(), ("irc",),
+            "一次真实的失败因为写不进去就从诊断里消失了 ⇒ 那是一条假的否定观测",
+        )
+        self.assertEqual(self.on_disk(), "")
+
+    def test_a_record_that_really_was_written_is_still_seen_by_these_probes(self):
+        """⚠️ 反"判据恒空"：上面那几条的探针**不是**恒空的。
+
+        没有这一条，一个认不出记录的探针会因为"盘上确实什么都没有"而把上面几条全
+        放过去（AGENTS.md §7.1：空集 ≠ 不存在）。
+        """
+        self.recorder.note_failure("irc", SendError.FORBIDDEN, "banned")
+
+        self.assertIn("banned", self.on_disk())
+        self.assertIsNotNone(self.recorded_entry("irc"))
+        self.assertEqual(self.count_writes_while(
+            lambda: self.recorder.note_success("irc")
+        ), 1, "盘上真的有记录时，恢复那一次必须写盘")
 
 
 if __name__ == "__main__":

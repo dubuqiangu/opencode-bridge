@@ -685,13 +685,29 @@ def outbound_failure_from_record(
     entry = platforms.get(str(key))
     if not isinstance(entry, Mapping):
         return None
-    return normalize_outbound_failure(
+    stored_at = entry.get("at")
+    normalized = normalize_outbound_failure(
         entry.get("kind"),
         entry.get("detail"),
         retry_after=entry.get("retry_after"),
-        at=entry.get("at"),
+        at=stored_at,
         recovered_at=entry.get("recovered_at"),
     )
+    # ⛔ **读路径不许把「盘上没记时刻」当成「失败发生在现在」** ——
+    # :func:`normalize_outbound_failure` 是**写**路径的规范化器，它给 ``at=None``
+    # 补 ``time.time()``。那在写路径上是对的（刚刚真的失败了一次），而在**读**
+    # 路径上就是**编造**：本次调用既不是失败发生的那一刻，``--status`` 却会把它
+    # 当成失败时刻打出来（实测：一条没有 ``at`` 的记录读出来的 ``at`` 与读盘
+    # 时刻相差 0.0 秒）。
+    # ⚠️ 手改过的 ``at`` 不是假想输入 —— 上面那段 docstring 说的就是"这份文件可能
+    # 被用户手改过"，而将来某个写入方漏掉 ``at`` 也会落进同一个坑。
+    # ⇒ 盘上解析不出时刻 ⇒ **不写这个键**（⛔ 不是补一个占位时刻），于是
+    # ``__main__.run_status`` 那一行只显示分类与原因。
+    # ⚠️ 对照：:func:`probe_from_record` 那一侧天然没这个问题 —— 它压根不产出
+    # ``at``。**别把写路径的语义漏进读路径**，那是同一个病根。
+    if _normalize_epoch(stored_at) is None:
+        normalized.pop("at", None)
+    return normalized
 
 
 def outbound_failures_in_record(record: Optional[Mapping]) -> Iterable[str]:
@@ -757,7 +773,29 @@ class OutboundFailureRecorder:
 
     ⚠️ **状态是进程内的，不从盘上恢复。** 所以桥重启后第一次失败会**再写一次**
     （把 ``at`` 刷新到本次运行）—— 那一次写盘是有用的（用户查的就是"重启之后还有
-    没有在失败"），而它每个进程至多一次，不构成无限写盘。
+    没有在失败"），而它是上面那个「每平台每次连击 ≤ 2 次」上界里的**第一次**。
+
+    ⚠️ **⛔ 上面的上界是「每平台每次连击」，不是「每个进程」。** 一个长跑进程可以
+    有任意多次连击（失败 → 恢复 → 失败 → 恢复 …），**每次连击各写自己的那 ≤ 2 次**
+    ⇒ 长期运行的桥总写盘次数**随连击次数增长**。⚠️ 把它读成"每进程至多一次"会
+    低估这一层对 ``mkstemp`` + ``fsync`` + ``os.replace`` 的压力 —— 而那正是它选
+    状态机（而不是时间窗）的理由。
+
+    ## 写盘失败时内存态怎么办（**一条不许造出来的记录**）
+
+    ⚠️ **写盘失败绝不允许留下"有个失败连击在结束"的印象**：那样下一次成功发送会去
+    给一条**盘上压根没有的**失败盖 ``recovered_at``，而盖不出时刻与分类时唯一的
+    办法就是**编一条**出来（那正是本模块要消灭的那类假话）。
+    ⇒ 所以两件事都守住：**① 写盘失败就不进连击**（:attr:`_failing` 只装"盘上真的
+    记着"的平台）；**② 恢复时盘上没有记录就不写**（:meth:`note_success` 不造）。
+
+    ⚠️ 代价与它的边界（**为什么不是"下一次失败再试一次"**）：写盘失败的那一次连击
+    在**本进程内不再重试写盘**（记进 :attr:`_unwritten`），否则每次失败观测都要付
+    一遍 ``mkstemp`` + ``fsync`` 的钱，而那些钱买到的**必然是又一次失败**。边界是
+    **按连击划的**，不是按时间窗：⛔ 连击的**下一次失败**会重试（记着"上次没写成"
+    的是故障本身，用户改完磁盘/权限就该立刻能记上），而**同一次连击**里重复观测不
+    重试（那与"失败 → 失败"被抑制是同一件事：盘上没有记录可改）。⇒ 每次连击仍
+    是 **≤ 2 次写盘尝试**（进入 + 恢复），写盘一直失败时也是。
 
     ⛔ **写盘失败绝不影响发送路径**：每个方法都自己兜住异常、记 warning、返回
     ``False``。这与 :func:`record_startup_probes` 的不变量同源 —— **排障记录
@@ -766,8 +804,14 @@ class OutboundFailureRecorder:
 
     def __init__(self, bridge_dir: str) -> None:
         self._bridge_dir = str(bridge_dir or "")
-        #: 正处于「失败连击」中的平台（内存态；见上面「状态是进程内的」）。
+        #: 正处于「失败连击」中、且**盘上真的记着**的平台（内存态；见上面
+        #: 「状态是进程内的」）。
+        #: ⛔ **只装写盘成功的** —— 见上面「写盘失败时内存态怎么办」：
+        #: 装进去一个盘上没有的平台，就会给一份从未发生的失败盖上恢复时刻。
         self._failing: set[str] = set()
+        #: 观测到失败、但那一次写盘**没成功**的平台（同一次连击内不再重试写盘；
+        #: 下一次成功发送会把它清掉，于是**下一次**失败连击会重新尝试写）。
+        self._unwritten: set[str] = set()
 
     # --- 观测入口 -----------------------------------------------------
     def note_failure(
@@ -788,10 +832,21 @@ class OutboundFailureRecorder:
             return False
         if key in self._failing:
             return False          # 失败连击中：记录已经写着"在失败"，不重复写
-        self._failing.add(key)
-        return self._write(key, normalize_outbound_failure(
+        if key in self._unwritten:
+            return False          # 同一次连击的写盘已经失败过（见类 docstring 的边界）
+        written = self._write(key, normalize_outbound_failure(
             kind, detail, retry_after=retry_after,
         ))
+        # ⚠️ **写盘成功之后才进连击** —— 顺序是承重的。
+        # 先记进 `_failing` 的话，一次写盘失败（磁盘满 / 目录只读 / 杀软锁 /
+        # 路径过长）会留下一个"盘上没有记录的失败连击"，而下一次成功发送就会去
+        # 给它盖 `recovered_at` ⇒ 盘上凭空多出一条**从未观测到**的失败
+        # （分类与时刻都是编的）。⇒ 判据：`_failing` ⊆ 盘上真的有这条记录。
+        if written:
+            self._failing.add(key)
+        else:
+            self._unwritten.add(key)
+        return written
 
     def note_success(self, platform: str) -> bool:
         """记一次出站成功（**仅当它结束了一段失败连击**才写盘）。
@@ -801,12 +856,28 @@ class OutboundFailureRecorder:
         而用户真正要问的是"我刚才那条回信去哪了"。把记录删掉会让这个问题彻底无解。
         """
         key = str(platform or "")
-        if not key or key not in self._failing:
+        if not key:
+            return False
+        if key in self._unwritten:
+            # 这一段连击**从来没写下去过** ⇒ 盘上没有可盖戳的记录，什么都不写
+            #（清掉标记，于是**下一次**失败连击会重新尝试写盘）。
+            self._unwritten.discard(key)
+            return False
+        if key not in self._failing:
             return False          # 没有失败连击在结束：没有记录要改
         self._failing.discard(key)
-        existing = self._entry_of(key) or normalize_outbound_failure(
-            SendError.UNKNOWN, "（未记录细节）",
-        )
+        existing = self._entry_of(key)
+        if existing is None:
+            # ⛔ **盘上没有 = 没有可盖戳的观测，不造。** 这条兜底过去会
+            # `normalize_outbound_failure(UNKNOWN, "（未记录细节）")` **编一条**
+            # 出来 —— 那条记录里的「失败发生在 X 时刻」与分类**都是假的**
+            # （盘上从来没有过失败时刻）。
+            # ⚠️ 它仍**可达**（盘上那份被用户删掉 / 改成坏 JSON，而进程内的连击
+            # 还在），而正因可达才更不能造：这条路唯一的输入是"我这儿记着连击，
+            # 盘上却没有"，如实上报"没有可盖戳的记录"就是全部答案。
+            # ⇒ 状态机的判据仍然是「没记下失败 ⇒ 没有要结束的连击」；
+            # 这里守的是另一半：`_failing` 记着的连击，盘上**也**必须有记录。
+            return False
         existing["recovered_at"] = time.time()
         return self._write(key, existing)
 
@@ -853,4 +924,7 @@ class OutboundFailureRecorder:
     # --- 测试与诊断 ---------------------------------------------------
     def failing_platforms(self) -> tuple[str, ...]:
         """当前处于失败连击中的平台（诊断用；``--status`` 读的是盘上那份）。"""
-        return tuple(sorted(self._failing))
+        # ⚠️ **并上 :attr:`_unwritten`**：那次连击确实观测到失败了（哪怕一个字都没
+        # 写下盘）—— 只报「盘上记着的」会把"刚失败过一次、但磁盘写不进去"说成没失败，
+        # 而那是一条**假的否定观测**（与本模块消灭的是同一类病）。
+        return tuple(sorted(self._failing | self._unwritten))

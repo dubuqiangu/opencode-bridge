@@ -381,6 +381,7 @@ opencode 引用。按权威度查：
 | `git status --porcelain` 的输出先 `.strip()` 再切 `l[3:]` | **状态位被吃掉了** —— 首行 ` M AGENTS.md` 变成 `M AGENTS.md` ⇒ 切出 `GENTS.md`，于是**「这是我的改动」被判成「别人的在制品」**。实测真发生过一次。**别 `.strip()` 整个输出**，用 `.splitlines()` 或先 `.rstrip("\n")` |
 | `print("45% 且 SLOC %s" % v)` | `ValueError: unsupported format character` —— **字面量里的 `%` 被当成格式符**。本项目到处是百分比（文档占比、覆盖率），这条会反复踩。**用字符串拼接或 f-string，别用 `%` 格式化含 `%` 的字面量** |
 | 用正则从源码里提取「CLI 有哪些 flag / 参数」，结果返回**空集** | 正则**匹配不到跨行**的实参、漏了前缀限定，**一个都没匹配上** ⇒ 我据此认定 `--verbose` 是子代理**编造的 flag**，差点从文档里删掉。跑 `python -m opencode_bridge --help` 才定案：**它真实存在**（`build_parser` 里 `"--verbose", action="store_true"`，`main()` 里 `_setup_logging("DEBUG" if args.verbose else cfg.log_level)`）。⇒ **凡是「程序对外暴露的命令面」（flag、命令行、配置键），权威来源是**跑一次它自己**（`--help`、实际调用），**不是正则扫源码**。§7.1 第一条规则在这里的代价是**删掉一个真实存在的功能** |
+| 用**行级**正则去找一个**跨行**的表达式（如 `int(\n    self.config.get("k") or D\n)`） | **行级正则必然漏** —— `int(` 与 `self.config.get(` 不在同一行。实测我据此判定「代码里没有裸 `int()`」，实际有**两处**，而那两处正是**会打死整个适配器**的缺陷。⇒ **知道确切符号名时，直接按名字 `grep` 那个键**，别写通用扫描；真要通用扫描就上 AST，但 **`ast.walk` 会吐出没有位置信息的节点**（`ast.arguments` 等），**别在它的结果上直接取 `.lineno`** |
 
 **三条规则：**
 

@@ -3976,3 +3976,84 @@ qqbot.py:1063        homeassistant.py:1047
 ⇒ 后续考虑一个**结构性**护栏（而非逐个平台手工审）：让
 「各适配器 `required_tokens` / 实际读取的键」与「README 配置项表」互为断言。
 ⚠️ 本次**未实施**，仅记账 —— 它会同时覆盖上表最后两行那类问题。
+
+---
+
+## 🔴 12 个平台的代码侧盘点（`exp-82`）与「打死适配器」那一类的根因
+
+**来源**：`exp-82`（explorer，只读，按范围限制**未读** `README.md` / `docs/install.md`）。
+我逐条核实了其中**承重的四条**，其中一条**它是对的而我的判据是错的**（见末节）。
+
+### 三条全局事实（写「各平台配置指导」的地基）
+
+**A. 13 个平台一律不需要公网可达地址。** 全是主动外连；
+**唯一监听端口的是 `a2a`**，默认绑 `127.0.0.1`，且非回环且无凭据时**回落回环**。
+
+**B. 群聊需要 @ 提及的只有三个**：`irc`、`twitch`、`qqbot`。
+**telegram 反过来** —— 没有 mention 过滤，群里每条文本消息都会驱动 agent（已在文档里作为坑 4 记下）。
+
+**C. ⚠️ 凭据/发送失败只进日志、不进任何 CLI 输出。**
+`_note_send_failure` → `Adapter._last_send_error` → `last_send_error` / `send_result`
+—— **这套结构化失败分类建好了，却没有任何生产调用方**（核实：生产里的命中
+全是 `base.py` 的定义 + 3 个适配器 docstring 里的提及，**零个调用点**）。
+⇒ **与 telegram `getMe` 完全同型：信息产生了，没有通道到达用户。**
+本批由 `fix-170` 给「启动期探测」建立通道；**出站失败这条通道仍未修**（记账）。
+
+### ⛔ 「非法值打死适配器」的真实机制（三处曾被我写错）
+
+**机制**：`build()` 把 `cls(config, hooks)` 的异常包成 `AdapterError`；
+`run_bridge` 对 `build` 是 `except Exception: … continue`（**不是整体退出**）；
+但 **`usable == 0` 时 `print(NO_ADAPTER_MESSAGE); return 1`**
+⇒ **只有出错的是唯一配置的平台时，桥才真的起不来。**
+`BridgeCore.start` 对 `adapter.start()` 也是 try/except
+⇒ **`start()` 期抛异常只让该平台不启动，桥照常跑。**
+
+⇒ 所以风险**只在 `__init__` 里做无保护类型转换的键上**。全仓库这一类**恰好三处**：
+
+| 键 | 位置 | 状态 |
+|---|---|---|
+| `telegram.poll_timeout` | `TelegramAdapter._coerce_poll_timeout` | ✅ `fix-170` 已改（带「已回落为」告警） |
+| `matrix.sync_timeout_ms` | `MatrixAdapter.__init__`，`int(self.config.get(...) or SYNC_TIMEOUT_MS)` | 🔴 裸 `int()` |
+| `email.dedupe_capacity` | `EmailAdapter.__init__`，`max(1, int(self.config.get(...) or self.dedupe_capacity))` | 🔴 裸 `int()` |
+
+**根因不是「漏了两次 try」，是「没有共享的类型强制助手」**：
+`nextcloud._config_int_value`（带区间双层校验）、`discord._config_intents`、
+`irc._resolve_port`、`a2a._coerce_port` / `_coerce_positive`、`email._port` / `_timeout`
+—— **12 个适配器里滚了 6 份近似实现，两份缺失因而崩溃。**
+`nextcloud` 那一处**已经是对的**（区间越界也回落，注释明写「不静默采纳」）
+⇒ **正确写法在本仓库现成存在，matrix / email 只是没用它。**
+⇒ 根治方向：**抽一个共享助手 + 一条结构断言（不许有裸 `int(self.config.get(...))`）**，
+不是给两个调用点各补一个 `try`。⚠️ 待 `fix-170` 落地后再派（它持有 `adapters/base.py`）。
+
+### 「配好了但不通」的三个结构性缺口（与 HA 那个同族）
+
+| 平台 | 缺口 | 有没有机器可读信号 |
+|---|---|---|
+| `homeassistant` | `accept_all` / `entities` / `domains` 三者皆空 ⇒ **默认一个事件都不收** | ✅ `capabilities()["inbound_accepts_anything"]`（`fix` 后能进 `--setup --json`） |
+| `a2a` | `config_optional=True` ⇒ **`--status` 把空配置报成 `configured=True` / `outbound_ready=True`**，而 `start()` 会拒绝启动（未配 `bind_port`） | ⚠️ 只有 `capabilities()["bind_port"] is None` 可间接判 |
+| `slack` | 缺 `app_token` 只降级为「只发出站」 | ✅ 仅因 `required_tokens` 含它，`--status` 的 `configured` 才是 False |
+
+⇒ **核实：只有 `a2a` 与 `homeassistant` 覆写 `capabilities()`**，其余 10 家都没有额外判据。
+⚠️ 但 **`running` 几乎每个适配器都覆写（13 个文件都有）** ⇒ 任何依赖 `running` 的新判据都不可靠。
+
+### 无限重连清单（凭据错时的行为，决定文档该怎么写）
+
+| 平台 | 凭据无效时 | 有没有 error 级日志 |
+|---|---|---|
+| `discord` | close `4004` / `4014` ∈ `FATAL_CLOSE_CODES` ⇒ **停止重连** | ✅ 有（**13 家里唯一会 fatal 停止的**） |
+| `qqbot` / `ntfy` / `homeassistant` / `mattermost` | 1→60s 指数退避**无限重连** | ✅ 有专门文案（含 intents 越权排查项） |
+| `matrix` | 恒 **2s** 无限重试 | ⚠️ 只有 warning |
+| `slack` | 恒 **3s** 无限重连 | ⚠️ 只有 `RuntimeError` 文本 |
+| `irc` / `twitch` | 5→60s 指数；表现为 30s 注册超时循环 | ⚠️ 只有 warning / `logger.info` |
+| `nextcloud` | **无退避，裸循环** | ⚠️ 只有 warning |
+| `email` | 1→60s；**出站认证失败一条日志都没有** | ❌ 入站也只有传输层的「会话出错」 |
+
+### ⚠️ 我自己在这条上错了两次（判据坏了，不是 `exp-82` 错了）
+
+我用行级正则找「`__init__` 里的裸 `int()`」，**返空集**⇒ 差点记成「这一类风险不存在」。
+按 §7.1 停下换方法、直接按确切键名 `grep`，才发现
+`email.py:484` 的 `int(` 与 `485` 的 `self.config.get(` **被换行拆开** ——
+**行级正则对跨行表达式必然漏**。中间又写错过两次（`ast.walk` 吐出没有 `lineno` 的
+`ast.arguments`；以及我自己占位符与实参错位）。
+⇒ **三次错在同一轴上，正好是 §7.1 规则 2 说的那种情况**；
+真正的教训已增补进 §7.1 表：**知道确切符号名就直接 `grep` 那个名字，别写通用扫描。**

@@ -148,7 +148,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/dubuqiangu/opencode-bridge@main/install.s
    python -m unittest discover -s tests
    ```
 
-   期望 `OK`，0 FAIL/ERROR（当前为 `Ran 113 tests` / `OK (skipped=1)`，数字随版本变化以 `OK` 为准）。
+   期望末行为 `OK`（`OK (skipped=N)` 也算通过），0 FAIL/ERROR。⛔ **不要把 `Ran N tests` 的 N 抄进文档**——它随用例增删而变，判据只有 `OK`；条数以该命令的实跑输出为准。
 
 4. （可选）插件自检：
 
@@ -157,7 +157,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/dubuqiangu/opencode-bridge@main/install.s
    bun harness.ts
    ```
 
-   期望 `PASS 15/15`。
+   期望**全部场景 PASS 且退出码 0**——`harness.ts` 末行会打印 `PASS n/n`，任一失败退出码 1。⛔ **不要把 n 抄进文档**：n 随场景增删而变（本仓库曾在三处写下三个不同的 n），判据只有「全部 PASS + 退出码 0」。
 
 > 未配置 token 时 bridge 打印「没有任何可用适配器」+ 提示后 **exit 0**（优雅退出、插件不进 backoff）——不要当成更新失败。
 

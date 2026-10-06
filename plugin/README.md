@@ -170,7 +170,7 @@ JSON 解析失败（含 BOM / 截断）→ 忽略该文件并提示，不抛。
 ```powershell
 cd opencode-bridge\plugin
 bun build index.ts --no-bundle        # 语法/解析检查
-bun harness.ts                        # 期望: PASS 14/14，退出码 0
+bun harness.ts                        # 期望: 全部场景 PASS（末行打印 PASS n/n），退出码 0
 ```
 
 `harness.ts` 覆盖 25 个场景：

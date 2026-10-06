@@ -380,6 +380,7 @@ opencode 引用。按权威度查：
 | 断言「这条路一条测试都没有」 | 实测有 6 条，但**测的是别的东西** —— 准确说法是「测了 A、没测 B」，而缺陷通常就活在 A 与 B 之间那条缝里。**说「没有」之前先数一遍** |
 | `git status --porcelain` 的输出先 `.strip()` 再切 `l[3:]` | **状态位被吃掉了** —— 首行 ` M AGENTS.md` 变成 `M AGENTS.md` ⇒ 切出 `GENTS.md`，于是**「这是我的改动」被判成「别人的在制品」**。实测真发生过一次。**别 `.strip()` 整个输出**，用 `.splitlines()` 或先 `.rstrip("\n")` |
 | `print("45% 且 SLOC %s" % v)` | `ValueError: unsupported format character` —— **字面量里的 `%` 被当成格式符**。本项目到处是百分比（文档占比、覆盖率），这条会反复踩。**用字符串拼接或 f-string，别用 `%` 格式化含 `%` 的字面量** |
+| 用正则从源码里提取「CLI 有哪些 flag / 参数」，结果返回**空集** | 正则**匹配不到跨行**的实参、漏了前缀限定，**一个都没匹配上** ⇒ 我据此认定 `--verbose` 是子代理**编造的 flag**，差点从文档里删掉。跑 `python -m opencode_bridge --help` 才定案：**它真实存在**（`build_parser` 里 `"--verbose", action="store_true"`，`main()` 里 `_setup_logging("DEBUG" if args.verbose else cfg.log_level)`）。⇒ **凡是「程序对外暴露的命令面」（flag、命令行、配置键），权威来源是**跑一次它自己**（`--help`、实际调用），**不是正则扫源码**。§7.1 第一条规则在这里的代价是**删掉一个真实存在的功能** |
 
 **三条规则：**
 

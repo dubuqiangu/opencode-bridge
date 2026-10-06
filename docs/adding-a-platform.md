@@ -7,15 +7,20 @@
 
 ## 成本预期
 
-| 项 | 行数 |
+| 项 | 规模 |
 |---|---|
-| 适配器本体（`adapters/<name>.py`） | 390~1200 行（上限看平台有多少协议特例） |
-| 单元测试（`tests/test_<name>.py`） | 40~110 个用例 |
+| 适配器本体（`adapters/<name>.py`） | 最短的几个平台约 400 行，协议特例多的会大一倍以上；**此处刻意不给数字** —— 它保质期只有一天，现量：`python -c "import io,sys;print(len(io.open(sys.argv[1],encoding='utf-8').read().splitlines()))" <file>` |
+| 单元测试（`tests/test_<name>.py`） | 按上面几个模块的测试条数量级自己估；同样**刻意不给数字** |
 | **连接/ 重连 / 线程 / `stop()` 代码** | **0 行** —— 来自 `transport/` |
 | 要改的核心文件（`core.py` / `__main__.py` / 注册表） | **0 行** —— 注册表动态发现 |
 
-参考量级：`ntfy.py` 388 行（最干净的一家）、`telegram.py` 831 行、
-`email.py` 1169 行（IMAP+SMTP+MIME，本质上更重）。
+想看现成的量级就自己量（⛔ 勿用 PowerShell 的 `Measure-Object -Line`，它系统性少算约 13%）：
+
+```bash
+python -c "import io,sys;[print(p, len(io.open(p,encoding='utf-8').read().splitlines())) for p in sys.argv[1:]]" opencode_bridge/adapters/ntfy.py opencode_bridge/adapters/telegram.py opencode_bridge/adapters/email.py
+```
+
+其中 `email`（IMAP+SMTP+MIME）本质上是三个协议叠在一起，比单协议的适配器重得多。
 
 ## 筛选：先判断这个平台值不值得接
 

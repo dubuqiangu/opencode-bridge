@@ -91,24 +91,32 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 
 ## 模块职责
 
-| 文件 | 行数 | 职责 | 不该出现在这里的东西 |
-|---|---|---|---|
-| `hooks.py` | 152 | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
-| `identity.py` | 241 | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
-| `split.py` | 320 | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
-| `state.py` | 560 | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
-| `conversation_keys.py` | 207 | 会话级状态读写门面 + **歧义旧前缀的归属划分**（`channel:` 键按各家 local id 文法认领） | 在多家之间仲裁（= 猜）、改盘上的歧义键 |
-| `status.py` | 436 | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
-| `transport/base.py` | 554 | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
-| `transport/polling.py` | 94 | HTTP 短轮询/长轮询 | — |
-| `transport/websocket.py` | 164 | WebSocket 事件流 | — |
-| `transport/tcp_lines.py` | 200 | TCP 行协议 | — |
-| `transport/queue.py` | 112 | `EventQueue`（批量 fetch → 一次一条）+ `NOTHING` | — |
-| `ws.py` | 563 | RFC 6455 客户端：握手三重校验、客户端掩码、分片、控制帧 | 平台知识 |
-| `adapters/base.py` | 766 | 注册表、`capabilities()`、`admits()`、`classify_http`、`send_result()`、**`config_optional` / `config_runnable`** | 循环/线程 |
-| `commands.py` | 596 | 斜杠命令 + **`_SETUP_GUIDES`/`SETUP_MENU_TEXT`（冻结文案真源）** | 平台协议细节 |
-| `core.py` | 484 | 编排、会话映射（七个职责簇已按 `AGENTS.md` §5.1 拆出并**注入**） | 平台协议细节 |
-| `__main__.py` | 958 | CLI（**唯一**的判定入口 `_readiness_verdict` / `_missing_required_keys` 在这里） | — |
+| 文件 | 职责 | 不该出现在这里的东西 |
+|---|---|---|
+| `hooks.py` | 契约类型：`Inbound`/`Outbound`/`MsgHandle`/`SendError`/`SendResult` | 任何 IO |
+| `identity.py` | `platform:local_id` 的格式化、解析、校验、旧格式归一 | 任何平台特判 |
+| `split.py` | 码点计长、组合序列原子切分、断点优先级、`（i/n）` 前缀两遍法 | 平台知识 |
+| `state.py` | `conversation_id ↔ session_id` 映射、原子落盘、**legacy 键迁移（A2b，`__main__` 以 `migrate_keys=True` 打开）** | 平台知识（只按 `identity` 的登记表判定，**绝不猜歧义前缀**） |
+| `conversation_keys.py` | 会话级状态读写门面 + **歧义旧前缀的归属划分**（`channel:` 键按各家 local id 文法认领） | 在多家之间仲裁（= 猜）、改盘上的歧义键 |
+| `status.py` | 状态四态归一、JSON 往返、表格渲染 | 平台知识 |
+| `transport/base.py` | 线程、指数退避、**先关连接再 join**、`reset_after` | 任何平台知识 |
+| `transport/polling.py` | HTTP 短轮询/长轮询 | — |
+| `transport/websocket.py` | WebSocket 事件流 | — |
+| `transport/tcp_lines.py` | TCP 行协议 | — |
+| `transport/queue.py` | `EventQueue`（批量 fetch → 一次一条）+ `NOTHING` | — |
+| `ws.py` | RFC 6455 客户端：握手三重校验、客户端掩码、分片、控制帧 | 平台知识 |
+| `adapters/base.py` | 注册表、`capabilities()`、`admits()`、`classify_http`、`send_result()`、**`config_optional` / `config_runnable`** | 循环/线程 |
+| `commands.py` | 斜杠命令 + **`_SETUP_GUIDES`/`SETUP_MENU_TEXT`（冻结文案真源）** | 平台协议细节 |
+| `core.py` | 编排、会话映射（七个职责簇已按 `AGENTS.md` §5.1 拆出并**注入**） | 平台协议细节 |
+| `__main__.py` | CLI（**唯一**的判定入口 `_readiness_verdict` / `_missing_required_keys` 在这里） | — |
+
+> **为什么这里没有行数**：行数是**保质期一天**的数字 —— 今天已实测出四处「代码变了 → 文档变旧」，其中一处就是这张表里的数字与另一条正在进行的改动在同一分钟内先后失效。⇒ 这张表只写**不会过期**的东西（职责与边界）。
+>
+> 需要行数时**现量**（⛔ 勿用 PowerShell 的 `Measure-Object -Line`，它系统性少算约 13%）：
+>
+> ```python
+> python -c "import io,sys;print(len(io.open(sys.argv[1],encoding='utf-8').read().splitlines()))" opencode_bridge/core.py
+> ```
 
 ## 关键不变量
 
@@ -255,5 +263,5 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 ## 加一个平台有多贵
 
 见 [`adding-a-platform.md`](adding-a-platform.md)。结论：适配器本体量级见那里
-（最干净的 `ntfy` 约 390 行，协议特例多的平台会高一倍），
+（最干净的 `ntfy` 最短，协议特例多的平台会大一倍；⛔ 不在此写具体行数 —— 它保质期只有一天，现量：`python -c "import io,sys;print(len(io.open(sys.argv[1],encoding='utf-8').read().splitlines()))" <file>`），
 其中**零行**是连接/重连/线程/停止代码。

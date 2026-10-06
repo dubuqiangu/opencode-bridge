@@ -836,7 +836,7 @@ class TestStripReplyPrefixes(unittest.TestCase):
         self.assertEqual(_strip_reply_prefixes("CI 挂了"), "CI 挂了")
 
     def test_strips_prefix_without_space(self):
-        """``Re:able`` 这种没有空格��写法也要剥（各家 MUA 都这么干）。"""
+        """``Re:able`` 这种没有空格的写法也要剥（各家 MUA 都这么干）。"""
         self.assertEqual(_strip_reply_prefixes("Re:able to help"), "able to help")
 
     def test_terminates_on_malformed_input(self):

@@ -3,11 +3,11 @@
 [![CI](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-把 **12 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+把 **13 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
 
 支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant —— **十三个全部支持双向对话**。
 
-> **a2a 是唯一方向相反的平台**：前十个都是我们主动连出去（长轮询 / WebSocket / IMAP），
+> **a2a 是唯一方向相反的平台**：其余十二个都是我们主动连出去（长轮询 / WebSocket / IMAP），
 > **a2a 是我们被调方** —— 起一个本机 HTTP 服务让外部 agent 调我们。因此它**默认无鉴权**，
 > 接入前请先读 [`docs/a2a.md`](docs/a2a.md) 的风险一节。
 
@@ -166,14 +166,14 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | IRC | ✅ TCP | ✅ | ❌ 无 | 仅响应提及；正文换行折成空格 |
 | Twitch | ✅ IRC over TLS WebSocket | ✅ | ❌ 无 | 仅响应提及 |
 | a2a | ✅ 本机 HTTP（**我们被调方**） | ✅ 回给等待方 | ❌ 无 | 默认 bind `127.0.0.1` + **默认无鉴权**；上限 1 MiB（规范未规定，自行声明） |
-| QQ Bot | ✅ WebSocket 网关 | ✅ REST | ❌ 无 | 上限 2000（**官方未给数字**，保守自定）；群/私聊/频道三种作用域 |
+| QQ Bot | ✅ WebSocket 网关 | ✅ REST | ❌ 无 | 上限 2000（**官方未给数字**，保守自定）；群/私聊/频道三种作用域；⚠️ **入站不做 @ 过滤**（见该节） |
 | Home Assistant | ✅ WebSocket 事件总线 | ✅ `call_service` | ❌ 无 | ⚠️ **默认一个事件都不收**，必须配 `entities`/`domains`/`accept_all`；上限 4096（官方未公布） |
 
 > 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
 >
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导；
 > `/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
-> **Matrix / Mattermost / IRC / Twitch 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按下面各节配置；
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按下面各节配置；
 > 配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### 配置文件位置
@@ -183,7 +183,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Windows | `%USERPROFILE%\.config\opencode-bridge\config.json` |
 | macOS / Linux | `${XDG_CONFIG_HOME:-~/.config}/opencode-bridge/config.json` |
 
-### Telegram（支持双向）
+### Telegram（支持双向对话 · 长轮询，无需公网地址）
 
 1. 打开 Telegram，找 **@BotFather** → 发送 `/newbot`
 2. 依次设置显示名、用户名（**必须以 `bot` 结尾**），复制返回的 token（形如 `123456789:AA...`）
@@ -214,7 +214,8 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
    im:history
    ```
 
-   （要 `@` 才响应加 `app_mentions:read`；用私有频道加 `groups:history`；
+   （**默认不 @ 也会响应** —— 桥接对 Slack 入站**不做 mention 过滤**；想让它**只**响应
+   @ 提及时，才另加 `app_mentions:read`。用私有频道加 `groups:history`；
    要往尚未加入的公开频道主动发言再加 `chat:write.public`）
 
 5. 同页顶部 **Install to Workspace** → **Allow** → 复制 **Bot User OAuth Token**（`xoxb-` 开头）
@@ -320,7 +321,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 4. 在频道里 **`@你的昵称` 或 `昵称:`** 发一句话，或直接私聊该昵称
 
 > - **只响应提及**（频道消息）或私聊 —— 频道很吵，不做这个会被刷屏。
-> - **`channels` 是入站前提**：留空则只能主动发（状态视图会显示"入站未就绪"）。
+> - **`channels` 是入站前提**：留空时桥接**只打一条 warning、仍然连接**（出站正常），但**入站永不触发**（状态视图会显示"入站未就绪"）。
 > - **IRC 没有编辑消息**，`edit()` 恒 `False` —— 长任务的进度更新会退化成连续发多条消息。
 > - **正文里的换行会被折成空格**（单行协议无法承载，原样发会被注入命令）。
 > - **整行上限 512 字节**（含 `PRIVMSG` 前缀与 CRLF），桥接逐字节算预算并按字符边界切分，不会切出半个多字节字符。`max_message_length=400` 是扣掉前缀后的保守字符值。
@@ -336,8 +337,14 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 3. 编辑配置文件：
 
    ```json
-   "adapters": { "twitch": { "token": "OAuth Token", "channel": "频道名" } }
+   "adapters": { "twitch": {
+     "token": "OAuth Token", "channel": "频道名", "nick": "你的 Twitch 用户名"
+   } }
    ```
+
+   ⚠️ **`nick` 与 `client_id` 至少要有一个** —— 两个都不配时**会话起不来**：每次注册都抛
+   「既没有配置 `nick`，也没有 `client_id` 可查 Helix」，基类关连接、退避重试 ⇒ **无限重连**。
+   不想手填 `nick` 就改填 `client_id`，让它查 Helix 自动取。
 
 4. 执行 `opencode service restart`
 5. 在该频道 **`@你的昵称`** 发一句话，收到回复即成功
@@ -347,7 +354,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > - **只响应提及**（Twitch 频道很吵）。命令前缀是 `!`。
 > - **Twitch 没有编辑消息**，`edit()` 恒 `False` —— 长任务进度会退化成连续发多条消息。
 > - 消息长度上限（默认 400 字符）与限流阈值是**社区经验值**，非官方文档公开常量。
-> - 填了 `client_id` 就能用 Helix API 取自己的 user id，回声过滤更准；不填则退回按昵称过滤。
+> - **回声过滤靠 `nick`**：`nick` 配了就能直接用（配置里**必须有**它）；没配 `nick` 但配了 `client_id` 时由 Helix 查出来，回声过滤更准。**两个都没有 ⇒ 会话起不来并无限重连**（见上面第 3 步）。⚠️ 回声过滤只管误回环，`allowed_chat_ids` 白名单与它无关。
 > - ⚠️ **翻转成「空 = 全拒」后，Twitch 的私聊对所有人不可用**（原因同 IRC：私聊 principal 是 bot 自己的 nick）。**频道里照常工作。** ⛔ **Twitch 不提供 `/pair`**，白名单**只能手填**。
 > - ⛔ **`allowed_chat_ids` 里绝不能出现 `nick` 自己的值**，理由与 IRC 相同：**这一条会把所有人的私聊一起放行**。⚠️ Twitch 的 nick 可能**不来自配置**（填了 `client_id` 时由 Helix 查出来，运行期才知道）⇒ 桥接在**每一次** nick 变成已知值时都重新查一次，查到就**拒绝**（`TwitchAdapter.nick` 的 setter 是唯一入口，配置里没写 nick 也一样）。
 
@@ -443,32 +450,37 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 
 ### a2a（支持双向对话 · **我们是被调方**，无需公网地址）
 
-这是唯一**方向相反**的平台：前十个是我们主动连出去，a2a 是**起一个本机 HTTP 服务**
+这是唯一**方向相反**的平台：其余十二个是我们主动连出去，a2a 是**起一个本机 HTTP 服务**
 让外部 A2A agent 调我们。协议细节见 [`docs/a2a.md`](docs/a2a.md)。
 
 1. 编辑配置文件（路径见上面的「配置文件位置」）：
 
    ```json
-   "adapters": { "a2a": { "bind_host": "127.0.0.1", "bind_port": 0 } }
+   "adapters": { "a2a": { "bind_host": "127.0.0.1", "bind_port": 9900 } }
    ```
 
+   ⚠️ **`bind_port` 必填、无默认值** —— 缺了（或不是合法端口）时 **a2a 这个适配器不启动**
+   （日志里一条 `ERROR a2a: 未配置 bind_port …，适配器未启动`；`--status` 显示 `missing: ['bind_port']`），
+   **不会**降级到某个默认端口。
+   **别照抄 `bind_port: 0`**：Agent Card 里公布的 URL 含端口，端口 0 每次重启都变，**对端永远连不上**，
+   它只适合测试。
 2. 执行 `opencode service restart`
-3. 看日志里打印的**实际端口**（`bind_port: 0` 时由系统分配），然后：
+3. 用上面配的那个端口访问：
 
    ```bash
-   curl http://127.0.0.1:<端口>/.well-known/agent-card.json   # 应返回 Agent Card
-   curl http://127.0.0.1:<端口>/health                          # 应返回 ok
+   curl http://127.0.0.1:9900/.well-known/agent-card.json   # 应返回 Agent Card
+   curl http://127.0.0.1:9900/health                          # 应返回 ok
    ```
 
 > ⚠️ **默认无鉴权，请先读风险**：a2a 出站侧不需要任何凭据，所以**默认没有任何鉴权**。
 > 此时**只有本机进程能访问**（`bind_host` 默认 `127.0.0.1`），但**本机也是攻击面** ——
 > 浏览器里的恶意网页可以 POST 到 `http://127.0.0.1:<端口>/rpc`。
 > 建议：① 保持 `127.0.0.1`；② 需要被其它机器访问时**必须**配 `auth_token`。
-> ⚠️ 把 `bind_host` 改成非回环地址**且**没配 `auth_token` 时，桥接会**回落回环并告警** ——
-> 绝不因为"方便调试"就开一个无鉴权的局域网端口。
+> ⚠️ 把 `bind_host` 改成非回环地址**且**没配**任何凭据**（`auth_token` **或** `peer_tokens` 都算）时，
+> 桥接会**回落回环并告警** —— 绝不因为"方便调试"就开一个无鉴权的局域网端口。
 >
 > 其它要点：
-> - **不需要配任何 token 就能用**（`config_optional`），所以只配 a2a 时桥接**能正常启动**。
+> - **不需要配任何凭据就能用**（`config_optional`），所以只配 a2a（含上面那个必填的 `bind_port`）时桥接**能正常启动**。
 > - 端点：`/rpc`（另接受 `/` 作别名）、`/health`、`/.well-known/agent-card.json`。
 > - 只实现 `SendMessage`/`GetTask`/`ListTasks`/`CancelTask`；**流式与推送如实声明为
 >   不支持**（Agent Card 里写 `false`，调用时返回规范错误码），**不做半成品接口**。
@@ -488,6 +500,12 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 4. 在开放平台后台把机器人加进群 / 频道，或直接私聊它
 
 > 其它要点：
+> - ⚠️ **入站不做 @ 过滤**（与 IRC / Twitch 相反）：只按 `message_type`（只收纯文本）与
+>   **平台签发**的防回环字段（`author.bot` / `author.id` 对比 READY 的 `user.id`）过滤，
+>   **不检查有没有 @ 机器人**。默认订阅的 intent `1<<25` 送来群里 **@ 消息**
+>   （`GROUP_AT_MESSAGE_CREATE`）；若在开放平台另开「接收所有消息」，**非 @ 的群消息**
+>   （`GROUP_MESSAGE_CREATE`）同样会驱动 agent ⇒ **群里很吵**，用 `allowed_chat_ids` 限定群，
+>   或干脆别开「接收所有消息」。
 > - 支持**群聊、私聊（C2C）、频道**三种作用域，`allowed_chat_ids` 填对应作用域前缀
 >   （`qqbot:group:...` / `qqbot:c2c:...` / `qqbot:channel:...`）。
 > - **主动消息在群里会失败**（`40034105`，除非开被动回复窗口），所以桥接会带上入站的
@@ -698,30 +716,45 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
-| `adapters.telegram.poll_timeout` | `25` | `getUpdates` 的**长轮询挂起秒数**（Bot API 上限 50）。⚠️ **必须填 JSON 整数**（如 `25`）：写成 `"25s"`、`"25.5"` 这类字符串会抛 `ValueError` ⇒ **该适配器被跳过 ⇒ 整个桥启动失败**，而报错只有「没有任何可用适配器」、**完全不提 `poll_timeout` 非法**（日志里那行是 `failed to build adapter 'telegram'; skipped`）。`--setup --json` 里该平台的 `capabilities` 同时会变成 `{"error": ...}` —— 那就是它构造失败的判据 |
+| `adapters.telegram.poll_timeout` | `25` | `getUpdates` 的**长轮询挂起秒数**（Bot API 上限 50）。⚠️ **写错不会打死桥接**：非整数（`"25s"`、`"25.5"`）或**非正数**（`0`、`-5`）都会**回落为默认值 `25` 并打一条 WARNING**（`telegram: 配置项 poll_timeout=… 已回落为 25`），适配器照常启动。留空 = 静默用默认值 |
 | `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
 | `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
 | `adapters.matrix.access_token` | `""` | Matrix access token（入站与出站都必需） |
 | `adapters.matrix.user_id` | `""` | 自己的 Matrix user id（如 `@me:example.org`）：用于**过滤自己的回声**，留空会把自己发的消息当入站消息收到（无限回环） |
+| `adapters.matrix.sync_timeout_ms` | `30000` | `/sync` 长轮询的挂起毫秒数（客户端 `/sync` 的 `timeout` 参数；`0` = 不长轮询、立即返回；⚠️ **但那会让轮询从「每 30 秒一轮」变成「每 `backoff_interval`（默认 2 秒）一轮」，对 homeserver 的请求率约 ×15 —— 一般不要设它**）。⚠️ **写错不会打死桥接**：非整数（`"30s"`、`"30000.5"` 这类**字符串**）会**回落为默认值 `30000` 并打一条 WARNING**（`matrix: 配置项 sync_timeout_ms=… 不是整数 …，已回落为 30000`），适配器照常启动。留空 = 静默用默认值 |
+| `adapters.matrix.since` | `""` | `/sync` 游标（上次拿到的 `next_batch`）。留空即从当前时刻起收，**不重放历史** |
 | `adapters.discord.bot_token` | `""` | Discord bot token（出站与 Gateway 入站共用同一枚） |
-| `adapters.mattermost.site_url` | `""` | Mattermost 站点地址（如 `https://mm.example.com`）；WS 与 REST 的 scheme 由它推导 |
+| `adapters.discord.gateway_url` | `""` | Gateway 地址；留空则走 Discord 官方地址 |
+| `adapters.discord.intents` | `37376` | Gateway intents 位掩码（默认 = 消息 + 私信 + **Message Content**，后者必须先在开发者后台勾上）。⚠️ **非法值会告警并回落默认**（`discord: intents 配置非法 …，改用默认 37376`），**不会**让适配器起不来 |
+| `adapters.mattermost.site_url` | `""` | Mattermost 站点地址（如 `https://mm.example.com`）；WS 与 REST 的 scheme 由它推导。**别名 `server_url`**（同义，二选一即可） |
 | `adapters.mattermost.token` | `""` | Mattermost bot / 用户 token（`Authorization: Bearer` 用它） |
+| `adapters.mattermost.user_id` | `""` | 自己的 user id；留空则启动时自动调 `GET /api/v4/users/me` 取。⚠️ **取不到时桥接整个停摆入站**并在日志里提示（防回环的唯一依据就是"这条是不是我自己发的"，宁可停摆也不冒险回环） |
+| `adapters.mattermost.team_id` | `""` | ⚠️ **仅用于日志**，v1 **不参与路由**（团队 / 多租户没实现） |
+| `adapters.mattermost.verify_tls` | `true` | 校验证书链与主机名。⚠️ **只影响 REST**：WebSocket 侧的 `ws.py` 固定用 `ssl.create_default_context()`、**不提供关校验的开关** ⇒ 配成 `false` 也关不掉 WS 的证书校验 |
 | `adapters.irc.host` | `""` | IRC 服务器地址（如 `irc.libera.chat`） |
 | `adapters.irc.nick` | `""` | 使用的昵称 |
-| `adapters.irc.channels` | `[]` | 自动 JOIN 的频道列表（如 `["#chan"]`）；**入站前提**，留空则只能发出站 |
+| `adapters.irc.channels` | `[]` | 自动 JOIN 的频道列表（如 `["#chan"]`）；**入站前提**，留空时**只告警、仍然连接**（出站正常），但**入站永不触发** |
 | `adapters.irc.port` | `6667` | 端口；`use_tls` 为真时默认 `6697` |
 | `adapters.irc.use_tls` | `false` | 是否用 TLS（IRC over TLS） |
 | `adapters.irc.bot_password` | `""` | SASL PLAIN 的密码（可选，与 nick 组成 SASL 凭据） |
+| `adapters.irc.server_password` | `""` | 服务器口令（`PASS` 命令；与 `bot_password`/SASL 是两回事） |
+| `adapters.irc.realname` | `""` | `USER` 命令里的 realname；留空则用 `nick`，再留空用 `opencode-bridge` |
 | `adapters.twitch.token` | `""` | Twitch bot token（从开发者控制台取，**不要**自己加 `oauth:` 前缀） |
 | `adapters.twitch.channel` | `""` | 要接入的频道名（小写，不带 `#`） |
-| `adapters.twitch.client_id` | `""` | 开发者控制台的 Client ID（可选，用于取自己的 user id 做回声过滤） |
+| `adapters.twitch.nick` | `""` | **IRC 协议用的 bot 用户名**。⚠️ 与 `client_id` **至少要有一个**：两个都没有时每次会话都抛「既没有配置 nick，也没有 client_id 可查 Helix」并退避重连 ⇒ **无限重连** |
+| `adapters.twitch.client_id` | `""` | 开发者控制台的 Client ID（可选；填了就能用 Helix API 取自己的 user id 做回声过滤，也能顶替 `nick`） |
+| `adapters.twitch.display_name` | `""` | `USER` 命令里的 realname；留空则用 `nick`。**只有它与 `nick` 都会被当作提及**做过滤 |
+| `adapters.twitch.user_id` | `""` | 自己的 user id（可选；留空则用 Helix 查到的） |
+| `adapters.twitch.membership` | `false` | `true` = 额外订阅 `twitch.tv/membership`，可维护成员名单（用于人名提及） |
+| `adapters.twitch.endpoint` | `wss://irc-ws.chat.twitch.tv:443/` | IRC over TLS WebSocket 端点 |
 | `adapters.nextcloud.base_url` | `""` | Nextcloud 站点地址（**含子路径前缀**，如 `https://host/nextcloud`） |
 | `adapters.nextcloud.username` | `""` | 登录用户名（建议用独立的机器人账号） |
 | `adapters.nextcloud.password` | `""` | **app password**（「设置 → 安全 → 设备专属密码」生成，可单独吊销且不影响登录） |
-| `adapters.nextcloud.user_id` | `""` | 自己的 Nextcloud user id（**大小写敏感**）；留空则启动时自动调 `cloud/user` 取 |
+| `adapters.nextcloud.user_id` | `""` | 自己的 Nextcloud user id（**大小写敏感**）；留空则启动时自动调 `cloud/user` 取。⚠️ **自动取失败 ⇒ 暂停入站处理**并在日志里提示（防回环的唯一依据就是"这条是不是我自己发的"，宁可停摆也不冒险成环）⇒ 取不到时在配置里**显式写出** `user_id` |
 | `adapters.nextcloud.max_concurrent_polls` | `5` | 同时长轮询的会话数上限；每个长轮询会占住一个服务端 worker 30 秒，不宜过大 |
 | `adapters.nextcloud.poll_timeout` | `30` | 服务端长轮询秒数，**上限就是 30**（源码 clamp，再大也被服务端压回） |
+| `adapters.nextcloud.full_refresh_seconds` | `300` | 每隔多久重扫一次会话列表（源码 clamp 到 `30`~`86400`） |
 | `adapters.ntfy.server` | `"https://ntfy.sh"` | ntfy 服务器地址（可用自建） |
 | `adapters.ntfy.topic` | `""` | 订阅的话题名（**必填**）；`allowed_chat_ids` 填的就是它 |
 | `adapters.ntfy.token` | `""` | read token（`tk_…`）；私有话题必填 |
@@ -738,25 +771,35 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.email.verify_tls` | `true` | 校验证书链与主机名。关掉必须显式配（自建/实验环境），会打警告 |
 | `adapters.email.echo_prefix` | `"[opencode]"` | 出站 Subject 加此前缀，入站见到即丢。**不可配成空串** —— 空前缀等于关掉防回环 |
 | `adapters.email.poll_interval` | `60.0` | 轮询间隔（秒）；每轮新建一次 IMAP 连接 |
-| `adapters.email.dedupe_capacity` | `2048` | 已处理 Message-ID 的记忆上限（FIFO 淘汰，防无界增长） |
-| `adapters.a2a.bind_host` | `"127.0.0.1"` | 监听地址。**非回环地址且没配 `auth_token` 时会回落回环 + 告警** —— 绝不因为方便就开一个无鉴权的局域网端口 |
-| `adapters.a2a.bind_port` | `0` | `0` = 由系统分配空闲端口（推荐，日志会打印实际端口） |
-| `adapters.a2a.auth_token` | `""` | Bearer token。**留空 = 无鉴权**，此时务必确认 `bind_host` 是回环地址 |
-| `adapters.a2a.reply_timeout` | `300.0` | 外部 agent 等待回复的超时（秒） |
-| `adapters.a2a.max_turns` | `20` | 单个任务的最大往返轮数，防无限对话 |
-| `adapters.qqbot.app_id` | `""` | QQ 开放平台的 AppID（**必填**） |
-| `adapters.qqbot.app_secret` | `""` | AppSecret（**必填**）；用它换 `access_token`，日志里会打码 |
+| `adapters.email.socket_timeout` | `30.0` | IMAP / SMTP socket 超时（秒）；非正数或非法值回落默认 |
+| `adapters.email.subject` | `"reply"` | 出站邮件的 Subject（会再加 `echo_prefix`） |
+| `adapters.email.dedupe_capacity` | `2048` | 已处理 Message-ID 的记忆上限（FIFO 淘汰，防无界增长）。⚠️ **写错不会打死桥接**：非整数（`"2048条"` 这类字符串）会**回落为默认值 `2048` 并打一条 WARNING**（`email: 配置项 dedupe_capacity=… 不是整数 …，已回落为 2048`）；**小于 `1`**（`0` / `-5`）同样**回落默认 + 告警**、⛔ 不静默改成 `1`。留空 = 静默用默认值 |
+| `adapters.a2a.bind_host` | `"127.0.0.1"` | 监听地址。**非回环地址且没配任何凭据（`auth_token` 或 `peer_tokens` 都算）时会回落回环 + 告警** —— 绝不因为方便就开一个无鉴权的局域网端口 |
+| `adapters.a2a.bind_port` | **无默认值（必填）** | 监听端口。⚠️ **没有默认值**：缺了它（或不是合法端口）**a2a 适配器不启动**（日志一条 ERROR，`--status` 显示 `missing: ['bind_port']`），**不会**降级到某个默认端口。`0` = 由操作系统分配，但 **Agent Card 里公布的 URL 含端口，每次重启都变、对端永远找不到我们 ⇒ 只适合测试** |
+| `adapters.a2a.auth_token` | `""` | 共享 Bearer token。**留空 = 无鉴权**，此时务必确认 `bind_host` 是回环地址 |
+| `adapters.a2a.peer_tokens` | `""` | **每个对端一个凭据**，`"alice:tok1,bob:tok2"`（或 `{"alice": "tok1"}`）。身份直接取名字，比 `auth_token` 更好定位与限流；配了它**同样算「已配凭据」**（影响 `bind_host` 的回落判断）—— 详见 [`docs/a2a.md`](docs/a2a.md) |
+| `adapters.a2a.reply_timeout` | `300.0` | 外部 agent 等待回复的超时（秒）。非法值回落默认并告警 |
+| `adapters.a2a.max_turns` | `5` | 单个 `contextId` 的入站往返轮数上限，防乒乓。⚠️ **硬顶 20**，配更大会被**下调并告警** |
+| `adapters.a2a.max_tasks` | `512` | 内存里保留的 task 记录条数（超了 FIFO 丢最老的终态） |
+| `adapters.a2a.agent_name` / `agent_description` / `agent_version` | 主机名派生 / 内置文案 / `0.1.0` | Agent Card 上的三个字段 —— 详见 [`docs/a2a.md`](docs/a2a.md) |
+| `adapters.qqbot.app_id` | `""` | QQ 开放平台的 AppID（**必填**）。**别名 `appid` / `appId`**（不同文档里拼法不同） |
+| `adapters.qqbot.app_secret` | `""` | AppSecret（**必填**）；用它换 `access_token`，日志里会打码。**别名 `appsecret` / `appSecret` / `client_secret` / `clientSecret`** |
 | `adapters.qqbot.api_base` | `https://api.bot.qq.com` | API 基址。**沙箱域名未在官方文档中核实**，默认走正式环境 |
+| `adapters.qqbot.sandbox` | `false` | `true` = 走沙箱域名（配合 `api_base` 覆盖）。⚠️ 该域名**未经官方文档核实**，开启时会打一条告警 |
 | `adapters.qqbot.gateway_url` | `""` | 留空则启动时 `GET /gateway` 自动取 |
-| `adapters.homeassistant.url` | `http://homeassistant.local:8123` | HA 地址。⚠️ `homeassistant.local` 是 **mDNS 惯例**、不是官方规定；留空会用它兜底并告警 |
-| `adapters.homeassistant.token` | `""` | **长期访问令牌**（HA 档案页生成）（**必填**） |
-| `adapters.homeassistant.entities` | `[]` | 只接收这些实体的事件，如 `["light.kitchen"]` |
-| `adapters.homeassistant.domains` | `[]` | 只接收这些域的事件，如 `["light","switch"]` |
+| `adapters.qqbot.intents` | `1107296256` | 事件订阅位掩码（默认 = 群聊/单聊 `1<<25` + 频道 @ `1<<30`）。⚠️ **非法值会告警并回落默认**；官方明确「传递了无权限的 `intents`，websocket 会报错并直接关闭连接」，所以**少订阅**比多订阅安全 |
+| `adapters.qqbot.shard` | `[0, 1]` | 分片位置/总数，如 `[0, 4]`。⚠️ **非法值会告警并回落默认** `[0, 1]`（单实例无需分片） |
+| `adapters.homeassistant.url` | `http://homeassistant.local:8123` | HA 地址。⚠️ `homeassistant.local` 是 **mDNS 惯例**、不是官方规定；留空会用它兜底并告警。**别名 `site_url` / `base_url` / `hass_url` / `server_url`**（与 mattermost 的 `site_url` **同形**，跨平台抄错时没有任何提示） |
+| `adapters.homeassistant.token` | `""` | **长期访问令牌**（HA 档案页生成）（**必填**）。**别名 `access_token` / `hass_token` / `long_lived_access_token`** |
+| `adapters.homeassistant.entities` | `[]` | 只接收这些实体的事件，如 `["light.kitchen"]`。**别名 `watch_entities`** |
+| `adapters.homeassistant.domains` | `[]` | 只接收这些域的事件，如 `["light","switch"]`。**别名 `watch_domains`** |
 | `adapters.homeassistant.accept_all` | `false` | `true` = **接收全部事件**（很吵慎用） |
 | `adapters.homeassistant.event_types` | `["state_changed"]` | 订阅哪些事件类型。⚠️ `["*"]` 通配**需要管理员**权限 |
 | `adapters.homeassistant.require_user_context` | `true` | 只接收能归因到**真人用户**的事件（`context.user_id` 非空）。定时器/脚本触发的事件会被丢 |
 | `adapters.homeassistant.ignore_entities` | `[]` | 收到事件后忽略这些实体（用于躲开自己触发的回声） |
-| `adapters.homeassistant.poll_interval` | `5.0` | 无事件时的重连间隔（秒） |
+| `adapters.homeassistant.service_domain` | `"persistent_notification"` | 出站 `call_service` 的 domain。**别名 `domain`** |
+| `adapters.homeassistant.service_name` | `"create"` | 出站 `call_service` 的 service 名。**别名 `service`** |
+| `adapters.homeassistant.notification_title` | `"opencode-bridge"` | 出站通知的标题。**别名 `title`** |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

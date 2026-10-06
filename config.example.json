@@ -15,6 +15,15 @@
   "adapters": {
     "telegram": { "bot_token": "", "allowed_chat_ids": [] },
     "slack": { "bot_token": "", "app_token": "", "allowed_chat_ids": [] },
-    "discord": { "bot_token": "", "allowed_chat_ids": [] }
+    "discord": { "bot_token": "", "allowed_chat_ids": [] },
+    "matrix": { "homeserver": "", "access_token": "", "user_id": "", "allowed_chat_ids": [] },
+    "mattermost": { "site_url": "", "token": "", "allowed_chat_ids": [] },
+    "irc": { "host": "", "nick": "", "channels": "", "allowed_chat_ids": [] },
+    "twitch": { "token": "", "channel": "", "allowed_chat_ids": [] },
+    "nextcloud": { "base_url": "", "username": "", "password": "", "allowed_chat_ids": [] },
+    "ntfy": { "topic": "", "allowed_chat_ids": [] },
+    "email": { "address": "", "password": "", "imap_host": "", "smtp_host": "", "allowed_chat_ids": [] },
+    "qqbot": { "app_id": "", "app_secret": "", "allowed_chat_ids": [] },
+    "homeassistant": { "url": "", "token": "", "allowed_chat_ids": [] }
   }
 }

@@ -52,6 +52,7 @@ import urllib.request
 import uuid
 from typing import Any, List, Optional, Tuple
 
+from ..config_coerce import coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
@@ -168,8 +169,12 @@ class MatrixAdapter(Adapter):
         #: 自己的 MXID，用于过滤自己发出的回声（不配置就不做该过滤）。
         self.user_id: str = str(self.config.get("user_id") or "").strip()
         # allowed_chat_ids 已由基类 _init_access() 统一解析（T1.2）
-        self.sync_timeout_ms = int(
-            self.config.get("sync_timeout_ms") or SYNC_TIMEOUT_MS
+        #: ``/sync`` 长轮询挂起时长（毫秒，进 ``_sync_path`` 的 ``timeout`` 参数）。
+        #: ⚠️ **刻意不设区间**：Matrix 协议对 ``timeout`` 本身不设上界（服务端会自己
+        #: 掐断），而 ``SYNC_SOCKET_TIMEOUT`` 是本适配器自己的常量、不由配置决定 ——
+        #: 加一个自造的上界只会把"用户故意调大长轮询"变成一次静默回落。
+        self.sync_timeout_ms: int = coerce_int(
+            self.config, "sync_timeout_ms", SYNC_TIMEOUT_MS, platform=self.name
         )
         #: ``next_batch`` 游标 —— Matrix 增量同步的核心，跨调用保存在实例上。
         self._since: str = str(self.config.get("since") or "").strip()

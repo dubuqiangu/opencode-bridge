@@ -12,6 +12,9 @@ bridge-plugin.log
 bridge-lifecycle.jsonl
 bridge-lifecycle.jsonl.1
 bridge-stacks.log
+# 「上次启动时各适配器的探测结论」（opencode_bridge/health.py 写的运行态记录）。
+# 含平台回的错误描述 —— 已脱敏，但仍是**运行态产物**，绝不提交。
+platform-health.json
 
 # Python
 __pycache__/

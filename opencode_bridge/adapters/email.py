@@ -83,6 +83,7 @@ from typing import Any, Optional
 import imaplib
 import smtplib
 
+from ..config_coerce import coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..transport import NOTHING, EventQueue, PollingTransport
@@ -481,9 +482,13 @@ class EmailAdapter(Adapter):
             self.echo_prefix = str(raw_prefix).strip()
 
         #: 去重集合容量（可配置，测试也用它验证淘汰策略）。
-        self.dedupe_capacity = max(1, int(
-            self.config.get("dedupe_capacity") or self.dedupe_capacity
-        ))
+        #: ⚠️ **下界 1 必须作为区间交给共享助手**，⛔ 不要在调用点外面再套 ``max(1, …)``：
+        #: 那会把 ``0`` / ``-5`` 静默改成 1 —— 用户以为自己配了 2048 却得到 1 条记忆，
+        #: 而且**没有任何东西会告诉他**（回环去重失效是本平台最致命的保护）。
+        self.dedupe_capacity: int = coerce_int(
+            self.config, "dedupe_capacity", self.dedupe_capacity,
+            minimum=1, platform=self.name,
+        )
 
         self._queue = EventQueue()
         #: IMAP UID 游标。``None`` = 尚未 bootstrap（首次连上时只取"当前水位"）。

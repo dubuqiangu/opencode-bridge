@@ -31,6 +31,7 @@ from .allowlist import resolve_allowlist
 from .config import Config, DEFAULT_CONFIG_NAME, adapter_scoped_config
 from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
+from . import health
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
@@ -207,11 +208,21 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
     这套输出。真正要挡的坑是：**凭据齐了 + 空=全开** 曾被报成"配置好了"，而
     ``bridge_setup`` 工具会照着这句话告诉用户"配好了"。所以另给一个
     :attr:`_NOT_READY_NO_ALLOWLIST` 级别的诚实判定 :func:`_not_ready_reasons`。
+
+    ⛔ **同一条纪律也适用于 :func:`health` 带来的 ``last_start_probe``：只增不改。**
+    现有 key（``admits_nobody`` / ``admits_any_sender`` / ``not_ready_reasons`` …）
+    一个都不许删、不许改名 —— 仓库外的消费者（``bridge_setup``）按**值**断言它们，
+    而我们读不到它的源码。任何"顺手清理"都可能打掉别人的判据。
     """
     from .adapters import adapter_class
 
     entries = cfg.adapters if isinstance(cfg.adapters, dict) else {}
     labels = dict(setup_platforms())
+    #: 「上次启动时」的探测结论（:mod:`opencode_bridge.health`）。⛔ **纯本地读盘**：
+    #: 本函数不做任何网络请求 —— 把 ``getMe`` 之类塞进来会让 ``--setup --json``
+    #: 在网络被墙时也发不出那条最该看的错误信息（且 ``run_check`` 的 docstring
+    #: 明写「no sessions, **no adapters**」）。读一次就够，**不逐平台重读**。
+    probe_record = health.read_platform_health(_bridge_dir())
     out: list[dict[str, object]] = []
     for key in _status_platform_keys():
         cls = adapter_class(key)
@@ -288,6 +299,16 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 "capabilities": (
                     _adapter_capabilities(key, cfg, entry) if configured else None
                 ),
+                # --- 「上次启动」时的探测结论（新增；configured 的含义不变）----
+                # ⚠️ **它回答的不是"现在能不能用"**：``configured`` / ``inbound_ready``
+                # 只看凭据齐不齐，而"token 到底有效吗"只有平台能回答。桥启动时
+                # 已经问过一次（Telegram 的 ``getMe``），结论落在这里（见
+                # :mod:`opencode_bridge.health`），本函数只**读盘**、不联网。
+                #
+                # ⛔ **``None`` 的含义是「没有记录」，不是「没问题」**：桥还没以
+                # 当前配置启动过、或从没启动过，两者都是 ``None``。把它显示成
+                # "ok"就是把"没验"说成"验过了"。
+                "last_start_probe": health.probe_from_record(probe_record, key),
             }
         )
     return out
@@ -522,6 +543,74 @@ def _pad(text: str, width: int) -> str:
     return text + " " * max(0, width - _dwidth(text))
 
 
+#: 「上次启动时没有探测记录」时的**逐字**文案。
+#: ⛔ 它必须既不像"正常"也不像"失败"：那是"**没验过**"，不是"验过了、没问题"。
+#: 措辞刻意把两种可能都说出来（"尚未以当前配置启动过" / "从未启动过"），
+#: 因为盘上没有记录时**分不出是哪一种** —— 而猜一个就是在编造（AGENTS.md §8）。
+NO_START_PROBE_TEXT = "无记录 —— 桥尚未以当前配置启动过，或从未启动过"
+
+
+def _print_last_start_probes(
+    rows: list[tuple[str, str, bool, bool, dict]],
+    bridge_dir: str,
+) -> None:
+    """打印「上次启动那一刻，各平台探测出了什么」。
+
+    ⚠️ 这一段与上面那张表**回答的不是同一个问题**，所以必须分开说：
+
+    * 「渠道配置与能力」表答"凭据齐不齐" —— 纯本地可判（它看的是
+      ``required_tokens`` 全部非空）；
+    * 这一段答"上次启动时平台**认不认**这个凭据" —— 只有平台能判（Telegram 的
+      ``getMe``、Slack 的 ``auth.test``）。
+
+    两者分开是因为**失效方式不同**：token 打错 / 被吊销 / 网络被墙时，那张表仍会
+    显示「已配置 / 就绪」，而桥实际上一条消息都收不到 —— 这正是本段存在的理由。
+
+    ⚠️ **纯本地读盘**：不联网、不构造适配器（``--status`` 必须是"网络坏了也能看"
+    的那条路）。结论由 :mod:`opencode_bridge.health` 在启动那一刻写好。
+
+    ⚠️ **措辞必须带时效性**：这是「**上次启动时**」的结论，不是实时探测。
+
+    :param rows: :func:`_channel_config_rows` 的行，**复用**它而不重算平台清单与
+        ``configured``（同一份判定只能有一处）。
+    :param bridge_dir: :func:`_bridge_dir` 的推导结果 —— 记录就落在那里。
+    """
+    record = health.read_platform_health(bridge_dir)
+    recorded = health.recorded_at(record)
+    # 只列**已配置**或**上次探测过**的平台：把十三个平台各写一行「无记录」既吵
+    # 又是废话（没配的平台压根不该被启动过）。而"上次探测过"的那些必须留着 ——
+    # 用户把它移出配置之后，正是最需要看见"上次启动时说它是好的"。
+    probed = set(health.platforms_in_record(record))
+    listed = [
+        (key, label)
+        for key, label, configured, _inbound_ready, _caps in rows
+        if configured or key in probed
+    ]
+    print("")
+    print("== 上次启动时的探测结论 ==")
+    print("  说明：以下结论取自**桥上次启动那一刻**向平台要到的答复（落盘在")
+    print("        platform-health.json），**不是现在的连接状态，也不是实时探测**。")
+    if recorded is not None:
+        print(
+            "  记录时间 : "
+            + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded))
+        )
+    if not listed:
+        print("  （没有已配置的平台，也没有任何探测记录）")
+        return
+    name_w = max(_dwidth("平台"), max(_dwidth(label) for _key, label in listed)) + 2
+    for key, label in listed:
+        probe = health.probe_from_record(record, key)
+        if probe is None:
+            print("  " + _pad(label, name_w) + NO_START_PROBE_TEXT)
+            continue
+        line = "上次启动 " + health.describe_verdict(probe)
+        if probe["verdict"] == health.VERDICT_OK and recorded is not None:
+            # 只给「正常」配时间戳：它是**唯一**可能被误读成"现在也是好的"的那一行。
+            line += "（%s）" % time.strftime("%m-%d %H:%M", time.localtime(recorded))
+        print("  " + _pad(label, name_w) + line)
+
+
 def run_status(cfg: Config) -> int:
     """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。"""
     bridge_dir = _bridge_dir()
@@ -599,6 +688,8 @@ def run_status(cfg: Config) -> int:
         print("== ⚠ 授权键冲突（实际生效的是哪一个键已在此说明） ==")
         for label, detail in conflicts:
             print(f"  {label}: {detail}")
+
+    _print_last_start_probes(rows, bridge_dir)
 
     print("")
     print("== bridge 运行态 ==")
@@ -710,6 +801,29 @@ def _run_bridge_locked(cfg: Config) -> int:
         return 1
 
     core.start()
+    # ⚠️ **整份写一次，且只在这一处写**：``core.start()`` 刚把每个适配器的启动探测
+    # 结论收进 ``core.startup_probes``（见 :meth:`BridgeCore.start`），而
+    # ``_bridge_dir()`` 只有这里知道 —— 适配器不知道、本类也不该自己推一遍。
+    #
+    # ⚠️⚠️ **保护必须包住「实参求值」，不只是那次调用**（实测回归，2026-10-06）：
+    # ``record_startup_probes`` 内部兜住了写盘失败，但 ``core.startup_probes`` 这个
+    # **实参**是在它外面求值的 —— core 若是鸭子类型替身（测试里就有两个刻意最小的
+    # ``patch`` 替身）没有这个属性，``AttributeError`` 就在 ``core.start()`` **成功之后**
+    # 把桥打死 ⇒ **一个排障辅助功能有权杀掉正在运行的桥**，直接违反上面那句
+    # 「写盘失败绝不打断启动」。
+    # ⇒ 这里连求值一起兜住：退化行为是「记一条 warning + 本轮不写记录」，
+    # **不是**让桥起不来。⚠️ 刻意**不用** ``getattr(core, "startup_probes", None)``：
+    # 那会把「真实类改了名」变成静默写空记录；异常里带着 ``AttributeError``
+    # 才是能让人查到的信号。
+    try:
+        probes = core.startup_probes
+        health.record_startup_probes(_bridge_dir(), probes)
+    except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+        logger.warning(
+            "platform-health: 本轮探测结论未落盘（%s: %s）—— 不影响桥的运行",
+            type(exc).__name__,
+            exc,
+        )
     logger.info("bridge running against %s — press Ctrl+C to stop", endpoint.url)
     stop_event = threading.Event()
 

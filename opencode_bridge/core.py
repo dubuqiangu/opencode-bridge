@@ -65,6 +65,7 @@ from .commands import (
 from .config import Config
 from .conversation_keys import ConversationState
 from .event_stream import EventStream, Turn
+from .health import platform_key, probe_after_start
 from .hooks import Inbound  # BridgeCore implements Hooks
 # 入站那一整块（适配器进来的两个 hook、每会话队列、写前收件箱与启动重放）搬进了
 # :mod:`opencode_bridge.inbound_gateway`，连同只有它才写的状态一起（AGENTS.md §5.1）。
@@ -205,6 +206,13 @@ class BridgeCore:
         self._turns: dict[str, Turn] = {}
         self._thread: threading.Thread | None = None
         self._started = False
+        #: 「上次启动」各适配器的探测结论（``{平台键: {verdict, code, detail}}``）。
+        #: 在 :meth:`start` 那一轮收集完，**由调用方（运行器）落盘** ——
+        #: 本类不知道 ``bridge_dir`` 在哪，而适配器更不知道（那是
+        #: :mod:`opencode_bridge.health` 存在的理由）。给默认值而不是只在
+        #: :meth:`start` 里凭空长出来，于是"没启动过"与"启动了但没人探测"
+        #: 对消费者都是同一个可读的形状（空 dict），不是 ``AttributeError``。
+        self.startup_probes: dict[str, dict] = {}
         #: 权限请求的本地账本（C4）。**必须早于** ``commands`` /
         #: ``event_stream`` / ``inbound_gateway`` 三处构造 —— 三个都要用到**同一个**
         #: 对象，否掉迟到回答才可能（见
@@ -361,7 +369,14 @@ class BridgeCore:
         self.routing.attach(adapter)
 
     def start(self) -> None:
-        """Start the SSE reader thread, replay the inbox, then start adapters."""
+        """Start the SSE reader thread, replay the inbox, then start adapters.
+
+        这一轮顺带收集每个适配器的**启动探测结论**到 :attr:`startup_probes`，
+        由**运行器**在全部适配器都试过之后统一落一次盘。⚠️ **收集必须在这里**，
+        而不是让调用方在 :meth:`start` 返回后再遍历一遍 —— ``start()`` 抛出的异常
+        在这里被接住并记了日志（调用方再也看不到它），而"抛异常"恰恰是最需要被
+        用户看见的那种失败。
+        """
         with self._lock:
             if self._started:
                 return
@@ -375,11 +390,21 @@ class BridgeCore:
         # ⚠️ 位置有意义：SSE 线程**之后**、适配器**之前**（理由见
         # InboundGateway.recover_inbox）。
         self.inbound_gateway.recover_inbox()
+        probes: dict[str, dict] = {}
         for adapter in self.adapters:
+            key = platform_key(adapter)
             try:
-                adapter.start()
-            except Exception:
+                start_result = adapter.start()
+            except Exception as exc:
                 logger.exception("adapter %s failed to start", adapter.name)
+                probe = probe_after_start(adapter, start_error=exc)
+                if probe is not None:
+                    probes[key] = probe
+                continue
+            probe = probe_after_start(adapter, start_result)
+            if probe is not None:
+                probes[key] = probe
+        self.startup_probes = probes
         logger.info("bridge core started with %d adapter(s)", len(self.adapters))
 
     def stop(self) -> None:

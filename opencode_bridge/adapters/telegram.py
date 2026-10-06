@@ -62,6 +62,7 @@ import threading
 import time
 from typing import Any, List, Optional
 
+from .. import health
 from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text  # 统一分片实现（T1.4b），此处再导出保持向后兼容
@@ -146,9 +147,7 @@ class TelegramAdapter(Adapter):
         super().__init__(config, hooks)
         self.bot_token: str = str(self.config.get("bot_token") or "").strip()
         # allowed_chat_ids 已由基类 _init_access() 统一解析（T1.2）
-        self.poll_long_timeout = int(
-            self.config.get("poll_timeout") or POLL_LONG_TIMEOUT
-        )
+        self.poll_long_timeout = self._coerce_poll_timeout()
         self._offset = 0
         self._api_lock = threading.Lock()          # serializes _post calls
         self._throttle_lock = threading.Lock()     # guards _last_send
@@ -158,6 +157,47 @@ class TelegramAdapter(Adapter):
         #: 而传输层的 fetch 一次只交**一条**，所以批量挂在这里逐条取）。
         #: 只被消费线程读写（测试里由 :meth:`_poll_once` 单线程读写）。
         self._pending: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # 配置解析
+    # ------------------------------------------------------------------
+    def _coerce_poll_timeout(self) -> int:
+        """``poll_timeout``（getUpdates 长轮询秒数）的取值。
+
+        **没配** -> :data:`POLL_LONG_TIMEOUT`（静默）；**配了但非法** ->
+        :data:`POLL_LONG_TIMEOUT` 并**告警**。纪律照抄本仓库既有的两处同款：
+        :func:`opencode_bridge.adapters.a2a._coerce_positive`（"说清是哪个键、
+        收到了什么、回落成多少"）与
+        :meth:`opencode_bridge.adapters.nextcloud.NextcloudAdapter._config_int_value`
+        （"配置非法 %r，按 %s 处理"）。⚠️ 不替用户决定成别的值：非正数也回落，
+        而**不**静默采纳 —— 一个写错的长轮询时长会让 socket 超时的大小关系
+        （:data:`POLL_SOCKET_TIMEOUT` 必须大于它）失效。
+
+        ⚠️ **这里绝对不许让 ``int()`` 的异常逃出去**：``base.build`` 会把它包成
+        :class:`~opencode_bridge.adapters.base.AdapterError`，``__main`` 那个循环
+        ``continue`` 掉这个适配器 ⇒ 整个桥 ``usable == 0``，而用户看到的报错是
+        「没有任何可用适配器」—— **一个字都不提 ``poll_timeout`` 非法**。
+        也就是说，一个旋钮写错会打死这条零容错关键路径，而真正的死因不在错误
+        信息里、只在日志的一行 ``failed to build adapter`` 里。
+        """
+        raw = self.config.get("poll_timeout")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return POLL_LONG_TIMEOUT
+        try:
+            seconds = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "telegram: 配置项 poll_timeout=%r 不是整数（%s），已回落为 %d",
+                raw, type(raw).__name__, POLL_LONG_TIMEOUT,
+            )
+            return POLL_LONG_TIMEOUT
+        if seconds <= 0:
+            logger.warning(
+                "telegram: 配置项 poll_timeout=%r 非法（非正数），已回落为 %d",
+                raw, POLL_LONG_TIMEOUT,
+            )
+            return POLL_LONG_TIMEOUT
+        return seconds
 
     # ------------------------------------------------------------------
     # HTTP plumbing
@@ -309,14 +349,35 @@ class TelegramAdapter(Adapter):
         """Verify the token, flush pending updates, spawn the poller.
 
         Missing / invalid token: log a warning and return (never raises).
+
+        ⚠️ **每个失败分支都调 :meth:`~opencode_bridge.adapters.base.Adapter.report_startup_probe`**
+        —— ``getMe`` 失败曾经只留一行日志、适配器直接 ``return``，而
+        ``--status`` / ``--setup --json`` 只看 token 字符串非空就报"已配置 / 入站就绪"
+        ⇒ **token 打错、被吊销、或网络被墙时，桥完全静默而状态视图说一切正常**。
+        现在结论被 :mod:`opencode_bridge.health` 落盘并由那两个视图读出来。
+
+        ⚠️ 本方法里那两行 ``telegram: getMe failed ...`` **原文保留**：用户与文档
+        （``docs/install.md`` / ``plugin/README.md``）都按这行字排障，改了会让
+        已写的排障指引失效。所以基类那条规范化日志**不取代**它，两条并存。
         """
         if not self.bot_token:
             logger.warning("telegram: bot_token missing; adapter not started")
+            self.report_startup_probe(
+                health.VERDICT_SKIPPED, detail="bot_token 没填，连 token 都没得验"
+            )
             return
         try:
             me = self._post("getMe", {}, timeout=8.0)
         except Exception as exc:
             logger.warning("telegram: getMe failed (%s); adapter not started", exc)
+            # ``_post`` 自己会把传输失败包成 ``{"ok": False, "error_code": 0, …}``
+            # —— 所以这里的 ``code=0`` 与那条路径**同一个含义**：没拿到 HTTP 状态码
+            # （同 ``classify_http`` 对 ``status <= 0`` 的判法）。不是"没有码"。
+            self.report_startup_probe(
+                health.VERDICT_FAILED,
+                code=0,
+                detail=f"getMe 抛出异常 {type(exc).__name__}: {exc}",
+            )
             return
         if not isinstance(me, dict) or me.get("ok") is not True:
             if isinstance(me, dict):
@@ -330,7 +391,17 @@ class TelegramAdapter(Adapter):
                 code,
                 desc,
             )
+            # 这一条分支同时覆盖两种失败：平台明确回的 API 错误
+            # （``ok:false`` + error_code/description），以及 ``_post`` 把传输层
+            # 异常包成的 ``error_code: 0`` —— 两者都要落盘，否则"网络被墙"
+            # 这种最常见的失败恰恰不在状态视图里。
+            self.report_startup_probe(
+                health.VERDICT_FAILED,
+                code=code,
+                detail=f"getMe: {desc or '（平台没给描述）'}",
+            )
             return
+        self.report_startup_probe(health.VERDICT_OK, detail="getMe 通过")
         try:
             self._flush_pending()
         except Exception:

@@ -18,6 +18,7 @@ from ..allowlist import (
     warn_if_conflicting_keys,
     warn_if_no_allowlist,
 )
+from ..health import VERDICT_FAILED, normalize_verdict
 from ..hooks import Hooks, MsgHandle, Outbound, SendError, SendResult
 from ..pairing import (
     CONFIG_VERSION_KEY,
@@ -205,6 +206,24 @@ class Adapter(abc.ABC):
     #: :meth:`_init_access` 的子类也拿得到一个"未解析"的对象，而不是
     #: ``AttributeError`` —— 状态视图问的是"能不能答"，答不出不该让它崩。
     allowlist_resolution: AllowlistResolution = AllowlistResolution()
+
+    #: 「上次启动时」本平台的自检结论，形状 ``{verdict, code, detail}``。
+    #: **类级默认 ``None`` = "这次启动没有做过任何探测"** ⛔ —— 而它**不是**"没问题"。
+    #:
+    #: 与 :attr:`allowlist_resolution` 同为**类级兜底的运行期槽**：声明在基类上，
+    #: 于是"这个平台有没有说过自己怎么样"对每个消费者都是同一个答案，不必
+    #: ``getattr(..., None)`` 满仓库抄。
+    #:
+    #: :attr:`~opencode_bridge.health.VERDICT_OK` 表示探测**通过**，
+    #: :attr:`~opencode_bridge.health.VERDICT_FAILED` 表示探测**失败且有原因**，
+    #: :attr:`~opencode_bridge.health.VERDICT_SKIPPED` 表示**压根没探测**
+    #: （三者**必须**分开：把"没验"说成"验过"就是假话）。
+    #:
+    #: ⚠️ **落盘不由适配器负责**：适配器不知道 bridge 目录在哪。写入
+    #: ``<bridge_dir>/platform-health.json`` 是**运行器**的事（见
+    #: :mod:`opencode_bridge.health` 与 :meth:`BridgeCore.start` 那一轮收集）。
+    #: 本类只负责"把结论规范化 + 记一行日志 + 暂存在实例上"。
+    startup_verdict: dict | None = None
 
     #: 本平台**是否提供配对**（未授权会话发 ``/pair`` 能否拿到码）。默认 **False**，
     #: 逐个平台显式 opt-in —— 没人继承"支持"这个属性。
@@ -458,6 +477,49 @@ class Adapter(abc.ABC):
     def running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    # --- 启动探测上报（契约在本类，落盘在 opencode_bridge.health）----------
+    def report_startup_probe(
+        self,
+        verdict: str,
+        *,
+        code: object = None,
+        detail: str = "",
+    ) -> dict:
+        """上报「上次启动时」的自检结论：记一行日志 + 暂存在 :attr:`startup_verdict`。
+
+        **为什么是基类上的一个方法，而不是每个适配器各写各的**：结论要一直走到
+        ``--status`` / ``--setup --json``（见 :mod:`opencode_bridge.health`），
+        而那条通路**只有一份** —— 各适配器自己拼 dict 的话，键名与取值域必然分叉，
+        而"字段名分叉"正是本任务最初那个缺陷的形态：信息已经产生出来了，却到不
+        了用户那里。
+
+        ⚠️ **本方法绝不落盘**：适配器不知道 ``bridge_dir`` 在哪。写入
+        ``<bridge_dir>/platform-health.json`` 由**运行器**在**全部**适配器都试过
+        之后统一做一次（:func:`opencode_bridge.health.record_startup_probes`）。
+
+        :param verdict: :mod:`opencode_bridge.health` 的三档取值（``ok`` /
+            ``failed`` / ``skipped``）。**认不出来的值按 ``failed`` 记** ——
+            上报方说了句读不懂的话时，绝不能默认成"好"。
+        :param code: 平台自己的错误码（Telegram 的 ``error_code``）。
+            ⛔ 没有就传 ``None``（该键会**被省略**），别用 ``0`` 顶替 ——
+            ``0`` 在本仓库里有确切含义（"没拿到 HTTP 状态码"，见
+            ``TelegramAdapter._post`` 与 :func:`classify_http`），两件事不能共用一个值。
+        :param detail: 一行说明；落盘前会先过 :mod:`opencode_bridge.redaction`
+            的 ``scrub``（凭据片段绝不许进盘）。
+        :return: 规范化后的结论（即 :attr:`startup_verdict`）。
+        """
+        entry = normalize_verdict(verdict, code=code, detail=detail)
+        self.startup_verdict = entry
+        label = self.name or type(self).__name__
+        summary = entry["verdict"] + (
+            "：" + entry["detail"] if entry.get("detail") else ""
+        )
+        if entry["verdict"] == VERDICT_FAILED:
+            logger.warning("%s: 启动探测 %s", label, summary)
+        else:
+            logger.info("%s: 启动探测 %s", label, summary)
+        return entry
 
     # --- messaging -----------------------------------------------------
     @abc.abstractmethod

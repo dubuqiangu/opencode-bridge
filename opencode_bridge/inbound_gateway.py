@@ -70,14 +70,28 @@ DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS = 15.0
 
 
 def _positive_float(value: Any, default: float) -> float:
-    """A finite, non-negative float, else ``default`` (NaN and negatives rejected)."""
+    """A finite, non-negative float, else ``default`` (NaN and negatives rejected).
+
+    ``0`` is legal (= 关掉保险丝，与 :func:`_positive_int` 同一条判据) ——
+    这里唯一用到它的是 ``merge_continue_timeout_seconds``，而那是 G2 崩溃窗口的
+    **唯一**旋钮：判成 ``> 0`` 会让「配 0 关掉窗口」悄悄变成「配 0 仍是 15 秒窗口」。
+
+    ⚠️ :func:`opencode_bridge.core.BridgeCore._positive_float` 是**同名但另一件事**：
+    它的判据是 ``number < 0`` 才回落 ⇒ **它也接受 ``0``**，而那里的 ``0`` 等于
+    「不做节流」（每个 delta 都改写），是一个**合法且有意义的**设置。
+    ⇒ 所以别把这一处的判据套过去，也别把那一处改成这里这样 ——
+    **同一个数字在两个函数里语义不同**：这里 ``0`` =「关掉保险丝」= 移除一个
+    **有界**的保护窗口；那里 ``0`` =「不节流」。⚠️ 而这里那个「有界」一旦被关掉，
+    暴露窗口就变成**无界**（见 `tasks.md` 未完成项总表那一行的代价说明）
+    ⇒ **正因为语义不同，混用判据会同时坏掉两边**。
+    """
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
     if number != number or number in (float("inf"), float("-inf")):
         return default
-    return number if number > 0 else default
+    return number if number >= 0 else default
 
 
 def _positive_int(value: Any, default: int) -> int:

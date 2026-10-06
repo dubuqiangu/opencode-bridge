@@ -30,8 +30,11 @@ from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import Turn
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.inbound_gateway import (
+    DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
     PROGRESS_TEXT,
     InboundGateway,
+    _positive_float,
+    _positive_int,
     _queued_prompt_for,
     _record_inbound,
 )
@@ -1036,6 +1039,105 @@ class InboundMergeWiringTests(InboundGatewayTestCase):
         self.assertNotIn("已收到", "".join(
             out.text for out in self.send_text.outgoing
         ))
+
+
+# ----------------------------------------------------------------------
+# 3b-续: ``merge_continue_timeout_seconds`` 的判据 —— 配 0 就是配 0
+# ----------------------------------------------------------------------
+# ⚠️ 这一类测的是**上一个环节**，缺陷就住在那儿：
+# ``tests/test_inbound_merge.py`` 锁的是合并器在 ``hold_timeout_seconds=0``
+# 时的行为（那条本来就绿），而 ``inbound_gateway._positive_float`` 曾把配置里的
+# ``0`` 换成默认值 ⇒ 合并器**永远收不到 0** ⇒ 那个分支是死代码。
+# ⇒ 只测合并器，这个缺陷会**整条漏掉**。
+#
+# 全类**不出现任何计时**（AGENTS.md §7.1：本机 ``monotonic`` 只有 16 ms 分辨率）：
+# 读的都是离散事实 —— 保险丝装没装上、缓冲还在不在。
+class MergeFuseTimeoutConfigurationTests(InboundGatewayTestCase):
+    """``merge_continue_timeout_seconds: 0`` 必须**真的**是 0。
+
+    ⚠️ 这个配置项是 G2 崩溃窗口的**唯一**旋钮：被扣在 ``ConversationMerger``
+    内存 dict 里的整条消息（落盘在它之后），暴露窗口的上界就是它。
+    判成 ``> 0`` 的话，「配 0 关掉窗口」会悄悄变成「配 0 仍是 15 秒窗口」。
+    """
+
+    def build_with_timeout(self, timeout_seconds) -> InboundGateway:
+        """每条用例都自己建网关 —— 判据各自不同，不吃类级默认值。"""
+        gateway = self.build_gateway(
+            bridge_config={"merge_continue_timeout_seconds": timeout_seconds},
+        )
+        # 别让装上去的保险丝在用例返回之后才到点（那会去碰替身）。
+        self.addCleanup(gateway._merger.stop)
+        return gateway
+
+    # --- 0 得真的到得了合并器 ---------------------------------------------
+    def test_a_configured_zero_reaches_the_merger_as_zero(self):
+        gateway = self.build_with_timeout(0)
+
+        self.assertEqual(gateway._merger._hold_timeout_seconds, 0.0)
+
+    def test_a_configured_zero_arms_no_fuse(self):
+        """0 = 关掉保险丝：缓冲还在，但**没有**计时器。
+
+        这才是那个分支的判据 —— 缺陷形态下这里会被装上一个 15 秒的保险丝。
+        """
+        gateway = self.build_with_timeout(0)
+
+        gateway.on_inbound(message("敲完就走了..", message_id="m1"))
+
+        self.assertEqual(gateway._merger._fuses, {})
+        self.assertEqual(gateway._merger.held_text(CONVERSATION), "敲完就走了")
+
+    def test_a_positive_timeout_still_arms_exactly_one_fuse(self):
+        """反向对照：不是"配什么都关掉保险丝" —— 否则上面两条就是恒真的。"""
+        gateway = self.build_with_timeout(0.05)
+
+        gateway.on_inbound(message("第一段..", message_id="m1"))
+
+        self.assertEqual(list(gateway._merger._fuses), [CONVERSATION])
+
+    # --- 0 的语义是"关掉保险丝"，不是"静默丢消息" --------------------------
+    def test_a_fuse_free_hold_is_delivered_together_with_the_next_line(self):
+        """关掉保险丝之后缓冲要**一直留着**，等下一条非 ``..`` 行一起发出去。
+
+        这条盯的是「有没有被静默丢掉」：``_rearm_fuse`` 那个 ``<= 0`` 早退只该
+        **不装计时器**，不该动缓冲本身。
+        """
+        gateway = self.build_with_timeout(0)
+
+        gateway.on_inbound(message("第一段..", message_id="m1"))
+        gateway.on_inbound(message("第二段!!", message_id="m2"))
+
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "第一段\n第二段")])
+
+    # --- 判据没被顺手放宽 ---------------------------------------------------
+    def test_a_negative_timeout_still_falls_back_to_the_default(self):
+        """改成 ``>= 0`` 不等于把判据删了：负数仍然要退回默认值。"""
+        gateway = self.build_with_timeout(-1)
+
+        self.assertEqual(
+            gateway._merger._hold_timeout_seconds,
+            DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
+        )
+
+    def test_a_non_finite_timeout_still_falls_back_to_the_default(self):
+        """NaN / ±inf 走的是同一个函数里的**另外两个** return，别碰坏它们。"""
+        for illegal_timeout in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(timeout=illegal_timeout):
+                gateway = self.build_with_timeout(illegal_timeout)
+
+                self.assertEqual(
+                    gateway._merger._hold_timeout_seconds,
+                    DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
+                )
+
+    def test_the_two_positive_parsers_agree_that_zero_is_legal(self):
+        """同族两个解析器对 ``0`` 必须**同一个答案** —— 一侧性是本条的判据。
+
+        ⚠️ ``core.py`` 里那个**同名**的 ``_positive_float`` 不在此列：它服务
+        ``edit_interval`` / ``max_message_chars``，那两个 ``0`` 无意义。
+        """
+        self.assertEqual(_positive_float(0, 15.0), 0.0)
+        self.assertEqual(_positive_int(0, 180), 0)
 
 
 # ----------------------------------------------------------------------

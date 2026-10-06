@@ -71,7 +71,7 @@ opencode service restart
 - **email**：填 `adapters.email` 的 `address` / `password` / `imap_host` / `smtp_host`；⚠️ 用 **app 专用密码**（凭据即完整信箱权限），且**必须**用 `allowed_chat_ids` 限定发件人 —— 任何能给你发信的人都能驱动 agent。
 - **a2a**：填 `adapters.a2a` 的 `bind_host` / `bind_port`（默认 `127.0.0.1`，**不需要任何 token**）；⚠️ **默认无鉴权**，需要被其它机器访问时**必须**配 `auth_token`。详见 [`docs/a2a.md`](https://github.com/dubuqiangu/opencode-bridge/blob/main/docs/a2a.md)。
 - **QQ Bot**：填 `adapters.qqbot` 的 `app_id` / `app_secret`；⚠️ 群里的**主动消息会被平台拒绝**，只能回复（被动窗口有时效与次数上限）。
-- **Home Assistant**：填 `adapters.homeassistant` 的 `url` 与长期访问令牌 `token`；⚠️ **还必须**给 `entities` / `domains` 或 `accept_all: true`，否则**默认一个事件都不收**（这是刻意设计：设备状态变更不等于"有人跟你说话"）。判据看 `--status --json` 的 `inbound_accepts_anything`。
+- **Home Assistant**：填 `adapters.homeassistant` 的 `url` 与长期访问令牌 `token`；⚠️ **还必须**给 `entities` / `domains` 或 `accept_all: true`，否则**默认一个事件都不收**（这是刻意设计：设备状态变更不等于"有人跟你说话"）。判据看 `--setup --json` 里 `platforms[].capabilities.inbound_accepts_anything`。
 
 以上十三个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
 

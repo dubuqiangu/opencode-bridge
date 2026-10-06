@@ -273,6 +273,21 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 # 能不能对用户说"这个平台配好了"。空 = []。
                 "not_ready_reasons": not_ready,
                 "ready_for_agent": not not_ready,
+                # --- 适配器自己声明的运行判据 ---------------------------------
+                # ⚠️ **为什么必须在这儿透出 `capabilities()`**（实测缺陷，2026-10-06）：
+                # 有些平台「凭据齐备」**不等于**「能收到东西」——
+                # homeassistant 默认**一个事件都不收**（`capabilities()` 里的
+                # `inbound_accepts_anything=False` 就是那个明确信号）。
+                # `homeassistant.py` 的 docstring 写着「`--setup --json` /
+                # `--status` 的 JSON 输出能直接读到」，而**本函数原来根本没调它**
+                # ⇒ 文档承诺的判据任何命令都读不到。
+                #
+                # 只在**已配置**时构造适配器：未配置时构造只会抛，而「配齐了却收不到」
+                # 正是我们要暴露的那个情形。`_NullHooks` 与构造方式沿用
+                # `_channel_config_rows`，⛔ 不新造第二套。
+                "capabilities": (
+                    _adapter_capabilities(key, cfg, entry) if configured else None
+                ),
             }
         )
     return out
@@ -282,7 +297,7 @@ def run_setup(cfg: Config, platform: str, as_json: bool) -> int:
     """Print the frozen onboarding copy. Never contacts opencode."""
     if as_json:
         payload = {
-            "config_path": _config_file_in_use(),
+            "config_path": _config_file_in_use(cfg),
             "platforms": _platform_status(cfg),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -291,8 +306,20 @@ def run_setup(cfg: Config, platform: str, as_json: bool) -> int:
     return 0
 
 
-def _config_file_in_use() -> str:
-    """Absolute path of the config the bridge would load right now."""
+def _config_file_in_use(cfg: Config | None = None) -> str:
+    """Absolute path of the config the bridge would load right now.
+
+    ⚠️ **优先读 ``cfg.source_path``**（实测缺陷，2026-10-06）：
+    原来这个函数**自己重写了一遍搜索链**，只查环境变量与 cwd ——
+    于是 ``--config /tmp/other.json --setup --json`` 明明用 ``--config`` 加载了，
+    报出来的却是**另一个文件**。根因是「解析出的路径从未被记录」，
+    已由 :meth:`Config.load` 记在实例上（``source_path``）。
+    下面的兜底分支保留：``cfg`` 没传、或一个文件都没加载成时仍要给出「会去哪儿找」。
+
+    参数可选 ⇒ 既有调用方与测试不必改。
+    """
+    if cfg is not None and getattr(cfg, "source_path", ""):
+        return cfg.source_path
     env_path = (os.environ.get("OPENCODE_BRIDGE_CONFIG") or "").strip()
     if env_path and os.path.isfile(env_path):
         return os.path.abspath(env_path)
@@ -376,6 +403,29 @@ class _NullHooks:
 
     def on_callback(self, conversation_id: str, data: str, query_id: str) -> None:  # pragma: no cover
         return None
+
+
+def _adapter_capabilities(key: str, cfg: Config, entry: dict) -> dict:
+    """构造适配器并读它的 ``capabilities()``。
+
+    ⚠️ **这是 ``_channel_config_rows`` 里那段构造逻辑的提取，不是第二份实现** ——
+    投影（:func:`adapter_scoped_config`）、hooks、错误兜底三处都与它一致，
+    改动面才只在一个文件里（§5）。实参形态也逐字照抄：``build(key, …)``
+    （第一参是**平台键字符串**，不是类 —— `build` 的签名是 ``(name, config, hooks)``）。
+
+    为什么 ``--setup --json`` 需要它：有些平台「凭据齐备」**不等于**「能收到东西」。
+    homeassistant 默认**一个事件都不收**，``inbound_accepts_anything=False`` 才是那个
+    「配好了但收不到」的明确信号 —— 而 homeassistant 的 docstring 明写这个信号要能从
+    ``--setup --json`` 读到，**原来却没有任何命令输出它**（实测，2026-10-06）。
+    """
+    try:
+        # 与 run_bridge 走**同一个**投影，否则状态视图会在一个真实运行着的
+        # 适配器上读出另一套语义（它也构造适配器，见 :class:`_NullHooks` 的说明）。
+        return dict(
+            build(key, adapter_scoped_config(cfg, entry), _NullHooks()).capabilities()
+        )
+    except Exception as exc:  # 能力读取失败不该让 --status / --setup --json 崩
+        return {"error": str(exc)[:80]}
 
 
 def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]:

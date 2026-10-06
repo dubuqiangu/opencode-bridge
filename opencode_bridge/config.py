@@ -144,6 +144,17 @@ class Config:
     #:
     #: 判定只有一处：:func:`opencode_bridge.pairing.empty_allowlist_is_open`。
     config_version: int = 0
+    #: **本实例实际加载自哪个文件**（绝对路径）；**空 = 没找到任何配置文件**
+    #: （:meth:`load` 的搜索链全部落空，走的是内置默认值）。
+    #:
+    #: **为什么必须记在实例上**（实测缺陷，2026-10-06）：
+    #: ``python -m opencode_bridge --config /tmp/other.json --setup --json`` 加载时
+    #: **确实用了** ``--config``，但它报出的 ``config_path`` 是**仓库里的
+    #: ``config.json``** —— 因为报告路径的那段代码**自己重写了一遍搜索链**
+    #: （``__main._config_file_in_use`` 只查环境变量与 cwd）。
+    #: ⇒ **根因是「解析出来的路径从未被记录」**，任何消费者都只能自己重算一遍，
+    #: 于是**第二份实现就出现了**（``commands._config_path_hint`` 就是）。
+    source_path: str = ""
 
     # ------------------------------------------------------------------
     # loading
@@ -176,6 +187,10 @@ class Config:
 
         if chosen is not None:
             data = cls._read_file(chosen)
+        # ⚠️ 记下**实际加载自哪个文件**。缺了这一句，任何消费者都得自己重算一遍搜索链
+        # —— 而第二份实现真的出现了（`__main._config_file_in_use`），于是
+        # `--config X --setup --json` 会报出另一个文件（实测，2026-10-06）。
+        cfg.source_path = os.path.abspath(chosen) if chosen else ""
 
         for key, value in data.items():
             if key not in _KNOWN_KEYS:

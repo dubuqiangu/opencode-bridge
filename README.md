@@ -525,7 +525,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 > ⚠️ **这一点很容易被"状态显示已就绪"误导**：只配 `url` + `token` 时 `--status` 会显示
 > 「已配置 / 入站就绪」，但实际收不到东西。所以 `capabilities()` 里给了机器可读的判据
 > —— `inbound_accepts_anything: false` 就是"配好了但收不到"的明确信号
-> （`--status --json` / `--setup --json` 能直接读到）。启动日志里也会打一次WARNING。
+> （`--setup --json` 的 `platforms[].capabilities` 能直接读到）。启动日志里也会打一次WARNING。
 >
 > 其它要点：
 > - **两层保活方向相反**：传输层是 **aiohttp 每 55s 发 RFC 6455 ping**（`ws.py` 自动回

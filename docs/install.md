@@ -396,7 +396,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 >
 > ⚠️ 只配 `url` + `token` 时 `--status` 会显示「已配置 / 入站就绪」，**但实际收不到
 > 任何事件** —— 所以 `capabilities()` 给了机器可读判据：`inbound_accepts_anything: false`
-> 就是"配好了但收不到"的明确信号（`--status --json` 可直接读到），启动日志也会打一次
+> 就是"配好了但收不到"的明确信号（`--setup --json` 的 `platforms[].capabilities` 可直接读到），启动日志也会打一次
 > WARNING。
 >
 > 其它：`homeassistant.local` 是 **mDNS 惯例**、不是官方规定；`event_types: ["*"]`
@@ -408,7 +408,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 >
 > ⚠️ 但 `--status` 的「入站就绪」只代表**凭据齐备且入站已实现**，不代表"真的会收到消息"：
 > **Home Assistant** 默认**一个事件都不收**（必须另配 `entities`/`domains`/`accept_all`），
-> 判据是 `--status --json` 里的 `inbound_accepts_anything`。
+> 判据是 `--setup --json` 里 `platforms[].capabilities.inbound_accepts_anything`。
 
 ### Step 3: 激活（需要用户点头）
 

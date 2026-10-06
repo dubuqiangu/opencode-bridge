@@ -31,7 +31,11 @@ from opencode_bridge.core import (
 )
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
-from opencode_bridge.outbound import OutboundSender, one_message_budget
+from opencode_bridge.outbound import (
+    CANCELLED_TURN_TEXT,
+    OutboundSender,
+    one_message_budget,
+)
 from opencode_bridge import redaction
 from opencode_bridge.state import StateStore
 from tests.test_outbound import CONVERSATION, ScriptedAdapter
@@ -326,6 +330,51 @@ class SessionLifecycleTests(unittest.TestCase):
 
             core.on_inbound(inbound("chat:55", "next"))
             self.assertEqual(client.prompts[-1][0], new_sid)
+
+    def test_new_while_the_model_is_still_answering_cancels_the_placeholder(self):
+        """⚠️ 确诊的缺陷：``/new`` 直接把在跑的那一轮弹掉、**全程无收尾**
+        ⇒ 用户的「⏳ 处理中…」气泡永远停在原地，而没有任何地方告诉他那条被丢了。
+
+        对比 ``/stop``：它走 ``interrupt()`` ⇒ 终止事件正常到达 ⇒ 收尾正常发生。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, state, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "hello"))
+            old_sid = client.created_ids[0]
+            placeholder = [out for out in adapter.sent
+                           if out.kind == "progress"]
+            self.assertEqual(len(placeholder), 1,
+                             "前提不成立：占位消息压根没发出去")
+
+            core.on_inbound(inbound("chat:55", "/new"))
+
+            self.assertEqual(len(adapter.edited), 1,
+                             "丢掉在跑的一轮却没有改写那条占位消息 —— "
+                             "读者只看到一个永远卡住的气泡")
+            # ``FakeAdapter`` 的句柄是按发送次序编号的（``m1`` / ``m2`` …），而那条
+            # 占位消息是本会话第一条出站消息 ⇒ 它的句柄必是 ``m1``。
+            self.assertEqual(adapter.edited[0][0].message_id, "m1")
+            self.assertEqual(adapter.edited[0][1].text, CANCELLED_TURN_TEXT)
+            self.assertEqual(adapter.edited[0][1].session_id, old_sid)
+            # ⛔ 绝不发半截正文（用户 2026-10-07 明确否掉了那个候选）
+            self.assertNotIn("progress", [out.kind for out in adapter.sent[1:]])
+
+    def test_new_while_nothing_runs_says_nothing_extra(self):
+        """⚠️ 没在跑任何东西时发 ``/new`` —— 多出来的任何一句都是噪音。"""
+        with tempfile.TemporaryDirectory() as td:
+            core, client, adapter, state, _, _ = make_env(td)
+            core.on_inbound(inbound("chat:55", "/new"))
+
+            self.assertEqual(adapter.edited, [], "不该去改写任何占位消息")
+            # 「已新建会话 xxx」是 ``/new`` 本来就要说的那句话（既有行为，不动它）；
+            # 这里守的是**除它之外一句都不多**，而不是"取消那句没出现"
+            # —— 后者只钉一个字面量，任何换个措辞的「取消」都能溜过去。
+            self.assertEqual(
+                [out.text for out in adapter.sent
+                 if not out.text.startswith("已新建会话")],
+                [], "没有在跑的一轮 ⇒ 除了「已新建会话」一句都不该多发",
+            )
+            self.assertEqual(client.deleted, [])
 
     def test_create_session_400_falls_back_to_no_permissions(self):
         with tempfile.TemporaryDirectory() as td:

@@ -34,6 +34,8 @@ from .normalize import _clean
 from .split import split_text
 
 __all__ = [
+    "CANCELLED_TURN_NOTICE_TEXT",
+    "CANCELLED_TURN_TEXT",
     "OutboundSender",
     "installed_outbound_failure_recorder",
     "install_outbound_failure_recorder",
@@ -42,6 +44,21 @@ __all__ = [
 logger = logging.getLogger("opencode_bridge.outbound")
 
 NO_OUTPUT_TEXT = "（无输出）"
+
+#: 某一轮被丢弃时，占位消息**被改写成**的那一句（平台改得动已发消息时走这条）。
+#:
+#: ⚠️ 冻结文案：用户 2026-10-07 在两个候选里明确否掉了"把半截正文当最终答复发出去"
+#: —— 他既然要开新会话，那一轮的正文就是噪音 ⇒ 这里写"已取消"，不写正文。
+CANCELLED_TURN_TEXT = "已取消"
+
+#: 同一条事实的**第二种落点**：没有占位消息可改写时，另发这一句。
+#:
+#: 为什么必须有它：七个 ``supports_message_edit`` 为 ``False`` 的平台上压根**不发**
+#: 占位消息（见 :meth:`OutboundSender.send_text` 的 ``kind == "progress"`` 闸门），
+#: 所以"刚才那条被清掉了"这件事**没有任何视觉载体** —— 不另发一句，用户就是零反馈。
+#: 能改写却**没发出去**占位消息的那六个平台同此理，所以判据是
+#: **"手上有没有一条可改写的消息"**，不是"这个平台在不在名单里"。
+CANCELLED_TURN_NOTICE_TEXT = "已取消上一条请求。"
 
 #: 按 conversation_id 找出该回哪个适配器（找不到返回 ``None``）。
 AdapterFor = Callable[[str], Optional[Adapter]]
@@ -274,6 +291,78 @@ class OutboundSender:
         if not ok:
             logger.debug("progress edit returned False for %s", conversation_id)
         return bool(ok)
+
+    def cancel_turn(
+        self, conversation_id: str, handle: Optional[MsgHandle],
+        session_id: str,
+    ) -> None:
+        """Tell the reader the turn they were waiting on is gone — nothing else.
+
+        本方法与 :meth:`finalize` **并列**，不是它的替代品。
+
+        * ``finalize`` 发布**完整答复**（由 ``session.execution.succeeded`` /
+          ``.failed`` 等终止事件驱动）；本方法对应那一轮被
+          :meth:`~opencode_bridge.session_registry.SessionRegistry.drop_session`
+          **直接丢弃** —— 没有终止事件、没有完整正文，只有一条永远停在
+          「⏳ 处理中…」上的占位消息。
+
+        ## ⛔ 绝不发半截正文
+
+        ``turn.parts`` 里确实攒了那一轮的半截输出，**但绝不发它**：用户 2026-10-07
+        在两个候选里明确否掉了这一条（他发 ``/new`` 就是要丢掉当前上下文，那轮正文
+        是噪音），而发半截正文会让读者以为那就是答案。⛔ 也不复用
+        :meth:`finalize` —— 它走的就是"发布完整答复"那条路，正是被否掉的行为。
+
+        ## 两条落点，判据是**手上有没有一条可改写的消息**
+
+        * 有（``handle is not None``）⇒ 改写成 :data:`CANCELLED_TURN_TEXT`。
+          读者看到的是**同一条消息**，而它已经不再显示"处理中"。
+        * 没有 ⇒ 另发一条 :data:`CANCELLED_TURN_NOTICE_TEXT`。
+
+        ⚠️ **判据不是平台名单**：那七个平台压根不发占位消息（``send_text`` 的
+        ``kind == "progress"`` 闸门），所以它们手上**永远**没有句柄 ⇒ 两种写法在
+        那七个平台上等价。而能改写的六个平台里占位消息**可能发失败**（网络 / 权限），
+        那时句柄同样是 ``None`` ⇒ 补一句同样是对的，因为读者手上确实什么都没有。
+        ⇒ 一个判据就够，不必两处都判。
+
+        ⚠️ 改写**可能失败**（声明了能力但部署关掉了 / 客户端不支持 / 网络）⇒ 退回补发
+        那一句，理由与 :meth:`finalize` 里那段"有界残留"同源：宁可多一句，也不让读者
+        盯着一个僵尸气泡猜。本方法**绝不抛** —— 收尾通道坏了不该让 ``/new`` 本身失败。
+
+        :param handle: 那一轮的占位消息句柄；``None`` = 没有可改写的消息。
+        :param session_id: 被丢弃的那一轮（随消息带出去，供平台侧记账）。
+        """
+        adapter = self._adapter_for(conversation_id)
+        if adapter is None:
+            logger.warning(
+                "no adapter for %s; the cancelled turn goes unreported",
+                conversation_id,
+            )
+            return
+        if handle is not None:
+            out = Outbound(
+                conversation_id=conversation_id,
+                text=CANCELLED_TURN_TEXT,
+                kind="text",
+                session_id=session_id,
+            )
+            replaced = False
+            try:
+                replaced = bool(adapter.edit(handle, out))
+            except Exception:
+                logger.exception("adapter.edit failed while cancelling a turn")
+                replaced = False
+            if replaced:
+                return
+            logger.warning(
+                "%s: could not rewrite the progress message of the cancelled "
+                "turn; sending a separate notice instead",
+                adapter.name,
+            )
+        self.send_text(
+            conversation_id, CANCELLED_TURN_NOTICE_TEXT, kind="text",
+            adapter=adapter, session_id=session_id,
+        )
 
     def finalize(
         self, conversation_id: str, handle: Optional[MsgHandle], text: str,

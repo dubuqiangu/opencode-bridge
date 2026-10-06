@@ -370,8 +370,13 @@ class ARaisingEditCannotEscapeItsCallerTests(unittest.TestCase):
         """前提：这条断言盯着的调用点**一个都没漏掉**。
 
         少盯一个就等于这条断言在"没有调用点"时也绿 —— 与其在解析失败时报错，
-        不如先确认它确实找到了三处（``commands`` 的按钮、``finalize``、
-        ``edit_progress``）。
+        不如先确认它确实找到了四处（``commands`` 的按钮、``finalize``、
+        ``edit_progress``、``cancel_turn``）。
+
+        ⚠️ ``cancel_turn`` 是 2026-10-07 修 ``/new`` 吞掉在跑那一轮时新增的：
+        它改写占位消息成「已取消」，与 :meth:`~opencode_bridge.outbound.
+        OutboundSender.finalize` 一样会在 ``adapter.edit`` 抛 ``ValueError``
+        （正文超限）时炸，所以它同样必须被下面那条"每个调用点都在 try 里"盯着。
         """
         self.assertEqual(
             sorted({site[0] for site in self._edit_call_sites()}),
@@ -379,7 +384,7 @@ class ARaisingEditCannotEscapeItsCallerTests(unittest.TestCase):
             "``adapter.edit(`` 的调用点变了：要么新增了一处（要给它加断言），"
             "要么少了一处（这条断言盯错地方了）",
         )
-        self.assertEqual(len(self._edit_call_sites()), 3)
+        self.assertEqual(len(self._edit_call_sites()), 4)
 
     def test_every_call_site_is_inside_a_try_that_catches(self):
         sites = {}

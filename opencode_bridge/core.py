@@ -261,6 +261,10 @@ class BridgeCore:
             lock=self._lock,
             turns=self._turns,
             asking_platform=self.routing.asking_platform,
+            # ⚠️ 删会话时弹掉在跑的那一轮要让读者知道（否则那条 `⏳ 处理中…` 变成
+            # 僵尸气泡，而用户零反馈）⇒ 注入**出站那一条**，它按平台能力决定改写
+            # 占位消息还是补发一句。⛔ 绝不发半截正文（用户 2026-10-07 拍板）。
+            cancel_turn=self.outbound.cancel_turn,
         )
         #: ``/model`` 的全部逻辑（参数解析、模型目录缓存、回复文案）都在这个对象
         #: 里，core 侧只把它当协作者传下去。

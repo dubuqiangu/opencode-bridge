@@ -22,6 +22,7 @@ from opencode_bridge.config import Config
 from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import Turn
+from opencode_bridge.hooks import MsgHandle
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.session_registry import (
     SESSION_TITLE_MAX,
@@ -76,7 +77,17 @@ class SessionRegistryTestCase(unittest.TestCase):
         self.lock = threading.RLock()
         self.turns: dict[str, Turn] = {}
         self.asked: list[str] = []
+        #: 「那一轮被丢弃了」的记录：``(conversation_id, handle, session_id)``。
+        self.cancellations: list[tuple[str, MsgHandle | None, str]] = []
+        self.cancel_error: Exception | None = None
         self.registry = self.build()
+
+    def _record_cancelled_turn(
+        self, conversation_id: str, handle: MsgHandle | None, session_id: str,
+    ) -> None:
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        self.cancellations.append((conversation_id, handle, session_id))
 
     def build(self, **overrides) -> SessionRegistry:
         kwargs = {
@@ -86,6 +97,7 @@ class SessionRegistryTestCase(unittest.TestCase):
             "lock": self.lock,
             "turns": self.turns,
             "asking_platform": self._asking_platform,
+            "cancel_turn": self._record_cancelled_turn,
         }
         kwargs.update(overrides)
         self.registry = SessionRegistry(**kwargs)
@@ -104,12 +116,12 @@ class SessionRegistryTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(SessionRegistryTestCase):
-    def test_the_constructor_takes_the_six_injected_dependencies(self):
+    def test_the_constructor_takes_the_seven_injected_dependencies(self):
         parameters = inspect.signature(SessionRegistry.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "config", "conversation_state", "lock", "turns",
-             "asking_platform"],
+             "asking_platform", "cancel_turn"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -352,6 +364,98 @@ class DropSessionTests(SessionRegistryTestCase):
 
         self.assertEqual(self.client.deleted, [])
         self.assertEqual(self.asked, ["brand:new"])
+
+
+# ----------------------------------------------------------------------
+# 6: 被丢弃的那一轮必须告诉读者（``ora-15`` 确诊的缺陷）
+#
+# ⛔ 这些用例**不**碰文案：文案的判据是"平台那两类各钉一条"，那是
+# ``tests/test_outbound.py`` 的职责。这里钉的是**契约**：有没有在跑的东西被丢掉，
+# 决定要不要说那句话，以及**说什么**（那个占位消息的句柄）。
+# ----------------------------------------------------------------------
+class CancelledTurnAnnouncementTests(SessionRegistryTestCase):
+    def seed_running_turn(
+        self, session_id: str = "ses_0001",
+        handle: MsgHandle | None = None,
+    ) -> str:
+        """种下一条「模型正在回答」的状态：会话已登记、turn 在跑、占位消息已发。"""
+        self.conversation_state.set_session(CONVERSATION, session_id)
+        self.turns[session_id] = Turn(
+            conversation_id=CONVERSATION, progress_handle=handle,
+        )
+        return session_id
+
+    def test_a_running_turn_is_reported_with_its_placeholder_handle(self):
+        """⛔ 缺陷形态下这一条是红的：弹掉 turn 时一句话都不说，读者只看到
+        **一个永远卡在「⏳ 处理中…」的气泡** 加一句「已新建会话 xxx」。"""
+        handle = MsgHandle(CONVERSATION, "m42", PLATFORM)
+        session_id = self.seed_running_turn(handle=handle)
+
+        self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(
+            self.cancellations, [(CONVERSATION, handle, session_id)],
+            "丢掉在跑的一轮却没有告诉读者 —— 占位消息会变成僵尸气泡",
+        )
+
+    def test_a_run_with_no_placeholder_message_is_still_reported(self):
+        """占位消息**发失败**时句柄是 ``None``，而那一轮照样在跑 ⇒ 照样要说。"""
+        session_id = self.seed_running_turn(handle=None)
+
+        self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(self.cancellations, [(CONVERSATION, None, session_id)])
+
+    def test_nothing_is_said_when_the_user_was_running_nothing(self):
+        """⚠️ 用户没在跑任何东西时发 ``/new`` —— 多出来的任何一句都是噪音。"""
+        self.seed_session_for_nothing_running()
+
+        self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(self.cancellations, [])
+
+    def seed_session_for_nothing_running(self) -> str:
+        """只有一条登记好的会话，**没有** turn。"""
+        self.conversation_state.set_session(CONVERSATION, "ses_idle")
+        return "ses_idle"
+
+    def test_a_conversation_with_no_session_says_nothing_either(self):
+        """连会话都没有 ⇒ 没有 turn 可丢 ⇒ 不该有任何一句话（也省掉那次 ``ask``）。"""
+        self.registry.drop_session("brand:new")
+
+        self.assertEqual(self.cancellations, [])
+
+    def test_the_report_is_not_raised_as_a_failure_of_new_itself(self):
+        """⛔ 收尾通道坏了不该让 ``/new`` 本身失败 —— 调用方拿到的仍是那个 id。"""
+        session_id = self.seed_running_turn()
+        self.cancel_error = RuntimeError("the IM platform is on fire")
+
+        with self.assertLogs("opencode_bridge.session_registry", level="ERROR"):
+            returned = self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(returned, session_id)
+        self.assertNotIn(session_id, self.turns,
+                         "收尾失败也不该把 turn 留在表里 —— 会话已经没了")
+
+    def test_the_report_happens_after_the_turn_leaves_the_shared_table(self):
+        """⚠️ 顺序：先弹掉、后说话。反过来会让收尾那一侧以为轮还在跑，
+        而它读的是**同一个** dict。"""
+        handle = MsgHandle(CONVERSATION, "m7", PLATFORM)
+        session_id = self.seed_running_turn(handle=handle)
+        seen_turn_present_during_report: list[bool] = []
+
+        def watching_report(
+            conversation_id: str, handle_arg: MsgHandle | None, dropped: str,
+        ) -> None:
+            seen_turn_present_during_report.append(dropped in self.turns)
+            self.cancellations.append((conversation_id, handle_arg, dropped))
+
+        self.registry = self.build(cancel_turn=watching_report)
+
+        self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(seen_turn_present_during_report, [False],
+                         "报告时那一轮仍在共享表里")
 
 
 if __name__ == "__main__":

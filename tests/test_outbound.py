@@ -14,10 +14,15 @@ from __future__ import annotations
 import inspect
 import unittest
 
-from opencode_bridge.adapters import Adapter
+from opencode_bridge.adapters import Adapter, adapter_class, registered_names
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import MsgHandle, Outbound
-from opencode_bridge.outbound import NO_OUTPUT_TEXT, OutboundSender
+from opencode_bridge.outbound import (
+    CANCELLED_TURN_NOTICE_TEXT,
+    CANCELLED_TURN_TEXT,
+    NO_OUTPUT_TEXT,
+    OutboundSender,
+)
 
 CONVERSATION = "chat:55"
 PLATFORM = "telegram"
@@ -203,6 +208,78 @@ class EditProgressTests(OutboundSenderTestCase):
 
         self.assertFalse(sender.edit_progress(CONVERSATION, self.handle,
                                               "进度", "ses_1"))
+
+
+# ----------------------------------------------------------------------
+# 4b: 被丢弃的一轮 —— 改写占位消息，或退化成补发一句
+#
+# ⛔ **绝不发半截正文**（用户 2026-10-07 明确否掉了那个候选：发 ``/new`` 就是要丢掉
+# 当前上下文，那轮正文是噪音）。⚠️ 判据是**手上有没有一条可改写的消息**，不是平台
+# 名单 —— 那七个不可改写的平台上压根没有占位消息（``send_text`` 的
+# ``kind == "progress"`` 闸门），所以它们的 ``handle`` 恒为 ``None``。
+# ----------------------------------------------------------------------
+class CancelTurnTests(OutboundSenderTestCase):
+    def test_a_platform_that_can_edit_has_its_placeholder_rewritten(self):
+        """支持编辑的六个平台：读者看到的是**同一条**消息，而它不再显示处理中。"""
+        self.sender.cancel_turn(CONVERSATION, self.handle, "ses_1")
+
+        self.assertEqual(len(self.adapter.edited), 1)
+        self.assertEqual(self.adapter.edited[0][0], self.handle)
+        self.assertEqual(self.adapter.edited[0][1].text, CANCELLED_TURN_TEXT)
+        self.assertEqual(self.adapter.edited[0][1].session_id, "ses_1")
+        self.assertEqual(self.adapter.sent, [],
+                         "改写成功就不该再多发一条")
+
+    def test_a_platform_that_cannot_edit_gets_one_separate_notice(self):
+        """不支持编辑的七个平台：手上没有占位消息可改 ⇒ 必须另发一句，
+        否则用户对「刚才那条被丢了」**零反馈**。"""
+        self.sender.cancel_turn(CONVERSATION, None, "ses_1")
+
+        self.assertEqual(self.adapter.edited, [],
+                         "没有句柄就不该去改写任何东西")
+        self.assertEqual(self.texts_of(), [CANCELLED_TURN_NOTICE_TEXT])
+        self.assertEqual(self.kinds_of(), ["text"])
+
+    def test_a_declared_capability_that_still_fails_falls_back_to_the_notice(self):
+        """声明了能力却改不动（部署关掉了 / 客户端不支持 / 网络）⇒ 与 :meth:`finalize`
+        同一条纪律：宁可多一句，也不让读者盯着僵尸气泡猜。"""
+        for outcome in ("false", "boom"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.adapter.edit_result = outcome
+
+                with self.assertLogs("opencode_bridge.outbound", level="WARNING"):
+                    self.sender.cancel_turn(CONVERSATION, self.handle, "ses_1")
+
+                self.assertEqual(self.texts_of(), [CANCELLED_TURN_NOTICE_TEXT])
+
+    def test_no_adapter_warns_instead_of_raising(self):
+        sender = OutboundSender(adapter_for=lambda conversation_id: None,
+                                max_message_chars=4000)
+
+        with self.assertLogs("opencode_bridge.outbound", level="WARNING"):
+            sender.cancel_turn(CONVERSATION, self.handle, "ses_1")
+
+    def test_a_failing_send_does_not_raise(self):
+        self.adapter.send_error = RuntimeError("socket closed")
+
+        with self.assertLogs("opencode_bridge.outbound", level="ERROR"):
+            self.sender.cancel_turn(CONVERSATION, None, "ses_1")
+
+    def test_the_two_adapter_classes_both_exist_among_the_registered_ones(self):
+        """覆盖面守门：钉了支持编辑的那条却**没有**钉不支持编辑的那条，
+        等于只覆盖了 13 个平台里的 6 个 —— 而缺陷正好落在另外 7 个上。"""
+        editable = {
+            name for name in registered_names()
+            if adapter_class(name)({}, None).supports_message_edit
+        }
+
+        self.assertEqual(len(editable), 6,
+                         "可改写的平台数变了：%s" % sorted(editable))
+        self.assertEqual(
+            sorted(set(registered_names()) - editable),
+            ["a2a", "email", "homeassistant", "irc", "ntfy", "qqbot", "twitch"],
+        )
 
 
 # ----------------------------------------------------------------------

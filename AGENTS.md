@@ -213,9 +213,9 @@ telegram `dropped callback from non-whitelisted chat` **零钉** ⇒ **覆盖面
 **事件消费路径：四条已审完，三条已修、`/new` 仍未修**（`ora-15` 复查，⚠️ 至此 telegram /
 `health.py` / `__main__.py` / 13 个适配器的配置面 / 入站投递 / 事件消费 ——
 **本仓库的功能面已全部审过一遍**）：
-· **`/new` 直接 `pop` 掉在跑的 turn 而不 finalize` ⇒ 确定性吞掉半截答复
-（⚠️ `/stop` 走 `interrupt` → 正常 finalize ⇒ **`/stop` 对了、`/new` 没有**）
-⇒ **第 1 类**，未修；
+· **a2a 把「已取消上一条请求。」记成 `TASK_STATE_COMPLETED`** ⇒ **第 1 类**（`fix-293` **新暴露**的：取消通知走 `kind="text"`，而 a2a 只把 `error` 判成 `FAILED`）⇒ 下一步 = 给取消一条独立 kind + 映射到 `STATE_CANCELED`，⚠️ **动前必须先用 AST 或按符号名普查 `out.kind` 的消费者**（编排者上一版普查判据太窄，只命中 2 处）；
+· **占位消息正在飞行中的窄窗 ⇒ `/new` 弹掉 turn 时留下孤儿气泡** ⇒ **第 1 类**（窗口 = 一次 HTTP send；⚠️ **改动前就存在，不是回归**）
+⇒ 而 **`/new` 那条已于 2026-10-07 闭合**（`fix-293`，**修在根上** `SessionRegistry.drop_session`）：**用户拍板「占位消息改成已取消」**、⛔ **明确否掉**「发半截正文」⇒ 结构性保证（`cancel_turn` 拿不到 `turn.parts`）；⚠️ **修在根上的副作用**：`/cd <目录>` 走同一条路 ⇒ 也会说「已取消」（此前静默丢弃）⇒ **用户可见的行为变化，已知情**；
 · **telegram 重试的代价**（`platform-health.json` 的 `failed`
 在进程余下整个生命周期不变 ⇒ **状态视图说坏了、实际在好好工作**）
 ⇒ **第 4 类「代价已知且刻意不做」**，候选处置已列在总表那一行，⛔ 未拍板

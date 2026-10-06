@@ -34,6 +34,7 @@ from .normalize import _clean
 from .split import split_text
 
 __all__ = [
+    "CANCELLED_TURN_KIND",
     "CANCELLED_TURN_NOTICE_TEXT",
     "CANCELLED_TURN_TEXT",
     "OutboundSender",
@@ -59,6 +60,19 @@ CANCELLED_TURN_TEXT = "已取消"
 #: 能改写却**没发出去**占位消息的那六个平台同此理，所以判据是
 #: **"手上有没有一条可改写的消息"**，不是"这个平台在不在名单里"。
 CANCELLED_TURN_NOTICE_TEXT = "已取消上一条请求。"
+
+#: 上面两句随消息带出去的 **:attr:`~opencode_bridge.hooks.Outbound.kind`**。
+#:
+#: 为什么必须独立于 ``"text"`` / ``"error"``：用户 2026-10-07 拍板取消**既不是失败也不是
+#: 完成**。而 ``adapters/a2a.py`` 此前是 ``error -> FAILED else COMPLETED``
+#: ⇒ 取消会落在"其它"那一支，被报成 ``TASK_STATE_COMPLETED``（"agent 正常答完了"），
+#: 而对端刚被告知的那件事恰恰相反。A2A 规范 §4.1.3 为此列了 ``TASK_STATE_CANCELED``，
+#: 于是这里给取消一条独立的 kind，由 :data:`~opencode_bridge.adapters.a2a.
+#: _TASK_STATE_BY_OUTBOUND_KIND` 显式映射。
+#:
+#: ⚠️ **刻意不是 ``"progress"``**：``send_text`` 里那道 ``kind == "progress"`` 闸门会
+#: 在七个改不动的平台上把 progress **直接丢掉**，而这句「已取消」必须真的发出去。
+CANCELLED_TURN_KIND = "cancelled"
 
 #: 按 conversation_id 找出该回哪个适配器（找不到返回 ``None``）。
 AdapterFor = Callable[[str], Optional[Adapter]]
@@ -329,6 +343,12 @@ class OutboundSender:
         那一句，理由与 :meth:`finalize` 里那段"有界残留"同源：宁可多一句，也不让读者
         盯着一个僵尸气泡猜。本方法**绝不抛** —— 收尾通道坏了不该让 ``/new`` 本身失败。
 
+        ⚠️ **两条落点的 ``kind`` 都是 :data:`CANCELLED_TURN_KIND`，不是 ``"text"``**：
+        取消既不是完成也不是失败（用户 2026-10-07 拍板），而 ``adapters/a2a.py`` 靠
+        ``kind`` 决定 A2A 终态 ⇒ 落回 ``"text"`` 会让对端收到 ``TASK_STATE_COMPLETED``。
+        改写那条同样要带：``adapter.edit`` 收的是同一个 ``Outbound``，平台把改写降级成
+        send 时（``adapters/matrix.py`` 就是这么做的）那个 kind 会被**原样转发**。
+
         :param handle: 那一轮的占位消息句柄；``None`` = 没有可改写的消息。
         :param session_id: 被丢弃的那一轮（随消息带出去，供平台侧记账）。
         """
@@ -343,7 +363,7 @@ class OutboundSender:
             out = Outbound(
                 conversation_id=conversation_id,
                 text=CANCELLED_TURN_TEXT,
-                kind="text",
+                kind=CANCELLED_TURN_KIND,
                 session_id=session_id,
             )
             replaced = False
@@ -360,7 +380,8 @@ class OutboundSender:
                 adapter.name,
             )
         self.send_text(
-            conversation_id, CANCELLED_TURN_NOTICE_TEXT, kind="text",
+            conversation_id, CANCELLED_TURN_NOTICE_TEXT,
+            kind=CANCELLED_TURN_KIND,
             adapter=adapter, session_id=session_id,
         )
 

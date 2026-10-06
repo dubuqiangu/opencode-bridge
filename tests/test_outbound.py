@@ -18,6 +18,7 @@ from opencode_bridge.adapters import Adapter, adapter_class, registered_names
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.outbound import (
+    CANCELLED_TURN_KIND,
     CANCELLED_TURN_NOTICE_TEXT,
     CANCELLED_TURN_TEXT,
     NO_OUTPUT_TEXT,
@@ -238,7 +239,38 @@ class CancelTurnTests(OutboundSenderTestCase):
         self.assertEqual(self.adapter.edited, [],
                          "没有句柄就不该去改写任何东西")
         self.assertEqual(self.texts_of(), [CANCELLED_TURN_NOTICE_TEXT])
-        self.assertEqual(self.kinds_of(), ["text"])
+        self.assertEqual(self.kinds_of(), [CANCELLED_TURN_KIND])
+
+    def test_both_landings_carry_the_cancelled_kind_not_text(self):
+        """⚠️ 用户 2026-10-07 拍板：取消**既不是完成也不是失败** ⇒ 独立的 kind。
+
+        ⛔ 落回 ``"text"`` 的后果是可测的：``adapters/a2a.py`` 靠 ``kind`` 选 A2A 终态，
+        ``"text"`` 会让对端收到 ``TASK_STATE_COMPLETED``（"agent 正常答完了"）
+        —— 而用户刚把那一轮丢掉。
+
+        ⚠️ **改写那条也必须带**：``adapter.edit`` 收的是同一个 ``Outbound``，而平台把
+        改写降级成 send 时（``adapters/matrix.py`` 就是这么做的）那个 kind 被**原样
+        转发** ⇒ 只在补发那条带 kind 等于漏掉一半。
+        """
+        self.sender.cancel_turn(CONVERSATION, self.handle, "ses_1")
+        self.sender.cancel_turn(CONVERSATION, None, "ses_2")
+
+        self.assertEqual(
+            [out.kind for _, out in self.adapter.edited] + self.kinds_of(),
+            [CANCELLED_TURN_KIND, CANCELLED_TURN_KIND],
+            "两条落点都必须带 cancelled 而不是 text",
+        )
+
+    def test_the_notice_survives_the_progress_gate_on_a_frozen_platform(self):
+        """⚠️ 这就是取消**不能**用 ``kind="progress"`` 的理由：``send_text`` 里那道
+        ``kind == "progress" and not supports_message_edit`` 闸门会把 progress
+        **直接丢掉**，而七个不可改写的平台上「已取消」必须真的发出去。"""
+        self.adapter.supports_message_edit = False
+
+        self.sender.cancel_turn(CONVERSATION, None, "ses_1")
+
+        self.assertEqual(self.texts_of(), [CANCELLED_TURN_NOTICE_TEXT],
+                         "冻结平台上也必须发出那句「已取消」")
 
     def test_a_declared_capability_that_still_fails_falls_back_to_the_notice(self):
         """声明了能力却改不动（部署关掉了 / 客户端不支持 / 网络）⇒ 与 :meth:`finalize`

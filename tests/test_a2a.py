@@ -24,8 +24,11 @@ HTTP 请求。零 mock，零外网。
 
 from __future__ import annotations
 
+import ast
+import io
 import json
 import logging
+import pathlib
 import socket
 import threading
 import time
@@ -66,6 +69,7 @@ from opencode_bridge.adapters.a2a import (
     STATE_WORKING,
     TERMINAL_STATES,
     A2aAdapter,
+    _TASK_STATE_BY_OUTBOUND_KIND,
     _coerce_port,
     _local_of,
     _parse_peer_tokens,
@@ -74,6 +78,7 @@ from opencode_bridge.adapters.a2a import (
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.httpsrv import HttpRequest, HttpResponse, Route, is_loopback_host
 from opencode_bridge.identity import format_id, platform_of
+from opencode_bridge.outbound import CANCELLED_TURN_KIND, CANCELLED_TURN_NOTICE_TEXT
 
 #: ``stop()`` 的耗时上界（秒）。``HttpServer`` 的 serve 循环轮询间隔是 0.25s，
 #: 所以正常停机应该在 1s 内完成。这里给 2.0s 留足余量，同时**足以抓住**
@@ -194,6 +199,15 @@ def task_of(parsed: dict) -> dict:
     """
     result = parsed["result"]
     return result["task"] if isinstance(result, dict) and "task" in result else result
+
+
+def _package_root() -> pathlib.Path:
+    """``opencode_bridge/`` 包目录 —— 覆盖面守门要扫它下面所有 ``.py``。
+
+    从**已导入的模块**取路径，而不是从 ``__file__`` 往上数层数：后者在测试文件
+    被换目录跑时会指到别处（§7.1「找到的那份不是它」）。
+    """
+    return pathlib.Path(a2a_mod.__file__).resolve().parent.parent
 
 
 def port_is_free(port: int, attempts: int = 60, delay: float = 0.1) -> bool:
@@ -762,6 +776,159 @@ class TestRealRoundTrip(A2aServerTestCase):
         self.assertEqual(
             task_of(got)["artifacts"][0]["parts"][0]["text"], "稍后到达的答复"
         )
+
+
+# ======================================================================
+# 3b. 出站 kind -> A2A 终态（用户 2026-10-07 拍板：取消要有自己的 kind）
+#
+# 缺陷形态是 ``STATE_FAILED if out.kind == "error" else STATE_COMPLETED`` ——
+# **任何没被显式列出的 kind 都被报成"完成"**，于是 ``/new`` 丢掉的那一轮在对端
+# 看起来是"agent 正常答完了"。
+# ======================================================================
+class TestOutboundKindToTaskState(A2aServerTestCase):
+    """``Outbound.kind`` -> A2A 终态。
+
+    缺陷形态是 ``STATE_FAILED if out.kind == "error" else STATE_COMPLETED`` ——
+    **任何没被显式列出的 kind 都被报成"完成"**，于是用户 ``/new`` 丢掉的那一轮在对端
+    看起来是"agent 正常答完了"（用户 2026-10-07 拍板给了 ``cancelled`` 一条独立 kind）。
+
+    ## 同步点，没有一处计时
+
+    一律走 ``returnImmediately=True``（:func:`send_params` 的默认）建 task，再用
+    ``hooks.wait_for_inbound()`` 拿到**那个对端的** ``conversation_id`` —— 那是
+    :meth:`A2aAdapter.send` 按 ``_local_of`` 反查 task 的唯一钥匙，猜不出来。
+    ``wait_for_inbound`` 返回即证明 task 已登记（登记发生在分发**之前**），
+    所以 :meth:`A2aAdapter.send` 一定找得到它 ⇒ 全程零 ``sleep``。
+    """
+
+    def _running_task(self, adapter: "A2aAdapter", hooks: RecordingHooks,
+                      text: str = "跑起来") -> tuple[str, str]:
+        """建一个非终态的 task，返回 ``(task_id, conversation_id)``。"""
+        _, body, _ = rpc(adapter, "SendMessage", send_params(text))
+        task_id = task_of(body)["id"]
+        self.assertEqual(task_of(body)["status"]["state"], STATE_WORKING,
+                         "前提不成立：这个 task 一开始就不是 WORKING")
+        conversation_id = hooks.wait_for_inbound().conversation_id
+        return task_id, conversation_id
+
+    def _task_state(self, adapter: "A2aAdapter", task_id: str) -> tuple[str, dict]:
+        _, body, _ = rpc(adapter, "GetTask", {"id": task_id})
+        task = task_of(body)
+        return task["status"]["state"], task
+
+    def test_a_cancelled_turn_is_reported_as_canceled_never_as_completed(self):
+        """⛔ 缺陷形态下这一条是红的：取消落在"其它"那一支 ⇒ ``COMPLETED``。
+
+        症状 = 「取消被记成 COMPLETED」，⛔ 不是"测试本身坏了"。
+        """
+        adapter, hooks = self.make(RecordingHooks())
+        task_id, conversation_id = self._running_task(adapter, hooks)
+
+        handle = adapter.send(Outbound(conversation_id,
+                                       CANCELLED_TURN_NOTICE_TEXT,
+                                       kind=CANCELLED_TURN_KIND))
+
+        self.assertIsInstance(handle, MsgHandle)
+        state, task = self._task_state(adapter, task_id)
+        self.assertEqual(state, STATE_CANCELED,
+                         "取消被报成了 %r —— 对端会以为 agent 正常答完了" % state)
+        self.assertEqual(task["artifacts"][0]["parts"][0]["text"],
+                         CANCELLED_TURN_NOTICE_TEXT,
+                         "对端拿到的必须是出站那一侧真正发出去的那句")
+
+    def test_each_kind_maps_to_the_state_the_a2a_spec_names(self):
+        """穷举这张表：规范 §4.1.3 的终态名与表里的键一一对上。
+
+        ⚠️ ``progress`` **不在**表里（它不判终态，见 :meth:`A2aAdapter.send` 开头）。
+        这条断言兼作"新增 kind 时要改两处"的强制点：只改 a2a 的表不改这里 ⇒ 红。
+        """
+        self.assertEqual(
+            _TASK_STATE_BY_OUTBOUND_KIND,
+            {"text": STATE_COMPLETED, "final": STATE_COMPLETED,
+             "error": STATE_FAILED, "cancelled": STATE_CANCELED},
+            "kind -> A2A 终态的映射变了：新增 kind 必须同时更新 a2a 的表与本断言",
+        )
+
+    def test_the_cancelled_kind_survives_the_blocking_send_message_path(self):
+        """端到端：core 真实走的那条路（blocking ``SendMessage``）。"""
+        holder: dict[str, A2aAdapter] = {}
+
+        def _cancel(inbound: Inbound) -> None:
+            holder["adapter"].send(
+                Outbound(inbound.conversation_id, CANCELLED_TURN_NOTICE_TEXT,
+                         kind=CANCELLED_TURN_KIND)
+            )
+
+        adapter, _ = self.make(RecordingHooks(_cancel))
+        holder["adapter"] = adapter
+        adapter.reply_timeout = 1.5
+
+        status, body, _ = rpc(adapter, "SendMessage",
+                              send_params("跑起来", immediate=False))
+
+        self.assertEqual(status, 200)
+        self.assertEqual(task_of(body)["status"]["state"], STATE_CANCELED)
+
+    def test_an_unregistered_kind_leaves_the_task_unfinished_and_is_recorded(self):
+        """⛔ 未知 kind **不判终态**（用户 2026-10-07 拍板），只记一次失败。
+
+        缺陷形态（``else STATE_COMPLETED``）下这一条**三处**都红：状态变成 COMPLETED、
+        多出一个 artifact、且**完全没有**任何失败被记下。
+        """
+        adapter, hooks = self.make(RecordingHooks())
+        task_id, conversation_id = self._running_task(adapter, hooks)
+
+        handle = adapter.send(Outbound(conversation_id, "?", kind="没登记过的kind"))
+
+        self.assertIsNone(handle, "未知 kind 不该交回句柄 —— 它没有送达任何东西")
+        self.assertEqual(adapter.last_send_error.value, "bad_format",
+                         "未知 kind 必须被记成失败，--status 靠这个分类")
+        state, task = self._task_state(adapter, task_id)
+        self.assertEqual(state, STATE_WORKING,
+                         "未知 kind 把任务判成了终态 %r" % state)
+        self.assertNotIn("artifacts", task, "未知 kind 不该产出任何 artifact")
+
+    def test_every_kind_the_bridge_can_put_on_a_message_is_registered_here(self):
+        """⚠️ 覆盖面守门（**AST**，不是行级正则 —— 后者匹配不到跨行的实参）。
+
+        判据：把生产代码里真正给 ``Outbound`` / ``self.send_text`` / ``self.finalize``
+        写的 ``kind=<字面量>`` 全收集起来，每一个都必须在
+        ``{"progress"} | set(_TASK_STATE_BY_OUTBOUND_KIND)`` 里。
+
+        ⇒ 新增 kind 却忘了在这里登记时，这一条会红 —— 而不登记的后果是「静默变成
+        COMPLETED」，用户完全看不出来（那正是本缺陷）。
+        """
+        produced: dict[str, list[str]] = {}
+        for path in sorted(_package_root().rglob("*.py")):
+            tree = ast.parse(io.open(path, encoding="utf-8").read(), str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if ast.unparse(node.func) not in ("Outbound", "self.send_text",
+                                                  "self.finalize"):
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg != "kind":
+                        continue
+                    value = keyword.value
+                    if (isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)):
+                        produced.setdefault(value.value, []).append(
+                            "%s:%d" % (path.name, node.lineno))
+
+        self.assertTrue(produced,
+                        "前提不成立：一个 kind 字面量都没扫到 —— 判据坏了")
+        unregistered = sorted(
+            kind for kind in produced
+            if kind != "progress" and kind not in _TASK_STATE_BY_OUTBOUND_KIND
+        )
+        self.assertEqual(
+            unregistered, [],
+            "这些 kind 会落到 a2a 的未知分支（不判终态）：%r"
+            % {kind: produced[kind] for kind in unregistered},
+        )
+        self.assertIn(CANCELLED_TURN_KIND, _TASK_STATE_BY_OUTBOUND_KIND,
+                      "取消的 kind 没有登记 —— 对端会收到 COMPLETED")
 
 
 # ======================================================================

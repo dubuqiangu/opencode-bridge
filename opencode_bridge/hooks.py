@@ -57,7 +57,7 @@ class Outbound:
 
     conversation_id: str
     text: str
-    kind: str = "text"  # "text" | "progress" | "final" | "error"
+    kind: str = "text"  # "text" | "progress" | "final" | "error" | "cancelled"
     buttons: tuple[Button, ...] = field(default_factory=tuple)
     session_id: Optional[str] = None
 

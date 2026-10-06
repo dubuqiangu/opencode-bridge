@@ -148,6 +148,25 @@ TERMINAL_STATES = frozenset(
     {STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED}
 )
 
+#: ``Outbound.kind`` -> 本适配器判定的终态。**穷举**，**刻意不设兜底**
+#: （理由见 :meth:`A2aAdapter.send` 里那段注释）。
+#:
+#: ⛔ ``progress`` **不在**表里：它不是终态 —— 进 :meth:`A2aAdapter.send` 必须先返回
+#: 句柄而**不**碰状态（core 拿那个句柄去改写占位消息），所以它由方法开头那一支处理。
+#: ⇒ 表的键恰好是"会判终态的那些 kind"。
+#:
+#: ⚠️ **新增 kind 时必须在这里加一行**：`tests/test_a2a.py` 里有一条断言把本表的键集
+#: 钉成一个字面集合，而 :mod:`opencode_bridge.outbound` 是唯一发 kind 的地方 ——
+#: 只改一边，那条断言会红并指出缺哪一行（比"静默变成 COMPLETED"好得多）。
+_TASK_STATE_BY_OUTBOUND_KIND = {
+    "text": STATE_COMPLETED,
+    "final": STATE_COMPLETED,
+    "error": STATE_FAILED,
+    #: 用户主动丢弃那一轮（``/new`` / ``/reset`` / ``/cd``）—— 既不是完成也不是失败，
+    #: A2A 规范 §4.1.3 为此列了 ``TASK_STATE_CANCELED``。
+    "cancelled": STATE_CANCELED,
+}
+
 #: ``Message.role``（规范 §4.1.5）。
 ROLE_USER = "ROLE_USER"
 ROLE_AGENT = "ROLE_AGENT"
@@ -1345,8 +1364,13 @@ class A2aAdapter(Adapter):
         * ``progress`` —— **绝不**据此判定任务完成。core 在 ``prompt()`` 返回后会先发
           一条进度占位消息，而本适配器 ``edit()`` 恒 ``False``，所以最终答复一定
           是**另一次** ``send()``。若在这里就完成任务，对端只会收到"处理中…"。
-        * ``error`` -> ``TASK_STATE_FAILED``。
-        * 其它（``text`` / ``final``）-> ``TASK_STATE_COMPLETED``。
+        * 其余走 :data:`_TASK_STATE_BY_OUTBOUND_KIND` 这张**穷举**表：
+          ``text`` / ``final`` -> ``TASK_STATE_COMPLETED``，
+          ``error`` -> ``TASK_STATE_FAILED``，
+          ``cancelled`` -> ``TASK_STATE_CANCELED``（用户主动 ``/new`` 丢掉那一轮）。
+        * ⛔ **表里没有的 kind 一律不判终态**，只记一次 ``bad_format`` 失败。
+          此前这里是 ``STATE_FAILED if out.kind == "error" else STATE_COMPLETED``
+          ⇒ 未知 kind **静默变成"完成"**（用户 2026-10-07 拍板改掉）。
         """
         peer_key = _local_of(out.conversation_id)
         with self._lock:
@@ -1384,7 +1408,34 @@ class A2aAdapter(Adapter):
             )
             return None
 
-        state = STATE_FAILED if out.kind == "error" else STATE_COMPLETED
+        state = _TASK_STATE_BY_OUTBOUND_KIND.get(out.kind)
+        if state is None:
+            # ⚠️ **未知 kind 不判终态，只记账**。
+            # ⚠️ **这一条是【编排者】裁定的，用户没参与** —— 它是一次**行为变更**，
+            # 而「用户拍板」的措辞会让下一个人以为它有用户授权。
+            #
+            # 此前这一行是 ``STATE_FAILED if out.kind == "error" else
+            # STATE_COMPLETED`` ⇒ **任何没被显式列出的 kind 都被报成"完成"**。
+            # 那正是本缺陷的形状：``cancelled`` 落进来时，对端拿到的是一个
+            # ``TASK_STATE_COMPLETED``，即"agent 正常答完了"—— 而用户刚把那一轮丢掉。
+            #
+            # ⛔ 这里**不用** ``raise``：``send`` 是出站通路，一个不认识的 kind
+            # 不该让整条桥崩掉（与 :meth:`~opencode_bridge.outbound.
+            # OutboundSender._record_outcome` 的同一条纪律）。
+            # ⇒ 代价（已知且刻意）：那个 task **留在非终态**，等
+            # ``reply_timeout`` 到点后由超时那一支判 ``STATE_FAILED``
+            # （"did not reply"）。也就是说一个不认识的 kind 从"立刻假成功"变成
+            # "响亮地失败 + ``--status`` 里看得见的 ``bad_format``" —— 这是要的。
+            logger.warning(
+                "a2a: 未知的出站 kind=%r（conversation=%s）—— 不判定任何终态，"
+                "只记失败；新增 kind 时必须登记在 _TASK_STATE_BY_OUTBOUND_KIND",
+                out.kind, out.conversation_id,
+            )
+            self._note_send_failure(
+                SendError.BAD_FORMAT,
+                "unknown outbound kind: %r" % (out.kind,),
+            )
+            return None
         self._finalize(task, state, out.text or "")
         return MsgHandle(out.conversation_id, task.task_id, self.name)
 

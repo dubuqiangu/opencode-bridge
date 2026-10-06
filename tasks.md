@@ -3701,6 +3701,98 @@ app_token · access_token · token ×4 …）⇒ **全部在读取器之外**，
 不如一个显式开关直接。
 ⇒ 但这是配置语义变更，⛔ 不自授权。
 
+## 🔍 §5 债重判定（`exp-68`，2026-10-06）：9 个文件里**只有 1 个该拆**
+
+派单的前提写明「**目标是缩短名单**，`不必拆` 是正当产出」。裁定如下，
+每条都有**反向检验**（搬代码去凑行数会发生什么），而不是「它很大」。
+
+| 文件 | SLOC/物理 | 互不相关的块 | 反向检验命中 | 裁定 |
+|---|---|---|---|---|
+| **`__main__.py`** | 479/727 | **有**（视图渲染 vs 装配起停，~326 行） | 无（**不需转发壳**，仓库已有 `pairing_cli.py` 先例） | ✅ **该拆** |
+| `event_stream.py` | 492/810 | 无（80 行是**事件名常量表** + 承重协议注释） | — | 不必拆 |
+| `telegram.py` | 505/760 | 无 | — | 不必拆 |
+| `httpsrv.py` | 459/787 | 无（数据类型 vs 实现是**同一职责内分层**） | — | 不必拆 |
+| `inbound_gateway.py` | 443/740 | 无（`recover_inbox` **刻意**复用 `_dispatch_prompt`） | 留转发壳 + 无法独立测试 | 不必拆 |
+| `commands.py` | 405/596 | 无（文案块 = `/setup` 的载荷） | — | 不必拆 |
+| `matrix.py` | 393/639 | 无 | — | 不必拆 |
+| `opencode_client.py` | 393/526 | 无（发现函数 = 模块自带纯工具） | 文档占比↑ + **拆完仍 ~448 行超线** | 不必拆 |
+| `ws.py` | 383/563 | 无（三条缝全部咬合私有状态） | 留转发 / 依赖原模块私有状态 | 不必拆 |
+
+### 我的独立复核（三条承重断言，全部成立）
+
+| 它声称 | 我的核实 |
+|---|---|
+| `--status --json` 不输出 JSON | ✅ `main():711` 只把 `args.json` 给 `run_setup`；`:713` `run_status(cfg)` **签名里没有 json 参数** |
+| 那两个文件**没有**协议常量表 | ✅ 各只有 **5 个标量常量**（唯一容器是 `_PERM_DECISIONS`，3 元素元组）⇒ **我在 `AGENTS.md` 里给它们编的理由是假的，已改** |
+| `__main__.py` 该拆 | ✅ B 块 **326 行** / A+C **281 行** / **共享 0 行** / **两边都 <400** / 无未归类顶层定义 |
+
+### ⭐ 最要紧的一条：8 个「不必拆」的债**在 §5.1 的账上，不在 §5 的账上**
+
+`event_stream` / `telegram` / `httpsrv` / `inbound_gateway` / `matrix` /
+`opencode_client` / `ws` / `commands` —— 这 8 个文件里的类**早已全部**列进
+「顶层类超阈值」表（`EventStream` 19/449 · `TelegramAdapter` 24/444 · `HttpServer` 19/281 ·
+`InboundGateway` 12/349 · `MatrixAdapter` 23/329 · `OpenCodeClient` 23/267 ·
+`WebSocketClient` 21/251 · `CommandHandler` 13/262）。
+
+⇒ **拆文件不会让 `WebSocketClient` 少一个方法。** 该动的是**类**，不是文件。
+⇒ 而 `__main__.py` 是这批里**唯一没有超阈值类**的文件 ⇒ 它的债**货真价实是文件级混装**。
+
+⚠️ **所以「按 SLOC 排序拆最大的 9 个」这个做法本身是错的** ——
+**该拆的那个是唯一没有胖类的那个。**
+
+---
+
+## 🔴🔴 实测确认两个 CLI 缺陷（doc 与行为对不上，用户会踩）
+
+### ① 三处文档让用户去读一个**任何 CLI 路径都不输出**的字段
+
+```
+README.md:528        （`--status --json` / `--setup --json` 能直接读到）
+docs/install.md:399  （`--status --json` 可直接读到）
+docs/install.md:411  判据是 `--status --json` 里的 `inbound_accepts_anything`
+```
+
+**核实**：
+- `run_status(cfg)` **签名里没有 json 参数** ⇒ `--status --json` 输出的是**文本表格**
+- `--setup --json` 输出 `{"config_path", "platforms"}`，而 `_platform_status`（198-278）
+  **函数体里不含 `capabilit`**（我用 `ast.unparse` 取全文核过）
+- 实跑（**简配与完整 HA 配置各试一次**）：`--setup --json` 与 `--status` **都没有**该字段
+- `inbound_accepts_anything` 只存在于 `homeassistant.py:530` 的 `capabilities()` 字典；
+  唯一读它的地方是 `__main__.py:410`（`_channel_config_rows`，喂给 `--status` 的文本表格）
+
+⇒ **⚠️ 这是产品判断，我不自授权**：两条修法方向相反 ——
+① **改文档**：删掉那个不存在的判据（用户失去一个排障信号）；
+② **改行为**：让 `--status` 或 `--setup --json` 真的把它吐出来（那是**加功能**，不是修 bug）。
+⇒ 但**当前状态下三处文档是在教用户去找一个不存在的东西**，这比没有文档更坏。
+
+### ② `--config` 被加载路径尊重，却被 JSON 视图忽略
+
+- `main():700` `cfg = Config.load(args.config)` ⇒ **加载确实用了 `--config`**
+- `_config_file_in_use():294-302` **只查 `OPENCODE_BRIDGE_CONFIG` 环境变量与 cwd**，
+  **根本不接收 `args.config`**；它唯一的调用点是 `:285`（`run_setup` 的 `config_path`）
+- 而 `Config.load` 把解析出的 `chosen` 留在**局部变量**里、**没有暴露**给实例
+
+⇒ **实跑撞到**：传 `--config <临时目录>/config.json`，`--setup --json` 报的
+`config_path` 却是**仓库里的 `config.json`**。
+
+**根修方向**（§8 选根治，不选「文档改口」）：让 `Config.load` 把解析后的路径**记在实例上**，
+`_config_file_in_use()` 读它。**否则任何实现都得重新实现一遍搜索链** ——
+而重复实现已经存在（见下）。
+
+---
+
+## 📌 顺带查出三笔跨文件重复（都不是「拆文件」的债）
+
+1. **按会话节流在 11 个适配器里各写一份** ——
+   `_throttle` + `MIN_SEND_INTERVAL` + `_last_send` + `_throttle_lock`
+   （telegram / matrix / slack / discord / mattermost / qqbot / twitch / ntfy /
+   homeassistant / irc / email 各一份）⇒ **共享工具缺失**，不是某个文件的内部混装。
+2. **同一条 C4 不变量有两份实现** ——
+   `commands._apply_permission_decision` 与 `inbound_gateway.on_callback` 的 `perm:` 分支
+   ⇒ 共享的是账本，被复制的是**投递序列**。
+3. **`commands._config_path_hint` 与 `__main__._config_file_in_use` 是同一套搜索链的两份实现**
+   ⇒ 与上面缺陷②同源。
+
 ## 📋 待办：拆 `tests/test_nick_in_allowlist.py`（746 行，方案已量好，**别让执行者发明边界**）
 
 `AGENTS.md` §5.0 实测：**746 物理行 / SLOC 495 / 文档 34%** ⇒ 不满足豁免（文档需 >45%）

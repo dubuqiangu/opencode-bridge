@@ -73,8 +73,12 @@ PLATFORM_STATUS_KEYS_BEFORE_OUTBOUND_FIELD = {
     "last_start_probe",
 }
 
-#: 四档 verdict —— 硬编码。⛔ 不要对着 ``health.VERDICTS`` 算期望值（那恒真）。
-EXPECTED_VERDICTS = ("ok", "failed", "skipped", "not_started")
+#: 五档 verdict —— 硬编码。⛔ 不要对着 ``health.VERDICTS`` 算期望值（那恒真）。
+#: ⚠️ **顺序也是契约**：``bridge_setup`` 按**值**断言，而本仓库这条按**序**断言 ——
+#: 所以新增一档必须**追加在末尾**，插在中间会把一次纯新增看成一串改写。
+#: 第五档 ``does_not_probe`` 是 2026-10-06 加的（「本平台压根没有启动期凭据探测这个动作」），
+#: 与 ``skipped`` 的区别是承重的：``skipped`` 说的是「你没配东西」，它说的是「这里没这个动作」。
+EXPECTED_VERDICTS = ("ok", "failed", "skipped", "not_started", "does_not_probe")
 
 
 class ScriptedAdapter(Adapter):
@@ -624,17 +628,21 @@ class SetupJsonContract(RecorderInstalled):
 # ⑥ 既有四档 verdict 一个都没被改
 # ======================================================================
 class ExistingVerdictsUntouched(unittest.TestCase):
-    def test_the_four_verdict_values_are_exactly_these_four_strings(self):
+    def test_the_verdict_values_are_exactly_these_five_strings(self):
         """⚠️ 硬编码期望，⛔ 不要对着 ``health.VERDICTS`` 算（那恒真）。
 
         ``bridge_setup`` 按**值**断言 ``--setup --json`` 的现有取值，所以改一个
         字符串（哪怕只是大小写）都可能打掉别人的判据，而本仓库不会有任何测试变红。
+
+        ⚠️ 第五档 ``does_not_probe``（2026-10-06）：它是**新增**的取值，
+        既有四档的字符串一个都没动 —— 下面那五条断言就是这句话的机械保证。
         """
         self.assertEqual(health.VERDICTS, EXPECTED_VERDICTS)
         self.assertEqual(health.VERDICT_OK, "ok")
         self.assertEqual(health.VERDICT_FAILED, "failed")
         self.assertEqual(health.VERDICT_SKIPPED, "skipped")
         self.assertEqual(health.VERDICT_NOT_STARTED, "not_started")
+        self.assertEqual(health.VERDICT_DOES_NOT_PROBE, "does_not_probe")
 
     def test_each_verdict_still_normalises_to_itself(self):
         for verdict in EXPECTED_VERDICTS:

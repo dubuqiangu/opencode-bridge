@@ -55,6 +55,35 @@ VERDICTS_BEFORE_REFUSAL_VERDICT = {"ok", "failed", "skipped"}
 #: 同样硬编码：这一条同时挡住「顺手又加一档」与「悄悄改掉某个字面量」。
 VERDICTS_AFTER_REFUSAL_VERDICT = {"ok", "failed", "skipped", "not_started"}
 
+#: 又加了 :data:`~opencode_bridge.health.VERDICT_DOES_NOT_PROBE`（「本平台压根没有
+#: 启动期凭据探测这个动作」）**之后**的取值集合。⚠️ 硬编码，⛔ 不许对着实现算。
+#: ⚠️ 「加第四档」那条的历史快照（上面那份）**一个字没动** —— 它记的是**那一批**做过的
+#: 事，删掉它等于把"当时为什么只有四档"的证据擦掉。
+VERDICTS_AFTER_UNPROBED_VERDICT = {
+    "ok", "failed", "skipped", "not_started", "does_not_probe",
+}
+
+#: ``health.VERDICTS`` 的**有序**序列。⚠️ 顺序也是契约的一部分：外部护栏
+#: ``tests/test_outbound_failure_channel.py`` 的 ``EXPECTED_VERDICTS`` 按**序**断言它
+#: ⇒ 把新档插在中间会让那条护栏的 diff 变成"重排"，把一次纯新增看成一串改写。
+VERDICTS_IN_ORDER = ("ok", "failed", "skipped", "not_started", "does_not_probe")
+
+#: 既有四档各自渲染出来的**逐字**文案，以及喂给
+#: :func:`~opencode_bridge.health.describe_verdict` 的那条结论的**实参**。
+#: ⛔ 硬编码成字面量，⛔ **不许**对着实现算：措辞也是既有对外表现的一部分，
+#: 而 ``--status`` 逐行拼的就是它 —— 改一个都可能打掉别人的判据。
+WORDING_OF_EACH_EXISTING_VERDICT = {
+    "ok": ({"verdict": "ok", "detail": "getMe 通过"}, "正常"),
+    "skipped": ({"verdict": "skipped", "detail": "没东西可验"}, "未探测 —— 没东西可验"),
+    "not_started": (
+        {"verdict": "not_started", "detail": "预检未通过"}, "桥未启动 —— 预检未通过",
+    ),
+    "failed": (
+        {"verdict": "failed", "code": 401, "detail": "Unauthorized"},
+        "失败（code=401）—— Unauthorized",
+    ),
+}
+
 
 class _RefusalHarness(unittest.TestCase):
     """把 ``_bridge_dir`` 钉在 :meth:`tempfile.TemporaryDirectory` 上（默认在 ``.tmp/``）。
@@ -238,6 +267,23 @@ class TestPreflightRefusalIsRecorded(_RefusalHarness):
         # 模板里 13 个平台全都没配 ⇒ 每一条都必须有记录，且**没有一条是 ok**
         self.assertEqual(len(self.verdicts_on_disk()), len(template["adapters"]))
         self.assertNotIn("ok", self.verdicts_on_disk().values())
+
+    def test_no_refusal_entry_is_ever_recorded_as_does_not_probe(self):
+        """⚠️ 「不做探测」那一档 ⛔ 不许出现在拒绝启动的那份记录里。
+
+        那条路上**一个适配器都没 attach 上去** ⇒ "本平台压根没有启动期凭据探测
+        这个动作"这个说法在这里是**编造**的：真实原因是"桥压根没起来"。
+        ⇒ 每一条都必须是 :data:`~opencode_bridge.health.VERDICT_NOT_STARTED`。
+        """
+        cfg = self.refusal_config()
+        self.run_refused_bridge(cfg)
+        verdicts = self.verdicts_on_disk()
+        self.assertNotIn(
+            health.VERDICT_DOES_NOT_PROBE, verdicts.values(),
+            "拒绝启动的那份记录里混进了「不做探测」—— 它把「桥没起来」说成了"
+            "「这个平台没有这个动作」，用户会去改一个压根没坏的配置",
+        )
+        self.assertEqual(set(verdicts.values()), {health.VERDICT_NOT_STARTED})
 
 
 class TestNoUsableAdapterRefusalIsRecorded(_RefusalHarness):
@@ -527,9 +573,30 @@ class TestTheVerdictVocabularyOnlyGrew(unittest.TestCase):
             % sorted(VERDICTS_BEFORE_REFUSAL_VERDICT - set(health.VERDICTS)),
         )
 
-    def test_the_value_set_is_exactly_four_named_verdicts(self):
-        """⛔ 硬编码断言：**不许**对着实现算（那恒真）。"""
-        self.assertEqual(set(health.VERDICTS), VERDICTS_AFTER_REFUSAL_VERDICT)
+    def test_the_value_set_is_exactly_these_five_named_verdicts(self):
+        """⛔ 硬编码断言：**不许**对着实现算（那恒真）。
+
+        ⚠️ 这一条同时挡住「顺手又加一档」与「悄悄改掉某个字面量」——
+        所以后来加 :data:`~opencode_bridge.health.VERDICT_DOES_NOT_PROBE` 时，
+        它是**照着这份硬编码扩到五档**的，而上面那份「加第四档之前」的快照没动。
+        """
+        self.assertEqual(set(health.VERDICTS), VERDICTS_AFTER_UNPROBED_VERDICT)
+
+    def test_the_new_value_is_appended_rather_than_inserted_in_the_middle(self):
+        """⚠️ **顺序**也是外部契约：``tests/test_outbound_failure_channel.py`` 的
+        ``EXPECTED_VERDICTS`` 按**序**断言 ``health.VERDICTS``。
+
+        ⇒ 新档必须**追加在末尾**：插在中间会把那边的 diff 变成"重排"，
+        把一次纯新增看成一串改写（而那份护栏本仓库改不动 —— 见交付报告里的欠账）。
+        """
+        self.assertEqual(health.VERDICTS, VERDICTS_IN_ORDER)
+
+    def test_the_four_existing_values_all_survived(self):
+        """⛔ 「四档一个都没被改」的那一半：取值**都还在**。"""
+        self.assertTrue(
+            VERDICTS_AFTER_REFUSAL_VERDICT <= set(health.VERDICTS),
+            "既有四档少了 %s" % sorted(VERDICTS_AFTER_REFUSAL_VERDICT - set(health.VERDICTS)),
+        )
 
     def test_the_three_existing_values_survive_normalisation(self):
         for verdict in sorted(VERDICTS_BEFORE_REFUSAL_VERDICT):
@@ -538,19 +605,19 @@ class TestTheVerdictVocabularyOnlyGrew(unittest.TestCase):
                 self.assertEqual(entry["verdict"], verdict)
                 self.assertEqual(entry["detail"], "原文")
 
-    def test_the_three_existing_values_keep_their_wording(self):
-        """措辞也是既有对外表现的一部分：``--status`` 逐行拼的就是它。"""
-        self.assertEqual(
-            health.describe_verdict({"verdict": "ok", "detail": "getMe 通过"}), "正常"
-        )
-        self.assertEqual(
-            health.describe_verdict({"verdict": "skipped", "detail": "没东西可验"}),
-            "未探测 —— 没东西可验",
-        )
-        self.assertEqual(
-            health.describe_verdict({"verdict": "failed", "code": 401, "detail": "Unauthorized"}),
-            "失败（code=401）—— Unauthorized",
-        )
+    def test_no_existing_verdict_wording_was_touched(self):
+        """⛔ **四档**的措辞一条都没变（硬编码，逐档比）。
+
+        ⚠️ 这一条**替掉了**原来的 :meth:`test_the_three_existing_values_keep_their_wording`：
+        同样的三条逐字断言一个字没少，而 :data:`WORDING_OF_EACH_EXISTING_VERDICT` 那张
+        硬编码表还多钉了一条 —— ``not_started`` 的措辞。那一档是上一批加的，
+        而"再加一档时别把上一批的措辞蹭掉"这件事从来没被断言过：
+        只盯最初三档的话，第四档可以被无声改掉。
+        ⛔ 期望值**不许**对着实现算。
+        """
+        for verdict, (entry, expected) in sorted(WORDING_OF_EACH_EXISTING_VERDICT.items()):
+            with self.subTest(verdict=verdict):
+                self.assertEqual(health.describe_verdict(entry), expected)
 
     def test_the_new_value_names_the_bridge_not_the_platform(self):
         """新档的措辞必须**自带**「桥没起来」这个主语，不能靠 detail 解释。"""
@@ -560,6 +627,28 @@ class TestTheVerdictVocabularyOnlyGrew(unittest.TestCase):
         self.assertEqual(rendered, "桥未启动 —— 预检未通过")
         self.assertEqual(health.describe_verdict({"verdict": health.VERDICT_NOT_STARTED}),
                          "桥未启动")
+
+    def test_the_unprobed_verdict_never_borrows_another_verdicts_wording(self):
+        """⚠️ 「不做探测」⛔ 不许说成 ``skipped``，也不许说成 ``not_started``。
+
+        两者都答"这个平台能不能用"，但排查方向**相反**：``skipped`` 说的是
+        「没有可探测的凭据」（去补配置），这一档说的是「压根没有这个动作」
+        （去看这条通道支持了哪些平台）。混用会把用户引到并不存在的缺失上去。
+        """
+        rendered = health.describe_verdict(health.normalize_verdict(
+            health.VERDICT_DOES_NOT_PROBE, detail=health.DOES_NOT_PROBE_DETAIL,
+        ))
+        for misleading in ("没有可探测的凭据", "未探测", "桥未启动"):
+            with self.subTest(word=misleading):
+                self.assertNotIn(misleading, rendered)
+        for other in (health.VERDICT_SKIPPED, health.VERDICT_NOT_STARTED):
+            with self.subTest(other=other):
+                self.assertNotEqual(
+                    rendered,
+                    health.describe_verdict(
+                        {"verdict": other, "detail": health.DOES_NOT_PROBE_DETAIL}
+                    ),
+                )
 
     def test_bridge_refusal_probes_shapes_one_entry_per_platform(self):
         """落盘形态：每个平台一条 not_started，各带**自己**那条原因。"""

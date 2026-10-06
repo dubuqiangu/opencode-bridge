@@ -25,21 +25,28 @@
 ::
 
     {"recorded_at": <epoch float>,
-     "platforms": {"<平台键>": {"verdict": "ok"|"failed"|"skipped"|"not_started",
+     "platforms": {"<平台键>": {"verdict": "ok"|"failed"|"skipped"|"not_started"
+                               |"does_not_probe",
                                "code": <int|str|省略>,
                                "detail": "<脱敏后的一行>"}}}
 
-**四档 verdict**（:data:`VERDICT_OK` / :data:`VERDICT_FAILED` /
-:data:`VERDICT_SKIPPED` / :data:`VERDICT_NOT_STARTED`）：
+**五档 verdict**（:data:`VERDICT_OK` / :data:`VERDICT_FAILED` /
+:data:`VERDICT_SKIPPED` / :data:`VERDICT_NOT_STARTED` /
+:data:`VERDICT_DOES_NOT_PROBE`）：
 
 * ``ok`` —— 探测通过（Telegram 的 ``getMe`` 返回 ``ok``）。
 * ``failed`` —— 探测失败，且**平台给了原因**（Telegram 的 ``error_code`` /
   ``description``）或传输层压根没拿到状态码。
-* ``skipped`` —— **这个平台压根没探测**（连要验的东西都没有，比如 bot_token 没填）。
+* ``skipped`` —— 适配器**试过了**，但**没有可探测的凭据**（比如 bot_token 没填）。
   ⛔ 它**不是** ``ok``：状态视图必须能把"没验"与"验过了、没问题"分开说，
   否则"没验"就会被读成"没问题"。
+  ⚠️ 措辞刻意从"压根没探测"改成"**没有可探测的凭据**"：现在的
+  :data:`VERDICT_DOES_NOT_PROBE` 说的才是"压根没探测"，而两者的**排查方向完全相反**
+  （见下面「第四态：不做探测」）。``--status`` 上渲染出来的**那一句一个字没改**。
 * ``not_started`` —— **桥这一轮压根没起来**（配置里没有任何可用适配器），
   于是**一条探测都没发生过**。见下面「拒绝启动也要落一条结论」。
+* ``does_not_probe`` —— **本平台压根没有「启动期凭据探测」这个动作**。
+  见下面「第四态：不做探测」。
 
 ⚠️ **没有记录 ≠ 成功**：读不到文件、或某个平台不在 ``platforms`` 里，返回的
 都是 ``None`` —— 调用方必须把它显示成"无记录"，而**不是**"正常"。
@@ -66,6 +73,37 @@
 ⛔ 既有三档**一个字没改**（只是多了一档）：仓库外的 ``bridge_setup`` 按**值**
 断言现有取值。
 
+第四态：不做探测
+================
+
+⚠️ **缺陷**（实测）：``Adapter.report_startup_probe`` 的**生产调用方只有**
+:mod:`opencode_bridge.adapters.telegram`（``getMe``）。⇒ 其余平台**永远不往
+``platforms`` 里写条目**，于是一个用 slack / matrix 的用户在 ``--status`` 与
+``--setup --json`` 上看到的恒是「无记录」/ ``null`` —— 而那一段的措辞是
+**通用**的 ⇒ **他分不清**是「我的配置坏了」还是「这个平台压根不上报」。
+
+⇒ 而「让其余平台也去探测」是**否掉的**：那不是补判据，是**新增十几处网络调用**
+（启动变慢、多一批失败模式、每家的凭据有效性语义还不一样），而 ``a2a``
+**压根没有凭据**（它是被调方），对它探测无意义。更要紧的是
+⚛️ **「构造成功」≠「凭据有效」** —— 只有 telegram 知道这件事，因为只有它会调
+``getMe``；给别家编一个「ok」就是**伪造观测**。
+
+⇒ 所以这一档说的是**关于本平台的一件事实**（它没有这个动作），**不是**一条探测
+结论：:func:`add_platforms_without_startup_probe` 由「**已 attach 却没上报**」
+反推出来 —— **推导，不是名单**（见该函数 docstring）。⛔ 它**不产生任何网络请求**。
+
+⛔ **不许复用 ``skipped``**：那一档的语义是「**没有可探测的凭据**」，也就是
+"**你少配了东西**"。拿它说「压根不探测」会把用户引到一个**并不存在**的缺失上去
+—— 而那正是本模块要消灭的那类误导（信息产生出来了，却被说成了另一件事）。
+⚛️ 也**不许**复用 ``not_started``：那一档答的是「**这一轮压根没有桥在跑**」，
+与「这个平台不探测」是**不同的轴**（一个是桥，一个是适配器），混用会让用户
+去看配置有没有适配器 —— 而他配得好好的。
+
+⚛️ 与上一段那句「没有记录 ≠ 成功」的关系：这一档让「**这个平台压根不上报**」
+在盘上**有**一条可读的条目，而不再退化成「无记录」。⚠️ 反过来，「记录里没有某个
+平台」仍然是「没有记录」——它可能是配置里构造失败被 ``continue`` 掉的平台，也可能是
+上一轮（更早的实现）写下的文件，**都不许**被读成「正常」。
+
 安全红线
 ========
 
@@ -83,8 +121,13 @@ Telegram 的 ``description`` 是平台回的自由文本 —— 它**可能**带
 说法直接矛盾（用户会拿三天前的成功去推断今天）。整份替换的语义只有一句话：
 **盘上这份 = 最近一次启动的全部结论**，没有别的。
 
-⚠️ 一次启动里**没有任何适配器探测**（比如只配了 irc）也会写一份空的
-``platforms`` —— 这是对的：那正是"这次启动什么也没验到"这个事实。
+⚠️ 一次启动里**没有任何适配器探测**（比如只配了 irc）现在也会写出一条记录 ——
+:data:`VERDICT_DOES_NOT_PROBE`（由 :func:`add_platforms_without_startup_probe` 在
+**落盘之前**补上，:func:`record_startup_probes` 自己仍然只是个"照写"的函数）。
+这比"写一份空的 ``platforms``"好：那正是"这个平台压根不上报"这个事实，
+而空清单只会让用户在 ``--status`` 上看到一片「无记录」，分不出原因。
+⇒ 补全之后，"盘上这份 = **每个已 attach 平台各自的一条**结论" —— 不再有
+"启动成功却一个平台都没记"这种形态。
 
 出站失败为什么**另开一份文件**
 ============================
@@ -124,15 +167,18 @@ from .pairing_cli import write_config_atomically
 from .redaction import default_redactor
 
 __all__ = [
+    "DOES_NOT_PROBE_DETAIL",
     "NO_OUTBOUND_FAILURE_TEXT",
     "OUTBOUND_FAILURES_FILE_NAME",
     "PLATFORM_HEALTH_FILE_NAME",
     "VERDICT_OK",
     "VERDICT_FAILED",
     "VERDICT_SKIPPED",
+    "VERDICT_DOES_NOT_PROBE",
     "VERDICT_NOT_STARTED",
     "VERDICTS",
     "OutboundFailureRecorder",
+    "add_platforms_without_startup_probe",
     "bridge_refusal_probes",
     "describe_outbound_failure",
     "describe_verdict",
@@ -177,14 +223,35 @@ NO_OUTBOUND_FAILURE_TEXT = (
 #: 绝不当成"没有原因"。
 _KNOWN_SEND_ERRORS = frozenset(item.value for item in SendError)
 
-#: 四档 verdict。名字用完整单词而不是 ``OK`` / ``FAIL`` —— 见名知意。
+#: 五档 verdict。名字用完整单词而不是 ``OK`` / ``FAIL`` —— 见名知意。
 #: ⚠️ :data:`VERDICT_NOT_STARTED` 答的是**桥**（这一轮压根没起来），
-#: 而前三档答的是**某个适配器** —— 混用会把用户引到错的方向上（见模块 docstring）。
+#: 而其余四档答的是**某个适配器** —— 混用会把用户引到错的方向上（见模块 docstring）。
 VERDICT_OK = "ok"
 VERDICT_FAILED = "failed"
 VERDICT_SKIPPED = "skipped"
+VERDICT_DOES_NOT_PROBE = "does_not_probe"
 VERDICT_NOT_STARTED = "not_started"
-VERDICTS = (VERDICT_OK, VERDICT_FAILED, VERDICT_SKIPPED, VERDICT_NOT_STARTED)
+VERDICTS = (
+    VERDICT_OK,
+    VERDICT_FAILED,
+    VERDICT_SKIPPED,
+    VERDICT_NOT_STARTED,
+    # ⚠️ **追加在末尾**，不插在中间：这是一份**有序**的取值序列，而外部护栏
+    # （``tests/test_outbound_failure_channel.py`` 的 ``EXPECTED_VERDICTS``）按**序**
+    # 断言它 ⇒ 插在中间会让那条护栏的 diff 变成"重排"，把一次纯新增看成一串改写。
+    VERDICT_DOES_NOT_PROBE,
+)
+
+#: 「**这个平台压根没有「启动期凭据探测」这个动作**」这一档的 ``detail``
+#: （:func:`add_platforms_without_startup_probe` 落的那一条用的就是它）。
+#:
+#: ⛔ **它绝不许暗示"你少配了东西"** —— 那正是 :data:`VERDICT_SKIPPED` 的语义，
+#: 而这一档说的是"这里压根没有这个动作"。用户读到它该做的事是"去看这条通道支持了
+#: 哪些平台"，**不是**"去补 token"。
+#:
+#: ⚠️ 末尾那半句（"构造成功不等于凭据有效"）是**承重**的：少了它，"不探测"很容易
+#: 被读成"所以这里没问题" —— 而那恰恰是**伪造观测**：``a2a`` 构造成功也照样可能收不到。
+DOES_NOT_PROBE_DETAIL = "本平台没有「启动期凭据探测」这个动作（构造成功不等于凭据有效）"
 
 #: ``detail`` 是**一行**说明（:attr:`~opencode_bridge.adapters.base.Adapter.startup_verdict`
 #: 的 ``detail`` 键）。上限截断的理由：Telegram 的 ``description`` 由服务端决定
@@ -267,6 +334,12 @@ def describe_verdict(entry: Mapping) -> str:
         # 「这个平台没验」，而这一行说的是「这一轮压根没有桥在跑」。
         # 两者指向的排查方向完全不同（前者去看凭据，后者去看配置有没有适配器）。
         return f"桥未启动 —— {detail}" if detail else "桥未启动"
+    if verdict == VERDICT_DOES_NOT_PROBE:
+        # ⚠️ 主语必须是「**本平台**」而不是「探测」：``skipped`` 渲染成「未探测」，
+        # 而「未探测」会被读成"试过了但没东西可验" ⇒ 用户去补 token。
+        # ⛔ 措辞里不许出现「没有可探测的凭据」「未探测」这类词（那属于 skipped），
+        # 也不许出现「桥未启动」（那属于 not_started，是另一根轴）。
+        return f"不探测 —— {detail}" if detail else "不探测"
     code = (entry or {}).get("code")
     # 没有平台错误码时**不硬凑一个括号**，而是留一个空格 ——
     # ``失败 —— <detail>`` 比 ``失败（无错误码）—— <detail>`` 短，
@@ -349,6 +422,48 @@ def bridge_refusal_probes(reason: str, platform_reasons: Mapping[str, str]) -> d
         }
         for key, text in (platform_reasons or {}).items()
     }
+
+
+def add_platforms_without_startup_probe(
+    probes: Optional[Mapping], platform_keys: Iterable[str]
+) -> dict:
+    """把「已 attach 却没上报任何探测」的那些平台补成 :data:`VERDICT_DOES_NOT_PROBE`。
+
+    :param probes: 这一轮**真的**探测结论（``core.startup_probes`` 收拢的那份）。
+    :param platform_keys: 这一轮**真的 attach 上去了**的平台键（调用方在构造循环里
+        记的，与 :func:`platform_key` 同源 —— 必须是**同一个**来源，否则集合相减
+        会把"探测过的"误当成"没探测的"）。
+    :return: **新**的 ``{平台键: 结论}``，可直接交给 :func:`record_startup_probes`。
+        已有条目**原样保留、绝不覆盖**。
+
+    ## 为什么是**推导**而不是名单
+
+    ⚠️ 硬编码「哪几个平台不做探测」会**在新增第 14 个平台那天静默漏掉它** ——
+    而漏掉的形态正是本函数要消灭的那个缺陷（用户又看到一片「无记录」）。
+    ⇒ 这里用的是**集合相减**：``attach 过`` 减 ``上报过``。
+    **新增平台不需要改这里一行**：它 attach 上来又没上报，就自动得到这一档。
+
+    ⚛️ **只做相减，不做判断**：本函数**不联网、不构造适配器、不问任何平台的 API**
+    —— 它只知道"有没有人上报过"，而"凭据有效吗"只有平台能回答，
+    替他编一个 ``ok`` 就是**伪造观测**（模块 docstring「第四态：不做探测」）。
+
+    ⛔ **绝不用 :data:`VERDICT_SKIPPED` 代替**：那一档说的是「**没有可探测的凭据**」，
+    拿它说「压根不探测」会把用户引到一个并不存在的缺失上去。
+    ⚛️ 也**绝不用 :data:`VERDICT_NOT_STARTED`**：那一档答的是"**桥**没起来"，
+    那是另一根轴（此刻桥正在跑）。
+
+    ⚠️ ``probes`` 里**不在** ``platform_keys`` 里的键（鸭子类型替身、历史上报过的
+    平台）**原样留着**：宁可多一条真实的观测，也不因为"名单里没有"就把它丢掉。
+    """
+    completed: dict = {}
+    for key in platform_keys or ():
+        completed[str(key)] = {
+            "verdict": VERDICT_DOES_NOT_PROBE,
+            "detail": DOES_NOT_PROBE_DETAIL,
+        }
+    for key, entry in (probes or {}).items():
+        completed[str(key)] = entry
+    return completed
 
 
 def record_startup_probes(bridge_dir: str, probes: Mapping) -> Optional[str]:

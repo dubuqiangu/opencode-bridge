@@ -46,6 +46,10 @@ SHAPE_TOKEN = "123456789" + ":" + _TOKEN_BODY
 #: 同一个形状规则的 ``re``，同样**拼接**而成（AGENTS.md §2.4）。
 _TOKEN_SHAPE = re.compile(r"\d{8,10}:" + r"[A-Za-z0-9_-]{35}")
 
+#: **缺陷现场**：这一轮**只有 telegram** 上报了探测结论（生产代码里只有它会调
+#: ``getMe``）⇒ 其余平台在 ``core.startup_probes`` 里压根没有条目。
+ONLY_TELEGRAM_PROBE = {"telegram": {"verdict": "ok", "detail": "getMe 通过"}}
+
 #: ``_platform_status`` 改动**之前**的 key 集合 —— 硬编码成字面量（不是对着
 #: 实现算一遍）：它是一道**防"顺手清理"**的护栏，而对着实现算就恒真了。
 #: 仓库外的消费者（``bridge_setup``）按**值**断言这些字段，我们读不到它的源码，
@@ -339,6 +343,397 @@ class TestCoreCollectsEveryAdapter(_BridgeDirIsolated):
         self.assertEqual(core.startup_probes, {})
         self.assertIsNone(
             health.probe_from_record(core.startup_probes, "quietplatform")
+        )
+
+
+# ======================================================================
+# 「不做探测」这一档（``does_not_probe``）：桥**成功启动**时补上
+# ======================================================================
+class _RunBridgeWithStubCore:
+    """跑**真的** ``cli.run_bridge``，只把网络 / 构造 / 线程换成替身。
+
+    ⚠️ 为什么不用「直接调那个新函数」的单元测试代替：这条判据的落点是
+    **生产代码那条路**（``_run_bridge_locked`` 里的 attach 循环 + 落盘），
+    而缺陷正是「生产路上没人补」。⇒ 替身刻意**最小**（不给真事件流、不给真适配器）。
+    """
+
+    class _QuietDiagnostics:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def install(self) -> None:
+            return None
+
+        def record(self, *args, **kwargs) -> None:
+            return None
+
+        def dump_stacks(self, *args, **kwargs) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _PermissiveLock:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def acquire(self):
+            return True, 0
+
+        def release(self) -> None:
+            return None
+
+    class _StopImmediately:
+        def wait(self, timeout=None) -> bool:
+            return True
+
+        def set(self) -> None:
+            return None
+
+    @staticmethod
+    def stub_core_class(startup_probes: dict) -> type:
+        """一个只带 ``startup_probes`` 的 core 替身（**别的属性一律不给**）。"""
+
+        class _StubCore:
+            def __init__(self, *args, **kwargs) -> None:
+                self.startup_probes = dict(startup_probes)
+
+            def attach(self, adapter) -> None:
+                return None
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+        return _StubCore
+
+    def run_bridge_reporting(self, cfg: Config, startup_probes: dict) -> int:
+        """跑一遍桥；``startup_probes`` 是 core 收拢到的那份（可为空）。"""
+        from opencode_bridge.opencode_client import Endpoint
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                cli, "discover_endpoint",
+                return_value=Endpoint("http://127.0.0.1:4096", "pw"),
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "OpenCodeClient",
+                lambda endpoint: types.SimpleNamespace(close=lambda: None),
+            ))
+            # 构造出来的适配器**只上报不出声**：``report_startup_probe`` 的生产
+            # 调用方只有 telegram，而它会真的调 ``getMe``（本用例绝不联网）。
+            stack.enter_context(mock.patch.object(
+                cli, "build",
+                lambda name, entry, hooks: types.SimpleNamespace(
+                    name=name, bot_token="token-not-real",
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "BridgeCore", self.stub_core_class(startup_probes),
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "ProcessDiagnostics", self._QuietDiagnostics,
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "InstanceLock", self._PermissiveLock,
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "_bridge_dir", lambda: self.bridge_dir,
+            ))
+            stack.enter_context(mock.patch.object(
+                cli, "threading",
+                types.SimpleNamespace(Event=lambda: self._StopImmediately()),
+            ))
+            with contextlib.redirect_stdout(io.StringIO()):
+                return cli.run_bridge(cfg)
+
+
+class TestPlatformsThatNeverProbeGetTheirOwnRecord(_RunBridgeWithStubCore,
+                                                   _BridgeDirIsolated):
+    """④ 「不做探测」这一档的落点：桥**成功启动**时每个 attach 上的平台都有一条。
+
+    ⚠️ 缺陷的形状（实测）：``Adapter.report_startup_probe`` 的**生产调用方只有**
+    telegram（只有它会调 ``getMe``）⇒ 其余平台压根不往 ``platforms`` 里写条目 ⇒
+    ``--status`` 上恒为「无记录」，而那一段措辞是**通用**的 ⇒ 用户**分不清**是
+    「我的配置坏了」还是「这个平台压根不上报」。
+    """
+
+    #: 只有 telegram 会上报 —— 这正是缺陷现场。
+    ONLY_TELEGRAM_REPORTED = ONLY_TELEGRAM_PROBE
+
+    def configured(self) -> Config:
+        return Config(adapters={
+            "telegram": {"bot_token": SHAPE_TOKEN},
+            "slack": {"bot_token": "token-not-real", "app_token": "xapp-not-real"},
+            "matrix": {
+                "homeserver": "https://matrix.example.org",
+                "access_token": "token-not-real",
+                "user_id": "@bridgebot:example.org",
+            },
+        })
+
+    def verdicts_on_disk(self) -> dict[str, str]:
+        record = health.read_platform_health(self.bridge_dir)
+        return {
+            key: str(entry.get("verdict"))
+            for key, entry in (record or {}).get("platforms", {}).items()
+        }
+
+    def test_a_platform_that_never_probed_still_gets_its_own_entry(self):
+        """⭐ 判据的反退化：把补全短路掉（直接落 ``core.startup_probes``），
+        slack / matrix 就**整行缺席**，本用例必须红。
+
+        ⚠️ 这正是缺陷本身：``--status`` 那一段的措辞是**通用**的，缺席的那一行
+        与「配置坏了」长得一模一样 —— 用户无从分辨。
+        """
+        cfg = self.configured()
+        exit_code = self.run_bridge_reporting(cfg, self.ONLY_TELEGRAM_REPORTED)
+        self.assertEqual(exit_code, 0)
+
+        verdicts = self.verdicts_on_disk()
+        for platform in ("slack", "matrix"):
+            with self.subTest(platform=platform):
+                self.assertIn(
+                    platform, verdicts,
+                    "attach 上来却没上报的平台在记录里整行缺席 —— "
+                    "用户分不清是「配置坏了」还是「这个平台压根不上报」",
+                )
+                self.assertEqual(verdicts[platform], health.VERDICT_DOES_NOT_PROBE)
+
+    def test_the_record_holds_exactly_one_entry_per_configured_platform(self):
+        """③ 「配置里有 N 个平台 ⇒ 记录里有 N 个条目」。
+
+        ⚠️ 硬编码断言：``len(record["platforms"]) == 3`` 而不是对着某个实现算出来的
+        集合比大小（那恒真）。
+        """
+        cfg = self.configured()
+        self.assertEqual(len(cfg.adapters), 3, "前提：本用例配了三个平台")
+        self.run_bridge_reporting(cfg, self.ONLY_TELEGRAM_REPORTED)
+
+        record = health.read_platform_health(self.bridge_dir)
+        self.assertIsNotNone(record)
+        self.assertEqual(
+            len(record["platforms"]), len(cfg.adapters),
+            "配置里有 N 个平台，记录里就该有 N 个条目 —— 缺一条就是那一行在视图上缺席",
+        )
+
+    def test_a_real_probe_is_never_overwritten_by_the_gap_filler(self):
+        """telegram 那条真探测必须**原样**留着（补全只补缺的那些）。"""
+        cfg = self.configured()
+        self.run_bridge_reporting(cfg, self.ONLY_TELEGRAM_REPORTED)
+
+        telegram = health.probe_from_record(
+            health.read_platform_health(self.bridge_dir), "telegram"
+        )
+        self.assertEqual(telegram["verdict"], "ok")
+        self.assertEqual(telegram["detail"], "getMe 通过")
+
+    def test_a_brand_new_platform_is_covered_without_touching_this_code(self):
+        """⭐ 「哪些平台不做探测」是**推导**出来的，不是名单 ⇒ 新增平台不会漏。
+
+        ⚠️ 反退化：哪天有人改成硬编码一份「不探测的平台名单」，这个**从没被登记过**
+        的平台键就会掉出名单，于是它重新变成「无记录」—— 本用例变红。
+        """
+        cfg = Config(adapters={
+            "telegram": {"bot_token": SHAPE_TOKEN},
+            # ⛔ 这个键**不在**仓库任何一个注册表里：它代表"将来新增的第 14 个平台"。
+            "brandnewplatform": {"bot_token": "token-not-real"},
+        })
+        self.run_bridge_reporting(cfg, self.ONLY_TELEGRAM_REPORTED)
+
+        self.assertEqual(
+            self.verdicts_on_disk()["brandnewplatform"], health.VERDICT_DOES_NOT_PROBE,
+            "新增平台没被补上 ⇒ 「哪些平台不探测」是名单而不是推导",
+        )
+
+    def test_a_platform_whose_start_raised_is_not_called_unprobed(self):
+        """⚠️ ``start()`` 抛异常的适配器已经有 ``failed`` 那一档（``probe_after_start``
+        补的）⇒ 它**不是**「不做探测」。两类都答"这个平台起不来/能不能用"，混成
+        一档就把「凭据被拒」说成了「压根没这个动作」。
+        """
+        cfg = self.configured()
+        probes = dict(self.ONLY_TELEGRAM_REPORTED)
+        probes["slack"] = {"verdict": "failed", "detail": "start() 抛出 RuntimeError"}
+        self.run_bridge_reporting(cfg, probes)
+
+        verdicts = self.verdicts_on_disk()
+        self.assertEqual(verdicts["slack"], "failed")
+        self.assertEqual(verdicts["matrix"], health.VERDICT_DOES_NOT_PROBE)
+
+
+class TestDoesNotProbeIsNotSkipped(_RunBridgeWithStubCore, _BridgeDirIsolated):
+    """② 「不做探测」⛔ **不许**被说成 ``skipped``（"没有可探测的凭据"）。"""
+
+    #: 这些词会把「压根没有这个动作」说成「你少配了东西」。
+    MISLEADING_WORDS = ("没有可探测的凭据", "未探测", "没填", "缺少", "请配置", "token")
+
+    def rendered(self) -> str:
+        entry = health.normalize_verdict(
+            health.VERDICT_DOES_NOT_PROBE, detail=health.DOES_NOT_PROBE_DETAIL,
+        )
+        return health.describe_verdict(entry)
+
+    def test_its_wording_does_not_blame_the_users_configuration(self):
+        rendered = self.rendered()
+        for word in self.MISLEADING_WORDS:
+            with self.subTest(word=word):
+                self.assertNotIn(
+                    word, rendered,
+                    "「不做探测」被说成了「%s」—— 用户会跑去补配置，"
+                    "而他压根没少配任何东西" % word,
+                )
+        self.assertIn("不探测", rendered)
+
+    def test_it_does_not_borrow_the_skipped_or_the_not_started_wording(self):
+        rendered = self.rendered()
+        self.assertNotEqual(
+            health.VERDICT_DOES_NOT_PROBE, health.VERDICT_SKIPPED,
+            "四档 ⛔ 不许合并：skipped 说的是「没有可探测的凭据」",
+        )
+        self.assertNotIn(
+            "桥未启动", rendered,
+            "not_started 答的是「这一轮压根没有桥在跑」，那是另一根轴",
+        )
+        # 即使 detail 一字不差，三档渲染出来的话也必须彼此不同
+        for other in (health.VERDICT_SKIPPED, health.VERDICT_NOT_STARTED,
+                      health.VERDICT_FAILED):
+            with self.subTest(other=other):
+                self.assertNotEqual(
+                    rendered,
+                    health.describe_verdict(
+                        {"verdict": other, "detail": health.DOES_NOT_PROBE_DETAIL}
+                    ),
+                    "这一档与 %s 在界面上分不开 —— 用户就无从分辨" % other,
+                )
+
+    def test_the_recorded_entry_never_normalises_into_skipped(self):
+        cfg = Config(adapters={
+            "telegram": {"bot_token": SHAPE_TOKEN},
+            "slack": {"bot_token": "token-not-real", "app_token": "xapp-not-real"},
+        })
+        self.run_bridge_reporting(cfg, ONLY_TELEGRAM_PROBE)
+
+        probe = health.probe_from_record(
+            health.read_platform_health(self.bridge_dir), "slack"
+        )
+        self.assertIsNotNone(probe)
+        self.assertEqual(probe["verdict"], health.VERDICT_DOES_NOT_PROBE)
+        self.assertNotEqual(probe["verdict"], health.VERDICT_SKIPPED)
+
+
+class TestStatusAndJsonBothCarryTheUnprobedState(_RunBridgeWithStubCore,
+                                                  _BridgeDirIsolated):
+    """④ 两个视图都读得到这一档；⑥「记录里没有它」不许看起来像正常。"""
+
+    def configured(self) -> Config:
+        return Config(adapters={
+            "telegram": {"bot_token": SHAPE_TOKEN},
+            "slack": {"bot_token": "token-not-real", "app_token": "xapp-not-real"},
+        })
+
+    def render(self, cfg: Config) -> str:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.run_status(cfg)
+        return buffer.getvalue()
+
+    def probe_section(self, cfg: Config) -> list[str]:
+        """只取「上次启动时的探测结论」那一段（到下一个 ``==`` 段为止）。
+
+        ⚠️ 必须切段：同一个平台名在上面的「渠道配置与能力」表里**也**有一行，
+        而那一行会含「已配置 / 就绪」等字样 ⇒ 整份输出里找第一个 ``Slack``
+        拿到的是**错的那一行**，断言就变成了恒真（AGENTS.md §7.1）。
+        """
+        lines = self.render(cfg).splitlines()
+        header = "== 上次启动时的探测结论 =="
+        start = next(index for index, line in enumerate(lines) if header in line)
+        tail = lines[start + 1:]
+        end = next(
+            (index for index, line in enumerate(tail) if line.startswith("== ")), len(tail)
+        )
+        return tail[:end]
+
+    def slack_row(self, rendered: list[str]) -> str:
+        for line in rendered:
+            if line.strip().startswith("Slack"):
+                return line
+        raise AssertionError("那一段里找不到 Slack 那一行：\n%s" % "\n".join(rendered))
+
+    def test_the_status_row_names_the_gap_instead_of_saying_no_record(self):
+        cfg = self.configured()
+        self.run_bridge_reporting(cfg, ONLY_TELEGRAM_PROBE)
+
+        row = self.slack_row(self.probe_section(cfg))
+        self.assertIn("不探测", row)
+        self.assertNotIn(cli.NO_START_PROBE_TEXT, row,
+                         "有这一档时还显示成「无记录」，用户就还是分不出来")
+        self.assertNotIn("正常", row)
+
+    def test_the_setup_json_row_carries_the_new_verdict(self):
+        cfg = self.configured()
+        self.run_bridge_reporting(cfg, ONLY_TELEGRAM_PROBE)
+
+        row = next(r for r in cli._platform_status(cfg) if r["key"] == "slack")
+        self.assertEqual(
+            row["last_start_probe"]["verdict"], health.VERDICT_DOES_NOT_PROBE,
+        )
+        # 载荷仍必须能 dumps（这是外部消费的机器可读出口）
+        json.dumps(cli._platform_status(cfg), ensure_ascii=False)
+
+    def test_a_platform_missing_from_the_record_still_reads_as_no_record(self):
+        """⑥ 双向断言的**另一半**：这一档**不许**让「记录里没有它」显得正常。
+
+        ⚠️ 反向也必须成立：某个平台压根不在记录里（构造失败被 ``continue`` 掉的、
+        或盘上是更早实现写下的文件）时，那一行仍然是「无记录」，
+        **绝不许**变成「不探测」（那是**另一件事**）更绝不许变成「正常」。
+        """
+        cfg = self.configured()
+        health.record_startup_probes(self.bridge_dir, ONLY_TELEGRAM_PROBE)
+
+        row = self.slack_row(self.probe_section(cfg))
+        self.assertIn(cli.NO_START_PROBE_TEXT, row)
+        self.assertNotIn("不探测", row)
+        self.assertNotIn("正常", row)
+
+
+class TestGapFillerOnlyEverAdds(_BridgeDirIsolated):
+    """:func:`health.add_platforms_without_startup_probe` 的集合语义本身。"""
+
+    def test_it_only_adds_and_never_removes_or_rewrites(self):
+        reported = {"telegram": {"verdict": "ok", "detail": "getMe 通过"}}
+        completed = health.add_platforms_without_startup_probe(
+            reported, ["telegram", "slack", "matrix"],
+        )
+        self.assertEqual(completed["telegram"], reported["telegram"])
+        self.assertEqual(
+            {k for k in completed if k not in reported}, {"slack", "matrix"},
+        )
+        for key in ("slack", "matrix"):
+            with self.subTest(platform=key):
+                self.assertEqual(
+                    health.normalize_verdict(
+                        completed[key]["verdict"], detail=completed[key]["detail"]
+                    )["verdict"],
+                    health.VERDICT_DOES_NOT_PROBE,
+                )
+
+    def test_a_probe_for_a_platform_outside_the_attached_list_is_kept(self):
+        """宁可多留一条真实观测，也不因为"名单里没有"就把它丢掉。"""
+        completed = health.add_platforms_without_startup_probe(
+            {"irc": {"verdict": "failed", "detail": "连不上"}}, ["slack"],
+        )
+        self.assertEqual(completed["irc"], {"verdict": "failed", "detail": "连不上"})
+        self.assertEqual(
+            completed["slack"]["verdict"], health.VERDICT_DOES_NOT_PROBE
+        )
+
+    def test_it_tolerates_the_absence_of_both_arguments(self):
+        """空输入不许抛：它在那条"求值一起兜住"的保护**里面**求值。"""
+        self.assertEqual(health.add_platforms_without_startup_probe(None, None), {})
+        self.assertEqual(
+            health.add_platforms_without_startup_probe({}, []), {},
         )
 
 

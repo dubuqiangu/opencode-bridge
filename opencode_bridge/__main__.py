@@ -386,7 +386,16 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 # 它答的是「**桥这一轮压根没起来**」，不是「这个平台起不来」——
                 # 拒绝启动的两条路径（见 :func:`_record_bridge_refusal`）现在也落
                 # 这样的记录，所以消费方读它就知道**别**把它当成平台级线索去
-                # 建议用户改凭据。⛔ 既有三档（``ok`` / ``failed`` / ``skipped``）
+                # 建议用户改凭据。
+                #
+                # ⚠️ **还有一档 :data:`health.VERDICT_DOES_NOT_PROBE`**（``does_not_probe``）：
+                # 它答的是「**本平台压根没有启动期凭据探测这个动作**」——
+                # 目前只有 telegram 会探（``getMe``）。⛔ 它**不是** ``skipped``
+                # （那一档说的是「没有可探测的凭据」＝"你少配了"），也**不是**
+                # ``not_started``（那一档说的是"桥没起来"）。消费方读它就该知道
+                # **这条通道压根没覆盖这个平台**，而**不是**"这里没问题"。
+                #
+                # ⛔ 既有三档（``ok`` / ``failed`` / ``skipped``）
                 # **一个字没改**：本函数对 ``platforms`` 的其它 key 也一样，只增不改。
                 "last_start_probe": health.probe_from_record(probe_record, key),
                 # --- 运行期出站失败（新增；outbound_ready 的含义不变）----------
@@ -1107,6 +1116,18 @@ def _run_bridge_locked(cfg: Config) -> int:
     #: ⚠️ **只在那些 ``continue`` 分支里写** ⇒ 而能 attach 的早就把 ``usable`` 加上去
     #: 了 ⇒ 所以 ``usable == 0`` 时它**必然覆盖了配置里的每一个平台**。
     unusable_reasons: dict[str, str] = {}
+    #: 「这一轮真的 attach 上去了」的平台键（:func:`~opencode_bridge.health.platform_key`
+    #: —— ⛔ 必须与 :meth:`BridgeCore.start` 给 ``startup_probes`` 用的**同一个**来源，
+    #: 否则集合相减会把"探测过的"误判成"没探测的"）。
+    #:
+    #: ⚠️ 它存在的唯一理由：**只有 telegram 会 ``report_startup_probe``**（只有它调
+    #: ``getMe``）⇒ 其余平台压根不往 ``platforms`` 里写条目 ⇒ ``--status`` 上恒为
+    #: 「无记录」，用户**分不清**是配置坏了还是这个平台压根不上报。⇒ 用
+    #: ``attach 过`` 减 ``上报过`` 反推出来，让「不做探测」有一档可读的落点。
+    #: ⛔ **这是推导、不是名单**：新增第 14 个平台不需要改这里（见
+    #: :func:`opencode_bridge.health.add_platforms_without_startup_probe`）。
+    #: ⛔ 它**不产生任何网络请求** —— 只用"谁没说话"这个已经发生的事实。
+    attached_platforms: list[str] = []
     for name, entry in list((cfg.adapters or {}).items()):
         try:
             # ⚠️ **必须过** ``adapter_scoped_config``：适配器只看得到自己的子树，
@@ -1129,6 +1150,7 @@ def _run_bridge_locked(cfg: Config) -> int:
             unusable_reasons[str(name)] = "bot_token 为空"
             continue
         core.attach(adapter)
+        attached_platforms.append(health.platform_key(adapter))
         usable += 1
 
     if usable == 0:
@@ -1148,6 +1170,15 @@ def _run_bridge_locked(cfg: Config) -> int:
     # 结论收进 ``core.startup_probes``（见 :meth:`BridgeCore.start`），而
     # ``_bridge_dir()`` 只有这里知道 —— 适配器不知道、本类也不该自己推一遍。
     #
+    # ⚠️ ⚠️ **「已 attach 却没上报」的那些平台也要补一条**（只有 telegram 会
+    # ``report_startup_probe`` ⇒ 其余平台的 ``startup_probes`` 里压根没有它们）：
+    # 不补的话 ``--status`` 上它们恒为「无记录」，而那一段措辞是**通用**的
+    # ⇒ 用户分不清「配置坏了」与「这个平台压根不上报」。
+    # ⛔ 补的这一档由 :func:`~opencode_bridge.health.add_platforms_without_startup_probe`
+    # 造，是**推导**（``attach 过`` 减 ``上报过``）⇒ **新增平台不用改这里**。
+    # ⛔ 它**不做任何网络请求**：⚛️「构造成功」≠「凭据有效」，替别人编一个 ``ok``
+    # 就是伪造观测。
+    #
     # ⚠️⚠️ **保护必须包住「实参求值」，不只是那次调用**（实测回归，2026-10-06）：
     # ``record_startup_probes`` 内部兜住了写盘失败，但 ``core.startup_probes`` 这个
     # **实参**是在它外面求值的 —— core 若是鸭子类型替身（测试里就有两个刻意最小的
@@ -1157,10 +1188,14 @@ def _run_bridge_locked(cfg: Config) -> int:
     # ⇒ 这里连求值一起兜住：退化行为是「记一条 warning + 本轮不写记录」，
     # **不是**让桥起不来。⚠️ 刻意**不用** ``getattr(core, "startup_probes", None)``：
     # 那会把「真实类改了名」变成静默写空记录；异常里带着 ``AttributeError``
-    # 才是能让人查到的信号。
+    # 才是能让人查到的信号。⚠️ 同理**不**给 ``attached_platforms`` 加 ``getattr``
+    # 兜底：它在上面那个循环里现填的，不是外部对象上的属性。
     try:
         probes = core.startup_probes
-        health.record_startup_probes(_bridge_dir(), probes)
+        health.record_startup_probes(
+            _bridge_dir(),
+            health.add_platforms_without_startup_probe(probes, attached_platforms),
+        )
     except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
         logger.warning(
             "platform-health: 本轮探测结论未落盘（%s: %s）—— 不影响桥的运行",

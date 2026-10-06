@@ -89,6 +89,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, List, Optional, Tuple
 
+from ..config_coerce import coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
@@ -296,16 +297,31 @@ class DiscordAdapter(Adapter):
         self._hb_due: float = 0.0
 
     def _config_intents(self) -> int:
-        """读 ``intents`` 配置；非法值退回默认 37376 而不是静默发 0。"""
-        raw = self.config.get("intents")
-        if raw in (None, ""):
-            return DEFAULT_INTENTS
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            logger.warning("discord: intents 配置非法 %r，改用默认 %d", raw, DEFAULT_INTENTS)
-            return DEFAULT_INTENTS
-        return value if value > 0 else DEFAULT_INTENTS
+        """读 ``intents`` 配置；非法值退回默认 37376 而不是静默发 0。
+
+        ⚠️ 已迁到共享助手 :func:`~opencode_bridge.config_coerce.coerce_int`。
+        下界是**闭区间 1**，因为改前那行的判据逐字是 ``value if value > 0`` ——
+        区间必须作为参数交给助手（⛔ 不许在调用点外面套 ``max(1, …)``，那会静默改值）。
+
+        ⇒ 迁移带来**四处行为变化**，逐条都有测试钉住改前/改后
+        （``tests/test_discord.py::TestIntentsConfigCoercion``）：
+
+        1. ``intents=0`` / 负数：改前**静默**回落（``value > 0`` 不成立就返回默认），
+           改后**告警**回落 —— 用户填了 ``0`` 却什么日志都看不到，而 ``0`` 是一个事件
+           都不收的合法 bitmask，值得点名一句。
+        2. ``intents=true``：改前 ``int(True) == 1`` **不抛异常** ⇒ 静默拿到 1，而 1
+           根本不是本适配器用的任何一个 intent 位（:data:`INTENT_GUILD_MESSAGES` 是
+           512）⇒ 结果是"连上了但一条消息也收不到"。改后助手在**共享层**拒 bool。
+        3. ``intents=37376.0``（JSON 没有 int/float 之分）：改前 ``int()`` **截断**成
+           37376，改后告警回落（值恰好相同，但那条告警告诉用户 JSON 里写的是浮点）。
+        4. ⚠️ 方向**相反**的一处（更安静，不算更正）：``intents="   "``（纯空白）改前
+           会走 ``int()`` 抛 ``ValueError`` ⇒ 告警；助手的「没配」判据含纯空白串 ⇒
+           现在静默用默认值（纪律 1：没配 ⇒ 静默）。
+        """
+        return coerce_int(
+            self.config, "intents", DEFAULT_INTENTS,
+            minimum=1, platform=self.name,
+        )
 
     # ------------------------------------------------------------------
     # HTTP plumbing

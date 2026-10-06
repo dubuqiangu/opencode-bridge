@@ -236,16 +236,36 @@ class ConfigReaderCredentialKeyTests(unittest.TestCase):
             "coerce_int",            # 共享助手；email._port 的告警搬到了它里面
             "coerce_float",          # 共享助手；email._timeout / ntfy.poll_interval
             "_config_verify_tls",    # email / mattermost
-            "_config_intents",       # discord / qqbot
-            "_config_shard",         # qqbot
-            "_truthy",               # homeassistant，形态 C
+            "_config_shard",         # qqbot ← ⚠️ 迁移后**仍必须留**（见下面那段注释）
             "_coerce_positive",      # a2a，形态 D
             "_coerce_turns",         # a2a，形态 C
-            "_resolve_port",         # irc ← 文案是英文，最容易漏
         ):
             self.assertIn(
                 expected, readers, "名单里少了 " + expected + " ⇒ 归属规则收窄过头了"
             )
+
+        # ⚠️⚠️ 2026-10-06 实测移出本名单的三个（**实测差集恰好这三个，不是我推的**）：
+        #
+        #   "_config_intents",   # discord / qqbot   → 迁到 coerce_int
+        #   "_truthy",           # homeassistant    → 迁到 coerce_bool，函数已删
+        #   "_resolve_port",     # irc              → 迁到 coerce_int，%r 告警随之搬走
+        #
+        # 三者的共同机制：这条护栏用「函数体里有 ``logger.…("%r"…)``」**发现**读取器
+        # （:func:`reader_names_in` 的全部判据），而迁移把那条 %r 日志搬进了
+        # :mod:`opencode_bridge.config_coerce` 的私有助手 ⇒ 启发式**认不出它们了**。
+        #
+        # ⇒ **移出名单不代表这些键不再被守**：``coerce_int`` / ``coerce_bool`` 早就在
+        # :data:`SHARED_CONFIG_READERS` 里，而它们**按构造**覆盖这三条
+        # （原因见该常量的注释：``%r`` 的键名在那个助手里是**参数**不是字面量，
+        # 所以启发式认不出 ``coerce_int`` 本身，才要手写）。
+        #
+        # ⛔ **但不要顺手把 ``_config_shard`` 也删掉**（迁移的那条 lane 这么建议过，
+        # **不采纳**）：它**仍在**实测发现集里 —— qqbot 交叉关系那条
+        # 「shard_id 与 num_shards 不匹配」的 %r 告警仍留在适配器自己身上，
+        # 是**形变 A**（有自己的 %r 日志）而不是形变 C（把已取出的值传出去）。
+        # ⇒ 删掉它 = 放弃盯一个仍然存在的读取器，护栏会**变弱**而不是变强。
+        # 「迁移过就一并删」是个看着合理的错法：判据是**「现在还有没有 %r 日志」**，
+        # 不是「这个键迁没迁」。
 
     def test_no_credential_shaped_key_reaches_a_config_reader(self):
         """主断言：凭据形状的键名不得作为读取器的实参出现。"""

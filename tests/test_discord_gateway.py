@@ -319,7 +319,13 @@ class TestCapabilities(GatewayTestCase):
 
     def test_intents_config_override_and_bad_value_fallback(self):
         self.assertEqual(self.adapter(intents=4096).intents, 4096)
-        with self.assertLogs("opencode_bridge.adapters.discord", level="WARNING"):
+        # ⚠️ 告警发出方是**共享助手**，不是适配器自己：`intents` 的强制已迁到
+        # `config_coerce.coerce_int`，而它的 logger 是 `opencode_bridge.config_coerce`
+        # （与 email / ntfy / matrix 迁移时同一条约定）。
+        # ⛔ **只改这一处**：同文件里其余 `assertLogs("opencode_bridge.adapters.discord")`
+        # 断言的是适配器**自己仍然会发**的日志（如 `bot_token missing`），
+        # 一起改会把那些测试弄坏。
+        with self.assertLogs("opencode_bridge.config_coerce", level="WARNING"):
             self.assertEqual(self.adapter(intents="oops").intents, DEFAULT_INTENTS)
 
 

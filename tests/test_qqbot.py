@@ -27,12 +27,15 @@ import threading
 import time
 import unittest
 import urllib.request
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from opencode_bridge import identity
 from opencode_bridge.adapters.base import adapter_class, build, registered_names
 from opencode_bridge.adapters.qqbot import (
     DEFAULT_INTENTS,
+    DEFAULT_SHARD,
+    INTENT_GUILD_MEMBERS,
+    INTENT_GUILDS,
     INTENT_GROUP_AND_C2C,
     INTENT_PUBLIC_GUILD_MESSAGES,
     MESSAGE_LIMIT,
@@ -762,6 +765,392 @@ class TestConfiguration(QQBotTestCase):
         self.assertEqual(transport.min_backoff, 1.0)
         self.assertEqual(transport.max_backoff, 60.0)
         self.assertEqual(transport.label, "qqbot")
+
+
+# ======================================================================
+# 配置类型强制（共享助手 config_coerce 迁移的改前 / 改后对照）
+# ======================================================================
+#: 迁移到共享助手之后，**告警的 logger 换了**：从
+#: ``opencode_bridge.adapters.qqbot`` 变成 ``opencode_bridge.config_coerce``。
+#: 消息文本的前缀（``qqbot: ``）由 ``platform=self.name`` 保住，所以**日志内容不变**，
+#: 只是发出方变了 —— 与 email / ntfy / matrix 的迁移同一条约定。
+COERCE_LOGGER = "opencode_bridge.config_coerce"
+#: 告警**内容**前缀（logger 换了，但 ``platform=self.name`` 把它保住了）。
+QQBOT_LOG_PREFIX = "qqbot: "
+
+
+def intents_before_migration(config: dict, warned: List[Any]) -> int:
+    """**改前**的 ``_config_intents``，逐行抄自迁移前的 ``adapters/qqbot.py``。
+
+    ⛔ 基线取自**迁移前的工作树**（⛔ 没有用 ``git stash`` —— 那会把并行 lane 的在制品
+    一起收走）。抄进来当**参照实现**：合法值必须与它逐字节相同。
+    """
+    from opencode_bridge.adapters.qqbot import _INTENT_NAMES   # 私有名，按仓库惯例局部 import
+
+    raw = config.get("intents")
+    if raw in (None, ""):
+        return DEFAULT_INTENTS
+    if isinstance(raw, (list, tuple)):
+        mask = 0
+        for item in raw:
+            mask |= _INTENT_NAMES.get(str(item).strip().upper(), 0)
+        if mask:
+            return mask
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        warned.append(raw)
+        return DEFAULT_INTENTS
+    return value if value > 0 else DEFAULT_INTENTS
+
+
+def shard_before_migration(config: dict, warned: List[Any]) -> Tuple[int, int]:
+    """**改前**的 ``_config_shard``，逐行抄自迁移前的 ``adapters/qqbot.py``。
+
+    ⚠️ 注意抄件里**两处**静默（都不记 ``warned``）：形状不对（不是长度 2 的
+    list/tuple）以及元素解析失败（``except`` 分支）—— 后者就是"改前那条静默回落且
+    无告警"的那一处，告警只挂在交叉关系（``num < 1 or not (0 <= shard_id < num)``）
+    那一条上。
+    """
+    raw = config.get("shard")
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return DEFAULT_SHARD
+    try:
+        shard_id, num = int(raw[0]), int(raw[1])
+    except (TypeError, ValueError):
+        return DEFAULT_SHARD            # ⚠️ 改前这里**没有**告警
+    if num < 1 or not (0 <= shard_id < num):
+        warned.append(raw)
+        return DEFAULT_SHARD
+    return (shard_id, num)
+
+
+#: ``intents`` 的**改前 / 改后**对照表：
+#: ``(配置值, 改前结果, 改前是否告警, 改后结果, 改后是否告警)``。
+INTENTS_BEFORE_AFTER = (
+    # --- 名字列表那一支没动（"字符串集合 → bitmask"刻意留在适配器里）----
+    (["PUBLIC_GUILD_MESSAGES"], INTENT_PUBLIC_GUILD_MESSAGES, False,
+     INTENT_PUBLIC_GUILD_MESSAGES, False),
+    (["GROUP_AND_C2C", "GUILDS"], INTENT_GROUP_AND_C2C | INTENT_GUILDS, False,
+     INTENT_GROUP_AND_C2C | INTENT_GUILDS, False),
+    (["public_guild_messages"], INTENT_PUBLIC_GUILD_MESSAGES, False,
+     INTENT_PUBLIC_GUILD_MESSAGES, False),
+    # --- 解析失败：改前就告警 ⇒ 行为不变 --------------------------------
+    ("not-a-number", DEFAULT_INTENTS, True, DEFAULT_INTENTS, True),
+    (["NO_SUCH_INTENT"], DEFAULT_INTENTS, True, DEFAULT_INTENTS, True),
+    # --- 非正数：改前**静默**回落，改后告警回落（纪律 2 的修正）-----------
+    (0, DEFAULT_INTENTS, False, DEFAULT_INTENTS, True),
+    (-1, DEFAULT_INTENTS, False, DEFAULT_INTENTS, True),
+    # --- bool / float：改前**静默采纳**，改后告警回落（纪律 3 的修正）-----
+    # ⚠️ ``True`` 改前拿到 **1**：不是任何 intent 位（1<<25 / 1<<30）⇒ 官方会因
+    # intents 越权直接关连接，而日志里一个字都没有。
+    (True, 1, False, DEFAULT_INTENTS, True),
+    (33554433.0, 33554433, False, DEFAULT_INTENTS, True),
+    (33554433.9, 33554433, False, DEFAULT_INTENTS, True),
+)
+
+#: ``shard`` 的**改前 / 改后**对照表，同一格式。
+SHARD_BEFORE_AFTER = (
+    # --- 形状不对：改前就**静默**（多半是"压根没配"）⇒ 行为不变 ----------
+    ([0], DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    ([0, 1, 2], DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    ("0,1", DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    ({0: 1}, DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    # --- 元素解析失败：⚠️ 改前**静默**回落且无告警，改后告警（本次迁移修掉的那处）---
+    (["x", 4], DEFAULT_SHARD, False, DEFAULT_SHARD, True),
+    ([None, "x"], DEFAULT_SHARD, False, DEFAULT_SHARD, True),
+    ([0, "4x"], DEFAULT_SHARD, False, DEFAULT_SHARD, True),
+    # --- ``None`` / 空串：改前静默回落；改后按纪律 1 当"没配"⇒ 仍静默回落 ---
+    ([None, 1], DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    (["", 1], DEFAULT_SHARD, False, DEFAULT_SHARD, False),
+    # --- 越界：改前告警，改后也告警（条数不变、文案变）------------------
+    ([0, 0], DEFAULT_SHARD, True, DEFAULT_SHARD, True),
+    ([-1, 4], DEFAULT_SHARD, True, DEFAULT_SHARD, True),
+    ([9, 4], DEFAULT_SHARD, True, DEFAULT_SHARD, True),
+    # --- bool / float：改前**静默采纳**，改后告警回落 ----------------------
+    ([1.0, 4], (1, 4), False, DEFAULT_SHARD, True),
+    ([True, 4], (1, 4), False, DEFAULT_SHARD, True),
+    ([0, 1.0], (0, 1), False, DEFAULT_SHARD, True),
+)
+
+
+class TestIntentsConfigCoercion(QQBotTestCase):
+    """``_config_intents`` → :func:`~opencode_bridge.config_coerce.coerce_int`。
+
+    ⚠️ 名字列表那一支**刻意留在适配器里**（"字符串集合 → bitmask"压不成整数强制），
+    所以这里既测"整数那支已迁到共享助手"，也测"名字列表那支一个字都没动"。
+    """
+
+    def _read(self, **config):
+        """读一次真拿到的 ``adapter.intents`` + 共享助手那条路径上的告警文本。
+
+        ⚠️ handler 必须**先挂后构造**：配置解析发生在 ``__init__`` 里。
+        """
+        logger = logging.getLogger(COERCE_LOGGER)
+        records: List[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        previous_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            value = make_adapter(**config).intents
+        finally:
+            logger.setLevel(previous_level)
+            logger.removeHandler(handler)
+        return value, [record.getMessage() for record in records]
+
+    def test_legal_values_are_byte_identical_to_the_pre_migration_expression(self):
+        """合法值必须与改前那份抄件**逐字节**相同，且一条告警都不打。"""
+        for raw in (
+            513,
+            INTENT_GROUP_AND_C2C,
+            INTENT_GROUP_AND_C2C | INTENT_PUBLIC_GUILD_MESSAGES,
+            1,
+            2 ** 31,
+            str(DEFAULT_INTENTS),      # JSON 里写数字字符串是常事，必须照常认
+            " 513 ",                  # 带空白的数字串
+        ):
+            with self.subTest(raw=raw):
+                expected = intents_before_migration({"intents": raw}, [])
+                actual, warnings = self._read(intents=raw)
+                self.assertEqual(actual, expected)
+                self.assertIs(type(actual), int, "intents 必须是整数 bitmask")
+                self.assertEqual(warnings, [], "合法值不许告警")
+
+    def test_the_before_and_after_table(self):
+        """非法值的取值与告警有无，逐行对照改前 / 改后。"""
+        for raw, before_value, before_warned, after_value, after_warned in INTENTS_BEFORE_AFTER:
+            with self.subTest(raw=raw):
+                warned_before: List[Any] = []
+                self.assertEqual(
+                    intents_before_migration({"intents": raw}, warned_before),
+                    before_value,
+                    "这张表的「改前结果」列与抄件对不上 —— 抄件或表漂了",
+                )
+                self.assertEqual(bool(warned_before), before_warned)
+
+                actual, warnings = self._read(intents=raw)
+                self.assertEqual(actual, after_value)
+                self.assertEqual(
+                    bool(warnings), after_warned,
+                    "改前 %r / 改后 %r 的告警有无与表不符" % (before_warned, after_warned),
+                )
+
+    def test_an_unset_value_is_silent(self):
+        """纪律 1：没配 ⇒ 静默用默认，否则每次启动都刷屏。"""
+        for config in ({}, {"intents": None}, {"intents": ""}):
+            with self.subTest(config=sorted(config, key=repr)):
+                actual, warnings = self._read(**config)
+                self.assertEqual(actual, DEFAULT_INTENTS)
+                self.assertEqual(warnings, [])
+
+    def test_a_whitespace_only_value_counts_as_unset_and_stays_silent(self):
+        """⚠️ 迁移带来的变化，方向是"更安静"：纯空白串从"告警"变成"静默"。
+
+        改前 ``"   " in (None, "")`` 为假 ⇒ ``int("   ")`` 抛 ``ValueError`` ⇒ 告警；
+        助手的「没配」判据含纯空白串 ⇒ 静默用默认值（纪律 1）。
+        """
+        actual, warnings = self._read(intents="   ")
+        self.assertEqual(actual, DEFAULT_INTENTS)
+        self.assertEqual(warnings, [])
+
+    def test_a_non_positive_bitmask_is_no_longer_silently_swallowed(self):
+        """⚠️ 判据反退化：把 ``coerce_int(…, minimum=1)`` 改回改前那句
+        ``return value if value > 0 else DEFAULT_INTENTS``，这条**必须红**。
+        """
+        for raw in (0, -1, -(2 ** 31)):
+            with self.subTest(raw=raw):
+                actual, warnings = self._read(intents=raw)
+                self.assertEqual(actual, DEFAULT_INTENTS)
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("intents", warnings[0])
+
+    def test_a_boolean_is_not_read_as_the_bitmask_one(self):
+        """⚠️ 判据反退化：改回裸 ``int(raw)`` 会让 ``intents=true`` **静默**拿到 1。
+
+        而官方明确"传递了无权限的 ``intents``，``websocket`` 会报错，并直接关闭连接"
+        ⇒ 结果是"刚鉴权就断"，而日志里一个字都没有。
+        """
+        actual, warnings = self._read(intents=True)
+        self.assertEqual(actual, DEFAULT_INTENTS)
+        self.assertEqual(len(warnings), 1)
+        self.assertNotEqual(actual, 1, "1 不是任何 intent 位，绝不能被当成合法配置采纳")
+
+    def test_a_float_is_not_truncated_into_a_silent_bitmask(self):
+        """``int(33554433.9)`` 只截断不抛 ⇒ 改前是**静默采纳**（用户写的小数丢了）。"""
+        for raw in (33554433.0, 33554433.9, 1e3):
+            with self.subTest(raw=raw):
+                actual, warnings = self._read(intents=raw)
+                self.assertEqual(actual, DEFAULT_INTENTS)
+                self.assertEqual(len(warnings), 1)
+
+    def test_the_name_list_branch_is_untouched(self):
+        """名字列表容错是**本适配器自己的语义**（认不出的名字按 0 算），一个字都没动。"""
+        self.assertEqual(self._read(intents=["GUILDS"])[0], INTENT_GUILDS)
+        self.assertEqual(
+            self._read(intents=["GUILD_MEMBERS", "public_guild_messages"])[0],
+            INTENT_GUILD_MEMBERS | INTENT_PUBLIC_GUILD_MESSAGES,
+        )
+        # 全是认不出的名字 ⇒ 掩码为 0 ⇒ 落到整数那条路 ⇒ 告警 + 默认（改前亦然）
+        actual, warnings = self._read(intents=["NOT_AN_INTENT_NAME"])
+        self.assertEqual(actual, DEFAULT_INTENTS)
+        self.assertEqual(len(warnings), 1)
+
+
+class TestShardConfigCoercion(QQBotTestCase):
+    """``_config_shard`` 的两个元素 → :func:`~opencode_bridge.config_coerce.coerce_int`。
+
+    ⚠️ 本类钉的是**本次迁移修掉的那处静默**：改前元素解析失败
+    （``except (TypeError, ValueError): return DEFAULT_SHARD``）**一条告警都不打** ——
+    而官方对鉴权阶段的失败「不给任何错误负载，只是直接关闭连接」，用户连 shard 配错了
+    都无从知道。
+    """
+
+    def _read(self, **config):
+        """读一次真拿到的 ``adapter.shard`` + **两个 logger** 上的告警文本。
+
+        ⚠️ **必须同时看两个 logger**：``shard`` 的告警有两处来源 ——
+        共享助手那条（元素被拒，报 ``shard[0]`` / ``shard[1]``）与适配器自己那条
+        （**交叉关系**非法，助手拿不到那个信息）。只看一个会漏判。
+
+        ⚠️ handler 必须**先挂后构造**：配置解析发生在 ``__init__`` 里。
+        """
+        logger = logging.getLogger(COERCE_LOGGER)
+        records: List[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        previous_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        adapter_records_before = len(self.records)
+        try:
+            value = make_adapter(**config).shard
+        finally:
+            logger.setLevel(previous_level)
+            logger.removeHandler(handler)
+        return (
+            value,
+            [record.getMessage() for record in records],
+            [record.getMessage() for record in self.records[adapter_records_before:]],
+        )
+
+    def test_legal_values_are_byte_identical_to_the_pre_migration_expression(self):
+        """合法值必须与改前那份抄件**逐字节**相同，且一条告警都不打。"""
+        # ⚠️ ``[1, 1]`` **不在**合法集里：``0 <= 1 < 1`` 不成立 ⇒ 交叉关系非法（见
+        # :data:`SHARD_BEFORE_AFTER` 与 :meth:`test_a_cross_relation_violation_...`）。
+        for raw in ([0, 1], [2, 4], [0, 4], ["0", "1"], (0, 1), [3, 4], [0, 2]):
+            with self.subTest(raw=raw):
+                expected = shard_before_migration({"shard": raw}, [])
+                actual, coerce_warnings, adapter_warnings = self._read(shard=list(raw))
+                self.assertEqual(actual, expected)
+                self.assertEqual(coerce_warnings, [], "合法值不许告警")
+                self.assertEqual(adapter_warnings, [], "合法值不许告警")
+
+    def test_the_before_and_after_table(self):
+        """非法值的取值与告警有无，逐行对照改前 / 改后。"""
+        for raw, before_value, before_warned, after_value, after_warned in SHARD_BEFORE_AFTER:
+            with self.subTest(raw=raw):
+                warned_before: List[Any] = []
+                self.assertEqual(
+                    shard_before_migration({"shard": raw}, warned_before),
+                    before_value,
+                    "这张表的「改前结果」列与抄件对不上 —— 抄件或表漂了",
+                )
+                self.assertEqual(bool(warned_before), before_warned)
+
+                actual, coerce_warnings, adapter_warnings = self._read(shard=raw)
+                self.assertEqual(actual, after_value)
+                self.assertEqual(
+                    bool(coerce_warnings) or bool(adapter_warnings), after_warned,
+                    "改前 %r / 改后 %r 的告警有无与表不符" % (before_warned, after_warned),
+                )
+
+    def test_an_unset_value_is_silent(self):
+        """纪律 1：没配 ⇒ 静默用默认 ``(0, 1)``。"""
+        for config in ({}, {"shard": None}):
+            with self.subTest(config=sorted(config, key=repr)):
+                actual, coerce_warnings, adapter_warnings = self._read(**config)
+                self.assertEqual(actual, DEFAULT_SHARD)
+                self.assertEqual(coerce_warnings, [])
+                self.assertEqual(adapter_warnings, [])
+
+    def test_a_wrong_shape_is_still_silent(self):
+        """⚠️ 形状不对（不是长度 2 的 list/tuple）**刻意保持静默**。
+
+        那多半是"这个键压根没配"（纪律 1），不是配置错误 —— 改前就静默，本次迁移
+        **没有**把它变成告警（否则每次少写一项就刷屏）。
+        """
+        for raw in ([0], [0, 1, 2], "0,1", {"shard_id": 0}, 1):
+            with self.subTest(raw=raw):
+                actual, coerce_warnings, adapter_warnings = self._read(shard=raw)
+                self.assertEqual(actual, DEFAULT_SHARD)
+                self.assertEqual(coerce_warnings, [])
+                self.assertEqual(adapter_warnings, [])
+
+    def test_an_unparsable_element_is_no_longer_silent(self):
+        """⚠️ **本次迁移修掉的那处静默** —— 判据反退化：把两个 ``coerce_int`` 调用改回
+        改前那个 ``try: int(raw[0]), int(raw[1]) except: return DEFAULT_SHARD``，
+        这三条**必须红**。
+        """
+        for raw, expected_key in ((["x", 4], "shard[0]"), ([2, "4x"], "shard[1]"),
+                                  ([None, "x"], "shard[1]")):
+            with self.subTest(raw=raw):
+                actual, coerce_warnings, adapter_warnings = self._read(shard=raw)
+                self.assertEqual(actual, DEFAULT_SHARD)
+                self.assertEqual(
+                    len(coerce_warnings), 1,
+                    "解析失败必须告警（改前是静默回落）：%r" % (raw,),
+                )
+                self.assertIn(expected_key, coerce_warnings[0])
+
+    def test_one_warning_per_bad_element_not_two(self):
+        """两个元素各自被判非法时，**同一个问题只打一条**告警（不重复刷屏）。"""
+        actual, coerce_warnings, adapter_warnings = self._read(shard=["x", "y"])
+        self.assertEqual(actual, DEFAULT_SHARD)
+        self.assertEqual(len(coerce_warnings), 2, "两个元素各一条，各自带自己的下标")
+        self.assertIn("shard[0]", coerce_warnings[0])
+        self.assertIn("shard[1]", coerce_warnings[1])
+
+    def test_a_rejected_element_does_not_add_a_second_generic_warning(self):
+        """元素被助手拒掉之后，**不许**再补一条笼统的 "shard 配置非法"。
+
+        （哨兵 :data:`_UNUSABLE_SHARD_ID` / :data:`_UNUSABLE_NUM_SHARDS` 的用途。）
+        """
+        _actual, coerce_warnings, adapter_warnings = self._read(shard=["x", 4])
+        self.assertEqual(len(coerce_warnings), 1)
+        self.assertIn("shard[0]", coerce_warnings[0])
+        self.assertEqual(adapter_warnings, [], "同一个问题不许在两个 logger 上各报一次")
+
+    def test_a_cross_relation_violation_is_still_reported_by_the_adapter(self):
+        """单个元素都合法、只有"放在一起看"才非法的那一条，仍由适配器告警
+        （助手拿不到交叉信息）。条数与改前相同。"""
+        actual, coerce_warnings, adapter_warnings = self._read(shard=[9, 4])
+        self.assertEqual(actual, DEFAULT_SHARD)
+        self.assertEqual(coerce_warnings, [], "两个元素各自合法 ⇒ 助手不该说话")
+        self.assertEqual(len(adapter_warnings), 1, "这一条打在 qqbot 自己的 logger 上")
+        self.assertIn("shard", adapter_warnings[0])
+
+    def test_a_boolean_or_float_element_is_not_silently_truncated(self):
+        """⚠️ 判据反退化：``[1.0, 4]`` 改前静默拿到 ``(1, 4)``、``[True, 4]`` 同理。
+
+        ``shard`` 是直接进 Identify 的 ``"shard": [shard_id, num]``，配错的后果是
+        官方侧的分片路由问题，而改前本地**一条日志都没有**。
+        """
+        for raw, before in (([1.0, 4], (1, 4)), ([True, 4], (1, 4))):
+            with self.subTest(raw=raw):
+                self.assertEqual(shard_before_migration({"shard": raw}, []), before)
+                actual, coerce_warnings, adapter_warnings = self._read(shard=raw)
+                self.assertEqual(actual, DEFAULT_SHARD)
+                self.assertEqual(len(coerce_warnings), 1)
+                self.assertIn("shard[0]", coerce_warnings[0])
+                self.assertEqual(adapter_warnings, [])
+
+    def test_the_identify_payload_still_carries_the_shard(self):
+        """兜底：迁移不许把 ``shard`` 从 Identify 载荷里弄丢（那是它唯一的用途）。"""
+        adapter = make_adapter(shard=[2, 4])
+        self.assertEqual(list(adapter.shard), [2, 4])
+        self.assertEqual(len(adapter.shard), 2)
 
 
 # ======================================================================

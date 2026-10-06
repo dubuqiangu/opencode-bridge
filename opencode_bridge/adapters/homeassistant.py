@@ -187,6 +187,7 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .. import identity
+from ..config_coerce import coerce_bool
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
 from ..transport import WebSocketTransport
@@ -286,6 +287,22 @@ def _classify_ha_error(code: object, detail: str = "") -> SendError:
     return SendError.UNKNOWN
 
 
+# ⛔ 以下三个读法**刻意不套** :mod:`opencode_bridge.config_coerce` 的 ``coerce_*``。
+# 理由逐条写在这里（它们各自承载一条"为什么"，压成通用助手就会丢掉）：
+#
+# * ``_first`` —— **别名回退**（``url`` / ``site_url`` / ``base_url`` / … 5 个键取第一个
+#   非空）。``coerce_text`` 只管**一个**键，配不出"依次试"这个语义；而"没配 ⇒ 返回
+#   空串，调用点再 ``or DEFAULT_*``"这条分工正是它存在的理由。
+# * ``_string_set`` —— **字符串集合**（list/tuple/set/单值 → ``set[str]``）。共享层只提供
+#   单值文本的 ``coerce_text``，没有集合档；硬套会把 ``["a","b"]`` 变成 ``"['a', 'b']"``
+#   这种字符串，白名单直接失效。
+# * ``_config_event_types`` —— 默认**不是** ``*``（见它自己的 docstring：``*`` 需要管理员，
+#   非管理员会被 ``Unauthorized`` 拒掉）。这个"为什么"与类型强制无关，套不进去。
+#
+# 两个布尔键（``accept_all`` / ``require_user_context``）**已经**迁到 ``coerce_bool``，
+# 因为它们要的正是"没配静默 / 非法回落 + 告警"那条纪律；而下面三个不要跟着一起动。
+
+
 def _first(config: dict, *keys: str) -> str:
     """按顺序取第一个非空字符串键（``None`` / 空白都算"没配"）。"""
     for key in keys:
@@ -307,21 +324,6 @@ def _string_set(value: object) -> Set[str]:
     else:
         items = [value]
     return {str(x).strip() for x in items if str(x).strip()}
-
-
-def _truthy(value: object, default: bool = True) -> bool:
-    """宽松读布尔；没配或非法时返回 ``default``（**不**静默当成 False）。"""
-    if value is None or value == "":
-        return default
-    if isinstance(value, bool):
-        return value
-    low = str(value).strip().lower()
-    if low in ("1", "true", "yes", "on"):
-        return True
-    if low in ("0", "false", "no", "off"):
-        return False
-    logger.warning("homeassistant: 布尔配置非法 %r，按 %s 处理", value, default)
-    return default
 
 
 def _redact(url: str) -> str:
@@ -427,14 +429,19 @@ class HomeAssistantAdapter(Adapter):
             self.config.get("domains") or self.config.get("watch_domains")
         )
         #: 显式"我要全收"。**默认 False**：两个白名单都空 ⇒ 事件全丢。
-        self.accept_all: bool = _truthy(self.config.get("accept_all"), False)
+        self.accept_all: bool = coerce_bool(
+            self.config, "accept_all", False, platform=self.name
+        )
         self.ignore_entities: Set[str] = _string_set(
             self.config.get("ignore_entities")
         )
         #: ⚠️ 默认 ``True``：只把 ``context.user_id`` 非空的事件当"某人做了一件事"。
         #: 这是"设备事件管道 ≠ 对话"这条判断被显式化的地方。
-        self.require_user_context: bool = _truthy(
-            self.config.get("require_user_context"), True
+        #: ⛔ 这个 ``True`` 是**安全侧的默认值**（少收而不是多收），不是随手写的 ——
+        #: 它由 :func:`~opencode_bridge.config_coerce.coerce_bool` 的 ``default``
+        #: 参数承载，⛔ 不要因为"两个布尔键看起来一样"就把它统一成 ``False``。
+        self.require_user_context: bool = coerce_bool(
+            self.config, "require_user_context", True, platform=self.name
         )
 
         # --- 出站 -------------------------------------------------------

@@ -54,6 +54,7 @@ import time
 from typing import Any, Callable, List, Optional
 
 from ..allowlist import describe_nick_in_allowlist, nick_in_allowlist
+from ..config_coerce import coerce_bool, coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..pairing import CONFIG_VERSION_KEY, empty_allowlist_is_open
@@ -358,7 +359,14 @@ class IRCAdapter(Adapter):
         self.host: str = str(self.config.get("host") or "").strip()
         self.nick = str(self.config.get("nick") or "")
         self.channels: List[str] = self._channel_list(self.config.get("channels"))
-        self.use_tls: bool = bool(self.config.get("use_tls"))
+        #: ⚠️ 默认 ``False``（明文 6667）。改前是 ``bool(config.get("use_tls"))`` ——
+        #: 裸 ``bool()`` 把 ``"false"`` / ``"0"`` / ``"off"`` / ``"no"`` **全部读成
+        #: ``True``**，也就是用户明明写了"不要 TLS"却被静默开了 TLS（并连带把默认端口
+        #: 从 6667 换成 6697）。这不是"宽松"，是**读反了**：JSON 里写字符串布尔极常见。
+        #: ``coerce_bool`` 收同一份词表且认得大小写与空白，非法值回落 + 告警。
+        self.use_tls: bool = coerce_bool(self.config, "use_tls", False, platform=self.name)
+        # ⚠️ 顺序有依赖：``_resolve_port`` 的**默认值**取自 ``use_tls``，所以这一行
+        # 必须在它下面（TLS ⇒ 6697，明文 ⇒ 6667）。
         self.port: int = self._resolve_port()
         self.server_password: str = str(self.config.get("server_password") or "")
         self.bot_password: str = str(self.config.get("bot_password") or "")
@@ -423,13 +431,23 @@ class IRCAdapter(Adapter):
         return [x for x in items if x]
 
     def _resolve_port(self) -> int:
-        raw = self.config.get("port")
-        try:
-            if raw not in (None, ""):
-                return int(raw)
-        except (TypeError, ValueError):
-            logger.warning("irc: bad port %r; falling back to default", raw)
-        return TLS_PORT if self.use_tls else DEFAULT_PORT
+        """``port``：区间 ``[1, 65535]``；**没配 ⇒ 默认端口，而默认端口随 ``use_tls`` 变**。
+
+        ⚠️ 默认值是本方法的活（明文 :data:`DEFAULT_PORT` / TLS :data:`TLS_PORT` 差 30），
+        所以**先按 ``use_tls`` 算出来**再交给共享助手当 ``default`` —— 区间也一并交给它，
+        ⛔ 不要在调用点外面再套一层夹取（那会把越界的值静默改小，用户以为配了别的数）。
+
+        **改前只判"能不能 ``int()``"，越界值静默采纳**：``port=-1`` / ``port=0`` /
+        ``port=65536`` 原样交给 :meth:`socket.create_connection`，日志里一个字都没有 ——
+        而它们没有一个能连上（``0`` 让监听端拿不到端口，负数/超界直接被内核拒）⇒
+        用户只看到"连不上 + 无限重连"，压根不知道是哪个旋钮写错了。改后一律回落默认 +
+        一条 WARNING，点名键名与收到的值。
+        """
+        default = TLS_PORT if self.use_tls else DEFAULT_PORT
+        return coerce_int(
+            self.config, "port", default,
+            minimum=1, maximum=65535, platform=self.name,
+        )
 
     # ------------------------------------------------------------------
     # TLS 接缝

@@ -1194,6 +1194,278 @@ class TestHygiene(AdapterCase):
         self.assertEqual(gw.errors, [])
 
 
+# ======================================================================
+# 配置类型强制：accept_all / require_user_context 迁到 config_coerce.coerce_bool
+# ======================================================================
+#: ⚠️ 迁移之后**告警的 logger 换了**：从 ``opencode_bridge.adapters.homeassistant``
+#: 变成 ``opencode_bridge.config_coerce``。消息前缀（``homeassistant: ``）由
+#: ``platform=self.name`` 保住，所以**日志内容不变**，只是发出方变了。
+HA_LOGGER = "opencode_bridge.adapters.homeassistant"
+COERCE_LOGGER = "opencode_bridge.config_coerce"
+HA_LOG_PREFIX = "homeassistant: "
+
+#: 造适配器用的最小配置（``required_tokens`` 齐备，够 ``__init__`` 走完）。
+HA_MINIMAL = {"url": "ws://ha.local:8123/api/websocket", "token": "tok"}
+
+#: 两个布尔键的 (键名, 默认值)。⚠️ **默认值不同，且这个不同是有原因的**：
+#: ``accept_all`` 默认 ``False``（两个白名单都空 ⇒ 事件全丢），而
+#: ``require_user_context`` 默认 ``True``（少收，而不是把设备事件当对话）。
+BOOL_KEYS = (
+    ("accept_all", False),
+    ("require_user_context", True),
+)
+
+
+def pre_change_truthy(value: object, default: bool = True) -> bool:
+    """改动前的 ``homeassistant._truthy()``（逐字抄；告警那行去掉，其余原样）。
+
+    抄自**迁移前**的工作树，作为"合法值逐字节等价"那组断言的参照实现。
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    low = str(value).strip().lower()
+    if low in ("1", "true", "yes", "on"):
+        return True
+    if low in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def make_ha_adapter(**cfg: Any) -> HomeAssistantAdapter:
+    """建一个**不发网络**的 HA 适配器（只读配置，不 ``start()``）。"""
+    adapter = build("homeassistant", {**HA_MINIMAL, **cfg}, None)
+    assert isinstance(adapter, HomeAssistantAdapter)
+    return adapter
+
+
+class TestBooleanConfigCoercion(unittest.TestCase):
+    """``accept_all`` / ``require_user_context`` 迁到 ``coerce_bool`` 的前后对照。
+
+    ⚠️ **两个键的默认值不同**（``False`` vs ``True``），而这正是"能不能统一"的判据：
+    能，因为 :func:`coerce_bool` 的 ``default`` 是**逐调用点传**的，那条"为什么"留在
+    调用点的注释里，不会被压成一个通用量。
+    """
+
+    #: 合法值：真 bool、数字、以及共享助手认的那份词表（大小写/空白不敏感）。
+    LEGAL_BOOLS = (
+        (True, True), (False, False), (1, True), (0, False),
+        ("1", True), ("0", False), ("true", True), ("false", False),
+        ("TRUE", True), ("False", False), (" yes ", True), (" off ", False),
+        ("on", True), ("no", False),
+    )
+
+    def test_legal_values_are_byte_identical_to_the_old_expression(self):
+        """两个键、每个合法值都要与改前**同答** —— 迁移不许动合法值。"""
+        for key, default in BOOL_KEYS:
+            for value, expected in self.LEGAL_BOOLS:
+                with self.subTest(key=key, value=value):
+                    self.assertEqual(
+                        pre_change_truthy(value, default), expected,
+                        "参照实现的改前取值与迁移前实测不符（抄错了）",
+                    )
+                    adapter = make_ha_adapter(**{key: value})
+                    self.assertIs(getattr(adapter, key), expected)
+
+    def test_legal_values_are_silent(self):
+        """合法值不许告警（纪律 1/2 之外：每次启动都刷屏会把真错误淹没）。"""
+        for key, _default in BOOL_KEYS:
+            for value, _expected in self.LEGAL_BOOLS:
+                with self.subTest(key=key, value=value):
+                    with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                        with self.assertNoLogs(HA_LOGGER, level="WARNING"):
+                            make_ha_adapter(**{key: value})
+
+    def test_the_two_keys_keep_their_own_defaults(self):
+        """⛔ ``accept_all`` 默认 ``False`` 而 ``require_user_context`` 默认 ``True``。
+
+        这不是随手写的：一个是"别乱收"，一个是"别把设备事件当人说话"。
+        ⛔ 若有人为了"统一"把 ``require_user_context`` 也改成 ``False``，
+        定时器 / 脚本触发的事件会全部变成对话 —— 这里立刻红。
+        """
+        adapter = make_ha_adapter()
+        self.assertIs(adapter.accept_all, False, "默认不该收任何事件")
+        self.assertIs(adapter.require_user_context, True, "默认必须要求 user_id 非空")
+
+    #: "没配"的四种写法（键不存在 / ``None`` / 空串 / 只含空白）。
+    BLANKS = (None, "", "   ")
+
+    def test_an_unset_key_is_silent(self):
+        """"没配"必须静默（纪律 1）：四种写法都不告警，且都取到该键自己的默认。"""
+        for key, default in BOOL_KEYS:
+            with self.subTest(key=key, blank="<键不存在>"):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    with self.assertNoLogs(HA_LOGGER, level="WARNING"):
+                        adapter = make_ha_adapter()
+                self.assertIs(getattr(adapter, key), default)
+            for blank in self.BLANKS:
+                with self.subTest(key=key, blank=blank):
+                    with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                        adapter = make_ha_adapter(**{key: blank})
+                    self.assertIs(getattr(adapter, key), default)
+
+    #: ``(配置值, 改前给的值, 改后给的值)`` —— ⚠️ **每一列都等于该键自己的默认**。
+    #: 也就是说迁移**没有改动任何取值**；变的只有"什么时候告警"。
+    ILLEGAL_BOOLS = [
+        "not-a-bool", "12abc", "maybe", "banana", [], {}, [True], [False],
+        6667, -1, 9900.7, 65536, 2,
+    ]
+
+    def test_an_unrecognized_value_falls_back_to_that_keys_own_default(self):
+        """认不出来 ⇒ 回落**该键自己的默认** + 点名**键名**的告警（纪律 2）。
+
+        ⚠️ 改前的 ``_truthy`` **打不出键名**（它拿到的是已经取出来的值，键名不在作用域里），
+        所以用户看到的是"布尔配置非法 'maybe'"，得自己猜是哪个旋钮坏了。
+        改后告警点名 ``accept_all`` / ``require_user_context`` —— 这条断言正是为此。
+        """
+        for key, default in BOOL_KEYS:
+            for value in self.ILLEGAL_BOOLS:
+                with self.subTest(key=key, value=value):
+                    self.assertIs(
+                        pre_change_truthy(value, default), default,
+                        "参照实现：改前也是回落到该键的默认（取值没被改动）",
+                    )
+                    with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                        adapter = make_ha_adapter(**{key: value})
+                    self.assertIs(getattr(adapter, key), default)
+                    joined = "\n".join(logs.output)
+                    for expected in (HA_LOG_PREFIX, key, repr(value), repr(default)):
+                        self.assertIn(
+                            expected, joined,
+                            "告警必须点名**是哪个键** / 收到了什么 / 回落到什么",
+                        )
+
+    def test_the_warning_names_the_key_which_the_old_one_could_not(self):
+        """⛔ 反向断言：改前那条 ``布尔配置非法 %r`` **没有键名**，两键混在一起无法分辨。
+
+        ⇒ 这不是"顺手统一文案"，是补上一条纪律 2 明确要求的信息。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as accept_all_logs:
+            make_ha_adapter(accept_all="maybe")
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as user_ctx_logs:
+            make_ha_adapter(require_user_context="maybe")
+        self.assertIn("accept_all", "\n".join(accept_all_logs.output))
+        self.assertNotIn("require_user_context", "\n".join(accept_all_logs.output))
+        self.assertIn("require_user_context", "\n".join(user_ctx_logs.output))
+        self.assertNotIn("accept_all", "\n".join(user_ctx_logs.output))
+
+    def test_the_whitespace_only_value_is_now_silent(self):
+        """⚠️ **唯一一处改前/改后行为不同**（两边取值都等于该键的默认）。
+
+        改前只判 ``value == ""``，于是 ``"   "`` 走到词表分支、认不出来、**告警**；
+        改后按"没配"处理（纪律 1），静默。这是有意的取舍：只含空白的串与没写这个键
+        在用户眼里是同一件事。
+        """
+        for key, default in BOOL_KEYS:
+            with self.subTest(key=key):
+                self.assertIs(pre_change_truthy("   ", default), default)
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter = make_ha_adapter(**{key: "   "})
+                self.assertIs(getattr(adapter, key), default)
+
+    def test_the_warning_now_comes_from_the_shared_helper(self):
+        """⛔ **判据反退化**：把两个调用点改回 ``_truthy`` ⇒ 这里红。
+
+        取值在非法值上本来就相同（两边都回落到各自的默认），所以只有"告警由谁发出"
+        能证明迁移真的发生了。
+        """
+        for key, _default in BOOL_KEYS:
+            with self.subTest(key=key):
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    make_ha_adapter(**{key: "banana"})
+                self.assertTrue(logs.output, "共享助手没有为非法布尔值发声")
+
+    def test_require_user_context_still_governs_inbound_decisions(self):
+        """迁移后的值必须真的**接到过滤逻辑**上，不只落在字段上。
+
+        ⚠️ 替换的是 :meth:`HomeAssistantAdapter._accepts` 的**结果**所依赖的字段读取 ——
+        这里直接验"字段的取值决定了能力快照里那两个信号"，因为那正是状态视图读的。
+        """
+        adapter = make_ha_adapter()
+        caps = adapter.capabilities()
+        self.assertIn("require_user_context", caps)
+        self.assertFalse(caps["accept_all"])
+        self.assertFalse(
+            caps["inbound_accepts_anything"],
+            "只配 url+token 时必须如实报告'收不到任何事件'",
+        )
+        adapter = make_ha_adapter(entities=["light.kitchen"])
+        self.assertTrue(adapter.capabilities()["inbound_accepts_anything"])
+
+
+class TestRetainedCoercionShapedHelpers(unittest.TestCase):
+    """⚠️ **保留原样的那些读法**：钉住它们**没被**改成共享助手。
+
+    ``_first`` / ``_string_set`` / ``_config_event_types`` 三条都**刻意不套**
+    ``coerce_*``（理由写在 :mod:`opencode_bridge.adapters.homeassistant` 里）。
+    没有这组测试的话，"顺手统一"会在某次重构里发生，而这三个的语义与整数/布尔档
+    **不同类** ⇒ 套上去会直接丢掉各自那条"为什么"。
+    """
+
+    def test_first_still_resolves_alias_keys_in_order(self):
+        """``_first`` 是**别名回退**（5 个键取第一个非空），不是单键强制。"""
+        from opencode_bridge.adapters.homeassistant import _first
+
+        for key in ("url", "site_url", "base_url", "hass_url", "server_url"):
+            with self.subTest(key=key):
+                self.assertEqual(_first({key: "http://x:8123"}, *(
+                    "url", "site_url", "base_url", "hass_url", "server_url",
+                )), "http://x:8123")
+        self.assertEqual(_first({}, "url", "site_url"), "")
+        self.assertEqual(_first({"url": "   ", "site_url": "http://y"}, "url", "site_url"),
+                         "http://y", "空白算'没配'，继续往后试")
+
+    def test_first_still_keeps_the_default_url_fallback(self):
+        adapter = make_ha_adapter(url="")
+        self.assertTrue(adapter.base_url.endswith(":8123"))
+        self.assertFalse(adapter._url_configured)
+
+    def test_string_set_still_folds_scalars_and_sequences(self):
+        """``_string_set`` 产出的是 ``set[str]`` —— 共享层**没有**集合档。"""
+        from opencode_bridge.adapters.homeassistant import _string_set
+
+        self.assertEqual(_string_set(["a", " b ", ""]), {"a", "b"})
+        self.assertEqual(_string_set(("a", "b")), {"a", "b"})
+        self.assertEqual(_string_set({"a"}), {"a"})
+        self.assertEqual(_string_set("light"), {"light"})
+        self.assertEqual(_string_set(None), set())
+        self.assertEqual(_string_set(""), set())
+        self.assertEqual(_string_set("  "), set(), "只含空白的串算'没配'")
+
+    def test_the_entity_filters_still_use_string_set(self):
+        adapter = make_ha_adapter(
+            entities=["light.kitchen", " light.hall "],
+            domains=["binary_sensor"],
+            ignore_entities=["binary_sensor.garage"],
+        )
+        self.assertEqual(adapter.entities, {"light.kitchen", "light.hall"})
+        self.assertEqual(adapter.domains, {"binary_sensor"})
+        self.assertEqual(adapter.ignore_entities, {"binary_sensor.garage"})
+
+    def test_event_types_still_default_to_state_changed_not_the_wildcard(self):
+        """⛔ ``event_types`` **刻意不默认** ``*``（``*`` 需要管理员，否则被 Unauthorized 拒）。"""
+        for cfg in ({}, {"event_types": None}, {"event_types": ""},
+                    {"event_types": []}, {"event_types": ["  "]}):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(make_ha_adapter(**cfg).event_types,
+                                 DEFAULT_EVENT_TYPES)
+        self.assertNotIn("*", DEFAULT_EVENT_TYPES)
+        self.assertEqual(make_ha_adapter(event_types=["*"]).event_types, ("*",))
+        self.assertEqual(
+            make_ha_adapter(event_types=["b", "a"]).event_types, ("a", "b"),
+            "给定的 event_types 要排序去重（订阅顺序稳定）",
+        )
+
+    def test_capabilities_still_expose_the_filter_state(self):
+        """状态视图读的四个信号必须都在（它们是"配得对但收不到"的唯一可检测出口）。"""
+        caps = make_ha_adapter().capabilities()
+        for key in ("inbound_accepts_anything", "accept_all",
+                    "require_user_context", "filter_entities_count",
+                    "filter_domains_count"):
+            self.assertIn(key, caps)
+
+
 class TestConfiguredButReceivesNothing(unittest.TestCase):
     """「凭据配齐了，但一个事件都收不到」必须**机器可检测**。
 

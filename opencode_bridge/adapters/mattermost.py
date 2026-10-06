@@ -97,6 +97,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, List, Optional, Tuple
 
+from ..config_coerce import coerce_bool
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text
@@ -287,21 +288,20 @@ class MattermostAdapter(Adapter):
         self._last_send: dict[str, float] = {}
 
     def _config_verify_tls(self) -> bool:
-        """读 ``verify_tls``（默认 ``True``）；非法值按 ``True`` 处理而不是静默降级。"""
-        raw = self.config.get("verify_tls")
-        if raw is None or raw == "":
-            return True
-        if isinstance(raw, bool):
-            return raw
-        low = str(raw).strip().lower()
-        if low in ("1", "true", "yes", "on"):
-            return True
-        if low in ("0", "false", "no", "off"):
-            return False
-        logger.warning(
-            "mattermost: verify_tls 配置非法 %r，按 True（校验证书）处理", raw
-        )
-        return True
+        """读 ``verify_tls``（默认 ``True``）；非法值按 ``True`` 处理而不是静默降级。
+
+        词表与"认不出来 ⇒ 回落 + 告警"这条纪律由
+        :func:`~opencode_bridge.config_coerce.coerce_bool` 统一提供（它的认词表本来就是
+        照本文件抄的，两边逐个取值同答）。⚠️ 与改前唯一的差别是**只含空白的串**：
+        改前会告警，改后按"没配"静默处理 —— 取值两种情况都是 ``True``。
+
+        ⚠️ **这个开关只管 REST 出站**（:meth:`_request` 里据此决定要不要
+        ``ssl._create_unverified_context()``）。WebSocket 侧固定用
+        ``ssl.create_default_context()``（不提供关校验的开关），所以**它关不掉 WS 的
+        证书校验** —— 自签证书的部署仍然只能配受信任的证书。这条边界与迁移无关，
+        迁移后依然成立。
+        """
+        return coerce_bool(self.config, "verify_tls", True, platform=self.name)
 
     # ------------------------------------------------------------------
     # URL 推导

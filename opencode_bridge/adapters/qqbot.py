@@ -111,6 +111,7 @@ import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
 from .. import identity
+from ..config_coerce import coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..split import split_text
 from ..transport import ReconnectNow, WebSocketTransport
@@ -198,6 +199,19 @@ DEFAULT_INTENTS = INTENT_GROUP_AND_C2C | INTENT_PUBLIC_GUILD_MESSAGES
 #: 官方示例 ``shard: [0, 4]`` 是 4 分片；单实例用 ``[0, 1]``（原文："若无需分片，使用
 #: ``[0, 1]`` 即可"）。
 DEFAULT_SHARD: Tuple[int, int] = (0, 1)
+
+#: ``shard`` 两个元素各自的"被判非法"哨兵，交给共享助手作回落值用。
+#:
+#: ⚠️ 刻意落在各自合法区间**之外**（``shard_id`` 要 ``>= 0``、``num_shards`` 要
+#: ``>= 1``）—— 于是"拿到哨兵"与"用户真的配了这个数"不可能混淆，
+#: :meth:`QQBotAdapter._config_shard` 才能用它判断"这条是不是助手已经告警过了"，
+#: 从而**同一个问题只打一条告警**。
+_UNUSABLE_SHARD_ID = -1
+_UNUSABLE_NUM_SHARDS = 0
+#: ``shard`` 两个元素在告警里的键名。写成带下标的路径，是为了让告警直接指向用户写的
+#: 那一项（``shard[0]`` / ``shard[1]``），而不是笼统的 ``shard``。
+_SHARD_ID_KEY = "shard[0]"
+_SHARD_NUM_SHARDS_KEY = "shard[1]"
 
 # 会话 scope → (事件名集合, 出站路径模板)
 SCOPE_GROUP = "group"
@@ -385,38 +399,85 @@ class QQBotAdapter(Adapter):
     # 配置
     # ------------------------------------------------------------------
     def _config_intents(self) -> int:
-        """读 ``intents`` 配置；非法值退回默认而不是静默发 0（0 = 一个事件都不收）。"""
+        """读 ``intents`` 配置；非法值退回默认而不是静默发 0（0 = 一个事件都不收）。
+
+        ⚠️ **名字列表那一支刻意留在这里**（"字符串集合 → bitmask"压不成 ``coerce_int``，
+        且它有自己的容错语义：认不出的名字按 0 算、全都认不出才落到整数那条路）。
+        整数那一支已迁到共享助手 :func:`~opencode_bridge.config_coerce.coerce_int`，
+        下界**闭区间 1** —— 改前那行逐字是 ``value if value > 0``。
+
+        ⇒ 迁移带来的**行为变化**（逐条有测试钉住改前/改后，
+        ``tests/test_qqbot.py::TestIntentsConfigCoercion``）：
+
+        1. ``intents=0`` / 负数：改前**静默**回落，改后**告警**回落（``0`` 同样值得
+           点名：它是一个事件都不收）。
+        2. ``intents=true``：改前 ``int(True) == 1`` **不抛异常** ⇒ 静默拿到 1，而 1
+           不是本适配器用的任何一个 intent 位（:data:`INTENT_GROUP_AND_C2C` 是
+           ``1 << 25``）⇒ 官方会因 intents 越权直接关连接，用户只看到"刚鉴权就断"。
+           改后助手在**共享层**拒 bool。
+        3. ``intents=33554433.0``（JSON 没有 int/float 之分）：改前 ``int()`` **截断**，
+           改后告警回落。
+        4. ``intents="   "``（纯空白）：改前告警（``int()`` 抛 ``ValueError``），改后
+           按纪律 1 当"没配" ⇒ 静默用默认。
+        """
         raw = self.config.get("intents")
-        if raw in (None, ""):
-            return DEFAULT_INTENTS
         if isinstance(raw, (list, tuple)):          # 也接受名字列表（容错）
             mask = 0
             for item in raw:
                 mask |= _INTENT_NAMES.get(str(item).strip().upper(), 0)
             if mask:
                 return mask
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            logger.warning(
-                "qqbot: intents 配置非法 %r，改用默认 %d", raw, DEFAULT_INTENTS
-            )
-            return DEFAULT_INTENTS
-        return value if value > 0 else DEFAULT_INTENTS
+        return coerce_int(
+            self.config, "intents", DEFAULT_INTENTS,
+            minimum=1, platform=self.name,
+        )
 
     def _config_shard(self) -> Tuple[int, int]:
-        """读 ``shard`` 配置（``[shard_id, num_shards]``）；非法值退回 ``(0, 1)``。"""
+        """读 ``shard`` 配置（``[shard_id, num_shards]``）；非法值退回 ``(0, 1)``。
+
+        三个元素各走各的判据（两个元素已迁到共享助手 ``coerce_int``）：
+
+        1. **形状不对**（不是长度 2 的 ``list`` / ``tuple``）⇒ 静默回默认。⚠️ 这条
+           **刻意保持静默**：那多半是"这个键压根没配"（纪律 1），不是配置错误。
+        2. **元素不是整数 / 越界** ⇒ 助手告警并回落到哨兵（见 :data:`_UNUSABLE_SHARD_ID`
+           与 :data:`_UNUSABLE_NUM_SHARDS`）⇒ 本方法看到哨兵就直接回默认。
+        3. **交叉关系非法**（``shard_id >= num_shards``）⇒ 仍由本方法告警：这一条
+           **单个元素都合法**（两个元素各自在区间内），只有"放在一起看"才非法，
+           助手拿不到这个信息。
+
+        ⚠️ ``coerce_int`` 的入参是「整份 config + 键名」（纪律 1 与纪律 2 的分界必须
+        由**同一个**判据划，见 ``config_coerce`` 的模块 docstring），所以每个元素包成
+        一份单键映射；键名写成 ``shard[0]`` / ``shard[1]`` 让告警指向用户写的那一项。
+
+        ⇒ 迁移带来的**行为变化**（逐条有测试钉住改前/改后，
+        ``tests/test_qqbot.py::TestShardConfigCoercion``）：
+
+        1. ⚠️ **改前那条"静默回落且无告警"就是第 2 步的解析失败分支**
+           （``except (TypeError, ValueError): return DEFAULT_SHARD``，**没有**日志）——
+           复核确认：告警只挂在**交叉关系**那一条（``if num < 1 or not (0 <= …)``）上。
+           ``shard=["x", 4]`` 改前静默回落，改后告警回落。
+        2. ``shard=[1.0, 4]`` / ``[True, 4]``：改前**静默采纳**（``int()`` 截断 /
+           ``int(True) == 1``），改后告警回落 ``(0, 1)``。
+        3. ``shard=[0, 0]``：改前告警（``num < 1`` 那条），改后**也**告警，但告警出自
+           助手（下界 ``minimum=1``）—— 条数不变，文案变。
+        """
         raw = self.config.get("shard")
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
             return DEFAULT_SHARD
-        try:
-            shard_id, num = int(raw[0]), int(raw[1])
-        except (TypeError, ValueError):
-            return DEFAULT_SHARD
-        if num < 1 or not (0 <= shard_id < num):
+        shard_id = coerce_int(
+            {_SHARD_ID_KEY: raw[0]}, _SHARD_ID_KEY, _UNUSABLE_SHARD_ID,
+            minimum=0, platform=self.name,
+        )
+        num_shards = coerce_int(
+            {_SHARD_NUM_SHARDS_KEY: raw[1]}, _SHARD_NUM_SHARDS_KEY, _UNUSABLE_NUM_SHARDS,
+            minimum=1, platform=self.name,
+        )
+        if shard_id == _UNUSABLE_SHARD_ID or num_shards == _UNUSABLE_NUM_SHARDS:
+            return DEFAULT_SHARD       # 助手已经点名告警过了，不再说第二遍
+        if not 0 <= shard_id < num_shards:
             logger.warning("qqbot: shard 配置非法 %r，改用 %s", raw, DEFAULT_SHARD)
             return DEFAULT_SHARD
-        return (shard_id, num)
+        return (shard_id, num_shards)
 
     # ------------------------------------------------------------------
     # 会话标识（``platform:local_id``）

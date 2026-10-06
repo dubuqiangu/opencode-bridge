@@ -197,6 +197,207 @@ class MattermostTestCase(unittest.TestCase):
 
         self.addCleanup(restore)
 
+    def patch_module_object(self, owner, name: str, value) -> None:
+        """同上，但作用于**任意对象**的属性（不限于本模块的顶层名字）。
+
+        :mod:`urllib.request` 是 :mod:`urllib` 的子模块，不是 ``mm_mod`` 的属性，
+        所以 :meth:`patch_module` 的 ``getattr(mm_mod, …)`` 那条路走不通。
+        """
+        original = getattr(owner, name)
+        setattr(owner, name, value)
+
+        def restore() -> None:
+            setattr(owner, name, original)
+
+        self.addCleanup(restore)
+
+
+# ======================================================================
+# 配置类型强制：verify_tls 迁到 opencode_bridge.config_coerce
+# ======================================================================
+#: ⚠️ 迁移之后**告警的 logger 换了**：从 ``opencode_bridge.adapters.mattermost``
+#: 变成 ``opencode_bridge.config_coerce``。消息前缀（``mattermost: ``）由
+#: ``platform=self.name`` 保住，所以**日志内容不变**，只是发出方变了。
+MM_LOGGER = "opencode_bridge.adapters.mattermost"
+COERCE_LOGGER = "opencode_bridge.config_coerce"
+MM_LOG_PREFIX = "mattermost: "
+
+
+def stub_urlopen(case: MattermostTestCase) -> list:
+    """把 ``urllib.request.urlopen`` 换成记录器，返回 ``[(request, kwargs), …]``。
+
+    ⚠️ 只**记录** kwargs，不替换被测逻辑（:meth:`MattermostAdapter._request`）本身 ——
+    替换掉它等于把"``verify_tls`` 决定要不要传 ``context``"这条一起替换没了。
+    还原交给 :meth:`MattermostTestCase.patch_module`（它会登记 ``addCleanup``）。
+    """
+    calls: list = []
+
+    class _Resp:
+        status = 200
+        headers: dict = {}
+
+        def read(self):
+            return b'{"id": "u_me"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, **kwargs):
+        calls.append((request, kwargs))
+        return _Resp()
+
+    case.patch_module_object(mm_mod.urllib.request, "urlopen", fake_urlopen)
+    return calls
+
+
+def pre_change_verify_tls(config: dict) -> bool:
+    """改动前的 ``MattermostAdapter._config_verify_tls()``（逐字抄；告警那行去掉）。
+
+    抄自**迁移前**的工作树，作为"合法值逐字节等价"那组断言的参照实现。
+    """
+    raw = config.get("verify_tls")
+    if raw is None or raw == "":
+        return True
+    if isinstance(raw, bool):
+        return raw
+    low = str(raw).strip().lower()
+    if low in ("1", "true", "yes", "on"):
+        return True
+    if low in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+class TestVerifyTlsCoercion(MattermostTestCase):
+    """``verify_tls`` 迁到 ``coerce_bool`` 之后的前后对照。
+
+    ⚠️ 这个键的**回落方向是安全那一侧**：默认值是 ``True``（校验证书），认不出来就
+    回落到"校验"，而不是"不校验" —— 一个写错的 ``verify_tls`` 绝不能静默变成关掉证书。
+    """
+
+    #: 合法值：真 bool、数字、以及共享助手认的那份词表（大小写/空白不敏感）。
+    LEGAL_VERIFY_TLS = (
+        (True, True), (False, False), (1, True), (0, False),
+        ("1", True), ("0", False), ("true", True), ("false", False),
+        ("TRUE", True), ("False", False), (" yes ", True), (" off ", False),
+        ("on", True), ("no", False),
+    )
+
+    def test_legal_verify_tls_is_byte_identical_to_the_old_expression(self):
+        for value, expected in self.LEGAL_VERIFY_TLS:
+            with self.subTest(verify_tls=value):
+                self.assertEqual(
+                    pre_change_verify_tls({"verify_tls": value}), expected,
+                    "参照实现的改前取值与迁移前实测不符（抄错了）",
+                )
+                adapter, _ = make_adapter({"verify_tls": value})
+                self.assertIs(adapter.verify_tls, expected)
+
+    def test_legal_verify_tls_is_silent(self):
+        """合法值不许告警（纪律 1/2 之外：每次启动都刷屏会把真错误淹没）。"""
+        for value, _expected in self.LEGAL_VERIFY_TLS:
+            with self.subTest(verify_tls=value):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    make_adapter({"verify_tls": value})
+
+    def test_an_unset_verify_tls_is_silent_and_defaults_to_verifying(self):
+        """"没配"必须静默，且**默认校验证书**。"""
+        for blank in ({}, {"verify_tls": None}, {"verify_tls": ""}):
+            with self.subTest(blank=blank):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter, _ = make_adapter(dict(blank))
+                self.assertIs(adapter.verify_tls, True)
+
+    #: ``(配置值, 改前, 改后)``；**取值全部相同** —— 这个键迁移不改任何取值。
+    ILLEGAL_VERIFY_TLS = [
+        "not-a-bool", "12abc", "maybe", "banana", [], {}, [False], 6667, -1,
+        9900.7, 65536,
+    ]
+
+    def test_an_unrecognized_verify_tls_falls_back_to_verifying_and_warns(self):
+        """认不出来 ⇒ 回落**校验证书**（不是"不校验"）+ 点名键名的告警（纪律 2）。"""
+        for value in self.ILLEGAL_VERIFY_TLS:
+            with self.subTest(verify_tls=value):
+                self.assertIs(
+                    pre_change_verify_tls({"verify_tls": value}), True,
+                    "参照实现：改前也按 True 处理（这条钉的是取值没被改动）",
+                )
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    adapter, _ = make_adapter({"verify_tls": value})
+                self.assertIs(
+                    adapter.verify_tls, True,
+                    "非法值必须按 True（校验证书）处理 —— 回落成不校验是安全缺陷",
+                )
+                joined = "\n".join(logs.output)
+                for expected in (MM_LOG_PREFIX, "verify_tls", repr(value), repr(True)):
+                    self.assertIn(expected, joined, "告警必须点名键/收到的值/回落目标")
+
+    def test_the_whitespace_only_value_is_now_silent(self):
+        """⚠️ **唯一一处改前/改后行为不同**（取值相同，两边都是 ``True``）。
+
+        改前只判 ``raw == ""``，于是 ``"   "`` 走到词表分支、认不出来、**告警**；
+        改后按"没配"处理（纪律 1），静默。这是有意的取舍：只含空白的串与没写这个键
+        在用户眼里是同一件事，为它刷一条告警只会训练用户忽略告警。
+        """
+        self.assertIs(pre_change_verify_tls({"verify_tls": "   "}), True)
+        with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_adapter({"verify_tls": "   "})
+        self.assertIs(adapter.verify_tls, True)
+
+    def test_the_warning_now_comes_from_the_shared_helper(self):
+        """⛔ **判据反退化**：把 ``_config_verify_tls`` 改回迁移前那份 ⇒ 这里红。
+
+        取值在非法值上本来就相同（两边都回落 ``True``），所以只有"告警由谁发出"
+        能证明迁移真的发生了 —— 这条就是那个锚点。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            make_adapter({"verify_tls": "banana"})
+        self.assertTrue(logs.output, "共享助手没有为非法 verify_tls 发声")
+
+    def test_verification_on_leaves_rest_without_an_unverified_context(self):
+        """反向一侧：``verify_tls=True``（含**没配**与非法值）不许传 ``context``。
+
+        传了就是显式降级，而用户配的是"校验证书" —— 传与不传都是"没配"的默认路径。
+        """
+        for blank in ({}, {"verify_tls": None}, {"verify_tls": ""},
+                      {"verify_tls": True}, {"verify_tls": "banana"}):
+            with self.subTest(blank=blank):
+                config = {"site_url": SITE_URL, "token": TOKEN, "user_id": MY_USER_ID}
+                config.update(blank)
+                adapter = MattermostAdapter(config, RecordingHooks())
+                rest_calls = stub_urlopen(self)
+                adapter._request("GET", "/api/v4/users/me", None)
+                self.assertNotIn(
+                    "context", rest_calls[0][1],
+                    "校验证书时不该把不校验的 context 递给 urlopen",
+                )
+
+    def test_turning_verification_off_only_affects_rest(self):
+        """⛔ **边界不变量**：``verify_tls=False`` 只关 REST，**关不掉 WS**。
+
+        WS 侧固定用 ``ssl.create_default_context()``（:mod:`opencode_bridge.ws` 内部），
+        不提供关校验的开关 ⇒ 自签证书的部署在 WebSocket 上仍然会被拒。
+        这条与迁移无关，迁移后依然成立 —— 钉住它是为了防止有人日后"顺手"把它扩到 WS。
+        """
+        adapter, _ = make_adapter({"verify_tls": False})
+        self.assertIs(adapter.verify_tls, False)
+        rest_calls = stub_urlopen(self)
+        adapter._request("GET", "/api/v4/users/me", None)
+        self.assertIn("context", rest_calls[0][1],
+                      "REST 侧必须拿到不校验证书的 context")
+        # WS 侧：``_make_ws`` 只把 url / timeout / headers 交给工厂，**没有** context。
+        ws_calls: list = []
+        adapter._ws_factory = lambda url, **kw: ws_calls.append((url, kw)) or FakeWS()
+        adapter._make_ws("wss://mm.example.test/api/v4/websocket")
+        self.assertEqual(len(ws_calls), 1)
+        self.assertNotIn(
+            "context", ws_calls[0][1],
+            "verify_tls=False 不许影响 WebSocket 侧 —— 那边固定校验证书",
+        )
+
 
 # ----------------------------------------------------------------------
 # 1) 能力声明

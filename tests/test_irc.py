@@ -33,9 +33,11 @@ logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 from opencode_bridge.adapters import adapter_class, build, registered_names
 from opencode_bridge.adapters.irc import (
     CONNECT_TIMEOUT,
+    DEFAULT_PORT,
     LINE_LIMIT,
     MESSAGE_LIMIT,
     SOCKET_TIMEOUT,
+    TLS_PORT,
     IRCAdapter,
     _byte_safe_split,
     _fit_utf8,
@@ -413,6 +415,293 @@ class TestIRCCapabilities(unittest.TestCase):
         adapter._known_nicks.add("alice")
         self.assertEqual(adapter._normalize_target("alice"), "alice")
         self.assertEqual(adapter._normalize_target("ALICE"), "ALICE")
+
+
+# ======================================================================
+# 配置类型强制：port / use_tls 迁到 opencode_bridge.config_coerce
+# ======================================================================
+#: ⚠️ 迁移之后**告警的 logger 换了**：从 ``opencode_bridge.adapters.irc`` 变成
+#: ``opencode_bridge.config_coerce``。消息前缀（``irc: ``）由 ``platform=self.name``
+#: 保住，所以**日志内容不变**，只是发出方变了 —— 顺带让"这一条是纪律 2 打的"可查。
+IRC_LOGGER = "opencode_bridge.adapters.irc"
+COERCE_LOGGER = "opencode_bridge.config_coerce"
+IRC_LOG_PREFIX = "irc: "
+
+#: IRC 的端口区间（16 位无符号 TCP/UDP 端口号）。
+PORT_MINIMUM = 1
+PORT_MAXIMUM = 65535
+
+
+def pre_change_resolve_port(config: dict, use_tls: bool) -> int:
+    """改动前的 ``IRCAdapter._resolve_port()``（逐字抄；告警那行去掉，其余原样）。
+
+    抄自**迁移前**的工作树，不是凭记忆重写 —— 这条是"合法值逐字节等价"那组断言的
+    参照实现。
+    """
+    raw = config.get("port")
+    try:
+        if raw not in (None, ""):
+            return int(raw)
+    except (TypeError, ValueError):
+        pass
+    return TLS_PORT if use_tls else DEFAULT_PORT
+
+
+def pre_change_use_tls(config: dict) -> bool:
+    """改动前 ``__init__`` 里的 ``bool(self.config.get("use_tls"))``。"""
+    return bool(config.get("use_tls"))
+
+
+class TestPortCoercion(unittest.TestCase):
+    """``port`` 迁到 ``coerce_int``（区间 ``[1, 65535]``）之后的前后对照。
+
+    ⚠️ **改前的 ``_resolve_port`` 根本没有区间**：只要 ``int()`` 解析成功就原样返回，
+    所以 ``-1`` / ``0`` / ``65536`` / ``True``（读成 1）/ ``9900.7``（截断成 9900）
+    全部被**静默采纳**。这不是"缺陷"，是一整类缺陷：**用户配了什么、实际生效的是什么，
+    日志里一个字都没有**。
+    """
+
+    #: 合法值：整数、数字字符串（含首尾空白与 ``+``）、以及区间两个端点。
+    LEGAL_PORTS = (1, 6667, 6697, 65535, "1", "6667", " 6697 ", "\t7001\n", "+7001")
+
+    def test_legal_ports_are_byte_identical_to_the_old_expression(self):
+        """合法值必须逐个与改前**同答**，且不打任何告警（纪律 1/2 之外的"不吵"）。"""
+        for value in self.LEGAL_PORTS:
+            for use_tls in (False, True):
+                with self.subTest(port=value, use_tls=use_tls):
+                    config = {"port": value}
+                    self.assertEqual(
+                        pre_change_resolve_port(config, use_tls),
+                        _resolve_port_for(use_tls, config),
+                        "合法值必须与改前逐字节等价",
+                    )
+
+    def test_legal_ports_are_silent(self):
+        """合法端口**不许**告警 —— 否则每次启动都刷屏，真错误反而被淹没。"""
+        for value in self.LEGAL_PORTS:
+            with self.subTest(port=value):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    with self.assertNoLogs(IRC_LOGGER, level="WARNING"):
+                        _resolve_port_for(False, {"port": value})
+
+    def test_an_unset_port_is_silent(self):
+        """"没配"必须静默：键不存在 / ``None`` / 空串 / 只含空白，四种都不告警。"""
+        for blank in ({}, {"port": None}, {"port": ""}, {"port": "   "}):
+            for use_tls in (False, True):
+                with self.subTest(blank=blank, use_tls=use_tls):
+                    with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                        port = _resolve_port_for(use_tls, dict(blank))
+                    self.assertEqual(port, pre_change_resolve_port(blank, use_tls))
+
+    def test_the_default_port_follows_use_tls(self):
+        """⚠️ 区间与**默认值**都随 ``use_tls`` 变 —— 两者都不能写死。
+
+        明文 6667 / TLS 6697。这条钉的是"别把 6697 硬写进 ``default``"：写死的话
+        ``use_tls=True`` 且端口非法时会回落到**明文**端口，而传输层仍在做 TLS 包装
+        ⇒ 连的是一个不响应的端口，而用户看到的日志说"已回落为 6667"。
+        """
+        for use_tls, expected in ((False, 6667), (True, 6697)):
+            with self.subTest(use_tls=use_tls):
+                adapter, _ = make_irc({"use_tls": use_tls})
+                self.assertEqual(adapter.port, expected, "没配 port 时的默认端口")
+                # 非法端口也必须回落到**同一个**默认值（而不是某个写死的数）。
+                with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter, _ = make_irc({"use_tls": use_tls, "port": -1})
+                self.assertEqual(adapter.port, expected, "非法端口的回落目标")
+
+    #: ``(配置值, 改前给的端口, 改后应当给的端口)``。
+    #: ⚠️ 后三个与前几个**不是同一类**问题：前几个是"越界"，后三个是"类型就不是整数"
+    #: （``int(True)==1`` / ``int(9900.7)==9900`` 都不抛异常，所以改前连告警都没有）。
+    ILLEGAL_PORTS = [
+        ("not-a-port", 6667, 6667),
+        ("12abc", 6667, 6667),
+        ([], 6667, 6667),
+        ({}, 6667, 6667),
+        (-1, -1, 6667),          # ⚠️ 改前把 -1 **当成端口**返回了
+        (0, 0, 6667),            # ⚠️ 改前把 0 当成端口返回了
+        (65536, 65536, 6667),    # ⚠️ 改前把越界值原样返回了
+        (70000, 70000, 6667),
+        (True, 1, 6667),         # ⚠️ 改前读成**端口 1**
+        (False, 0, 6667),        # ⚠️ 改前读成**端口 0**
+        (9900.7, 9900, 6667),    # ⚠️ 改前**截断**成 9900
+        (1000.0, 1000, 6667),    # ⚠️ 同上：JSON 里没有 int/float 之分
+    ]
+
+    def test_illegal_ports_fall_back_instead_of_being_silently_accepted(self):
+        """改前静默采纳的越界值，改后必须**回落 + 告警**（纪律 2 + 纪律 3）。"""
+        for value, before, after in self.ILLEGAL_PORTS:
+            with self.subTest(port=value):
+                self.assertEqual(
+                    pre_change_resolve_port({"port": value}, False), before,
+                    "参照实现的改前取值与迁移前实测不符（抄错了）",
+                )
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    adapter, _ = make_irc({"port": value})
+                self.assertEqual(adapter.port, after)
+                joined = "\n".join(logs.output)
+                for expected in (IRC_LOG_PREFIX, "port", repr(value), repr(6667)):
+                    self.assertIn(expected, joined, "告警必须点名键/收到的值/回落目标")
+
+    def test_an_out_of_range_port_is_never_handed_to_the_socket(self):
+        """⛔ 反向断言：改前 ``port=-1`` 会一路走到 :meth:`socket.create_connection`。
+
+        那不是"一个奇怪但合法的端口" —— 内核会直接拒，于是表现是**连不上 + 按退避
+        无限重连**，而用户从头到尾没收到任何一条提示。⇒ 越界值必须**在进传输层之前**
+        就被换掉。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_irc({"port": -1})
+        self.assertEqual(adapter.port, DEFAULT_PORT)
+        self.assertGreaterEqual(adapter.port, PORT_MINIMUM)
+        self.assertLessEqual(adapter.port, PORT_MAXIMUM)
+        self.assertEqual(adapter._make_transport().port, DEFAULT_PORT,
+                         "越界端口不许被原样交给传输层（那才是 create_connection）")
+
+    def test_a_boolean_port_is_not_silently_one(self):
+        """⛔ 反向断言：``True`` 曾被 ``int(True)`` 读成**端口 1**。
+
+        端口 1 不是"一个小端口"，而是一个用户几乎不可能真的想连的东西；用户配的是
+        ``true``，**没有任何东西会告诉他**。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_irc({"port": True})
+        self.assertEqual(adapter.port, DEFAULT_PORT)
+
+    def test_a_float_port_is_not_silently_truncated(self):
+        """⛔ 反向断言：``9900.7`` 曾被 ``int(9900.7)`` **截断**成 9900。
+
+        截断就是"悄悄改了用户配的值"，而日志里一个字都没有。⚠️ 代价写在
+        ``config_coerce`` 的 docstring 里：JSON 没有 int/float 之分 ⇒ ``1000.0``
+        也会被拒（+ 告警），用户改成 ``1000`` 即可。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_irc({"port": 9900.7})
+        self.assertEqual(adapter.port, DEFAULT_PORT)
+
+    def test_the_bounds_are_the_ones_announced(self):
+        """告警里说的区间必须就是**实际生效**的区间（否则文案在骗人）。"""
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            make_irc({"port": 0})
+        self.assertIn("[%d, %d]" % (PORT_MINIMUM, PORT_MAXIMUM), "\n".join(logs.output))
+
+    def test_the_warning_now_comes_from_the_shared_helper(self):
+        """⛔ **判据反退化**：告警必须由 ``config_coerce`` 发出。
+
+        把 :meth:`IRCAdapter._resolve_port` 改回迁移前那份（自带 ``irc: bad port %r``）
+        ⇒ 这里立刻红。这条是"迁移真的发生了"的锚点：只看取值的话，改回原写法时
+        ``("not-a-port", 6667, 6667)`` 这几行仍然绿（取值本来就一样）。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            make_irc({"port": "not-a-port"})
+        self.assertTrue(logs.output, "共享助手没有为非法端口发声")
+        self.assertNotIn("bad port", "\n".join(logs.output),
+                         "迁移前的英文告警不该再出现")
+
+
+class TestUseTlsCoercion(unittest.TestCase):
+    """``use_tls`` 迁到 ``coerce_bool`` 之后的前后对照。
+
+    ⚠️ 这条**不在**原派单点名的三个键里，是复核代码时发现的第四个：改前是
+    ``bool(self.config.get("use_tls"))``，而裸 ``bool()`` 只会问"是不是非空"，于是
+    ``"false"`` / ``"0"`` / ``"off"`` / ``"no"`` **全部读成 ``True``** ——
+    用户明明写了"不要 TLS"，却被静默开了 TLS，并连带把默认端口从 6667 换成 6697。
+    """
+
+    #: 合法值：真 bool、数字，以及**改前与改后同答**的那些词（大小写/空白不敏感）。
+    #: ⛔ 词表里的 ``false`` / ``off`` / ``no`` / ``"0"`` **不在这里** —— 它们正是改前
+    #: 读反方向的那一组，由 :meth:`test_the_word_false_is_no_longer_read_as_true` 单独钉。
+    LEGAL_USE_TLS = (
+        (True, True), (False, False), (1, True), (0, False),
+        ("1", True), ("true", True), ("TRUE", True), ("TRUE ", True),
+        (" yes ", True), ("on", True), ("ON", True),
+    )
+
+    def test_legal_use_tls_is_byte_identical_to_the_old_expression(self):
+        """改前改后**同答**的那组值必须逐个相等（这才是"迁移没改语义"的意思）。"""
+        for value, expected in self.LEGAL_USE_TLS:
+            with self.subTest(use_tls=value):
+                self.assertEqual(
+                    pre_change_use_tls({"use_tls": value}), expected,
+                    "参照实现的改前取值与迁移前实测不符（抄错了）",
+                )
+                adapter, _ = make_irc({"use_tls": value})
+                self.assertIs(adapter.use_tls, expected)
+
+    def test_legal_use_tls_is_silent(self):
+        """合法值不许告警（纪律 1/2 之外：每次启动都刷屏会把真错误淹没）。"""
+        for value, _expected in self.LEGAL_USE_TLS:
+            with self.subTest(use_tls=value):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    make_irc({"use_tls": value})
+
+    def test_the_word_false_is_no_longer_read_as_true(self):
+        """⛔ 反向断言：``"false"`` 曾被 ``bool("false")`` 读成 ``True``（开了 TLS）。
+
+        这不是"宽松认词"能解释的：**用户写的是 false，系统开的是 TLS**，方向完全反了。
+        """
+        for value in ("false", "False", "FALSE", " no ", "off", "0"):
+            with self.subTest(use_tls=value):
+                self.assertIs(
+                    pre_change_use_tls({"use_tls": value}), True,
+                    "参照实现：改前确实读成了 True（这条钉的是缺陷本身）",
+                )
+                adapter, _ = make_irc({"use_tls": value})
+                self.assertIs(
+                    adapter.use_tls, False,
+                    "写了 %r 必须是不开 TLS" % (value,),
+                )
+
+    def test_an_unrecognized_use_tls_falls_back_to_no_tls_and_warns(self):
+        """认不出来 ⇒ 回落**默认（不开 TLS）** + 一条点名键名的告警（纪律 2）。"""
+        for value in ("maybe", "not-a-bool", 6667, []):
+            with self.subTest(use_tls=value):
+                with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+                    adapter, _ = make_irc({"use_tls": value})
+                self.assertIs(adapter.use_tls, False)
+                joined = "\n".join(logs.output)
+                for expected in (IRC_LOG_PREFIX, "use_tls", repr(value), repr(False)):
+                    self.assertIn(expected, joined)
+
+    def test_an_unset_use_tls_is_silent(self):
+        """没配 ⇒ 静默用默认 ``False``（纪律 1：否则每次启动都刷屏）。"""
+        for blank in ({}, {"use_tls": None}, {"use_tls": ""}, {"use_tls": "   "}):
+            with self.subTest(blank=blank):
+                with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+                    adapter, _ = make_irc(dict(blank))
+                self.assertIs(adapter.use_tls, False)
+
+    def test_use_tls_false_keeps_the_plaintext_default_port(self):
+        """⛔ 两个键的耦合必须一起钉住：``use_tls=False`` ⇒ 默认端口回到**明文** 6667。
+
+        改前用户写 ``"use_tls": "false"`` 得到的是 TLS + 6697；现在两处读法一致，
+        才不会出现"没开 TLS 却去连 6697"。
+        """
+        with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_irc({"use_tls": False})
+        self.assertEqual(adapter.port, DEFAULT_PORT)
+        with self.assertNoLogs(COERCE_LOGGER, level="WARNING"):
+            adapter, _ = make_irc({"use_tls": True})
+        self.assertEqual(adapter.port, TLS_PORT)
+
+    def test_the_warning_comes_from_the_shared_helper(self):
+        """⛔ **判据反退化**：把 ``use_tls`` 改回 ``bool(...)`` ⇒ 这里红。
+
+        ``bool("false")`` 不告警也不抛，所以没有别的判据能发现它退回去了。
+        """
+        with self.assertLogs(COERCE_LOGGER, level="WARNING") as logs:
+            make_irc({"use_tls": "maybe"})
+        self.assertTrue(logs.output)
+
+
+def _resolve_port_for(use_tls: bool, config: dict) -> int:
+    """按给定 ``use_tls`` 跑一遍**当前**的 ``IRCAdapter._resolve_port``。
+
+    绕开适配器构造是因为要断言"这组配置的端口解析结果"，而构造还会做别的事
+    （建 nick 白名单、起 `_warn_private_messages_unpairable``）。
+    """
+    adapter = IRCAdapter({"host": "h", "nick": NICK, "channels": CHAN,
+                          "use_tls": use_tls, **config}, RecordingHooks())
+    return adapter.port
 
 
 # ----------------------------------------------------------------------

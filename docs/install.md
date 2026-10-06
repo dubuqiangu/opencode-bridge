@@ -444,6 +444,20 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > ⚠️ 但 `--status` 的「入站就绪」只代表**凭据齐备且入站已实现**，不代表"真的会收到消息"：
 > **Home Assistant** 默认**一个事件都不收**（必须另配 `entities`/`domains`/`accept_all`），
 > 判据是 `--setup --json` 里 `platforms[].capabilities.inbound_accepts_anything`。
+>
+> ⚠️ **「配好了」也不等于「发得出去」**：上面几段说的都是**入站**的判据。**出站**失败有它自己的
+> 记录：跑 `python -m opencode_bridge --status` 看「**上次出站失败（运行期记录）**」段
+> （逐平台一条：上一次发送失败是什么时候、为什么）；逐平台细节在
+> `<bridge 目录>\outbound-failures.json`，日志上下文在 `bridge-output.log` 搜 `出站失败`；
+> 机器可读的是 `--setup --json` 的 `last_outbound_failure`
+> （⚠️ 它与 `outbound_ready` **不是一回事**：后者只答「出站凭据齐备」，不代表发送能用）。
+> ⚠️ **凭据齐、平台认，而发出去那一步仍然失败时，上面几段全都是绿的** —— 这正是这一段存在的理由。
+>
+> ⚠️ **读它必须连时效一起读**（这一段自带四条声明，不是啰嗦）：时间戳说的是**那一刻**发生的事，
+> **不是**现在的连接状态；「此后没有观测到成功」**≠**「现在还坏着」（也可能是压根没人再发消息）；
+> 「已恢复」指的是**发送又成功了**，而**失败那次的答复不会补发** —— 平台没有「重投」这个原语，
+> 那条答复要你自己重发一次；显示「无记录」时**既不是「正常」也不是「失败」**（桥可能压根没发过消息）。
+> **完整读法与「下一步做什么」见 README「9. 故障排查」里的「收不到回信」小节。**
 
 ### Step 3: 激活（需要用户点头）
 
@@ -472,7 +486,14 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
    python -m unittest discover -s tests
    ```
 
-   期望 `Ran 113 tests` / `OK (skipped=1)`（若版本更新后数字变化，以 `OK` 为准，且 0 FAIL/ERROR）。
+   期望末行 `OK` 且 **0 FAIL / 0 ERROR**（`skipped` 的数量不作判据）。
+   ⛔ **不要拿测试条数当验收标准** —— 它每个版本都在变，**以你实跑那次的 `Ran N tests` 为准**。
+   要复算（`unittest` 把结果写在 **stderr**，所以要 `2>&1`）：
+
+   ```powershell
+   python -m unittest discover -s tests 2>&1 | Select-String -Pattern 'Ran \d+ tests','^OK','FAILED'
+   ```
+
    注：`tests/` 与 `opencode_bridge/` 已随包分发；方式 1 自举到稳定 bridge 目录后，`python -m unittest discover -s tests` 用法不变（把目录指向稳定 bridge 目录执行即可）。
 
 3. （可选）插件自检（离线，不碰 opencode 服务）：
@@ -482,7 +503,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
    bun harness.ts
    ```
 
-   期望 `PASS 15/15`。
+   期望末行 `PASS n/n` 且 **退出码 0**。⚠️ **n 以这次实跑为准**（`harness.ts` 按它自己跑过的断言数算，场景数会随版本变）—— ⛔ 不要照抄任何文档里写死的数字。**判据是「0 FAIL + 退出码 0」**：出现 `FAIL n/m` 或退出码非 0 才算失败，`0` 表示全过。
 
 4. **未配置 token 时的行为（不要当成失败）**：bridge 打印 `没有任何可用适配器：请在 config.json 的 adapters 中配置 bot_token` + 提示后 **exit 0**——这是优雅退出，不是崩溃，插件**不会**进 backoff。配置完成即可正常运行。
 
@@ -506,6 +527,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 | 原生更新 | `opencode plugin update github:dubuqiangu/opencode-bridge`（建议在 `~` 下执行） |
 | 原生卸载 | `opencode plugin remove github:dubuqiangu/opencode-bridge` |
 | 连通性自检 | `cd <bridge 目录> ; python -m opencode_bridge --check` |
+| 排障总览（连不通 / 没回信 / 想知道配置缺什么） | `cd <bridge 目录> ; python -m opencode_bridge --status` ⚠️ **同样依赖 cwd**：它读 `./config.json`、并把 **cwd 当作 bridge 目录**（去那里读 `platform-health.json` / `outbound-failures.json`）⇒ 不 `cd` 就会去看错目录；改用 `OPENCODE_BRIDGE_CONFIG` 指向配置文件时，**bridge 目录会跟着那个文件所在的目录走**。⛔ `--status` **没有** JSON 视图（要机器可读就 `--setup --json`） |
 | 调试日志 | `python -m opencode_bridge --verbose` |
 | 手动运行 | `cd <bridge 目录> ; python -m opencode_bridge` |
 | 卸载（Windows） | `powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Uninstall` |

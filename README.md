@@ -692,7 +692,7 @@ opencode_bridge.opencode_client.OpenCodeError: GET /api/info -> HTTP 401
 ```bash
 python -m opencode_bridge --setup                 # 平台菜单
 python -m opencode_bridge --setup telegram        # 单平台分步引导
-python -m opencode_bridge --setup --json          # {config_path, platforms:[{key,label,configured}]}
+python -m opencode_bridge --setup --json          # 机器可读视图：{config_path, platforms:[{key,label,configured,…}]}（每个平台还带一批诊断字段，逐条见「9. 故障排查」；⛔ `--status` **没有** JSON 视图，JSON 视图只有 `--setup --json` 这一个命令）
 ```
 
 三处入口共用 `core.py` 的同一份冻结文案（`setup_reply()`），不复制副本；`--setup` 不连接 opencode、不需要 token，因此在配置之前就能运行。
@@ -775,7 +775,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `adapters.email.subject` | `"reply"` | 出站邮件的 Subject（会再加 `echo_prefix`） |
 | `adapters.email.dedupe_capacity` | `2048` | 已处理 Message-ID 的记忆上限（FIFO 淘汰，防无界增长）。⚠️ **写错不会打死桥接**：非整数（`"2048条"` 这类字符串）会**回落为默认值 `2048` 并打一条 WARNING**（`email: 配置项 dedupe_capacity=… 不是整数 …，已回落为 2048`）；**小于 `1`**（`0` / `-5`）同样**回落默认 + 告警**、⛔ 不静默改成 `1`。留空 = 静默用默认值 |
 | `adapters.a2a.bind_host` | `"127.0.0.1"` | 监听地址。**非回环地址且没配任何凭据（`auth_token` 或 `peer_tokens` 都算）时会回落回环 + 告警** —— 绝不因为方便就开一个无鉴权的局域网端口 |
-| `adapters.a2a.bind_port` | **无默认值（必填）** | 监听端口。⚠️ **没有默认值**：缺了它（或不是合法端口）**a2a 适配器不启动**（日志一条 ERROR，`--status` 显示 `missing: ['bind_port']`），**不会**降级到某个默认端口。`0` = 由操作系统分配，但 **Agent Card 里公布的 URL 含端口，每次重启都变、对端永远找不到我们 ⇒ 只适合测试** |
+| `adapters.a2a.bind_port` | **无默认值（必填）** | 监听端口。⚠️ **没有默认值**：缺了它（或不是合法端口）**a2a 适配器不启动**，**不会**降级到某个默认端口。**看哪里**：`--status` 的「配置」列显示 `未配置`；`--setup --json` 的 `missing` 是 `["bind_port"]`（⚠️ `missing` **只在 `--setup --json` 里**，`--status` 不输出它）。⚠️ **填了非法值会多一条告警**：`a2a: 配置项 bind_port='nope' 不是整数（str），已回落为 -1` —— 由**共享助手** `opencode_bridge.config_coerce` 发出（**不是 a2a 自己打的**），跑一次 `--status` / `--setup --json` 就会打出来，不必重启桥；**缺省或只填空白没有这条**（"没配"是静默的，见「9. 故障排查」的 `config_coerce` 小节）。⚠️ **桥启动时看到哪条日志取决于是哪条路**：只有 a2a 时预检就拒 ⇒ 打印 `没有任何可用适配器…` 后 **exit 0**，**走不到** a2a 那条 ERROR；**还有别的平台让桥起得来**时才会看到 `a2a: 未配置 bind_port（'nope'）…适配器未启动`。`0` = 由操作系统分配，但 **Agent Card 里公布的 URL 含端口，每次重启都变、对端永远找不到我们 ⇒ 只适合测试** |
 | `adapters.a2a.auth_token` | `""` | 共享 Bearer token。**留空 = 无鉴权**，此时务必确认 `bind_host` 是回环地址 |
 | `adapters.a2a.peer_tokens` | `""` | **每个对端一个凭据**，`"alice:tok1,bob:tok2"`（或 `{"alice": "tok1"}`）。身份直接取名字，比 `auth_token` 更好定位与限流；配了它**同样算「已配凭据」**（影响 `bind_host` 的回落判断）—— 详见 [`docs/a2a.md`](docs/a2a.md) |
 | `adapters.a2a.reply_timeout` | `300.0` | 外部 agent 等待回复的超时（秒）。非法值回落默认并告警 |
@@ -878,7 +878,9 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | 发消息没有回复、日志见 **opencode 侧** `HTTP 409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
 | telegram 发消息没反应、日志见 `transport[telegram]: 会话出错` 且含 `code=409` | ⚠️ **这个 409 与上面那个不是一回事**：它是**同一 bot token 有第二个 `getUpdates` 消费者**（你自己写的脚本 / 另一个 bot 程序 / 上一个实例没退干净）。**消息被第二消费者吃掉，不会排队、也不会补发** ⇒ 停掉那个消费者。详见「接入平台引导 → Telegram」的常见坑 |
 | 日志见 `provider.transport` 重试（`⏳ 重试中 (attempt N): ...`） | 上游模型服务不可达 / 超时，opencode 正在按退避重试；检查网络与 provider 配置 |
+| 回信**发不出去**：`--status` 里「已配置」「入站就绪」都是绿的，却收不到回信 | **凭据齐 ≠ 发送能用** —— SMTP 密码被改、bot 被踢、机器人退群、对端限流时，出站凭据照样齐备。跑 `python -m opencode_bridge --status` 看「**上次出站失败（运行期记录）**」段；逐平台细节在 `<bridge 目录>\outbound-failures.json`，日志上下文在 `bridge-output.log` 搜 `出站失败`。⚠️ 那一段只答**上一次失败发生在哪一刻**，别当成现在的连接状态 —— 见本节末尾「收不到回信」 |
 | `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。按「接入平台引导」填好**该平台自己的凭据键**（不都是 `bot_token`：Slack 入站另需 `app_token`、Matrix 用 `homeserver`/`access_token`/`user_id`、IRC 用 `host`/`nick`/`channels`、Mattermost 用 `site_url`/`token`、Twitch 用 `token`/`channel`）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge。用 `--status` 逐平台核对缺什么 |
+| 日志一条 `opencode_bridge.config_coerce: <平台>: 配置项 <键>=<收到的值> … 已回落为 <默认值>` | 你给某个**数值 / 布尔**键填了非法值（类型不对或越出区间）⇒ 桥**回落到默认值继续跑**，**不是崩溃**。⚠️ 「跑起来了」不等于「你配的值生效了」。⚠️ **按适配器的 logger 名搜不到这条**（它由共享助手 `config_coerce` 发出，不是各适配器自己打的）⇒ 按 `config_coerce` 搜；跑 `--status` / `--setup --json` 时也会当场打出来。四段含义见本节末尾「`config_coerce`」小节 |
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中。⚠️ 若是升级后**突然**收不到消息、而你的 `allowed_chat_ids` 是空的：多半是这次翻转。查 `config.json` 的 `config_version` —— **`< 2`**（含没有这个键）时是「空 = 全放行」，**`>= 2`** 则是新语义「空 = 全拒」。解法见「7. 安全须知」的「两步走」：`/pair` 在未授权的 chat 上就能用。⚠️ **日志里那个 chat 已经不是原值了**：脱敏层只认 `platform:local_id` 这种带前缀的形式（裸 id 按形状无法脱敏 —— discord 雪花号本身就是个合法纳秒时间戳），所以落盘形态是 `<平台>:conv#<6位>-<6位>`，例如 `telegram:conv#4f5307-ab5f8c`。**同一个会话在多行日志里仍是同一个 `conv#`** ⇒ 「是不是同一个人 / 同一个 chat 在刷屏」照样查得到；**跨进程 / 跨重启对不上**（摘要密钥只在内存里，别拿昨天的 `conv#` 对今天的） |
 | irc / twitch 私聊没反应（频道里正常） | **已知的行为变更**：私聊的 principal 是 bot 自己的 nick，闸门无法区分 ⇒ 白名单为空且 `config_version >= 2` 时必然被拒。频道不受影响（频道名是真会话标识）。这两个平台**不提供 `/pair`**（无发件人认证），只能在 `allowed_chat_ids` 里手填 |
 | irc / twitch 启动失败，日志有 `拒绝启动` 且写着「**这一条会把所有人的私聊一起放行**」 | `allowed_chat_ids` 里写了本适配器**自己的 nick**。⛔ 这一行不是「只授权你自己」：**这一条会把所有人的私聊一起放行**（私聊的 principal 就是 bot 自己的 nick，所有人的私聊共用它）⇒ 桥接**拒绝启动**，而不是打个 warning 继续跑。**改法**：把这一行从 `allowed_chat_ids` 里删掉；频道授权（`#channel`）不受影响。⚠️ Twitch 报这条时 nick 可能来自 Helix 而非配置（配置里没写 `nick` 也一样会被拒） |
@@ -891,6 +893,61 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `opencode plugin list` 里出现两条 `opencode-bridge` | 说明脚本安装产物与原生条目并存，见「11. 卸载」末尾的说明，只保留一种 |
 | `bridge-output.log` 打开是乱码 | 该文件由 Python 按**系统代码页**写出（中文 Windows = GBK/cp936）。用 GBK 打开即可；这是既有行为，不影响功能 |
 | 想看插件在 opencode 里的日志 | `~/.local/share/opencode/log/opencode.log` 中搜 `[bridge-plugin]` |
+
+### 收不到回信：先把「发出去那一步」单独验一遍
+
+⚠️ **`--status` 的三段各答各的，不能互相代替**：
+
+| 段 | 答什么 |
+|---|---|
+| 渠道配置与能力 | 凭据**齐不齐**（纯本地可判，不联网） |
+| 上次启动时的探测结论 | 上次**启动那一刻**平台**认不认**这个凭据（落盘在 `platform-health.json`） |
+| **上次出站失败（运行期记录）** | **上一次发送失败是什么时候、为什么**（落盘在 `outbound-failures.json`） |
+
+第三段存在的理由：**凭据齐、平台认，而发出去那一步仍然失败时，前两段全都是绿的** ——
+而这可能发生在启动之后十分钟（SMTP 密码被改、对端限流、bot 被踢、机器人退群）。
+
+形态如下（`python -m opencode_bridge --status`，内容为示意）：
+
+```text
+== 上次出站失败（运行期记录） ==
+  记录时间 : 2026-10-05 19:13:20（这份文件最后一次被写入的时刻，不是失败发生的时刻）
+  Telegram  上次出站失败 forbidden：bot was kicked from the supergroup（10-05 18:26:40） · 此后没有观测到成功
+  Email     上次出站失败 rate_limited：421 Too many recipients（10-04 09:40:00） · 已恢复于 10-04 11:03:20
+  Slack     无记录 —— 自该记录建立以来未观测到出站失败（不代表此刻可达）
+```
+
+⚠️ **别只读那一行末尾 —— 那一段的说明刻意用四行讲时效**，四条都要带上：
+
+1. 时间戳说的是**那一刻**发生的事，**不是**现在的连接状态。
+2. 「此后没有观测到成功」**≠**「现在还坏着」：也可能是压根没人再发消息（它在**状态变化**时才记一次，不是每次发送都记 ⇒ 连续失败只在第一次写盘）。
+3. 「已恢复」指的是**发送又成功了**，而失败那次的答复**不会补发** —— 平台没有「重投」这个原语。⇒ **那条丢掉的答复要你自己重发一次**，恢复不等于补上。
+4. 显示「无记录」时**既不是「正常」也不是「失败」**：桥可能压根没发过消息。
+
+**接下来做什么**：
+
+- **要逐平台细节** ⇒ 打开 `<bridge 目录>\outbound-failures.json`。⚠️ 它与 `platform-health.json` **是两份记录、各答各的**（那份答「上次启动那一刻认不认凭据」）。每平台一条：`at`（失败时刻）、`kind`（平台中立的分类 —— `too_long` / `bad_format` / `forbidden` / `not_found` / `rate_limited` / `transient` / `unknown`）、`detail`（**定位问题看这个**）、`retry_after`（平台建议的等待秒数，只有平台给了才有）、`recovered_at`（有值 = 之后又成功发出去过）。⚠️ 文件里的 `detail` 已脱敏过，但**它仍是运行期产物，别提交**（已在 `.gitignore` 里）。
+- **要日志上下文** ⇒ `bridge-output.log` 里搜 `出站失败`（同一件事的日志形态，带 `conversation=`）。⚠️ 该文件按**系统代码页**写出（中文 Windows = GBK，同本节表格里 `bridge-output.log` 那行）。
+- **要机器可读** ⇒ `--setup --json` 的 `last_outbound_failure`。⚠️ `--status` **没有** JSON 视图 —— JSON 视图只有 `--setup --json` 这一个命令。⚠️ 它与 `outbound_ready` **不是一回事**：后者只答「**出站凭据齐备**」，不代表发送能用；`last_outbound_failure` 为 `null` 的含义是**没有记录**，不是「没问题」。
+
+### 非法配置值的那条告警怎么读（`config_coerce`）
+
+`config.json` 里某个**数值 / 布尔**键填了非法值（类型不对，或越出该平台要求的区间）时，桥**不会崩溃**：它回落到该键的默认值继续跑，同时打一条 WARNING。文案是固定的一句，四段依次是 **哪个平台 / 哪个键 / 收到了什么（原样 `%r`）/ 为什么 / 回落到了什么**：
+
+```text
+WARNING opencode_bridge.config_coerce: a2a: 配置项 bind_port='nope' 不是整数（str），已回落为 -1
+WARNING opencode_bridge.config_coerce: email: 配置项 socket_timeout=0 越界（要求 > 0.0），已回落为 30.0
+```
+
+⚠️ **回落到默认值是真的在用默认值** ⇒ 「桥跑起来了」**不等于**「你配的值生效了」。这是「绝不静默采纳非法值」这条纪律的代价，也正是它换来「至少你被告知了」的地方。修法就是照告警里的键名与原因改 `config.json`。
+
+⚠️ **按适配器的 logger 名搜不到这条**（例如搜 `opencode_bridge.adapters.email` 搜不到它）—— 它由**共享助手** `opencode_bridge/config_coerce` 统一发出，不是各适配器各自打的。⇒ **按 `config_coerce` 搜**。
+
+⚠️ **跑 `--status` / `--setup --json` 时也会当场打出这条**（判定「配好了没有」会读同一个键）⇒ 它不只是启动时的东西；**状态视图本身可能就是那条告警的来源**。
+
+⚠️ **两类「看着像数字但不是」的值也会被拒**：`bool`（`true` / `false`）与整数档的 `float` —— `int(True)` 不抛异常而静默读成 `1`、`int(9900.7)` 静默截断成 `9900`，用户以为配的值生效了而日志一个字都没有 ⇒ 宁可告警。⚠️ **代价**：JSON 没有 int/float 之分 ⇒ `9900.0` 与 `1e3` 在**整数档**也会被拒（告警点名了键与值，改成 `9900` 即可）。数值字符串（`"9900"`）照常认。
+
+⚠️ **没配 / 只填空白是静默的**（走默认值、不告警）—— 「没配」与「配错了」是分开判的。⇒ **日志里一条都没有**只说明「这些键要么没填、要么填得合法」，**不能**当成「键名都对」。
 
 ## 10. 开发与测试
 

@@ -270,7 +270,9 @@ class Adapter(abc.ABC):
     #:
     #: :attr:`~opencode_bridge.health.VERDICT_OK` 表示探测**通过**，
     #: :attr:`~opencode_bridge.health.VERDICT_FAILED` 表示探测**失败且有原因**，
-    #: :attr:`~opencode_bridge.health.VERDICT_SKIPPED` 表示**压根没探测**
+    #: :attr:`~opencode_bridge.health.VERDICT_SKIPPED` 表示**试过了，但没有可探测的凭据**
+    #: （⛔ **不是**"压根没探测" —— 那是另一档
+    #: :attr:`~opencode_bridge.health.VERDICT_DOES_NOT_PROBE`，两者的排查方向相反）
     #: （三者**必须**分开：把"没验"说成"验过"就是假话）。
     #:
     #: ⚠️ **落盘不由适配器负责**：适配器不知道 bridge 目录在哪。写入

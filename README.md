@@ -155,7 +155,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
-| Telegram | ✅ 长轮询 `getUpdates` | ✅ | ✅ 原生 | 最成熟，按钮交互已支持 |
+| Telegram | ✅ 长轮询 `getUpdates` | ✅ | ✅ 原生 | 最成熟，按钮交互已支持；**私聊 / 群消息皆收、群里无需 @ bot** —— ⚠️ 群里每条文本消息都会驱动 agent，加群前先看 [`docs/install.md`](docs/install.md) Telegram 节「收不到消息怎么查」第 4 条 |
 | Slack | ✅ Socket Mode | ✅ | ✅ 原生 | 入站需另配 `app_token`（`xapp-`） |
 | Discord | ✅ Gateway v10 | ✅ | ✅ 原生 | 需在后台开 **Message Content Intent** |
 | Matrix | ✅ `/sync` 长轮询 | ✅ | ⚠️ 兼容近似 | 无标准编辑 API，见该节说明 |
@@ -698,6 +698,7 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
+| `adapters.telegram.poll_timeout` | `25` | `getUpdates` 的**长轮询挂起秒数**（Bot API 上限 50）。⚠️ **必须填 JSON 整数**（如 `25`）：写成 `"25s"`、`"25.5"` 这类字符串会抛 `ValueError` ⇒ **该适配器被跳过 ⇒ 整个桥启动失败**，而报错只有「没有任何可用适配器」、**完全不提 `poll_timeout` 非法**（日志里那行是 `failed to build adapter 'telegram'; skipped`）。`--setup --json` 里该平台的 `capabilities` 同时会变成 `{"error": ...}` —— 那就是它构造失败的判据 |
 | `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
 | `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |
@@ -831,7 +832,8 @@ python -m opencode_bridge --setup --json          # {config_path, platforms:[{ke
 |---|---|
 | `--check` 报 `HTTP 401` | 密码不对，或 opencode 服务未启动。确认服务在跑、`OPENCODE_PASSWORD` / `service.json` 中的密码一致 |
 | 连接被拒绝（`Connection refused`） | 服务没起或端口不对；`opencode serve` 后确认 `url` |
-| 发消息没有回复、日志见 `409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
+| 发消息没有回复、日志见 **opencode 侧** `HTTP 409` | 会话正忙（上一个任务还在跑）。消息会自动排队，当前任务结束后补发；也可 `/stop` 打断当前任务 |
+| telegram 发消息没反应、日志见 `transport[telegram]: 会话出错` 且含 `code=409` | ⚠️ **这个 409 与上面那个不是一回事**：它是**同一 bot token 有第二个 `getUpdates` 消费者**（你自己写的脚本 / 另一个 bot 程序 / 上一个实例没退干净）。**消息被第二消费者吃掉，不会排队、也不会补发** ⇒ 停掉那个消费者。详见「接入平台引导 → Telegram」的常见坑 |
 | 日志见 `provider.transport` 重试（`⏳ 重试中 (attempt N): ...`） | 上游模型服务不可达 / 超时，opencode 正在按退避重试；检查网络与 provider 配置 |
 | `没有任何可用适配器` | 配置未完成**不再报错退出**（exit 0 + 提示）。按「接入平台引导」填好**该平台自己的凭据键**（不都是 `bot_token`：Slack 入站另需 `app_token`、Matrix 用 `homeserver`/`access_token`/`user_id`、IRC 用 `host`/`nick`/`channels`、Mattermost 用 `site_url`/`token`、Twitch 用 `token`/`channel`）后重启即可生效；也可在插件 `config.json` 设 `enabled: false` 暂停拉起 bridge。用 `--status` 逐平台核对缺什么 |
 | bot 无响应但日志有 `dropped message from non-whitelisted chat` | 该 chat 不在 `allowed_chat_ids` 白名单中。⚠️ 若是升级后**突然**收不到消息、而你的 `allowed_chat_ids` 是空的：多半是这次翻转。查 `config.json` 的 `config_version` —— **`< 2`**（含没有这个键）时是「空 = 全放行」，**`>= 2`** 则是新语义「空 = 全拒」。解法见「7. 安全须知」的「两步走」：`/pair` 在未授权的 chat 上就能用。⚠️ **日志里那个 chat 已经不是原值了**：脱敏层只认 `platform:local_id` 这种带前缀的形式（裸 id 按形状无法脱敏 —— discord 雪花号本身就是个合法纳秒时间戳），所以落盘形态是 `<平台>:conv#<6位>-<6位>`，例如 `telegram:conv#4f5307-ab5f8c`。**同一个会话在多行日志里仍是同一个 `conv#`** ⇒ 「是不是同一个人 / 同一个 chat 在刷屏」照样查得到；**跨进程 / 跨重启对不上**（摘要密钥只在内存里，别拿昨天的 `conv#` 对今天的） |

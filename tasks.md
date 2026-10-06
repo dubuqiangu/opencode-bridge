@@ -3880,3 +3880,99 @@ qqbot.py:1063        homeassistant.py:1047
 需要评审「哪些平台的 local-id 真的可能含 CJK」再定排除集。
 ⚠️ `fix-136` 当初用「中间留一个空格」绕过了它那一处 —— **那是权宜，不是修复**，
 且它**没有覆盖半吞那一类**。
+
+---
+
+## 🔴 telegram 上手路径审计（`exp-75`，21 条）—— 用户明确「telegram 不允许出任何错」
+
+**来源**：`exp-75`（explorer，只读，未跑测试）。⚠️ 它自己在报告里声明
+`__main__.py` 正被并行修改、部分行号会漂 ⇒ **本节一律引用符号名，不引用行号。**
+
+### 我当场修掉的两条（`3e2c691`）
+
+| 缺陷 | 性质 | 修法 |
+|---|---|---|
+| `--config <X>` 加载用了 X，JSON 视图报的却是**另一个文件** | 根因是「解析出的路径从未被记录」 | `Config.load` 记 `source_path`；`_config_file_in_use` 改读它 |
+| `capabilities()` **从未进过任何 CLI 输出** | 「凭据齐备」被当成了「能用」 | `_platform_status` 透出 `capabilities`；连带更正**四处**文档 |
+
+### ⛔ 一个必须写清的前提：`--status --json` **根本不存在**
+
+`build_parser` 的 `--json` help 明写「与 `--setup` 搭配」；`main()` 里
+`run_status(cfg)` **签名中没有 json 参数** ⇒ **`--status --json` 被 argparse 接受、
+然后被完全忽略。**（`exp-75` 独立查出，与我先前实测一致。）
+
+⇒ **决策**：**不改文档去迁就一个不存在的命令，也不给 `run_status` 加 `--json`。**
+改为让 `--setup --json` 真的吐出 `capabilities`，并把四处文档指向它。
+- **为什么不加 `--json` 到 `run_status`**：`run_status` 的人读表已经把
+  「空清单按 `config_version` 给两套文案」这件事做对了，**离机器可读只差一个 `json.dumps`**，
+  看起来很便宜 —— 但那会**新增一条输出契约**，而这条契约的消费方我读不到（见下）。
+- **`exp-75` 指出 `commands._config_path_hint()` 是 `Config.load` 搜索链的第二份实现**
+  ⇒ 与本次修好的 `_config_file_in_use` 不同步。**记为待办，不在此批动。**
+
+### 🔴 最高危：`getMe` 失败 ⇒ 完全静默（零容错路径上的静默）
+
+`TelegramAdapter.start()` 调 `getMe`；失败**只写一行日志**然后 return。
+而 `configured` 的判据是 `required_tokens` 全部非空 ⇒ **token 打错 / 被吊销 / 被墙**，
+`--setup --json` 仍显示 `configured: true` + `inbound_ready: true`。
+⇒ **这就是 HA 那个「状态说就绪、实际不工作」缺陷在 telegram 上的同型复现。**
+
+**根因不是「少了个检查」，是「token 有效性这个信息在产生后没有通道到达用户」。**
+
+**两个被否决的替代方案**（记下来，免得下一个人再走一遍）：
+
+| 方案 | 为什么否 |
+|---|---|
+| 把 `getMe` 塞进 `--status` / `--setup --json` | 让**纯本地的状态视图依赖网络**；且 `run_check` 的 docstring 明确声明「no sessions, **no adapters**」，塞进去破它自己的契约 |
+| 加 `--verify <platform>` 之类**新命令** | 扩大公开面，而「启动时落盘」已足够覆盖「token 打错」这个真实场景 |
+
+**采纳**：`health.py` 落盘「上次启动时各适配器的探测结论」⇒
+`--setup --json` 加 `last_start_probe`（**只许新增 key**）、`--status` 加一段，
+措辞必须体现**时效性**（是「上次启动时」，不是实时探测）；无记录时**既不显示正常也不显示失败**。
+顺带修 `poll_timeout` 填非整数会 `ValueError` ⇒ **整个桥起不来**、
+而报错文案「没有任何可用适配器」完全不提是哪个键非法。
+
+**同时修一条插件侧根因**：`plugin/index.ts` 的 `stdio:["ignore","pipe","ignore"]`
+**丢弃 stderr** ⇒ 那行唯一的线索只进 `bridge-output.log`，**插件用户看不到**。
+
+### ⚛️ 外部契约：我读不到 `bridge_setup`，改不动就一个字都别动
+
+`_NOT_READY_NO_ALLOWLIST = "no_allowlist"` 与 `admits_nobody` 的极性是**外部契约**
+（仓库外的 `bridge_setup` 按值断言）⇒ **不能排除它也读 `capabilities`**。
+⇒ 已写死：**只许新增 key，不许改/删/重命名任何现有 key。**
+本节的测试里有一条回归断言硬编码了「改动前的 key 集合」作护栏。
+
+### 剩余 19 条（按严重度；未修的先记账）
+
+| 严重度 | 要点 | 证据符号名 |
+|---|---|---|
+| 高 | token 无效/被墙/409 ⇒ 静默 | `TelegramAdapter.start`（`getMe` 只写日志）+ `Adapter.capabilities`（10 键无凭据有效性） |
+| 高 | opencode 端点解析失败 ⇒ 桥 exit 1 ⇒ 插件 5 分钟 backoff 且**无自动恢复**；`--setup --json` 无此字段 | `_run_bridge_locked` 首行 `discover_endpoint`（无 try）+ `plugin/index.ts` 的 `FAST_FAIL_MS` |
+| 高 | 同一 token 有第二个 `getUpdates` 消费者 ⇒ 409 ⇒ **恒定 2s 无限重试**，完全静默 | `_poll_round` → `RuntimeError` → `Transport._run` |
+| 高 | 群 chat id 是**负数**，而文档三处只教 `@userinfobot` 拿**正数 user id** | `Adapter._gate_rejects` |
+| 高 | **群聊不需要 @** ⇒ 群里每条消息都驱动 agent（IRC/Twitch **有** mention 判定，telegram 没有） | `TelegramAdapter._dispatch_update` |
+| 高 | BotFather **privacy mode 默认开** ⇒ 群里发普通文字 bot 一声不吭；**代码无旋钮**（平台事实） | `allowed_updates`；**不在代码里** |
+| 中 | `--pair` 漏 `--conversation` 且白名单非空 ⇒ 报「码不匹配」，**把用户引向「抄错了」** | `pairing_cli.run_pair` 的 `if not candidates:` / `if not matched:` 分支顺序 |
+| 中 | `--pair` 在任意 cwd 下可能改**另一份** `config.json`，而回信与输出都**不含路径**（只 `basename`） | `pairing_cli.config_file_in_use()` |
+| 中 | `--status` / `--setup --json` 只给 `allowed_chat_ids_count`，**不给清单内容** ⇒ 用户无法核对「我授权的是不是这个会话」 | `_platform_status` |
+| 中 | **配对是否可用不在任何状态输出里**，只在启动时一行 log | `Adapter.pairing_supported` + `_platform_status`（无 pairing 字段） |
+| 中 | 启动时**丢弃 Telegram 侧全部积压 update**（`getUpdates offset=-1` + `_pending.clear()`）且零提示 ⇒ 「先发消息再启桥」必丢 | `TelegramAdapter._flush_pending` + `start` |
+| 低 | 已授权会话发 `/pair` ⇒ 回「未知命令 pair」（README 却把 `/pair` 列为命令） | `answer_pairing_request` 首个 `if` + `CommandHandler.handle_command` |
+| 低 | 适配器子树**零键名校验**：`"bot_tokens"` 拼错 ⇒ 只得到「没有任何可用适配器」，从不点名是哪个键 | `Config._KNOWN_KEYS` 只管顶层 |
+| 低 | `capabilities.running` 在两个视图里**恒为 false**（构造但从不 `start()`），不能读成「没在跑」 | `_adapter_capabilities` / `_channel_config_rows` |
+| 低 | `supports_media: true` **只对出站**成立；收不到任何非文本消息。README 平台表「媒体 ✅」正是这个歧义 | `TelegramAdapter._dispatch_update` |
+| 低 | `commands._config_path_hint()` 是 `Config.load` 搜索链的第二份实现 | 与 `_config_file_in_use` 对照 |
+| 低 | `plugin/index.ts` 丢弃 stderr ⇒ 子进程异常只剩「引导命令无输出 (code=1)」 | `runSetup` |
+| 低 | `docs/install.md` 引用的未配 token 提示文案与 `NO_ADAPTER_MESSAGE` 实际文本不符 | `__main.NO_ADAPTER_MESSAGE` |
+| 低 | `poll_timeout` 代码读得到、README 配置表没有 | `TelegramAdapter.__init__` |
+
+### 一条方法论结论（比上面 21 条更值钱）
+
+`telegram` 的**「常见坑」小节在 `docs/install.md` 里根本不存在** ——
+同文件里 Slack 有「两个常见坑」、Discord 有、Home Assistant 有专门 ⚠，唯独 telegram
+只有安全警告，最后一步是「发一句 `hi`，收到回复即成功」，**没有任何「没收到怎么办」的下一跳**。
+
+⇒ **「按文档做」这个前提本身没被验证过。** 上面 21 条里有 7 条是纯文档缺口（零代码风险），
+它们此前**没有任何机制会发现** —— 因为没有任何东西把「文档承诺」与「代码实际」对起来。
+⇒ 后续考虑一个**结构性**护栏（而非逐个平台手工审）：让
+「各适配器 `required_tokens` / 实际读取的键」与「README 配置项表」互为断言。
+⚠️ 本次**未实施**，仅记账 —— 它会同时覆盖上表最后两行那类问题。

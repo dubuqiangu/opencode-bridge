@@ -146,6 +146,26 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >
 > ⚠️ **下一版起这里会变成「空 = 谁都不放行」**（由 `config_version` 兜底：`< 2` = 旧语义，`>= 2` = 新语义；启动时会有醒目预告）。届时**不必手改配置文件**：填顶层键 `pairing_secret` → 重启 → 在 bot 里发 `/pair` 拿码 → 本机 `python -m opencode_bridge --pair <码> --conversation platform:local_id` → **再重启一次**。三条边界见 README「7. 安全须知」，其中一条必须先知道：**irc / twitch 的私聊在翻转后对所有人都不可用**（这两个平台也不提供 `/pair`）。
 
+> **收不到消息怎么查（五个常见坑）**
+>
+> 这五条的共同点是**几乎全部静默** —— 发什么都没人回，IM 里也不会有任何报错提示。
+> **先定位日志**：手动运行（`python -m opencode_bridge`）时它直接打在终端；**由插件拉起**时进 **bridge 目录下的 `bridge-output.log`**（⚠️ 该文件由 Python 按**系统代码页**写出，中文 Windows 是 GBK，用文本编辑器打开是乱码就换 GBK 打开；想看更细的内容用 `--verbose`）。下面每条都给出日志里能搜到的**原文关键字**。
+>
+> 1. **token 无效 / 被吊销 / 复制时多打一个字符**。**症状：完全静默** —— 发什么都没人回，而 `--setup --json` 里照样是 `configured: true` / `inbound_ready: true`（这两个字段**只检查 token 字符串非空，不验证它是否真的有效**）。
+>    **去日志搜**：`telegram: getMe failed` —— ⚠️ 它有**两种形态，两个都要认**：
+>    - `telegram: getMe failed (code=401): ...; adapter not started` —— token 被 Telegram **拒绝**（无效 / 已吊销）。
+>    - `telegram: getMe failed (<异常文字>); adapter not started` —— **压根没连上**（网络被墙、代理没配、DNS 不通）。**这一条里没有 `code=`**，只按 `code=` 去搜会**什么都搜不到**。
+>    **处理**：回 **@BotFather** 重新 `/newbot` 拿一枚 token，逐字复制（别连空格/换行一起复制）填进 `config.json`，再 `opencode service restart`。
+> 2. **同一个 bot token 有第二个 `getUpdates` 消费者** —— 你自己写的脚本、另一个 bot 程序，或上一个实例没退干净。Telegram 对"同一 bot 有两个长轮询消费者"返回 **409**，桥会**恒定每 2 秒**重试一次，日志因此反复刷同一行。**症状同样是静默**：消息被那个第二消费者吃掉了。
+>    **去日志搜**：`transport[telegram]: 会话出错: ...`，且这一行里含 `code=409`。
+>    **处理**：把第二个消费者停掉。⚠️ `opencode-bridge` 自己双开时会给明确提示（`已有另一个 bridge 实例在运行（pid=...）`），**这一条管的是本机之外的消费者**：脚本、另一个 bot 程序。
+>    ⚠️ 这个 409 与 README「9. 故障排查」里"会话正忙"那个 409 **不是一回事**：后者是 opencode session 忙，消息会排队、当前任务结束后自动补发。
+> 3. **在群里发消息，bot 一声不吭**。这有**两个互相独立**的原因，两个都要排干净：
+>    - **@BotFather 的 privacy mode 默认开着** ⇒ Telegram **服务端根本不下发**非提及消息，这是**平台侧**的事，桥里**没有这个旋钮**。⇒ **去 BotFather 对该 bot 关掉 privacy mode**。
+>    - **私聊 id ≠ 群 id**：群 chat id 是**负数**（形如 `-1001234567890`），而 **@userinfobot** 给的是**正数的 user id**（只有私聊能用它）。⇒ **去 `@RawDataBot`**（或在群内用 Telegram 客户端 / 第三方工具）**拿到那个负数群 id**，把**它**填进 `allowed_chat_ids`。
+> 4. ⚠️ **群里不需要 @ bot —— 这有安全含义**。Telegram 适配器**没有任何 mention 过滤**：群里**每一条文本消息**都会被当成"有人在对 agent 说话"送进模型（对照 **IRC / Twitch 只响应提及**）。所以把群 id 加进 `allowed_chat_ids` 之前先想清楚：**那个群里所有人、所有话都会以你的权限驱动 agent**。
+> 5. **只收文本消息**。图片 / 语音 / 贴纸等**非文本** update 一律**静默丢弃**（`text` 字段不是字符串就直接 return）。⚠️ 而 `capabilities()` 报的 `supports_media: true` 指的是「**能发出站媒体**」，**不是「能收媒体」** —— README 平台能力表里 Telegram 行的媒体能力也是这个意思。
+
 #### Slack（支持双向对话 · Socket Mode，无需公网地址）
 
 1. 打开 <https://api.slack.com/apps> → **Create New App** → **From scratch** → 选 workspace

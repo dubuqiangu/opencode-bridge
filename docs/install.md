@@ -166,6 +166,18 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >    - **私聊 id ≠ 群 id**：群 chat id 是**负数**（形如 `-1001234567890`），而 **@userinfobot** 给的是**正数的 user id**（只有私聊能用它）。⇒ **去 `@RawDataBot`**（或在群内用 Telegram 客户端 / 第三方工具）**拿到那个负数群 id**，把**它**填进 `allowed_chat_ids`。
 > 4. ⚠️ **群里不需要 @ bot —— 这有安全含义**。Telegram 适配器**没有任何 mention 过滤**：群里**每一条文本消息**都会被当成"有人在对 agent 说话"送进模型（对照 **IRC / Twitch 只响应提及**）。所以把群 id 加进 `allowed_chat_ids` 之前先想清楚：**那个群里所有人、所有话都会以你的权限驱动 agent**。
 > 5. **只收文本消息**。图片 / 语音 / 贴纸等**非文本** update 一律**静默丢弃**（`text` 字段不是字符串就直接 return）。⚠️ 而 `capabilities()` 报的 `supports_media: true` 指的是「**能发出站媒体**」，**不是「能收媒体」** —— README 平台能力表里 Telegram 行的媒体能力也是这个意思。
+>
+> ⚠️ **上面五条都排干净、启动探测也是绿的，却仍然收不到回信** ⇒ 那是**运行期**的另一个记录，
+> 坑 1 讲的「上次启动时的探测结论」/ `last_start_probe` **帮不上忙** —— 它答的是
+> **启动那一刻**，而 bot 被踢出群、被限流、凭据事后被改，都**不会**改变那一次的启动结论。
+> ⇒ 跑 `python -m opencode_bridge --status` 看「**上次出站失败（运行期记录）**」段
+> （⚠️ 它**依赖 cwd**：`cd` 到 bridge 目录再跑，或设 `OPENCODE_BRIDGE_CONFIG` 指向配置文件）；
+> 逐平台细节在 `<bridge 目录>\outbound-failures.json`（**`detail` 是定位问题的那一半**，
+> 已脱敏）；日志上下文在 `bridge-output.log` 搜 `出站失败`；
+> 机器可读的是 `--setup --json` 的 `last_outbound_failure`。
+> ⚠️ **读法别凭字面猜**：「此后没有观测到成功」**≠**「现在还坏着」（也可能压根没人再发消息），
+> 「已恢复」也**不等于**那条答复补发了（平台没有「重投」原语，那条答复要你自己重发一次）。
+> **那一段的完整读法与那四条时效声明见本 Step 2 末尾，以及 README「9. 故障排查」的「收不到回信」小节。**
 
 #### Slack（支持双向对话 · Socket Mode，无需公网地址）
 

@@ -388,6 +388,12 @@ class CliOpensKeyMigration(LegacyStateFileTestCase):
             cli, "InstanceLock", _PermissiveInstanceLock
         ), mock.patch.object(
             cli, "threading", types.SimpleNamespace(Event=lambda: _AlreadyStopping())
+        ), mock.patch.object(
+            # ⚠️ 必须钉住 ``_bridge_dir``：``run_bridge`` 会把 ``health.OutboundFailureRecorder``
+            # 装到 ``_bridge_dir()`` 上，而那个推导在没有 ``OPENCODE_BRIDGE_CONFIG`` 时退回
+            # **cwd**（跑测试时就是仓库根）⇒ 不隔离的话 ``outbound-failures.json`` 会被写进
+            # 仓库。手法抄 ``tests/test_bridge_refusal_probe.py`` 的 ``_RefusalHarness``。
+            cli, "_bridge_dir", lambda: self.directory
         ):
             return cli.run_bridge(config)
 

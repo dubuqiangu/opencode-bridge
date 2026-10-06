@@ -636,6 +636,14 @@ class CliWiresTheInbox(unittest.TestCase):
                 cli, "InstanceLock", PermissiveInstanceLock
             ), mock.patch.object(
                 cli, "threading", types.SimpleNamespace(Event=lambda: AlwaysStopping())
+            ), mock.patch.object(
+                # ⚠️ 必须钉住 ``_bridge_dir``：``run_bridge`` 会把
+                # ``health.OutboundFailureRecorder`` 装到 ``_bridge_dir()`` 上，而那个推导在
+                # 没有 ``OPENCODE_BRIDGE_CONFIG`` 时退回 **cwd**（跑测试时就是仓库根）
+                # ⇒ 不隔离的话 ``outbound-failures.json`` 会被写进仓库。手法抄
+                # ``tests/test_bridge_refusal_probe.py`` 的 ``_RefusalHarness``；⛔ **不许**
+                # 用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
+                cli, "_bridge_dir", lambda: directory
             ):
                 exit_code = cli.run_bridge(config)
 

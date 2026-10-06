@@ -2068,6 +2068,22 @@ class CliTests(unittest.TestCase):
         """
         self.addCleanup(redaction.remove_redaction_filter)
 
+    @staticmethod
+    def _run_main_pinned_to(bridge_dir: str, argv: list[str]) -> int:
+        """跑**真的** :func:`cli.main`，但把 :func:`cli._bridge_dir` 钉在 ``bridge_dir`` 上。
+
+        ⚠️ 为什么必须钉：``main`` 在"配置里没有可用适配器"那条路上会走
+        :func:`cli._record_bridge_refusal` → :func:`opencode_bridge.health.record_startup_probes`，
+        而它写的目录是 ``_bridge_dir()`` 的推导结果 —— 没有 ``OPENCODE_BRIDGE_CONFIG`` 时
+        那个推导退回 **cwd**，跑测试时 cwd 就是**仓库根** ⇒ ``platform-health.json`` 会被
+        写进仓库（``.gitignore`` 收得住它，但那是运行期产物，不该出现在仓库里）。
+
+        手法抄 :mod:`tests.test_bridge_refusal_probe` 的 ``_RefusalHarness``；⛔ **不许**
+        用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
+        """
+        with mock.patch.object(cli, "_bridge_dir", lambda: bridge_dir):
+            return cli.main(argv)
+
     def test_empty_adapter_tokens_exit_0_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             path = self._write_config(
@@ -2090,7 +2106,7 @@ class CliTests(unittest.TestCase):
                 },
             ):
                 with redirect_stderr(stderr):
-                    rc = cli.main(["--config", path])
+                    rc = self._run_main_pinned_to(td, ["--config", path])
         out = stderr.getvalue()
         self.assertEqual(rc, 0)
         self.assertIn("没有任何可用适配器", out)
@@ -2111,7 +2127,7 @@ class CliTests(unittest.TestCase):
                 },
             ):
                 with redirect_stderr(stderr):
-                    rc = cli.main(["--config", path])
+                    rc = self._run_main_pinned_to(td, ["--config", path])
         out = stderr.getvalue()
         self.assertEqual(rc, 0)
         self.assertIn("没有任何可用适配器", out)

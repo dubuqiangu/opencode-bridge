@@ -85,6 +85,30 @@ Telegram 的 ``description`` 是平台回的自由文本 —— 它**可能**带
 
 ⚠️ 一次启动里**没有任何适配器探测**（比如只配了 irc）也会写一份空的
 ``platforms`` —— 这是对的：那正是"这次启动什么也没验到"这个事实。
+
+出站失败为什么**另开一份文件**
+============================
+
+同一个模块还记第二件事：**运行期**观测到的出站发送失败（适配器已经把它算成
+:class:`~opencode_bridge.hooks.SendError` 的结构化分类，却从来没有人读 ——
+见 :class:`OutboundFailureRecorder`）。它落在**另一个文件**
+``outbound-failures.json``，⛔ **不是** ``platform-health.json`` 的子键。三个理由，
+按承重程度排：
+
+1. ⛔ **整份替换会把它抹掉。** :func:`record_startup_probes` 每次启动都
+   ``write_config_atomically`` 一份 ``{"recorded_at", "platforms"}`` 把整个文件
+   替换掉（这正是「盘上这份 = 最近一次启动的全部结论」这条语义）。同键共存 ⇒
+   下次启动**顺手把上一轮运行期的失败记录删了**。而那份记录恰恰是用户最需要它
+   的时候（用户是在"收不到回信"之后才去查的，此刻桥已经重启过一次）。
+2. ⛔ **两个全量替换的写者共用一个文件 = 丢更新。** 两边都是 read-free 的整份
+   写入，谁后写谁赢，前者的字段无声消失 —— 而消失的那一半是"排障记录"，
+   没有任何东西会报错。
+3. **时效语义不同，而 ``--status`` 的那一段自带声明。** ``platforms`` 答的是
+   「**上次启动那一刻**平台认不认这个凭据」，写在这一段的开头；运行期的出站失败
+   答的是「**上一次**发送失败是什么时候、为什么」。混在一份文件里，读者就得自己
+   分清哪个键是哪个时刻 —— 而这一段文案的存在理由恰恰是**不**让读者去猜。
+
+⇒ 所以是**两个平行的文件 + 两个平行的 ``--status`` 段**，且两份记录**互不覆盖**。
 """
 
 from __future__ import annotations
@@ -95,22 +119,32 @@ import os
 import time
 from typing import Any, Iterable, Mapping, Optional
 
+from .hooks import SendError
 from .pairing_cli import write_config_atomically
 from .redaction import default_redactor
 
 __all__ = [
+    "NO_OUTBOUND_FAILURE_TEXT",
+    "OUTBOUND_FAILURES_FILE_NAME",
     "PLATFORM_HEALTH_FILE_NAME",
     "VERDICT_OK",
     "VERDICT_FAILED",
     "VERDICT_SKIPPED",
     "VERDICT_NOT_STARTED",
     "VERDICTS",
+    "OutboundFailureRecorder",
     "bridge_refusal_probes",
+    "describe_outbound_failure",
     "describe_verdict",
+    "normalize_outbound_failure",
     "normalize_verdict",
+    "outbound_failure_from_record",
+    "outbound_failures_in_record",
+    "outbound_failure_recorded_at",
     "platform_key",
     "probe_after_start",
     "probe_from_record",
+    "read_outbound_failures",
     "read_platform_health",
     "record_startup_probes",
 ]
@@ -121,6 +155,27 @@ logger = logging.getLogger("opencode_bridge.health")
 #: :func:`opencode_bridge.__main__._bridge_dir` 的推导给出 —— **那套推导只有一份**，
 #: 本模块不自己再写一遍，否则"状态视图读的"与"启动时写的"会指向两个目录）。
 PLATFORM_HEALTH_FILE_NAME = "platform-health.json"
+
+#: **运行期**出站失败记录的落盘文件名，与 :data:`PLATFORM_HEALTH_FILE_NAME` **并列**
+#: （⛔ 不是它的子键）—— 理由见模块 docstring「出站失败为什么另开一份文件」。
+OUTBOUND_FAILURES_FILE_NAME = "outbound-failures.json"
+
+#: 「这个平台没有出站失败记录」时的**逐字**文案（``--status`` 那一段逐行显示）。
+#:
+#: ⛔ 它必须**既不像"正常"也不像"失败"**，理由与 :data:`NO_START_PROBE_TEXT` 同源：
+#: 盘上没有记录时分不出"确实没失败过"与"这份记录还没被写过"，而把"没观测到"
+#: 说成"一切正常"就是假话（那正是本任务要消灭的那类静默）。
+#: 末尾那半句（"不代表此刻可达"）是承重的：没有记录**真的**推不出现在可达 ——
+#: 桥可能压根没发过消息。
+NO_OUTBOUND_FAILURE_TEXT = (
+    "无记录 —— 自该记录建立以来未观测到出站失败（不代表此刻可达）"
+)
+
+#: :class:`~opencode_bridge.hooks.SendError` 的取值集合，用来判定落盘的 ``kind``
+#: 是不是我们认识的分类。**认不出来的按** :data:`~opencode_bridge.hooks.SendError.UNKNOWN`
+#: **记**，理由与 :func:`normalize_verdict` 对未知 ``verdict`` 的处置一样：读不懂的话
+#: 绝不当成"没有原因"。
+_KNOWN_SEND_ERRORS = frozenset(item.value for item in SendError)
 
 #: 四档 verdict。名字用完整单词而不是 ``OK`` / ``FAIL`` —— 见名知意。
 #: ⚠️ :data:`VERDICT_NOT_STARTED` 答的是**桥**（这一轮压根没起来），
@@ -397,3 +452,290 @@ def platforms_in_record(record: Optional[Mapping]) -> Iterable[str]:
     if not isinstance(platforms, Mapping):
         return ()
     return tuple(str(key) for key in platforms)
+
+
+# ======================================================================
+# 运行期出站失败记录（**另开一份文件**；理由见模块 docstring）
+# ======================================================================
+
+
+def _normalize_epoch(value: Any) -> Optional[float]:
+    """epoch 秒；``bool`` 不是时间戳、非数字一律 ``None``（理由同 :func:`recorded_at`）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def normalize_outbound_failure(
+    kind: Any,
+    detail: Any = "",
+    *,
+    retry_after: Any = None,
+    at: Any = None,
+    recovered_at: Any = None,
+) -> dict:
+    """把一次出站失败规范化成**唯一**的落盘形态。
+
+    ::
+
+        {"at": <epoch float>,
+         "kind": "<SendError 的取值>",
+         "detail": "<脱敏后的一行>",
+         "retry_after": <float|省略>,
+         "recovered_at": <epoch float|省略>}
+
+    ⚠️ **与启动探测结论分开的两件事，措辞上不许混**（见模块 docstring）：
+    ``at`` 答"**上一次**出站失败是什么时候"，``recovered_at`` 答"之后有没有成功发出去过"。
+    ``recovered_at`` **缺失 = 还没成功过**，而它**不是**"现在一定还坏着" ——
+    可能是压根没人再发消息（桥空闲）。所以读它的人必须把两种可能都说出来。
+
+    ⚠️ ``kind`` 认不出来一律按 ``unknown`` 记：分类丢了也必须留下"有过一次失败"
+    这个事实 —— 而把它归成某个具体类别才是编造。
+    """
+    raw_kind = str(getattr(kind, "value", kind) or "").strip().lower()
+    entry: dict = {
+        "at": _normalize_epoch(at) if at is not None else time.time(),
+        "kind": raw_kind if raw_kind in _KNOWN_SEND_ERRORS else SendError.UNKNOWN.value,
+    }
+    if raw_kind and raw_kind not in _KNOWN_SEND_ERRORS:
+        logger.warning(
+            "outbound-failures: 认不出的失败分类 %r，按 %s 记 —— 绝不当成没有原因",
+            kind, SendError.UNKNOWN.value,
+        )
+    scrubbed_detail = default_redactor().scrub(_one_line(detail))
+    if scrubbed_detail:
+        entry["detail"] = scrubbed_detail
+    seconds = _normalize_epoch(retry_after)
+    if seconds is not None:
+        entry["retry_after"] = seconds
+    recovered = _normalize_epoch(recovered_at)
+    if recovered is not None:
+        entry["recovered_at"] = recovered
+    return entry
+
+
+def describe_outbound_failure(entry: Optional[Mapping]) -> str:
+    """把一条出站失败渲染成给人看的一段（``--status`` 与日志共用这一份措辞）。
+
+    ⚠️ 这里**只说那一次失败本身**（分类 + 原因），**不说"什么时候"** ——
+    时效性由调用方的段标题与时间戳负责。理由与 :func:`describe_verdict` 相同：
+    混在一行里会让"昨天那次失败"读起来像"现在是坏的"。
+
+    ``entry`` 为 ``None`` 时返回 :data:`NO_OUTBOUND_FAILURE_TEXT` ——
+    ⛔ 那句**不是**"正常"，读它的人不许这么转述（理由见该常量的注释）。
+    """
+    if not isinstance(entry, Mapping):
+        return NO_OUTBOUND_FAILURE_TEXT
+    kind = str(entry.get("kind") or SendError.UNKNOWN.value)
+    detail = str(entry.get("detail") or "")
+    return f"{kind}：{detail}" if detail else kind
+
+
+def read_outbound_failures(bridge_dir: str) -> Optional[dict]:
+    """读回整份**运行期**出站失败记录；没有 / 读不出来都是 ``None``。
+
+    ``None`` 的含义是「**没有记录**」，而它**不代表成功**（见
+    :data:`NO_OUTBOUND_FAILURE_TEXT`）。
+
+    ⚠️ 这里的坏文件处置与 :func:`read_platform_health` 一致：记一条 warning 当它
+    没有记录，而不是让 ``--status`` 崩 —— 排障通道自己坏了已经够糟。
+    """
+    path = os.path.join(str(bridge_dir or ""), OUTBOUND_FAILURES_FILE_NAME)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - 手改坏的文件不该让 --status 崩
+        logger.warning(
+            "outbound-failures: %s 读不出来（%s）—— 只当它没有记录", path, exc
+        )
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def outbound_failure_from_record(
+    record: Optional[Mapping], key: str
+) -> Optional[dict]:
+    """从整份运行期记录里取**一个平台**的出站失败；没有就 ``None``（= 无记录）。
+
+    读取侧**再过一次** :func:`normalize_outbound_failure`：这份文件可能被用户手改过，
+    而消费方不该为"文件里有个没见过的字段"自己兜底。
+    """
+    if not isinstance(record, Mapping):
+        return None
+    platforms = record.get("platforms")
+    if not isinstance(platforms, Mapping):
+        return None
+    entry = platforms.get(str(key))
+    if not isinstance(entry, Mapping):
+        return None
+    return normalize_outbound_failure(
+        entry.get("kind"),
+        entry.get("detail"),
+        retry_after=entry.get("retry_after"),
+        at=entry.get("at"),
+        recovered_at=entry.get("recovered_at"),
+    )
+
+
+def outbound_failures_in_record(record: Optional[Mapping]) -> Iterable[str]:
+    """运行期记录里出现过的平台键（坏文件当空的）。"""
+    if not isinstance(record, Mapping):
+        return ()
+    platforms = record.get("platforms")
+    if not isinstance(platforms, Mapping):
+        return ()
+    return tuple(str(key) for key in platforms)
+
+
+def outbound_failure_recorded_at(record: Optional[Mapping]) -> Optional[float]:
+    """这份运行期记录最后一次被写入的时刻（epoch 秒）；没有 / 不是数字则 ``None``。"""
+    if not isinstance(record, Mapping):
+        return None
+    return _normalize_epoch(record.get("recorded_at"))
+
+
+class OutboundFailureRecorder:
+    """运行期出站失败记录的写入方：**状态变化时才写盘**。
+
+    存在的理由：各适配器失败时都调
+    :meth:`~opencode_bridge.adapters.base.Adapter._note_send_failure` 把结构化原因
+    算出来存进 ``_last_send_error``，而**在它被造出来之前没有任何人读它** ——
+    ``send_result`` 与 ``last_send_error`` 在生产代码里零个调用方。于是 agent 回消息
+    失败时**用户那边什么都没有**（结构化的 ``FORBIDDEN`` / ``RATE_LIMITED`` /
+    ``TIMEOUT`` 被算出来后直接丢掉）。本类就是那条缺失的通道。
+
+    ## 落盘形态
+
+    ::
+
+        {"recorded_at": <epoch float>,
+         "platforms": {"<平台键>": {"at": …, "kind": …, "detail": …,
+                                    "retry_after": …, "recovered_at": …}}}
+
+    ⚠️ 与 :func:`record_startup_probes` 的**整份替换**相反，这里是**读改写**：
+    每个平台一条、彼此独立，必须保住别的平台已经记下的内容（启动探测那份文件
+    之所以能整份替换，正是因为它的语义是"最近一次启动的全部结论"，而这里不是）。
+
+    ## 为什么只在**状态变化**时写（节流的判据）
+
+    出站失败可以**非常频繁** —— 对端限流、用户在批量操作、一次长答复被切成几十片
+    而中途中断。每次失败都写一次盘会把一次网络抖动放大成每秒几十次
+    ``mkstemp`` + ``fsync`` + ``os.replace``，**在排障功能自己的位置上**制造压力。
+
+    ⇒ 判据是**状态机**而不是时间窗（时间窗只会让记录更不准，而不会更省）：
+
+    ==========================  ======  ====================================
+    观测                          写盘?   理由
+    ==========================  ======  ====================================
+    「健康 → 失败」（首次失败）   是      这就是要让人看见的那一次
+    「失败 → 失败」（连续失败）   **否**  记录已经写着"这个平台在失败"，
+                                    再写一遍不增加任何信息
+    「失败 → 健康」（恢复）      是      不写就永远显示"正在失败"，
+                                    而它其实已经好了 —— 那比不显示更坏
+    「健康 → 健康」              否      压根没有记录要改
+    ==========================  ======  ====================================
+
+    ⇒ **上界是「每平台每次失败连击 ≤ 2 次写盘」**（进入 + 恢复）。这个界比任何
+    时间窗都紧，且不需要一个会随时钟漂移的常量。
+
+    ⚠️ **状态是进程内的，不从盘上恢复。** 所以桥重启后第一次失败会**再写一次**
+    （把 ``at`` 刷新到本次运行）—— 那一次写盘是有用的（用户查的就是"重启之后还有
+    没有在失败"），而它每个进程至多一次，不构成无限写盘。
+
+    ⛔ **写盘失败绝不影响发送路径**：每个方法都自己兜住异常、记 warning、返回
+    ``False``。这与 :func:`record_startup_probes` 的不变量同源 —— **排障记录
+    绝不该决定桥的生死**。
+    """
+
+    def __init__(self, bridge_dir: str) -> None:
+        self._bridge_dir = str(bridge_dir or "")
+        #: 正处于「失败连击」中的平台（内存态；见上面「状态是进程内的」）。
+        self._failing: set[str] = set()
+
+    # --- 观测入口 -----------------------------------------------------
+    def note_failure(
+        self,
+        platform: str,
+        kind: Any,
+        detail: Any = "",
+        *,
+        retry_after: Any = None,
+    ) -> bool:
+        """记一次出站失败；**真的写了盘**才返回 ``True``。
+
+        :param platform: 平台键（:func:`platform_key` —— 与 ``--status`` 列平台的
+            同一个来源，否则这条记录永远落不到用户看到的那一行上）。
+        """
+        key = str(platform or "")
+        if not key:
+            return False
+        if key in self._failing:
+            return False          # 失败连击中：记录已经写着"在失败"，不重复写
+        self._failing.add(key)
+        return self._write(key, normalize_outbound_failure(
+            kind, detail, retry_after=retry_after,
+        ))
+
+    def note_success(self, platform: str) -> bool:
+        """记一次出站成功（**仅当它结束了一段失败连击**才写盘）。
+
+        ⛔ 它**不会**删掉那条失败记录，而是给它盖一个 ``recovered_at`` 时间戳。
+        理由：发送恢复**不等于**那条失败的答复补发了 —— 平台压根没有"重投"原语，
+        而用户真正要问的是"我刚才那条回信去哪了"。把记录删掉会让这个问题彻底无解。
+        """
+        key = str(platform or "")
+        if not key or key not in self._failing:
+            return False          # 没有失败连击在结束：没有记录要改
+        self._failing.discard(key)
+        existing = self._entry_of(key) or normalize_outbound_failure(
+            SendError.UNKNOWN, "（未记录细节）",
+        )
+        existing["recovered_at"] = time.time()
+        return self._write(key, existing)
+
+    # --- 内部 ---------------------------------------------------------
+    def _entry_of(self, key: str) -> Optional[dict]:
+        """盘上这个平台**已经记着**的那条（读改写的前半段；坏文件当没有）。"""
+        return outbound_failure_from_record(self._read(), key)
+
+    def _read(self) -> Optional[dict]:
+        return read_outbound_failures(self._bridge_dir)
+
+    def _write(self, key: str, entry: Mapping) -> bool:
+        """读改写一次整份记录；**任何异常都在这里兜住**，返回是否真写到盘上。
+
+        ⚠️ 与 :func:`record_startup_probes` 一样复用
+        :func:`~opencode_bridge.pairing_cli.write_config_atomically`，不复制函数体：
+        截断一半的 JSON 会让下次 ``--status`` 读不到记录，而读不到记录正是本任务
+        想消灭的那种"零线索"。
+        """
+        document = self._read()
+        if not isinstance(document, dict):
+            document = {}
+        # 只留别的平台 —— 本平台那条由本方法**整体替换**，否则残留的
+        # ``recovered_at`` 会挂在一次全新的失败上（说"这次失败已恢复"）。
+        platforms = {
+            name: value
+            for name, value in dict(document.get("platforms") or {}).items()
+            if str(name) != key and isinstance(value, Mapping)
+        }
+        platforms[key] = dict(entry)
+        payload = {"recorded_at": time.time(), "platforms": platforms}
+        path = os.path.join(self._bridge_dir, OUTBOUND_FAILURES_FILE_NAME)
+        try:
+            write_config_atomically(
+                path, default_redactor().scrub_persisted_value(payload)
+            )
+        except Exception as exc:  # noqa: BLE001 - 落盘失败绝不打断发送
+            logger.warning(
+                "outbound-failures: 写入 %s 失败（%s）—— 不影响桥的发送", path, exc
+            )
+            return False
+        return True
+
+    # --- 测试与诊断 ---------------------------------------------------
+    def failing_platforms(self) -> tuple[str, ...]:
+        """当前处于失败连击中的平台（诊断用；``--status`` 读的是盘上那份）。"""
+        return tuple(sorted(self._failing))

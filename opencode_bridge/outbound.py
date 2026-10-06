@@ -13,6 +13,12 @@
 依赖只有两条：``adapter_for``（一条路由协作者）与 ``max_message_chars``（构造时读一次的
 配置上限）。出站这一侧不碰会话、不碰 turn、不碰事件流状态，所以搬出去就能脱离 core
 单独测。
+
+⚠️ 构造器**没有第三个依赖**，那是刻意的：``tests/test_outbound.py`` 用
+``inspect.signature`` 把这两个参数的名字与形态钉死了。而"这次发送到底成没成"
+要落盘就得知道 ``bridge_dir`` —— 那只有运行器知道。于是那条通路走**进程级装配**
+（:func:`install_outbound_failure_recorder`），由 :mod:`opencode_bridge.__main__`
+在启动时装一次；没装就只是不记，发送行为一个字不变。
 """
 
 from __future__ import annotations
@@ -22,11 +28,16 @@ from collections.abc import Callable
 from typing import Optional
 
 from .adapters import Adapter
-from .hooks import MsgHandle, Outbound
+from .health import OutboundFailureRecorder, platform_key
+from .hooks import MsgHandle, Outbound, SendResult
 from .normalize import _clean
 from .split import split_text
 
-__all__ = ["OutboundSender"]
+__all__ = [
+    "OutboundSender",
+    "installed_outbound_failure_recorder",
+    "install_outbound_failure_recorder",
+]
 
 logger = logging.getLogger("opencode_bridge.outbound")
 
@@ -34,6 +45,33 @@ NO_OUTPUT_TEXT = "（无输出）"
 
 #: 按 conversation_id 找出该回哪个适配器（找不到返回 ``None``）。
 AdapterFor = Callable[[str], Optional[Adapter]]
+
+#: 进程级的出站失败记录器。``None`` = **没装**（测试、单进程工具、或运行器尚未装配）
+#: ⇒ 出站失败只是不再落盘，发送路径的行为**一个字不变**。
+_installed_recorder: Optional[OutboundFailureRecorder] = None
+
+
+def install_outbound_failure_recorder(
+    recorder: Optional[OutboundFailureRecorder],
+) -> None:
+    """装上（或卸下）进程级的 :class:`~opencode_bridge.health.OutboundFailureRecorder`。
+
+    由 :mod:`opencode_bridge.__main__` 在**启动时**调用一次 —— 必须早于
+    :meth:`~opencode_bridge.core.BridgeCore.start`，因为适配器一启动就可能发信
+    （探针回复、排队中的消息补发）。
+
+    ⚠️ **进程级而不是构造注入**只有一个理由：``OutboundSender.__init__`` 的参数
+    列表被 ``tests/test_outbound.py`` 用 ``inspect.signature`` 钉死成两个，而第三个
+    依赖（``bridge_dir``）只有运行器知道。⚛ 这条装配是**单向可加的**：没装时
+    :meth:`OutboundSender.send_text` 照旧工作，所以它坏了也不会让桥发不出消息。
+    """
+    global _installed_recorder
+    _installed_recorder = recorder
+
+
+def installed_outbound_failure_recorder() -> Optional[OutboundFailureRecorder]:
+    """当前装着的记录器（没装返回 ``None``）。诊断与测试用。"""
+    return _installed_recorder
 
 
 def one_message_budget(bridge_budget: int, adapter: Optional[Adapter]) -> int:
@@ -115,6 +153,13 @@ class OutboundSender:
 
         返回 ``None`` 与「发送失败」同形是刻意的：调用方本来就把返回值当作
         「有没有可改写的句柄」在用（``Turn.progress_handle``），所以**上游一个字都不用改**。
+
+        ⚠️ **这里是全仓唯一一处「出了 ``send()`` 之后判成败」的地方** ——
+        ``commands.py`` / ``event_stream.py`` / ``inbound_gateway.py`` 的每一次
+        ``_send_text`` 都从这里过。⇒ :meth:`_record_outcome` 就是那条缺失的通道的
+        落点：适配器算出来的结构化失败原因（``FORBIDDEN`` / ``RATE_LIMITED`` /
+        ``TIMEOUT`` …）在这里被读出来、落盘，供 ``--status`` 报给用户 ——
+        在此之前它们被算完就直接丢掉，用户那边什么都没有。
         """
         adapter = adapter or self._adapter_for(conversation_id)
         if adapter is None:
@@ -132,11 +177,71 @@ class OutboundSender:
             kind=kind,
             session_id=session_id,
         )
-        try:
-            return adapter.send(out)
-        except Exception:
+        # ⚠️ 用 :meth:`~opencode_bridge.adapters.base.Adapter.send_observed` 而不是直接
+        # ``send()``：它**先清再读**，所以"这一条"的结果不会与"上一次"混淆
+        # （判据的完整理由见 :meth:`_record_outcome`），而且它把抛出的异常
+        # **交还**给我们 —— 栈必须留在这里（``adapter.send failed`` 这条 ERROR 是
+        # 既有的、被测试钉住的），而只拿到一句 ``"send() raised: …"`` 查不出是哪
+        # 一层炸的。
+        result, raised = adapter.send_observed(out)
+        if raised is not None:
             logger.exception("adapter.send failed for %s", conversation_id)
-            return None
+        self._record_outcome(adapter, result, conversation_id)
+        return result.handle
+
+    @staticmethod
+    def _record_outcome(
+        adapter: Adapter,
+        result: SendResult,
+        conversation_id: str,
+    ) -> None:
+        """把**这一次**发送的成败喂给出站失败记录器（没装记录器就是空操作）。
+
+        ## 判据：句柄 **和** ``error_kind``，而不是句柄**或**它
+
+        两者各自都会漏掉一种真实的丢消息：
+
+        * 只看句柄 ⇒ ``telegram`` / ``irc`` / ``twitch`` 那种"分片发到第 3 片
+          断了、前 2 片已送达"的**部分成功**会被记成成功 ⇒ 调用方以为答复整条到了，
+          而读者少收了一截。:attr:`~opencode_bridge.hooks.SendResult.partial` 正是
+          为这件事准备的信号。
+        * 只看 ``error_kind`` ⇒ ``ok=True`` 时它只是 ``UNKNOWN`` 的默认值，
+          把它读成"有过失败"就是误报。
+
+        ⇒ 判据落在 :attr:`~opencode_bridge.hooks.SendResult` 上（``ok`` /
+        ``partial`` / ``error_kind`` 三者一起），而那个结构是**每个适配器都已经
+        在记**的东西 —— 不需要各平台再改一行。
+
+        ⛔ **本方法绝不抛**：它服务于一条排障通道，而排障通道坏了不该让一条**本来
+        能发出去的消息**发不出去（与 ``record_startup_probes`` 的不变量同源）。
+        """
+        recorder = None
+        try:
+            recorder = installed_outbound_failure_recorder()
+            if recorder is None:
+                return
+            if result.ok and not result.partial:
+                recorder.note_success(platform_key(adapter))
+                return
+            detail = result.error_detail or "send() returned None"
+            if result.partial:
+                detail = f"部分送达：{detail}"
+            recorder.note_failure(
+                platform_key(adapter),
+                result.error_kind,
+                detail,
+                retry_after=result.retry_after,
+            )
+            logger.warning(
+                "出站失败 %s conversation=%s：%s —— %s",
+                platform_key(adapter), conversation_id,
+                getattr(result.error_kind, "value", result.error_kind), detail,
+            )
+        except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+            logger.warning(
+                "outbound-failure 记录器抛了（%s: %s）—— 不影响这次发送",
+                type(exc).__name__, exc,
+            )
 
     def edit_progress(
         self,

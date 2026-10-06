@@ -1134,6 +1134,14 @@ class EmailAdapter(Adapter):
             self._note_send_failure(SendError.BAD_FORMAT, "bad recipient or empty text")
             return None
         if not self.smtp_host:
+            # ⚠️ 这条与下面 SMTP 会话失败那条此前**都没有日志**：结构化分类算出来
+            # 就被丢掉，于是用户把 SMTP 密码改错之后既收不到回信、也查不到原因。
+            # 分类（``FORBIDDEN`` / ``RATE_LIMITED`` / …）照旧只进
+            # ``outbound-failures.json`` 供 ``--status`` 读，而这里负责**当场**说清
+            # 是哪一类失败 —— 两者的受众不同（一个是事后排查，一个是日志）。
+            logger.warning(
+                "email: 拒绝发送 —— smtp_host 没配（收件人 %r）", recipient,
+            )
             self._note_send_failure(SendError.BAD_FORMAT, "smtp_host not configured")
             return None
 
@@ -1159,6 +1167,21 @@ class EmailAdapter(Adapter):
             self._smtp_send(recipient, raw)
         except Exception as exc:  # noqa: BLE001 - 适配器不向调用方抛
             kind, detail = _classify_smtp(exc)
+            # ⚠️ **这条此前一条日志都没有**（全仓最坏的一处）：``_classify_smtp``
+            # 把 ``SMTPAuthenticationError`` 收敛成 ``FORBIDDEN``、把 45x 收敛成
+            # ``RATE_LIMITED``，然后 ``return None`` —— 于是用户改了 SMTP 密码、
+            # 收不到任何回信，日志里也查不到。**必须连分类一起说**（"发送失败"
+            # 不等于"密码错了"），而**不许**把 ``exc`` 的 repr 整段打出来（那是
+            # 自由文本，可能带着凭据片段 —— 走 :func:`_classify_smtp` 的 detail
+            # 已经过 SMTP 层筛选，仍然只打分类与脱敏后的一行）。
+            #
+            # ⚠️ 打的是 ``kind.value``（``forbidden``）而不是 ``kind``（打出来会是
+            # ``SendError.FORBIDDEN``）：**日志与 ``--status`` 必须是同一套词** ——
+            # 用户照着状态视图里那个词去 grep 日志，搜不到就等于这条日志不存在。
+            logger.warning(
+                "email: SMTP 发送失败（%s）收件人=%s：%s",
+                getattr(kind, "value", kind), recipient, detail,
+            )
             self._note_send_failure(kind, detail)
             return None
 

@@ -366,6 +366,12 @@ class TestSetupJsonCarriesTheProbe(_BridgeDirIsolated):
 
         ⛔ **不许**对着实现算一遍期望集合 —— 那恒真。必须是上面那份硬编码的
         ``PLATFORM_STATUS_KEYS_BEFORE_PROBE_FIELD``。
+
+        ⚠️ 第二段断言期望的「新增键集合」从 ``{"last_start_probe"}`` 扩成了两个：
+        后来那条出站失败通道又**只增**了 ``last_outbound_failure``（见
+        ``tests/test_outbound_failure_channel.py``，那里**另抄**了一份硬编码的
+        「改动前的 key 集合」并单独守这条护栏）。⚠️ 第一段那份硬编码集合**一个字
+        没动** —— 它才是真正的护栏；两段都要，因为它们守的不是同一件事。
         """
         cfg = Config(adapters={"telegram": {"bot_token": "t"}})
         for row in cli._platform_status(cfg):
@@ -378,8 +384,8 @@ class TestSetupJsonCarriesTheProbe(_BridgeDirIsolated):
         sample = cli._platform_status(cfg)[0]
         self.assertEqual(
             set(sample) - PLATFORM_STATUS_KEYS_BEFORE_PROBE_FIELD,
-            {"last_start_probe"},
-            "本次只许新增 last_start_probe 这一个键",
+            {"last_start_probe", "last_outbound_failure"},
+            "只许**新增**键：既有 key 一个都不许删 / 改名",
         )
 
 

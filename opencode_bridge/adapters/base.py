@@ -628,8 +628,16 @@ class Adapter(abc.ABC):
         *,
         retry_after: float | None = None,
     ) -> None:
-        """适配器在检测到失败时调用，记录**结构化**原因（供 ``send_result`` /
-        ``--status`` 消费）。``send()`` 的既有签名与行为保持不变。"""
+        """适配器在检测到失败时调用，记录**结构化**原因。``send()`` 的既有签名与
+        行为保持不变。
+
+        ⚠️ **记下来还不够**：本方法此前算出的分类**零个生产调用方**（``send_result``
+        与 :attr:`last_send_error` 都没人调），于是失败原因算完就丢、用户收不到回信
+        也查不到原因。现在消费者是 :meth:`~opencode_bridge.outbound.OutboundSender`
+        在 :meth:`~opencode_bridge.outbound.OutboundSender.send_text` 里经
+        :meth:`send_observed` 把它读出来，落到 ``outbound-failures.json`` 供
+        ``--status`` 读（见 :mod:`opencode_bridge.health`）。**新增适配器不必改
+        任何东西**即可自动获得这条通道。"""
         self._last_send_error: tuple[SendError, str, float | None] = (
             kind,
             str(detail)[:400],
@@ -641,27 +649,47 @@ class Adapter(abc.ABC):
 
     @property
     def last_send_error(self) -> SendError | None:
-        """最近一次发送失败的分类（成功过则为 ``None``）。"""
+        """最近一次发送失败的分类（成功过则为 ``None``）。
+
+        ⚠️ **只有分类，没有原因** —— 而"是什么失败"（SMTP 的 ``535``、Telegram 的
+        ``Forbidden: bot was blocked by the user``）才是用户看得懂的那一半。
+        ⚠️ **而且它是"上一次"，不是"刚才那一次"**：:meth:`_note_send_failure` 只写不清
+        （它由各适配器在 ``send()`` **内部**调用，那时"这次"与"上次"分不开）。
+        ⇒ **想要"刚才那一次"的完整答案，用 :meth:`send_observed`**，别在这里加属性
+        —— 这正是本任务之前的状态：一堆只写、没人读的槽。
+        """
         return self._last_send_error[0] if self._last_send_error else None
 
-    def send_result(self, out: Outbound) -> SendResult:
-        """结构化出站结果（T1.3 新增，**向后兼容**）。
+    def send_observed(
+        self, out: Outbound,
+    ) -> tuple[SendResult, Optional[BaseException]]:
+        """发一条，并交出「**这一条**发得怎么样」—— ``(结构化结果, 抛出的异常)``。
 
-        默认实现包装既有的 ``send()``：拿到句柄即成功，否则回读适配器在
-        ``send()`` 内部记下的 ``_note_send_failure``。子类可覆写以给出更精确的
-        ``partial`` / ``retry_after``。
+        :meth:`send_result` 的加强版：结果一样，**外加把那个异常交还调用方** ——
+        因为上层要留**栈**（``logger.exception``），而只拿到一句
+        ``"send() raised: …"`` 的调用方永远查不出是哪一层炸的。
+
+        ⚠️ **它先清再读，所以它是「发一条 + 问结果」的**唯一入口**：清在前、读在后，
+        调用方就**不可能**忘记清 ⇒「失败 → 成功」不会被显示成"仍在失败"。
+
+        ⚠️ **绝不向上抛**：适配器抛了也不让上层崩，异常从第二个返回值出去，由调用方
+        决定要不要留栈。
+
+        子类要给出更精确的 ``partial`` / ``retry_after`` 就覆写本方法；只想改结果
+        形状（不要那个异常）可以覆写 :meth:`send_result`。
         """
         self._clear_send_failure()
         try:
             handle = self.send(out)
         except Exception as exc:  # 适配器不应抛出；真抛了也不让上层崩
-            self._note_send_failure(SendError.TRANSIENT, f"send() raised: {exc}")
+            detail = f"send() raised: {exc}"
+            self._note_send_failure(SendError.TRANSIENT, detail)
             return SendResult(
                 platform=self.name,
                 ok=False,
                 error_kind=SendError.TRANSIENT,
-                error_detail=f"send() raised: {exc}",
-            )
+                error_detail=detail,
+            ), exc
         if handle is not None:
             # 分片发送中"部分成功"：send() 返回了最后一个好句柄，但过程中记过失败。
             # 这种情况必须显式带出 partial，否则调用方会把未送达当成已送达。
@@ -675,8 +703,8 @@ class Adapter(abc.ABC):
                     error_detail=detail,
                     retry_after=retry_after,
                     partial=True,
-                )
-            return SendResult(platform=self.name, ok=True, handle=handle)
+                ), None
+            return SendResult(platform=self.name, ok=True, handle=handle), None
         kind, detail, retry_after = self._last_send_error or (
             SendError.UNKNOWN,
             "send() returned None",
@@ -688,7 +716,21 @@ class Adapter(abc.ABC):
             error_kind=kind,
             error_detail=detail,
             retry_after=retry_after,
-        )
+        ), None
+
+    def send_result(self, out: Outbound) -> SendResult:
+        """结构化出站结果（T1.3 新增，**向后兼容**）。
+
+        默认实现包装既有的 ``send()``：拿到句柄即成功，否则回读适配器在
+        ``send()`` 内部记下的 ``_note_send_failure``。子类可覆写以给出更精确的
+        ``partial`` / ``retry_after``。
+
+        ⚠️ 本方法**委托**给 :meth:`send_observed`（只丢掉那个异常）—— 判定式必须
+        只有一份：两个各自实现的副本迟早会漂，而漂掉的恰恰是"用户到底收没收到
+        消息"这个最要紧的判据。
+        """
+        result, _exception = self.send_observed(out)
+        return result
 
 
 def _ensure_loaded(name: str) -> None:

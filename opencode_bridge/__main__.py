@@ -35,6 +35,7 @@ from . import health
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
+from .outbound import install_outbound_failure_recorder
 from .pairing import empty_allowlist_is_open
 from .pairing_cli import run_pair
 from .redaction import install_redaction_filter
@@ -286,6 +287,12 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
     #: 在网络被墙时也发不出那条最该看的错误信息（且 ``run_check`` 的 docstring
     #: 明写「no sessions, **no adapters**」）。读一次就够，**不逐平台重读**。
     probe_record = health.read_platform_health(_bridge_dir())
+    #: **运行期**出站失败记录（**另一个文件**，见 :mod:`opencode_bridge.health`
+    #: 的「出站失败为什么另开一份文件」）。⛔ 与上面的 ``probe_record`` 时效语义
+    #: 不同（一个是「上次启动那一刻」，一个是「上一次失败的那一刻」），所以连
+    #: 载体都分开 —— 否则 :func:`health.record_startup_probes` 的整份替换会顺手
+    #: 把它删掉。同样**纯本地读盘**：本函数不做任何网络请求。
+    outbound_record = health.read_outbound_failures(_bridge_dir())
     out: list[dict[str, object]] = []
     for key in _status_platform_keys():
         cls = adapter_class(key)
@@ -382,6 +389,24 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 # 建议用户改凭据。⛔ 既有三档（``ok`` / ``failed`` / ``skipped``）
                 # **一个字没改**：本函数对 ``platforms`` 的其它 key 也一样，只增不改。
                 "last_start_probe": health.probe_from_record(probe_record, key),
+                # --- 运行期出站失败（新增；outbound_ready 的含义不变）----------
+                # ⚠️ **不要把它读成"发送能用"**：``outbound_ready`` 的原义是
+                # 「**出站凭据齐备**」，是一个**有测试钉住的既有契约**，一个字没改
+                # （改它等于让每个既有消费者重新学一遍这套输出）。而"凭据齐"与
+                # "真发得出去"是两件事 —— SMTP 密码改了、Telegram 把 bot 踢了、
+                # 对端限流，凭据照样齐备而**一条都发不出去**。
+                # ⇒ 所以**另加**这一个字段回答后者。
+                #
+                # ⛔ **它回答的是"上一次失败"，不是"现在能不能发"**：``at`` 是那
+                # 一刻的时刻，``recovered_at`` 缺失 = 之后**没有观测到**成功
+                # （可能是仍在失败，也可能是压根没人再发消息 —— 盘上分不出是哪
+                # 一种，而猜一个就是编造，见 AGENTS.md §8）。
+                #
+                # ⛔ **``None`` 的含义是「没有记录」，不是「没问题」**：桥还没以
+                # 当前配置运行过、或运行期间一条都没发出去，两者都是 ``None``。
+                "last_outbound_failure": health.outbound_failure_from_record(
+                    outbound_record, key,
+                ),
             }
         )
     return out
@@ -806,6 +831,100 @@ def _print_last_start_probes(
         print("  " + _pad(label, name_w) + line)
 
 
+#: 「这个平台没有出站失败记录」时 ``--status`` 那一段逐行显示的**逐字**文案。
+#: 取 :data:`opencode_bridge.health.NO_OUTBOUND_FAILURE_TEXT` 而不是在这里另写一份：
+#: 那份是 :func:`opencode_bridge.health.describe_outbound_failure` 也会用到的文案，
+#: 两处各写一次就会漂 —— 而"没有记录"这句话一旦漂成"正常"，就是本任务要消灭的
+#: 那类假话。
+NO_OUTBOUND_FAILURE_TEXT = health.NO_OUTBOUND_FAILURE_TEXT
+
+_OUTBOUND_SECTION_HEADER = "== 上次出站失败（运行期记录） =="
+
+
+def _print_last_outbound_failures(
+    rows: list[tuple[str, str, bool, bool, dict]],
+    bridge_dir: str,
+) -> None:
+    """打印「上一次出站发送失败是什么、为什么」。
+
+    ⚠️ 这一段与上面两段**回答的都不是同一个问题**，所以必须分开说：
+
+    * 「渠道配置与能力」答"凭据齐不齐"（纯本地可判）；
+    * 「上次启动时的探测结论」答"上次**启动那一刻**平台**认不认**这个凭据"；
+    * **这一段**答"**上一次**发送失败是什么时候、为什么" —— 那可能是启动之后
+      十分钟才发生的（SMTP 密码被改、对端限流、bot 被踢、机器人退群）。
+
+    它们的失效方式不同：凭据齐、平台认，而**发出去那一步**仍然失败时，前两段
+    全都是绿的 —— 那正是本段存在的理由。
+
+    ⚠️ **纯本地读盘**：与其它段一样不联网、不构造适配器（``--status`` 必须是
+    "网络坏了也能看"的那条路）。
+
+    ⚠️ **措辞必须带时效，而且不许把一条旧记录说成"现在坏了"**：
+    * 有记录、``recovered_at`` **缺失** ⇒「此后**没有观测到**成功」。⚠️ 这里
+      **不能**说"仍在失败" —— 盘上分不出"还在失败"与"没人再发消息"（见
+      AGENTS.md §8：靠猜的方案必然在某些输入上错）。
+    * 有记录、``recovered_at`` **有值** ⇒ 明确说"已恢复"，**并且**说明那次失败的
+      答复**不会补发**（平台没有"重投"原语）—— 不说这句，用户会以为恢复之后
+      那条消息就补上了。
+    * 无记录 ⇒ :data:`NO_OUTBOUND_FAILURE_TEXT`，⛔ 既不显示成"正常"、也不显示成
+      "失败"。
+
+    :param rows: :func:`_channel_config_rows` 的行，**复用**它（平台清单只有一份）。
+    :param bridge_dir: :func:`_bridge_dir` 的推导结果 —— 记录就落在那里。
+    """
+    record = health.read_outbound_failures(bridge_dir)
+    recorded = health.outbound_failure_recorded_at(record)
+    recorded_platforms = set(health.outbound_failures_in_record(record))
+    # 与 :func:`_print_last_start_probes` 同一个取舍：只列**已配置**或**盘上有记录**
+    # 的平台。没配的平台既不该发过消息，也就不该有出站失败记录。
+    listed = [
+        (key, label)
+        for key, label, configured, _inbound_ready, _caps in rows
+        if configured or key in recorded_platforms
+    ]
+    print("")
+    print(_OUTBOUND_SECTION_HEADER)
+    print("  说明：以下是**运行期间**观测到的出站发送失败（落盘在")
+    print("        outbound-failures.json；与上面那份 platform-health.json **是两份**")
+    print("        记录，**各答各的**：那一份答「上次启动那一刻平台认不认凭据」，")
+    print("        这一份答「上一次发送失败是什么时候、为什么」）。")
+    print("        ⚠ 时间戳说的是**那一刻**发生的事，**不是**现在的连接状态。")
+    print("        ⚠ 「没有观测到成功」≠「现在还坏着」：也可能是压根没人再发消息。")
+    print("        ⚠ 「已恢复」指的是**发送又成功了**，而失败那次的答复")
+    print("          **不会补发** —— 平台没有「重投」这个原语。")
+    if recorded is not None:
+        print(
+            "  记录时间 : "
+            + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded))
+            + "（这份文件最后一次被写入的时刻，不是失败发生的时刻）"
+        )
+    if not listed:
+        print(
+            "  （没有已配置的平台，也没有任何出站失败记录）" if record is None
+            else "  （盘上有记录，但没有属于这些平台的）"
+        )
+        return
+    name_w = max(_dwidth("平台"), max(_dwidth(label) for label, _f in listed)) + 2
+    for key, label in listed:
+        failure = health.outbound_failure_from_record(record, key)
+        if failure is None:
+            print("  " + _pad(label, name_w) + NO_OUTBOUND_FAILURE_TEXT)
+            continue
+        line = "上次出站失败 " + health.describe_outbound_failure(failure)
+        at = failure.get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            line += "（%s）" % time.strftime("%m-%d %H:%M:%S", time.localtime(at))
+        recovered_at = failure.get("recovered_at")
+        if isinstance(recovered_at, (int, float)) and not isinstance(recovered_at, bool):
+            line += " · 已恢复于 %s" % time.strftime(
+                "%m-%d %H:%M:%S", time.localtime(recovered_at)
+            )
+        else:
+            line += " · 此后没有观测到成功"
+        print("  " + _pad(label, name_w) + line)
+
+
 def run_status(cfg: Config) -> int:
     """汇总视图：服务连通性 + 各平台配置与能力 + bridge 运行态证据（T1.5）。"""
     bridge_dir = _bridge_dir()
@@ -885,6 +1004,7 @@ def run_status(cfg: Config) -> int:
             print(f"  {label}: {detail}")
 
     _print_last_start_probes(rows, bridge_dir)
+    _print_last_outbound_failures(rows, bridge_dir)
 
     print("")
     print("== bridge 运行态 ==")
@@ -972,6 +1092,17 @@ def _run_bridge_locked(cfg: Config) -> int:
     core = BridgeCore(cfg, client, state, inbox)
 
     usable = 0
+    # ⚠️ **装在 `core.start()` 之前**：适配器一启动就可能发信（探针回复、启动时
+    # 排队消息的补发），而这一路此前完全没有落盘 ⇒ 那几条失败会在记录里缺一段。
+    # ⛔ 装不上不许阻断启动（排障通道不该决定桥的生死）；退化行为就是「不记」，
+    # 发送路径一个字不变。
+    try:
+        install_outbound_failure_recorder(health.OutboundFailureRecorder(_bridge_dir()))
+    except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+        logger.warning(
+            "outbound-failures: 记录器未装配（%s: %s）—— 不影响桥的发送",
+            type(exc).__name__, exc,
+        )
     #: 「这个平台为什么没能进来」—— ``usable == 0`` 时它就是那条记录的 ``detail`` 来源。
     #: ⚠️ **只在那些 ``continue`` 分支里写** ⇒ 而能 attach 的早就把 ``usable`` 加上去
     #: 了 ⇒ 所以 ``usable == 0`` 时它**必然覆盖了配置里的每一个平台**。

@@ -147,6 +147,60 @@ def _token_present(entry: dict, key: str) -> bool:
     return bool(str(entry.get(key) or "").strip())
 
 
+def _readiness_verdict(cls: object | None, entry: dict) -> bool | None:
+    """「用户这份配置此刻配好了没有」的答案。``None`` = 由通用规则回答。
+
+    ⚠️ **三处判定（preflight / ``--setup --json`` / ``--status``）必须问同一个函数。**
+    此前它们各自读一遍 ``getattr(cls, "config_optional", False)`` —— 也就是说
+    "某个平台的可省略配置"这个前提被**三份**代码各自无条件信任，改一处另外两处
+    继续说同一个（过期的）谎。本函数是**唯一**那个入口。
+
+    返回值三态，含义各不相同，别把 ``None`` 当成 ``False``：
+
+    * ``True`` / ``False`` —— 该平台**自己**作答（``config_optional = True``：
+      「我没有凭据可填，'够不够跑'只能我说」），答案来自
+      :meth:`~opencode_bridge.adapters.base.Adapter.config_runnable`。
+      ⇒ 它是**权威**答案，**不再**落回 ``required_tokens`` 那条通用规则。
+    * ``None`` —— 该平台走通用规则：「``required_tokens`` 的键逐个非空」
+      （多数平台）。此时 ``cls`` 甚至可能是 ``None``（未注册的适配器键）。
+
+    ⛔ 消费方**只**调用 :meth:`~opencode_bridge.adapters.base.Adapter.config_runnable`，
+    绝不能写 ``bool(getattr(cls, "config_runnable", False))`` —— 那样拿到的是类上
+    绑定的函数对象（永远真值）⇒ 每个平台都会被判成"能跑"。
+
+    :param cls: :func:`~opencode_bridge.adapters.adapter_class` 的结果（可为 ``None``）。
+    :param entry: ``cfg.adapters`` 里该平台的**原始条目**（三条路径都先归一成 dict）。
+    """
+    if not bool(getattr(cls, "config_optional", False)):
+        return None
+    judge = getattr(cls, "config_runnable", None)
+    # ⛔ 刻意不写 ``bool(getattr(...))``（见上面）：非可调用 ⇒ 失败关闭（"没配好"），
+    # 而不是把一个布尔属性/方法对象当成答案。
+    return bool(judge(entry)) if callable(judge) else False
+
+
+def _missing_required_keys(cls: object | None, entry: dict) -> list[str]:
+    """状态视图说的「还差哪些键」。空列表 = 配好了。
+
+    ⚠️ **与 :func:`_readiness_verdict` 同源**：平台自己作答时它的答案**权威** ——
+    否则 ``bind_port: "nope"`` 这种「键非空、但起不来」的配置会被通用规则重新
+    判成"配好了"（那正是本缺陷的形态：一个说不过期的前提被无条件信任）。
+
+    :func:`_has_configured_adapter` **不走**本函数：它对未注册的适配器键另有一条
+    分支（"有像凭据的字段就别凭空拦住用户"），且 ``required_tokens`` 缺省值不同
+    （``()`` vs ``("bot_token",)``）—— 那条路的形状照旧，不在这里合并。
+    """
+    required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
+    verdict = _readiness_verdict(cls, entry)
+    if verdict is True:
+        return []
+    if verdict is False:
+        # 自家说"起不来"，而它要的正是这些键 —— 报"缺哪个"才有意义
+        #（a2a 就是 ``["bind_port"]``，也是 ``docs/a2a.md`` 承诺的那条提示）。
+        return list(required)
+    return [key for key in required if not _token_present(entry, key)]
+
+
 #: ``not_ready_reasons`` 的取值。**稳定 token**，不是给人看的话 —— 人看的是
 #: ``detail`` 字段。理由码单独成常量，是为了让消费方（含测试）能按值断言，
 #: 而不是去匹配会改字的提示语。
@@ -227,13 +281,14 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
     for key in _status_platform_keys():
         cls = adapter_class(key)
         entry = entries.get(key) if isinstance(entries.get(key), dict) else {}
-        required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
         outbound = tuple(getattr(cls, "outbound_tokens", ("bot_token",)) or ("bot_token",))
-        # ``config_optional``（无凭据可填、且默认值安全）→ 不看配置也能跑。
-        # 见 ``adapters/base.py`` 里该属性的说明：此前这里只看 required_tokens，
-        # 于是 a2a 空配置会被报成"未配置"/"发不出去"，而它本来就能跑。
-        optional = bool(getattr(cls, "config_optional", False))
-        missing = [] if optional else [k for k in required if not _token_present(entry, k)]
+        # 「这份配置此刻配好了没有」问**唯一**那个判定入口（见 :func:`_readiness_verdict`）。
+        # ⚠️ **不再**问 ``config_optional`` 那个静态声明：它记录的是"曾经为真"的事实
+        # —— 注释曾断言"a2a 空配置即可运行（端口由系统分配）"，而 ``_coerce_port("")``
+        # 给的是 ``UNCONFIGURED_PORT``（-1）、``A2aAdapter.start()`` 据此打 error
+        # **不绑定就 return** ⇒ 那条前提早就不成立了。
+        verdict = _readiness_verdict(cls, entry)
+        missing = _missing_required_keys(cls, entry)
         supports_inbound = bool(getattr(cls, "supports_inbound", False))
         configured = not missing
         # 授权面与闸门读**同一个**解析函数（``allowlist.resolve_allowlist``）——
@@ -251,8 +306,10 @@ def _platform_status(cfg: Config) -> list[dict[str, object]]:
                 "configured": configured,
                 # 出站凭据各平台不同（Matrix 用 homeserver/access_token、IRC 用
                 # host/nick…），必须由适配器声明，不能硬编码 bot_token。
-                "outbound_ready": optional
-                or all(_token_present(entry, k) for k in outbound),
+                # 平台自己作答时（``verdict`` 非 None）它的答案是权威的 ——
+                # 与 :attr:`configured` 同一个来源，两列不会互相矛盾。
+                "outbound_ready": verdict if verdict is not None
+                else all(_token_present(entry, k) for k in outbound),
                 # 入站要"能力已实现"且"配置齐备"两个条件同时成立
                 "inbound_ready": supports_inbound and not missing,
                 "inbound_implemented": supports_inbound,
@@ -358,6 +415,19 @@ def _has_configured_adapter(cfg: Config) -> bool:
     桥接直接拒绝启动 —— 这三个平台根本没有 ``bot_token`` 这个键。
 
     仍然刻意简单，好在 endpoint discovery 之前就给出有用的提示。
+
+    ⚠️ **⛔ 不许问「有没有哪个 ``config_optional`` 平台」，要问「这份配置此刻够不够
+    跑」。** 那是本函数此前的一个真缺陷：``a2a`` 声明 ``config_optional = True``
+    （分类：我没有凭据可填），而**这个分类**曾被当成"空配置即可运行"的**判定**无条件
+    信任 —— 那条前提早已不成立：``_coerce_port("")`` 是 ``UNCONFIGURED_PORT``（-1），
+    ``A2aAdapter.start()`` 据此打 error 并**不绑定就 return**。⇒ 于是模板里那行
+    ``"a2a": {"bind_port": "", …}`` 就能让全新安装的桥**跳过本函数**、不再走
+    :data:`NO_ADAPTER_MESSAGE` 那条提前退出。
+
+    现在分两种问法（见 :func:`_readiness_verdict`）：平台自己作答的走
+    :meth:`~opencode_bridge.adapters.base.Adapter.config_runnable`
+    （答案**权威**，不落回 ``required_tokens``）；其余走 ``required_tokens`` 通用规则
+    —— 后者一个字没改，那正是「Matrix/IRC/Mattermost 不能被拒启动」的守卫。
     """
     entries = cfg.adapters or {}
     if not isinstance(entries, dict) or not entries:
@@ -369,11 +439,9 @@ def _has_configured_adapter(cfg: Config) -> bool:
         if not isinstance(entry, dict):
             continue
         cls = adapter_class(str(name))
-        if bool(getattr(cls, "config_optional", False)):
-            # 无凭据可填、且默认值安全的平台（a2a bind 127.0.0.1 + 端口由系统分配）
-            # —— 空配置即可运行，**不许**因为没填 required_tokens 而拒绝启动。
-            # 这与当年 Matrix/IRC/Mattermost 被拒启动是同一类 bug。
-            return True
+        verdict = _readiness_verdict(cls, entry)
+        if verdict is not None:
+            return verdict
         required = tuple(getattr(cls, "required_tokens", ()) or ())
         if not required:
             # 未知/未注册的适配器：只要有像凭据的字段就别凭空拦住用户
@@ -468,11 +536,10 @@ def _channel_config_rows(cfg: Config) -> list[tuple[str, str, bool, bool, dict]]
         cls = adapter_class(key)
         raw = entries.get(key)
         entry = raw if isinstance(raw, dict) else {}
-        required = tuple(getattr(cls, "required_tokens", ("bot_token",)) or ("bot_token",))
-        # 同 _platform_status：config_optional 的平台不看配置也算就绪
-        missing = [] if getattr(cls, "config_optional", False) else [
-            k for k in required if not _token_present(entry, k)
-        ]
+        # 同 _platform_status / _has_configured_adapter：问**唯一**那个判定入口。
+        # 少改这一处的代价是它继续说"a2a 空配置已配置"，而 `--status` 的
+        # 「配置 / 入站」两列正是用户决定填不填 bind_port 的依据。
+        missing = _missing_required_keys(cls, entry)
         caps: dict = {}
         try:
             # 与 run_bridge 走**同一个**投影，否则状态视图会在一个真实运行着的

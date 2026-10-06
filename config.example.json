@@ -24,6 +24,7 @@
     "ntfy": { "topic": "", "allowed_chat_ids": [] },
     "email": { "address": "", "password": "", "imap_host": "", "smtp_host": "", "allowed_chat_ids": [] },
     "qqbot": { "app_id": "", "app_secret": "", "allowed_chat_ids": [] },
-    "homeassistant": { "url": "", "token": "", "allowed_chat_ids": [] }
+    "homeassistant": { "url": "", "token": "", "allowed_chat_ids": [] },
+    "a2a": { "bind_port": "", "allowed_chat_ids": [] }
   }
 }

@@ -153,19 +153,73 @@ class Adapter(abc.ABC):
     #: （Matrix 用 homeserver/access_token、IRC 用 host/nick、Mattermost 用 site_url/token），
     #: 否则状态视图会把它们一律报成"发不出去"。
     outbound_tokens: tuple[str, ...] = ("bot_token",)
-    #: **本平台是否"无需任何显式配置即可运行"** ——默认 False。
+    #: **本平台的「配好了没有」是否由它自己回答** —— 默认 False。
     #:
     #: ``required_tokens`` 回答的是"**你必须声明**你的配置面"（`test_cli` 守这条，
     #: 它抓到过 Matrix 忘了声明 ``required_tokens`` 导致配得完全正确的用户被判成
-    #: 没配的真bug）；而 preflight 与 ``--status`` 回答的是"**用户必须显式配了**
-    #: 才能跑"。这两件事此前被混为一谈，于是 a2a 被迫把 ``bind_port`` 填进
-    #: ``required_tokens``，而它空配置本来就能跑（bind 127.0.0.1 + 端口由系统分配）——
-    #: 结果是**只配 a2a 的用户被桥接拒绝启动**，与当年 Matrix/IRC/Mattermost
-    #: 被拒启动是同一类bug。
+    #: 没配的真bug）；而 preflight 与 ``--status`` 回答的是"**用户手里这份配置
+    #: 此刻够不够跑**"。这两件事此前被混为一谈，于是 a2a 被迫把 ``bind_port``
+    #: 填进 ``required_tokens``。
     #:
-    #: 置True 表示"我没有凭据可填，且默认值是安全的"。它**不豁免任何配置声明义务**：
-    #: ``required_tokens`` 仍须非空（守那条不变量的测试照样通过）。
+    #: 置 ``True`` 表示"**我是这一类**：我没有凭据可填，'够不够跑'只能由我自己
+    #: 回答"**。置 ``True`` 的平台，其 preflight / 两个状态视图**一律**走
+    #: :meth:`config_runnable`，**不再**落回 ``required_tokens`` 那条通用规则 ——
+    #: 否则我的判定只是个"提前放行"，填错的值仍会被通用规则（"键非空"）重新
+    #: 判成已配置，等于把刚修好的洞从旁边再开一个。
+    #:
+    #: ⚠️ **必须与覆写 :meth:`config_runnable` 一起改。** 只置 ``True`` 而不覆写
+    #: ⇒ 默认实现回答"否" ⇒ 该平台永远配不好（缺什么键会被如实报出来，属**失败
+    #: 关闭**，但显然不是意图）；反过来只覆写 :meth:`config_runnable` 而不置这个
+    #: ⇒ 判定一次都不会被问到（原因见该方法的 docstring）。
+    #:
+    #: 它**不豁免任何配置声明义务**：``required_tokens`` 仍须非空（守那条不变量的
+    #: 测试照样通过）。
+    #:
+    #: ⛔ **必须保持 ``bool``，绝不能改成方法。** 消费方在**类**上读它
+    #: （``getattr(cls, "config_optional", False)``），而 ``getattr`` 取到的是
+    #: **未绑定函数对象** —— 永远真值 ⇒ **13 个平台会同时**变成"可省略配置"。
+    #: 同一个键还是 :meth:`capabilities` 的输出项（``--setup --json`` 直接
+    #: ``json.dumps`` 整个结果）⇒ 变成方法对象时序列化当场炸。
+    #: 要"按配置作答"就用 :meth:`config_runnable`，两者的分工写在那里。
     config_optional: bool = False
+
+    @classmethod
+    def config_runnable(cls, entry: Optional[dict]) -> bool:
+        """给定**这一份**配置条目，本平台**此刻**能不能真的跑起来。默认 ``False``。
+
+        与 :attr:`config_optional` 的分工 —— **两个不同的问题，缺一不可**：
+
+        * :attr:`config_optional` —— **分类**：「我是没有凭据可填的那一类平台」。
+          静态、与具体配置无关，且作为 JSON 值出现在 :meth:`capabilities` 里。
+        * 本方法 —— **判定**：「用户手里这份 ``entry`` 够不够跑」。它读配置，
+          所以同一类平台在不同配置下答案**可以不同**：a2a 填了 ``bind_port``
+          与没填，答案就是不一样。
+
+        ⚠️ **默认 ``False``，而这个默认是承重的**：其余十二个平台的「够不够跑」
+        走的是 ``required_tokens`` 那条通用规则（逐键看值非空），默认 ``False``
+        让它们**一个字都不用改**地继续走那条路。默认成 ``True`` 等于一次拆掉
+        全仓库所有平台的配置门槛。
+
+        ⛔ **它只在 :attr:`config_optional` 为 ``True`` 时被问到**（判定入口在
+        :mod:`opencode_bridge.__main__`：``_readiness_verdict``）—— 那个属性就是
+        "这一类平台的答案由自己给"的开关。⇒ **覆写本方法就必须同时置它**，
+        否则这段代码一次都不会被执行；而只置它不覆写本方法，就会拿到这里的默认
+        "否"（失败关闭：宁可说"还差 bind_port"，也不放行一份起不来的配置）。
+
+        ⛔ **消费方必须 :meth:`调用 <config_runnable>` 它**，绝不能写
+        ``bool(getattr(cls, "config_runnable", False))`` —— 那取到的是类上绑定
+        的函数对象（永远真值）⇒ 每个平台都会被判成"能跑"。
+
+        ⛔ **不许要求构造适配器实例**：本方法由 preflight 与状态视图在
+        **endpoint discovery 之前**、且**不建任何适配器**的那条路上被问
+        （``run_check`` 的契约是「no sessions, **no adapters**」）。
+
+        :param entry: 用户配置里 ``adapters.<本平台>`` 那棵**原始条目**
+            （不是投影后的 :func:`~opencode_bridge.config.adapter_scoped_config`
+            结果 —— 三条判定路径拿到的都是原始条目，本方法也就只读原始条目）。
+        :return: ``True`` = 不用再填任何东西就能起来。
+        """
+        return False
 
     #: 迁移**前**本平台用的 ``conversation_id`` 前缀，**仅当它有歧义**（多家共用）
     #: 时才需要声明；``None`` 表示"没有歧义旧前缀"（那种由

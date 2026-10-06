@@ -423,9 +423,9 @@ class TestStatusTableShowsTheProbe(_BridgeDirIsolated):
     def row_for(body: str, label: str) -> str:
         """只取某个平台在那一段里的**那一行**。
 
-        必须逐行取：``config_optional`` 的平台（a2a）永远算"已配置"，于是它**本来
-        就该**显示「无记录」—— 整段断言会把这些无关行混进来，"不许说无记录"那条
-        也就恒真了。
+        必须逐行取：未配置的平台（含 ``bind_port`` 没填的 a2a）只显示「无记录」，
+        而配置齐备的平台可能显示一条**别的**结论 —— 整段断言会把这些无关行混进来，
+        "不许说无记录"那条也就恒真了。
         """
         for line in body.splitlines():
             if line.strip().startswith(label):

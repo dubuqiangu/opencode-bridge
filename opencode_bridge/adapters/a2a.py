@@ -95,6 +95,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ..config_coerce import coerce_int
 from ..hooks import Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..httpsrv import (
     DEFAULT_BIND_HOST,
@@ -117,6 +118,9 @@ __all__ = [
     "MESSAGE_LIMIT",
     "MAX_BODY_BYTES",
     "DEFAULT_BIND_HOST",
+    "UNCONFIGURED_PORT",
+    "MIN_BIND_PORT",
+    "MAX_BIND_PORT",
     "RPC_PATHS",
     "AGENT_CARD_PATH",
     "PROTOCOL_VERSION",
@@ -231,6 +235,16 @@ BRIDGE_VERSION = "0.1.0"
 DEFAULT_AGENT_DESCRIPTION = (
     "opencode-bridge: a local coding agent exposed over the A2A protocol."
 )
+
+#: :func:`_coerce_port` 用它表示「**未配置**」（与"配了 0"严格分开，见那里）。
+#: 抽成常量是因为**两处**必须对这个约定用同一个数：``__init__`` 解析出来的那一个，
+#: 以及 :meth:`A2aAdapter.config_runnable` 回答「这份配置够不够跑」时强制出来的
+#: 那个缺省值。各自写一个字面量 ``-1`` 时，改动只会落在一处 ⇒ 两处悄悄不再一致
+#: ⇒ 判定说"配好了"而 ``start()`` 打 ``port < 0`` 报错不绑定（本缺陷的形态）。
+UNCONFIGURED_PORT = -1
+#: 合法端口区间（与 :func:`_coerce_port` 逐字一致：``0 <= port <= 65535``）。
+MIN_BIND_PORT = 0
+MAX_BIND_PORT = 65535
 
 
 def _default_agent_name() -> str:
@@ -450,15 +464,57 @@ class A2aAdapter(Adapter):
     #: 这不是为了让 ``outbound ⊆ required`` 的不变量好看而硬凑的，仓库的
     #: ``test_cli.py`` 也要求两个声明都**非空**。
     outbound_tokens = ("bind_port",)
-    #: 空配置即可运行，且**默认值是安全的**：bind 127.0.0.1 + 端口 0（由系统分配）+
-    #: 无鉴权也只对本机开放。所以它声明 ``config_optional``，让 preflight 与
-    #: ``--status`` 不再因为"没填 bind_port"而把一个开箱可用的平台报成未配置、
-    #: 或让**只配了 a2a 的用户被桥接拒绝启动**（与当年 Matrix/IRC/Mattermost
-    #: 被拒启动同一类bug）。
+    #: 「配好了没有」**由本平台自己回答**（读 :meth:`config_runnable`）——
+    #: a2a 属于"没有凭据可填"的那一类：通用规则（"``required_tokens`` 的键非空"）
+    #: 对它既不充分也不必要：``bind_port: ""`` 非空吗？不空 ⇒ 通用规则说"配好了"，
+    #: 而 :meth:`start` 会打 ``port < 0`` 报错**根本不绑定**。
     #:
-    #: 注意这**不豁免**配置声明义务：``required_tokens`` 仍须非空，
-    #: ``test_cli`` 的那条守卫照样作用在本类上。
+    #: ⛔ **"空配置即可运行"这条前提已经不成立**（它曾让本仓库把空模板判成已配置）：
+    #: 本平台没有"没有配置也能跑"的默认端口 —— :data:`_coerce_port` 对空串给出
+    #: :data:`UNCONFIGURED_PORT`，:meth:`start` 据此拒绝启动。所以这里**不再**
+    #: 声明"可省略配置"，而是声明"**我的答案我自己给**"（配合下面的覆写）。
     config_optional = True
+
+    @classmethod
+    def config_runnable(cls, entry: dict) -> bool:
+        """a2a 的答案是：**这份配置里有没有一个能绑的整数端口。**
+
+        判据只有一条：``bind_port`` 强制成 ``int`` 后 ``>= 0``。而那个 ``int`` 是
+        :func:`opencode_bridge.config_coerce.coerce_int` 给的（⛔ 不另写一份解析 ——
+        本仓库的纪律是同一类解析只留一份，见该模块的模块 docstring），
+        区间与 :func:`_coerce_port` 逐字一致（``[0, 65535]``），缺省值与它共用
+        :data:`UNCONFIGURED_PORT`。
+
+        * ``0`` 与正整数 ⇒ **能跑**。``0`` 是**合法配置**：绑到回环的临时端口，
+          :meth:`start` 会把系统分配的端口写回 ``self.port``（见那里的注释）——
+          只适合测试（每次重启都变），但它**确实起得来**。
+        * 缺键 / 空串 / 空白 ⇒ **不能跑**（:data:`UNCONFIGURED_PORT`）。
+        * 负数 / 超区间 / 解析失败 ⇒ **不能跑**，并且用户会同时拿到一条
+          ``config_coerce`` 的 WARNING，点名是 ``bind_port`` 这个键配错了。
+
+        ⚠️ **为什么不能只看"键非空"**（通用规则）：``bind_port: "nope"`` 非空，
+        而 :meth:`start` 会拒绝启动 —— 那种配置一旦被说成"配好了"，用户就会得到
+        一个**空转**的桥（它照常启动，只是 a2a 那个适配器永远没绑上）。
+
+        :param entry: 用户配置里 ``adapters.a2a`` 那棵**原始条目**。非 ``dict``
+            的传入按空条目处理（三条判定路径本来就都先归一成 dict，这里只是
+            不给本方法留一个 ``AttributeError`` 的口子）。
+        """
+        settings = entry if isinstance(entry, dict) else {}
+        raw = settings.get("bind_port")
+        # ⛔ 先挡 ``bool`` / ``float``（**不是**另一种解析，只是"这个值的类型压根不是
+        # 端口"）：``coerce_int`` 会把 ``True`` 读成 1、把 ``9900.7`` **截断**成 9900
+        # （它文档里明写的行为），而 :func:`_coerce_port` 把两者都判成
+        # :data:`UNCONFIGURED_PORT`。放过它们的话本判定会说"能跑"而
+        # :meth:`start` 拒绝启动 —— 又是同一形态的谎。挡掉之后两条解析在**每一个**
+        # 取值上都给出同一个答案（用例见 ``tests/test_config_runnable_verdict.py``）。
+        if isinstance(raw, (bool, float)):
+            return False
+        port = coerce_int(
+            settings, "bind_port", UNCONFIGURED_PORT,
+            minimum=MIN_BIND_PORT, maximum=MAX_BIND_PORT, platform=cls.name,
+        )
+        return port >= 0
 
     # --- 类级默认值（实例属性在 __init__ 里被配置覆盖）---------------
     #: 见 :data:`DEFAULT_REPLY_TIMEOUT` 等常量；这里保留类级声明是为了
@@ -1408,7 +1464,7 @@ _UNSUPPORTED_METHODS: dict[str, tuple[int, str]] = {
 # 小工具
 # ----------------------------------------------------------------------
 def _coerce_port(value: Any) -> int:
-    """配置里的端口 -> ``-1`` 表示**未配置**，``0`` 表示"由操作系统分配"。
+    """配置里的端口 -> :data:`UNCONFIGURED_PORT` 表示**未配置**，``0`` 表示"由操作系统分配"。
 
     刻意区分 ``-1``（没配）与 ``0``（配了 0）：
 
@@ -1418,12 +1474,16 @@ def _coerce_port(value: Any) -> int:
       也不要"偷偷挑一个"—— 状态要可观测，不能悄悄发生。
     * 配了 0 -> 绑到回环的临时端口。**这是测试用的合法配置**（与本项目 IRC / ws
       测试里 ``127.0.0.1:0`` 同一手法），生产不该用：重启即换端口。
+
+    ⚠️ **"未配置"的取值范围只有这一个**（``-1``）：不是配置、类型非法、超出
+    ``[0, 65535]``（含负数）**全部**折叠成它。因此"能不能跑"的判定只剩一条
+    ``port >= 0``，而那正是 :meth:`A2aAdapter.config_runnable` 回答的依据。
     """
     try:
         port = int(str(value).strip())
     except (TypeError, ValueError, AttributeError):
-        return -1
-    return port if 0 <= port <= 65535 else -1
+        return UNCONFIGURED_PORT
+    return port if MIN_BIND_PORT <= port <= MAX_BIND_PORT else UNCONFIGURED_PORT
 
 
 def _coerce_positive(value: Any, fallback: float, key: str = "") -> float:

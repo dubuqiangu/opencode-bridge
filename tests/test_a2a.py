@@ -383,44 +383,77 @@ class TestDeclarations(A2aServerTestCase):
                     self.assertIsInstance(key, str)
                     self.assertNotIn(" ", key)
 
-    def test_configured_without_any_explicit_config(self):
-        """a2a 空配置即"已配置"—— 因为它 bind 127.0.0.1 + 端口 0（由系统分配）。
+    def test_configured_only_with_a_bindable_port(self):
+        """a2a「已配置」= **有一个能绑的端口**，不是"没有配置"。
 
-        ⚠️ **这条断言的语义在本轮被反转过一次**，值得留下痕迹：
-        最初这里是 ``assertFalse(..., "缺 bind_port 时不该被判成配置齐备")``。
-        那条断言守的其实是**一个真bug** —— a2a 空配置本来就能跑，但 preflight只看
-        ``required_tokens``，于是**只配了 a2a 的用户被桥接拒绝启动**，与当年
-        Matrix / IRC / Mattermost 被拒启动是同一类问题。
+        ⚠️ **这条断言的语义被反转过两次，痕迹留在这里**：
 
-        根因是"``required_tokens`` 必须非空"那条守卫把两件事混为一谈：
-        **必须声明**配置面 vs **必须显式配置**才能跑。a2a 满足前者、不满足后者。
-        修法是新增 ``Adapter.config_optional``（a2a 置 True），显式豁免 preflight
-        与两个状态视图判定点 —— 但**不豁免声明义务**（见下一个用例）。
+        第一次（最初）：``assertFalse(..., "缺 bind_port 时不该被判成配置齐备")``。
+        那条守的是**一个真 bug** —— 预检只看 ``required_tokens``（且硬编码找
+        ``bot_token``），于是**只配了 a2a 的用户被桥接拒绝启动**，与当年
+        Matrix / IRC / Mattermost 被拒启动是同一类问题。第一次反转后引入了
+        ``Adapter.config_optional``，判据变成 ``assertTrue(...)``，理由是
+        「空配置即可运行（bind 127.0.0.1 + 端口 0 由系统分配）」。
+
+        第二次（本次，2026-10-06）：**那条前提本身早已不成立** ——
+        ``_coerce_port("")`` 给的是
+        :data:`~opencode_bridge.adapters.a2a.UNCONFIGURED_PORT`（-1），而
+        :meth:`A2aAdapter.start` 恰恰以 ``port < 0`` 为由打 error **不绑定就
+        return**。⇒ 一个"曾经为真"的事实被当成了判定，于是 ``config.example.json``
+        里那行空 ``bind_port`` 就足以让全新安装的预检从 ``False`` 翻成 ``True``，
+        桥不再走 ``NO_ADAPTER_MESSAGE`` 那条提前退出。
+
+        ⇒ 第三次反转：**判据换成「此刻这份配置能不能真跑起来」**，由
+        ``Adapter.config_runnable``（a2a 覆写）回答；"当年那个被拒启动的 bug
+        不许回来"这条守卫保留在下面**按新形态**写的断言里。
         """
         from opencode_bridge import __main__ as cli
         from opencode_bridge.config import Config
 
-        # 空配置也必须放行 —— 修复前这里是 False，也就是**拒绝启动**
+        # ⭐ 守卫：配了能绑的端口就不许拒绝启动 —— 那是当年那个 bug 的当前形态。
         self.assertTrue(
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 9900}})),
+            "只配 a2a 且端口可用时，桥接不许拒绝启动",
+        )
+        # bind_port: 0 也算（由系统分配，确实起得来）—— 拒掉它就是新的行为回退。
+        self.assertTrue(
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 0}}))
+        )
+
+        # 空配置 = **未配置**：start() 会拒绝启动，预检必须照实说。
+        self.assertFalse(
             cli._has_configured_adapter(Config(adapters={"a2a": {}})),
-            "a2a 空配置本来就能跑，不许拒绝启动",
+            "空配置起不来，不许说成已配置",
         )
-        self.assertTrue(
-            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 9900}}))
-        )
-        # 状态视图两个口径都要说"就绪"
+
+        # 状态视图两个口径都要照实说，并说出缺的是哪个键（那是可操作的提示）。
         entries = [e for e in cli._platform_status(Config(adapters={"a2a": {}}))
                    if e["key"] == "a2a"]
         self.assertTrue(entries, "a2a 没出现在 _platform_status 里")
-        entry = entries[0]
-        self.assertTrue(entry["configured"])
-        self.assertTrue(entry["inbound_ready"])
-        self.assertTrue(entry["outbound_ready"])
-        self.assertEqual(entry["missing"], [])
+        unconfigured = entries[0]
+        self.assertFalse(unconfigured["configured"])
+        self.assertFalse(unconfigured["inbound_ready"])
+        self.assertFalse(unconfigured["outbound_ready"])
+        self.assertEqual(unconfigured["missing"], ["bind_port"])
+
+        ready = [e for e in cli._platform_status(Config(adapters={"a2a": {"bind_port": 9900}}))
+                 if e["key"] == "a2a"]
+        self.assertTrue(ready)
+        self.assertTrue(ready[0]["configured"])
+        self.assertTrue(ready[0]["inbound_ready"])
+        self.assertTrue(ready[0]["outbound_ready"])
+        self.assertEqual(ready[0]["missing"], [])
 
     def test_config_optional_exempts_running_not_declaring(self):
-        """``config_optional`` 只豁免"必须显式配置才能跑"，不豁免"必须声明配置面"。"""
+        """``config_optional`` 说的是「答案由我自己给」，**不豁免**"必须声明配置面"。
+
+        ⚠️ 它的含义 2026-10-06 收紧过：此前它是「空配置即可运行」的豁免，而那条
+        前提已不成立。现在它只表示「a2a 属于**没有凭据可填**的那一类平台，
+        '够不够跑'由 :meth:`A2aAdapter.config_runnable` 回答」——
+        断言本身不变（仍须为 True，且两条 token 列表仍须非空）。
+        """
         self.assertTrue(A2aAdapter.config_optional)
+        self.assertTrue(callable(A2aAdapter.config_runnable))
         # 声明义务照旧：两条token 列表仍须非空（test_cli 的守卫依赖这点）
         self.assertTrue(A2aAdapter.required_tokens)
         self.assertTrue(A2aAdapter.outbound_tokens)

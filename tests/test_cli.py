@@ -247,22 +247,41 @@ class TestPreflightAndCredentialDeclarations(unittest.TestCase):
         )
         self.assertFalse(cli._has_configured_adapter(Config(adapters={})))
 
-    def test_config_optional_platform_needs_no_explicit_config(self):
-        """★ 回归：只配 a2a（空配置）的用户曾被**拒绝启动**。
+    def test_platform_that_answers_its_own_readiness_is_not_rejected(self):
+        """★ 回归：只配 a2a 的用户曾被**拒绝启动** —— 这条守卫**必须**留着。
 
-        a2a bind 127.0.0.1 + 端口 0（由系统分配）+ 无鉴权也只对本机开放 ⇒
-        空配置即可运行。但preflight 只看 ``required_tokens``，而 a2a 的
-        ``required_tokens`` 里有 ``bind_port``（因为"必须声明非空"那条守卫），
-        于是报"没配任何适配器"并拒绝启动 —— 与当年 Matrix / IRC / Mattermost
-        被拒启动是**同一类** bug。
+        最初这里硬编码找 ``bot_token``，导致 Matrix / IRC / Mattermost 三类用户被判成
+        "没配任何适配器"而直接退出；后来 a2a 走同一条路时又栽了一次（它没有
+        ``bot_token``，只有 ``bind_port``）。
+
+        ⚠️ **判据在 2026-10-06 被换过一次，形态变了、守卫没变。** 当时它被写成
+        "a2a 空配置即可运行（端口由系统分配）"，而那条前提**已经不成立**：
+        ``_coerce_port("")`` 给的是 ``UNCONFIGURED_PORT``（-1），
+        ``A2aAdapter.start()`` 据此打 error 并**不绑定就 return** ⇒ 拿"空配置"当
+        "能跑"，等于让预检说谎（``config.example.json`` 里那行 ``"a2a":
+        {"bind_port": "", …}`` 就足以把全新安装的预检从 False 翻成 True）。
+
+        ⇒ 现在的判据是**「有一个能绑的端口」**，由 ``config_runnable`` 回答
+        （见 ``tests/test_config_runnable_verdict.py``）：
         """
+        # 端口可用 ⇒ 放行（当年那条修复在当前形态下）
         self.assertTrue(
-            cli._has_configured_adapter(Config(adapters={"a2a": {}})),
-            "只配 a2a 时不许拒绝启动：它空配置就能跑",
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 9900}})),
+            "只配 a2a 且端口可用时不许拒绝启动",
         )
-        # 显式给了端口也一样放行（这条修复前就能过，守住别回退）
+        # bind_port: 0 也算 —— 由系统分配，确实起得来
         self.assertTrue(
-            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 9900}}))
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": 0}}))
+        )
+        # 空配置 ⇒ 说"没配好"，并由 run_bridge 打 NO_ADAPTER_MESSAGE
+        # （docs/install.md Step 4 第 4 项写给用户的行为）
+        self.assertFalse(
+            cli._has_configured_adapter(Config(adapters={"a2a": {}})),
+            "a2a 空配置起不来（未配置 bind_port），不许说成已配置",
+        )
+        # 非空但解析失败也一样：那种配置会起不来，而桥会照常启动、空转
+        self.assertFalse(
+            cli._has_configured_adapter(Config(adapters={"a2a": {"bind_port": "nope"}}))
         )
 
     def test_config_optional_defaults_to_false_for_every_other_platform(self):
@@ -277,7 +296,7 @@ class TestPreflightAndCredentialDeclarations(unittest.TestCase):
                 )
 
     def test_config_optional_does_not_exempt_declaration_obligations(self):
-        """它豁免的是"必须**显式配置**才能跑"，**不豁免**"必须**声明**配置面"。"""
+        """它回答的是"配好了没有"，**不豁免**"必须**声明**配置面"。"""
         for name in registered_names():
             cls = adapter_class(name)
             with self.subTest(platform=name):
@@ -287,27 +306,57 @@ class TestPreflightAndCredentialDeclarations(unittest.TestCase):
                 )
                 self.assertTrue(getattr(cls, "outbound_tokens", ()))
 
-    def test_status_view_reports_config_optional_platform_as_ready(self):
-        """状态视图不许把开箱可用的平台报成"未配置"/"发不出去"。"""
-        rows = {
+    def test_status_view_reports_a2a_as_ready_only_with_a_usable_port(self):
+        """状态视图不许把**起不来**的 a2a 报成"已配置"/"发不出去"。
+
+        ⚠️ **形态在 2026-10-06 换过一次**：此前这里断言"空配置即就绪"，依据是
+        「端口由系统分配 ⇒ 空配置即可运行」。那条前提**已不成立** ——
+        ``_coerce_port("")`` 是 ``UNCONFIGURED_PORT``（-1），
+        ``A2aAdapter.start()`` 据此打 error 并**不绑定就 return**。
+        ⇒ 一个起不来的 a2a 若报成 ``configured=True``，用户会以为桥已经能接 A2A 请求。
+        """
+        configured = {
+            row["key"]: row
+            for row in cli._platform_status(Config(adapters={"a2a": {"bind_port": 9900}}))
+        }
+        self.assertIn("a2a", configured)
+        self.assertTrue(configured["a2a"]["configured"], "端口可用应显示已配置")
+        self.assertTrue(configured["a2a"]["outbound_ready"], "端口绑上了才能交付")
+        self.assertTrue(configured["a2a"]["inbound_ready"], "端口绑上了才能收请求")
+
+        unconfigured = {
             row["key"]: row
             for row in cli._platform_status(Config(adapters={"a2a": {}}))
         }
-        self.assertIn("a2a", rows)
-        self.assertTrue(rows["a2a"]["configured"], "a2a 空配置应显示已配置")
-        self.assertTrue(rows["a2a"]["outbound_ready"], "a2a 能发出去")
-        self.assertTrue(rows["a2a"]["inbound_ready"], "a2a 入站已实现且应就绪")
+        self.assertIn("a2a", unconfigured)
+        self.assertFalse(unconfigured["a2a"]["configured"], "空配置必须显示未配置")
+        self.assertFalse(unconfigured["a2a"]["outbound_ready"])
+        self.assertFalse(unconfigured["a2a"]["inbound_ready"])
+        self.assertEqual(unconfigured["a2a"]["missing"], ["bind_port"])
 
     def test_channel_config_rows_respect_config_optional(self):
-        """``--check`` 的行构建走的是另一条判定路径，也必须一致。"""
+        """``--check`` 的行构建走的是**另一条**判定路径，也必须一致。
+
+        ⛔ 少改这一处的代价：``--status`` 的「配置 / 入站」两列正是用户决定填不填
+        ``bind_port`` 的依据 —— 它继续说"就绪"就把用户引向一个起不来的桥。
+        """
         rows = dict(
+            (key, (configured, inbound_ready))
+            for key, _label, configured, inbound_ready, _caps
+            in cli._channel_config_rows(Config(adapters={"a2a": {"bind_port": 9900}}))
+        )
+        self.assertIn("a2a", rows)
+        self.assertTrue(rows["a2a"][0], "端口可用应显示已配置")
+        self.assertTrue(rows["a2a"][1], "端口绑上了才能收请求")
+
+        empty_rows = dict(
             (key, (configured, inbound_ready))
             for key, _label, configured, inbound_ready, _caps
             in cli._channel_config_rows(Config(adapters={"a2a": {}}))
         )
-        self.assertIn("a2a", rows)
-        self.assertTrue(rows["a2a"][0], "a2a 空配置应显示已配置")
-        self.assertTrue(rows["a2a"][1], "a2a 入站应就绪")
+        self.assertIn("a2a", empty_rows)
+        self.assertFalse(empty_rows["a2a"][0], "空配置必须显示未配置")
+        self.assertFalse(empty_rows["a2a"][1])
 
     def test_incomplete_config_is_still_rejected_for_normal_platforms(self):
         """拆掉门槛之后，普通平台的拒绝路径**必须仍然有效**。"""

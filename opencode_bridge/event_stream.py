@@ -36,6 +36,9 @@ from .opencode_client import OpenCodeClient
 from .outbound import one_message_budget
 from .permission_ledger import PermissionLedger
 from .state import StateStore
+# ``/api/event`` 订阅的**看护者**：重连状态机与退避策略归它（见该模块的 docstring
+# 为什么这件事必须住在另一个文件里）。这里只做装配。
+from .subscription_supervisor import SubscriptionStatus, SubscriptionSupervisor
 
 __all__ = ["EventStream", "Turn"]
 
@@ -290,6 +293,14 @@ class EventStream:
         self._flush_queue = flush_queue
         self._permission_ledger = permission_ledger
 
+        #: ``/api/event`` 订阅的**看护者**。它拥有重连状态机、退避策略与那份
+        #: 「正在重连 / 线程已经死了」的状态记录（AGENTS.md §5.1：新机制进新模块，
+        #: 本模块已经 800 多行、在 §5.0 的待拆名单上，不该继续加厚）。
+        self._supervisor = SubscriptionSupervisor(
+            subscribe=lambda: self._client.subscribe(),
+            on_frame=self._consume_frame,
+        )
+
         #: Set once the event stream has delivered its first frame, i.e. the
         #: subscription is live. Startup recovery waits for it (bounded) before
         #: replaying anything — see ``BridgeCore._recover_inbox`` for why.
@@ -325,26 +336,44 @@ class EventStream:
     # 订阅与分发
     # ------------------------------------------------------------------
     def run(self) -> None:
-        """Consume ``/api/event`` until the stream ends (the SSE thread body)."""
+        """SSE 线程主体（:meth:`BridgeCore.start` 那个 ``Thread`` 的 target）。
+
+        ⚠️ 这里**不再**有「记一行日志然后 return」—— 那正是 ``ora-15`` 确诊的缺陷：
+        ``/api/event`` 的任何非 200 都会让这条线程永久结束，于是进程余下的全部答复
+        静默丢失、还不自愈。退避与重新订阅由
+        :class:`~opencode_bridge.subscription_supervisor.SubscriptionSupervisor` 负责，
+        而**只有** :meth:`request_stop` 叫停才会让本方法返回。
+        """
+        self._supervisor.run()
+
+    def request_stop(self) -> None:
+        """请这条 SSE 线程收工（:meth:`BridgeCore.stop` 在关客户端**之前**调它）。
+
+        为什么不能只靠 ``client.close()``：关客户端只让**正在收帧**的那次订阅结束，
+        而**正处于退避等待**中的看护者等的是它自己那个 Event ⇒ 它会睡满这一拍才去
+        订阅（那时候订阅立刻返回空），``join(5.0)`` 有可能刚好等不满、平白打一行
+        "did not exit within 5s"。
+        """
+        self._supervisor.request_stop()
+
+    def subscription_status(self) -> SubscriptionStatus:
+        """订阅现在处于什么状态 —— 「正在重连」与「线程已经死了」必须分得开。"""
+        return self._supervisor.status()
+
+    def _consume_frame(self, event: object) -> None:
+        """看护者收到**一帧**时走这里（这一段原先就在 :meth:`run` 里）。
+
+        ⚠️ ``stream_confirmed`` 在 :func:`isinstance` **之前**置位，与修复前逐字相同：
+        它答的是"订阅是通的"，而畸形帧同样证明连接是通的。启动恢复在重放任何东西之前
+        （**有界地）**等这个信号（见 :meth:`BridgeCore._recover_inbox`）。
+        """
+        self.stream_confirmed.set()
+        if not isinstance(event, dict):
+            return
         try:
-            for event in self._client.subscribe():
-                # A first frame means the subscription is live. Startup recovery
-                # blocks on this before replaying (see :meth:`_recover_inbox`).
-                self.stream_confirmed.set()
-                try:
-                    if not isinstance(event, dict):
-                        continue
-                    self.dispatch(event)
-                except Exception:
-                    logger.exception(
-                        "event dispatch failed: %s",
-                        event.get("type")
-                        if isinstance(event, dict)
-                        else repr(event),
-                    )
+            self.dispatch(event)
         except Exception:
-            logger.exception("event stream terminated")
-        logger.debug("event loop exited")
+            logger.exception("event dispatch failed: %s", event.get("type"))
 
     def dispatch(self, event: dict) -> None:
         """Route one event frame to its handler (unknown names are accounted)."""

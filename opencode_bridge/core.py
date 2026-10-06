@@ -419,6 +419,13 @@ class BridgeCore:
                 adapter.stop()
             except Exception:
                 logger.exception("adapter %s failed to stop", adapter.name)
+        # ⚠️ 顺序：**先叫停看护者，再关客户端**。反过来时，处于退避等待中的 SSE
+        # 看护者不会被客户端关闭唤醒（它等的是自己那个 Event），于是
+        # ``join(5.0)`` 有可能刚好等不满、平白打一行 "did not exit within 5s"。
+        try:
+            self.event_stream.request_stop()
+        except Exception:
+            logger.exception("event stream stop request failed")
         try:
             self.client.close()
         except Exception:

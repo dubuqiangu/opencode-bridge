@@ -924,18 +924,45 @@ def _print_last_outbound_failures(
     * 无记录 ⇒ :data:`NO_OUTBOUND_FAILURE_TEXT`，⛔ 既不显示成"正常"、也不显示成
       "失败"。
 
+    ⚠️⚠️ **本段必须能看见盘上**任何**出站失败记录 —— 包括未注册键的**
+    （实测缺陷，2026-10-06，与 :func:`_print_last_start_probes` **同一个病根**）。
+    用户把 ``telegram`` 拼成 ``telegramm`` 时，那次失败的观测是以**那个键**落盘的，
+    而上面那张「渠道配置与能力」表**只列注册表里的平台**、压根没有它那一行 ⇒ 而
+    :data:`NO_OUTBOUND_FAILURE_TEXT` 与下面那三句免责**全都以"这一段列出来的键"**
+    为前提 ⇒ 不并进来的话，那条记录连同原因一个字都不显示，用户看到的却是
+    「无记录」或一句**假的**「盘上有记录，但没有属于这些平台的」。
+
     :param rows: :func:`_channel_config_rows` 的行，**复用**它（平台清单只有一份）。
     :param bridge_dir: :func:`_bridge_dir` 的推导结果 —— 记录就落在那里。
     """
     record = health.read_outbound_failures(bridge_dir)
     recorded = health.outbound_failure_recorded_at(record)
-    recorded_platforms = set(health.outbound_failures_in_record(record))
+    recorded_platform_keys = tuple(health.outbound_failures_in_record(record))
     # 与 :func:`_print_last_start_probes` 同一个取舍：只列**已配置**或**盘上有记录**
     # 的平台。没配的平台既不该发过消息，也就不该有出站失败记录。
+    recorded_platforms = set(recorded_platform_keys)
+    #: 注册表里那些键（``rows`` 是**唯一**的平台清单，这里不重算一份）。
+    registered_keys = {key for key, _label, _cfg, _inbound, _caps in rows}
     listed = [
         (key, label)
         for key, label, configured, _inbound_ready, _caps in rows
         if configured or key in recorded_platforms
+    ]
+    # ⚠️⚠️ **盘上的键不限于已注册的平台名**（实测缺陷，2026-10-06）：用户把平台键拼错
+    # （``telegram`` → ``telegramm``）时，那次失败的观测是以**那个键**落盘的
+    # （见 :meth:`health.OutboundFailureRecorder.note_failure`），而 ``rows`` **只含
+    # 注册表里的平台名** ⇒ 不并进来的话，那条记录连同它的原因**一个字都不显示**。
+    # ⇒ 与 :func:`_print_last_start_probes` 是**同一个病根、同一处修法**（那段是启动期
+    # 探测结论，这一段是运行期出站失败；它们读的是两份不同的文件）。
+    # label 取**键本身**：没有适配器类可以问 label，而用户要认的恰恰是自己敲错的那串。
+    #
+    # ⚠️ **下面那两套「已恢复 / 没有观测到成功」的措辞对未注册键同样有意义**：
+    # ``recovered_at`` 落在**每个平台条目自己**身上（读侧
+    # :func:`health.outbound_failure_from_record` 按同一个键取），而"平台注册没注册"
+    # 与"发送后来成功没有"是**两根正交的轴** ⇒ ⛔ 不许出现"只有已注册键才走得到"的那
+    # 种分支（那会让一个拼错的键**静默地**拿不到恢复状态）。
+    listed += [
+        (key, key) for key in recorded_platform_keys if key not in registered_keys
     ]
     print("")
     print(_OUTBOUND_SECTION_HEADER)
@@ -954,10 +981,20 @@ def _print_last_outbound_failures(
             + "（这份文件最后一次被写入的时刻，不是失败发生的时刻）"
         )
     if not listed:
-        print(
-            "  （没有已配置的平台，也没有任何出站失败记录）" if record is None
-            else "  （盘上有记录，但没有属于这些平台的）"
-        )
+        # ⛔ 「盘上有记录，但没有属于这些平台的」这一句**只有真的没有任何记录时才为真**
+        # （实测缺陷，2026-10-06）。⚠️ 旧判据是 ``listed`` 为空 ⇒ 走这一支，而那两件事
+        # 在缺陷现场**恰好相反**：文件存在、键未注册（``telegramm``）⇒ ``listed`` 空 ⇒
+        # 输出「盘上有记录，但没有属于这些平台的」—— **而盘上确实有一条**，它是唯一能
+        # 解释「为什么没看到失败原因」的线索，这句话却让用户以为那些记录与自己无关。
+        # ⇒ 改问 ``recorded_platform_keys``（记录自己说了什么），而不是 ``listed``
+        # （它混进了"这个平台配没配"这一层与记录无关的过滤）。
+        # 上面 ``listed`` 已并入未注册的键，所以这一支**只在盘上真的没有任何记录时**
+        # 才走得到 ⇒ 那句话从一句**断言**变成了一个**事实**。
+        if not recorded_platform_keys:
+            print(
+                "  （没有已配置的平台，也没有任何出站失败记录）" if record is None
+                else "  （盘上有记录，但没有属于这些平台的）"
+            )
         return
     name_w = max(_dwidth("平台"), max(_dwidth(label) for label, _f in listed)) + 2
     for key, label in listed:

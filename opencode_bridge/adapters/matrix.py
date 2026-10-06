@@ -296,6 +296,19 @@ class MatrixAdapter(Adapter):
         if not self.access_token:
             logger.warning("matrix: access_token missing; adapter not started")
             return
+        # ⚠️ `user_id` 在 :attr:`required_tokens` 里、却**不在**上面那两道闸门里，
+        # 而它是 :meth:`_handle_event` 里过滤自己回声的**唯一**依据
+        # （`if self.user_id and sender == self.user_id`）⇒ 空值时整个条件短路，
+        # **回声一条都挡不住**，桥会无限自问自答。这里点名它，别让这个陷阱只在
+        # 症状里出现。
+        # ⛔ 只告警、**不改行为**：``user_id` 缺失时是否改成「失败关闭」
+        # （缺了就拒收）**尚未拍板** —— 那是行为变更，不是告警能顺带做的事。
+        if not self.user_id:
+            logger.warning(
+                "matrix: user_id missing; the adapter cannot filter its own "
+                "echoes — the bridge will treat its own messages as inbound "
+                "and keep talking to itself (fill in user_id = this bot's MXID)"
+            )
         self._stop_event.clear()
         transport = self._make_transport()
         self._transport = transport

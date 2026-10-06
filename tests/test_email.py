@@ -19,6 +19,7 @@ IMAP / SMTP 的调用面被收敛到两个可覆写的方法：:meth:`EmailAdapt
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import smtplib
 import tempfile
@@ -215,6 +216,21 @@ COERCE_LOGGER = "opencode_bridge.config_coerce"
 
 #: 告警**内容**的前缀（logger 换了，但 ``platform=self.name`` 把它保住了）。
 EMAIL_LOG_PREFIX = "email: "
+
+
+class _WarningCollector(logging.Handler):
+    """收集 WARNING 及以上的**已渲染**消息。
+
+    ⚠️ 只收本 logger 自己的记录（handler 挂在它上面），所以 transport 层那句
+    「会话出错」**不会**混进来 —— 钉「点名 password 的那条」时不能被别的告警顶掉。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
 
 
 def make_email(*, hooks=None, **cfg) -> tuple[EmailAdapter, RecordingHooks]:
@@ -1531,6 +1547,62 @@ class TestLifecycle(unittest.TestCase):
         with self.assertLogs("opencode_bridge.adapters.email", level="WARNING"):
             adapter.start()
         adapter.stop()
+
+    def test_missing_password_warns_by_key_name_and_still_starts_inbound(self):
+        """缺 ``password`` 必须有一条**点名该键**的 WARNING。
+
+        ⚠️ 断言钉的是**文案里出现 ``password``**，⛔ 不是「有一条 warning」——
+        后者在缺 ``smtp_host`` 时同样成立（上面那条用例就会命中），等于恒真。
+
+        为什么这条值得钉：``password`` 在 :attr:`~EmailAdapter.required_tokens` 里、
+        却不在 :meth:`~EmailAdapter.start` 的闸门里 ⇒ 空密码也照常起入站线程，
+        之后每轮 IMAP 认证失败，而日志里**只有 transport 层那句「会话出错」**，
+        没有任何东西指向这个键 —— 比「真·没配置」（那条会直说认证失败）更难查。
+        """
+        adapter, _ = make_email(password="")
+        stub_network(adapter)
+        warnings = self.collect_warnings()
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(
+            adapter.running,
+            "⛔ 行为不许变：缺 password 只是**告警**，入站线程照常起来（刻意降级）",
+        )
+        self.assertTrue(
+            any("password" in line for line in warnings.messages),
+            "缺 password 时日志里没有点名该键的 WARNING：\n  %s"
+            % "\n  ".join(warnings.messages),
+        )
+
+    def test_a_configured_password_produces_no_such_warning(self):
+        """⭐ 反向护栏：``password`` **填了**就不许打那条告警。
+
+        ⚠️ 少了这一条，那条 WARNING 会退化成常态噪音而被忽略 —— 而它唯一的作用
+        就是「这个键没填」那一刻说出来。
+        """
+        adapter, _ = make_email()
+        stub_network(adapter)
+        warnings = self.collect_warnings()
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertFalse(
+            [line for line in warnings.messages if "password" in line],
+            "password 已配置却仍在告警（它会变成被忽略的噪音）：\n  %s"
+            % "\n  ".join(warnings.messages),
+        )
+
+    def collect_warnings(self) -> "_WarningCollector":
+        """在 email logger 上挂一个收集器（由 ``addCleanup`` 摘掉）。
+
+        ⛔ 为什么不用 ``assertLogs`` / ``assertNoLogs``：前者在**零条**记录时直接失败、
+        后者在**任何**一条记录时失败，而这里要钉的是「**没有点名 password 的**那一条」
+        —— 同一时刻别的告警（游标落不了盘等）出现与否都不该决定红绿。
+        """
+        collector = _WarningCollector()
+        logger = logging.getLogger(EMAIL_LOGGER)
+        logger.addHandler(collector)
+        self.addCleanup(logger.removeHandler, collector)
+        return collector
 
     def test_stop_without_start_is_safe(self):
         adapter, _ = make_email()

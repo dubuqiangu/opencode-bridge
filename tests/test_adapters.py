@@ -317,6 +317,13 @@ class TestTelegramLifecycle(unittest.TestCase):
         }
         with self.assertLogs("opencode_bridge.adapters.telegram", level="WARNING") as cm:
             adapter.start()  # must not raise
+        # ⚠️ 这条 cleanup 是**必须的**，不是顺手加的：``getMe`` 被拒时适配器**照样**
+        # 起传输层（凭据闸门必须有个线程才能带退避重试到通过），而那个线程在
+        # ``stop()`` 之前会一直重试。漏掉它 ⇒ 一条 ``transport:telegram`` 线程
+        # 泄漏到进程结束 ⇒ ``tests/test_telegram.py`` 的
+        # ``test_start_creates_exactly_one_poller_thread``（按名字数线程）变成红的
+        # —— 而那个红的成因在**另一个文件**里，正是最难查的那种。
+        self.addCleanup(adapter.stop)
         self.assertIsNone(adapter._thread)
         self.assertFalse(adapter.running)
         self.assertTrue(any("getMe" in line for line in cm.output))

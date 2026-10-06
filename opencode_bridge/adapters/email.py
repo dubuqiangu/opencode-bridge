@@ -628,6 +628,17 @@ class EmailAdapter(Adapter):
                 "email: 缺少必需配置 %s；adapter not started", ", ".join(missing)
             )
             return
+        # ⚠️ `password` 在 :attr:`required_tokens` 里、却**不在**上面那道闸门里
+        # ⇒ 空密码也照常起入站线程，之后每轮 IMAP 登录都被服务端拒，而日志里只有
+        # transport 层那句「会话出错」—— **没有任何东西指向这个键**，
+        # 比「真·没配置」（那条会直接说认证失败）更难查。所以这里点名它。
+        # ⛔ 只告警、**不改行为**：`--status` 仍按 `required_tokens` 报未配置，
+        # 入站线程照旧起来（这是刻意降级，不是回退）。
+        if not self.password:
+            logger.warning(
+                "email: 未配置 password —— 入站照常启动，但每轮 IMAP 登录都会被"
+                "服务端拒绝（一封邮件都收不到）"
+            )
         if not self.smtp_host:
             logger.warning(
                 "email: 未配置 smtp_host —— 入站可用，但出站会全部失败"

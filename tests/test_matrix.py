@@ -51,6 +51,24 @@ ROOM_CID = "matrix:!abc:example.org"
 LEGACY_ROOM_CID = "room:!abc:example.org"
 BOT = "@bot:example.org"
 
+MATRIX_LOGGER = "opencode_bridge.adapters.matrix"
+
+
+class _WarningCollector(logging.Handler):
+    """收集 WARNING 及以上的**已渲染**消息。
+
+    ⚠️ 只收本 logger 自己的记录（handler 挂在它上面），所以 ``_request`` 里那句
+    「transport error」**不会**混进来 —— 钉「点名 user_id 的那条」时不能被别的
+    告警顶掉。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
 
 def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
     """轮询等条件成立（比裸 sleep 稳；失败信息由调用方的断言给出）。"""
@@ -165,6 +183,68 @@ class TestMatrixLifecycle(unittest.TestCase):
         self.assertTrue(any("access_token" in line for line in cm.output))
         self.assertIsNone(adapter.transport)
         self.assertFalse(adapter.running)
+
+    def test_missing_user_id_warns_by_key_name_and_still_starts(self):
+        """缺 ``user_id`` 必须有一条**点名该键**的 WARNING。
+
+        ⚠️ 断言钉的是**文案里出现 ``user_id``**，⛔ 不是「有一条 warning」——
+        后者在缺 ``homeserver`` / ``access_token`` 时同样成立（上面那两条用例
+        就会命中），等于恒真。
+
+        为什么这条比 email 那条严重一量级：``user_id`` 是 :meth:`_handle_event`
+        里过滤自己回声的**唯一**依据（``if self.user_id and sender == self.user_id``）
+        ⇒ 空值时**整个条件短路**，桥接自己发出的消息一条都挡不住 ⇒ 无限自问自答。
+        而修复前 ``start()`` 不查它、全文件零告警、``tests/`` 零覆盖。
+        """
+        adapter, _ = make_matrix({"user_id": ""})
+        adapter._request = lambda method, path, payload=None, **kw: (
+            200, {"next_batch": "s1", "rooms": {}}
+        )
+        warnings = self.collect_warnings()
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertTrue(
+            adapter.running,
+            "⛔ 行为不许变：缺 user_id 只是**告警**，轮询线程照常起来"
+            "（是否改成失败关闭尚未拍板，见台账）",
+        )
+        self.assertTrue(
+            any("user_id" in line for line in warnings.messages),
+            "缺 user_id 时日志里没有点名该键的 WARNING：\n  %s"
+            % "\n  ".join(warnings.messages),
+        )
+
+    def test_a_configured_user_id_produces_no_such_warning(self):
+        """⭐ 反向护栏：``user_id`` **填了**就不许打那条告警。
+
+        ⚠️ 少了这一条，那条 WARNING 会退化成常态噪音而被忽略 —— 而它唯一的作用
+        就是「这个键没填」那一刻说出来。
+        """
+        adapter, _ = make_matrix()
+        adapter._request = lambda method, path, payload=None, **kw: (
+            200, {"next_batch": "s1", "rooms": {}}
+        )
+        warnings = self.collect_warnings()
+        adapter.start()
+        self.addCleanup(adapter.stop)
+        self.assertFalse(
+            [line for line in warnings.messages if "user_id" in line],
+            "user_id 已配置却仍在告警（它会变成被忽略的噪音）：\n  %s"
+            % "\n  ".join(warnings.messages),
+        )
+
+    def collect_warnings(self) -> "_WarningCollector":
+        """在 matrix logger 上挂一个收集器（由 ``addCleanup`` 摘掉）。
+
+        ⛔ 为什么不用 ``assertLogs`` / ``assertNoLogs``：前者在**零条**记录时直接失败、
+        后者在**任何**一条记录时失败，而这里要钉的是「**没有点名 user_id 的**那一条」
+        —— 同一时刻别的告警（``/sync`` 失败等）出现与否都不该决定红绿。
+        """
+        collector = _WarningCollector()
+        logger = logging.getLogger(MATRIX_LOGGER)
+        logger.addHandler(collector)
+        self.addCleanup(logger.removeHandler, collector)
+        return collector
 
     def test_start_spawns_thread_and_stop_joins(self):
         adapter, _ = make_matrix()

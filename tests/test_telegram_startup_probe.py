@@ -81,7 +81,23 @@ class TestGetMeVerdictIsReported(unittest.TestCase):
         self.assertEqual(adapter.startup_verdict["verdict"], VERDICT_FAILED)
         self.assertEqual(adapter.startup_verdict["code"], 401)
         self.assertIn("Unauthorized", adapter.startup_verdict["detail"])
-        self.assertIsNone(adapter.transport, "getMe 被拒时不得启动轮询")
+        # ⚠️ **下面两条断言是随设计一起改的，不是放松**（§8：断言表达的是"不变量"，
+        # 不变量变了断言就必须跟着变 —— 悄悄留着旧断言才是假绿）。
+        # 旧断言是 ``assertIsNone(adapter.transport, "getMe 被拒时不得启动轮询")``。
+        # 它守的不变量是「**凭据没过就不许放行入站**」—— 那条不变量**一个字没变**，
+        # 但它**不再**由"传输层是 None"来表达了：
+        # 改之前 ``getMe`` 一失败就 ``return`` ⇒ ``self._transport`` 恒 ``None``
+        # ⇒ **入站 100% 死掉**、而生产里没有任何重试入口（``adapter.start()``
+        # 只有 ``core.BridgeCore.start`` 一处调用点，且被 ``_started`` 守着）。
+        # ⇒ 现在传输层**必须**起来（它是重试循环唯一的落脚点，⛔ 不新增线程），
+        # 而"不许放行"由 :attr:`TelegramAdapter.running` 表达 —— 线程活着但停在
+        # 凭据闸门里 ⇒ 一条 update 都不会分发 ⇒ 报成 True 就是假话。
+        self.assertFalse(
+            adapter.running, "凭据没过就不许报成在跑（入站一条都收不到）"
+        )
+        self.assertIsNotNone(
+            adapter.transport, "闸门必须跑在传输线程里，否则入站永远无法自愈"
+        )
 
     def test_valid_token_is_reported_as_ok(self):
         """② ``getMe`` 通过 ⇒ ``ok``（**没有**这条，"正常"就永远不会被记下来）。"""

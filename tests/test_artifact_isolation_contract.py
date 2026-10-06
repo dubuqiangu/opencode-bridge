@@ -273,6 +273,7 @@ class TestTheArtifactNamesAreNotHardCodedAnywhere(unittest.TestCase):
         TESTS_DIR / "test_cli_module_alias_guard_reporting_regressions.py",
         TESTS_DIR / "test_cli_module_alias_guard_stays_quiet_regressions.py",
         TESTS_DIR / "test_repository_root_artifacts.py",
+        TESTS_DIR / "test_telegram_credential_gate.py",
     )
 
     def test_no_judgment_code_hard_codes_the_runtime_artifact_names(self):

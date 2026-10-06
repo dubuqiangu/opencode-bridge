@@ -122,6 +122,24 @@ CONTRADICTORY_STREAK_PROMISE_TEXT = "连击的**下一次失败**会重试"
 #: 类 docstring 现在**必须**说出、且与代码一致的那半句（硬编码；⛔ 不许对着源码算）。
 UNWRITTEN_DOES_NOT_OUTLIVE_SUCCESS_TEXT = "活不过一次成功发送"
 
+# ======================================================================
+# 键**未注册**时，那条记录也必须看得见（缺陷，与探测结论那一段同根）
+# ======================================================================
+#: 用户把平台键拼错成的那一个键 —— ⛔ **必须是一个注册表里没有的名字**，整条缺陷就长
+#: 在这个事实上（见 :class:`UnregisteredKeyStaysVisible`）。⚠️ 与
+#: ``tests/test_bridge_refusal_probe.py`` 里那份同名常量**同值但各抄一份**：两个文件
+#: 各自钉自己那一段，而跨文件 import 判据会在其中一段被拆走时静默失效。
+UNREGISTERED_PLATFORM_KEY = "telegramm"
+
+#: 盘上那条出站失败记录的 ``detail``。⚠️ 硬编码字面量：这一组断言的正是"它被显示
+#: 出来了"，而对着实现算期望值恒真。
+UNRECORDED_FAILURE_DETAIL = "bot 被移出群聊"
+
+#: ``--status`` 在「文件存在、但里面没有任何平台级记录」时说的话。⛔ 硬编码。
+#: ⚠️ 这一句**只有真的没有任何记录时才为真** —— 缺陷版本会在「盘上有一条未注册键的
+#: 记录」时也打它，而那时它是一句**错误的肯定断言**。
+NOT_BELONGING_TO_THESE_PLATFORMS_TEXT = "盘上有记录，但没有属于这些平台的"
+
 
 class ScriptedAdapter(Adapter):
     """可编程的 ``send()`` 结果，用来走完成功 / 失败 / 部分送达三条路。"""
@@ -778,6 +796,277 @@ class StatusSectionWording(unittest.TestCase):
         self.assertIn(health.describe_outbound_failure(
             {"kind": "forbidden", "detail": "bot 被移出群聊"}
         ), without_a_time, "缺时刻不该顺带把分类与原因也吃掉")
+
+
+class UnregisteredKeyStaysVisible(unittest.TestCase):
+    """⭐ 键**未注册**时，那条出站失败记录必须看得见（实测缺陷，2026-10-06）。
+
+    它钉的缺陷（实测，不是推断）
+    ===========================
+
+    ``_print_last_outbound_failures`` 的 ``listed`` 过滤与
+    ``_print_last_start_probes`` **逐字同形**（``rows`` 只含注册表里的平台名）⇒
+    用户把 ``telegram`` 拼成 ``telegramm`` 时，那次失败观测虽以**那个键**落了盘，
+    这一段却一个字都不显示它。实测那时的输出：
+
+    * ``cfg`` 里只有那个未注册键 ⇒「（盘上有记录，但没有属于这些平台的）」
+      —— **这句是假的**：盘上确实有一条，而它让用户以为那些记录与自己无关；
+    * ``cfg`` 里另有**已配置**的 telegram ⇒ 只剩「无记录」一行，原因同样消失。
+
+    ⚠️ 与 :class:`StatusSectionWording` 的**实质差别**：这一段对「已恢复 / 没有观测到
+    成功」的区分依赖条目自己的 ``recovered_at``，而它落在**每个条目自己**身上 ⇒
+    「平台注册没注册」与「发送后来成功没有」是两根**正交**的轴 ⇒ 那两套措辞对
+    **未注册键**必须同样有意义（:meth:`test_the_recovered_wording_reaches_an_unregistered_key`）。
+    """
+
+    SECTION_HEADER = cli._OUTBOUND_SECTION_HEADER
+
+    def setUp(self) -> None:
+        # ⚠️ **不继承** :class:`StatusSectionWording` —— 继承会把母类那 11 条用例
+        # **原样重跑一遍**（它们对未注册键一条都不适用），让这一组的真实条数
+        # 看不出来。⚠️ 这里照抄母类的隔离三件套（临时目录 / config.json / 环境变量），
+        # ⛔ **不许**改成"共用母类的目录" —— 那会让两组的落盘互相污染。
+        self._previous_env = os.environ.get("OPENCODE_BRIDGE_CONFIG")
+        self.addCleanup(self._restore_config_env)
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.bridge_dir = self._directory.name
+        self._write_a_config_pointing_here()
+
+        # ⚠️ 判据**自己**先站得住：那个键必须真的不在注册表里，否则下面每一条都在测一件
+        # 已经不存在的事（恒真，且零红灯 —— AGENTS.md §7.1 第一条）。
+        from opencode_bridge.adapters import registered_names
+
+        self.assertNotIn(
+            UNREGISTERED_PLATFORM_KEY, set(registered_names()),
+            "拼错的那个键已经变成已注册的了 —— 本类守的缺陷不复存在，"
+            "请换一个新的未注册键（并同步核对本类的用例名）",
+        )
+
+    def _write_a_config_pointing_here(self) -> None:
+        """写一份 ``config.json`` 并把 ``OPENCODE_BRIDGE_CONFIG`` 指过去。
+
+        ⚠️ 这一步**承重**：:func:`opencode_bridge.__main__._bridge_dir` 取的是那个
+        环境变量**所在目录**，⛔ 不看别的 ⇒ 不指它的话，视图读到的是 cwd 而不是本用例
+        的临时目录（⛔ 那样会读到仓库根目录里别人留下的记录）。
+        """
+        config_path = os.path.join(self.bridge_dir, "config.json")
+        with io.open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"adapters": {}}, handle)
+        os.environ["OPENCODE_BRIDGE_CONFIG"] = config_path
+
+    def _restore_config_env(self) -> None:
+        if self._previous_env is None:
+            os.environ.pop("OPENCODE_BRIDGE_CONFIG", None)
+        else:
+            os.environ["OPENCODE_BRIDGE_CONFIG"] = self._previous_env
+
+    def hand_write_a_record(self, platforms: dict, *, recorded_at: float) -> None:
+        """**像用户那样**直接写盘上那份记录（不经过记录器）。
+
+        与 :meth:`StatusSectionWording.hand_write_a_record` 同一个理由：走记录器的话
+        写路径会把所有字段补齐，于是"盘上缺 ``at``"这条路径永远测不到。
+        """
+        with io.open(
+            os.path.join(self.bridge_dir, health.OUTBOUND_FAILURES_FILE_NAME),
+            "w", encoding="utf-8",
+        ) as handle:
+            json.dump({"recorded_at": recorded_at, "platforms": platforms}, handle)
+
+    def render_with(self, cfg: Config) -> str:
+        """按给定的 ``cfg`` 渲染（母类那条 :meth:`render` 写死了 telegram 的 ``cfg``）。"""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cli.run_status(cfg)
+        return buffer.getvalue()
+
+    def section_with(self, cfg: Config) -> str:
+        """只取出站失败那一段 —— 理由与母类 :meth:`section` 完全相同。"""
+        lines = self.render_with(cfg).splitlines()
+        start = next(i for i, line in enumerate(lines) if self.SECTION_HEADER in line)
+        tail = lines[start + 1:]
+        end = next((i for i, line in enumerate(tail) if line.startswith("== ")), len(tail))
+        return "\n".join(tail[:end])
+
+    @staticmethod
+    def typo_only_config() -> Config:
+        """只有那个**未注册**键的配置。
+
+        ⚠️ 它带着 ``bot_token``：未注册键压根没有 ``required_tokens``，而
+        ``_channel_config_rows`` 对「配没配」的判定要问适配器类 ⇒ 空条目会让
+        ``configured`` 的取值不可预期，而这一组要守的是"记录看得见"，
+        判据不该被另一根轴污染（两根轴分开测：见 :meth:`test_a_configured_key_next_to_it`）。
+        """
+        return Config(adapters={UNREGISTERED_PLATFORM_KEY: {"bot_token": "t"}})
+
+    def record_a_failure_for_the_unregistered_key(self, *, recovered: bool) -> None:
+        """盘上放一条以未注册键为键的失败记录（走**唯一**那个写入口）。
+
+        ⚠️ ``recovered`` 这两个取值**必须**用**同一个**记录器实例连着走 ——
+        :meth:`health.OutboundFailureRecorder.note_success` 记的是**这个实例**的内存
+        状态，另起一个实例去 ``note_success`` 等于**没人成功过**
+        （⚠️ 我第一版的探针就是这么写的，它以"已恢复于没出现"报给我，
+        而那时候错的是探针：见 ``outbound-recovered-axis`` 那次核对）。
+        """
+        recorder = health.OutboundFailureRecorder(self.bridge_dir)
+        recorder.note_failure(
+            UNREGISTERED_PLATFORM_KEY, SendError.FORBIDDEN, "bot 被移出群聊",
+        )
+        if recovered:
+            recorder.note_success(UNREGISTERED_PLATFORM_KEY)
+
+    def use_a_fresh_bridge_dir(self) -> None:
+        """换一套**全新的**落盘目录（三态之间用，避免 subTest 之间互相污染）。
+
+        ⚠️ 必须连 ``OPENCODE_BRIDGE_CONFIG`` 一起重指 —— 而这**不是**多余的讲究：
+        :func:`opencode_bridge.__main__._bridge_dir` 的实现是「读那个环境变量、
+        取它的**目录**」，⛔ **不**看别的。所以只换 ``self.bridge_dir`` 的话，视图
+        仍然去读**旧**目录里那份记录，于是"这一态压根没有记录"变成恒假
+        （⚠️ 我第一版就这么写的，它以「找不到 telegramm 那一行」红给我，
+        而那时候错的是用例：`hand_write_a_record` / 记录器写的是新目录，
+        读的却是旧目录）。
+        """
+        self._directory.cleanup()
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        self.bridge_dir = self._directory.name
+        self._write_a_config_pointing_here()
+
+    def row_for_unregistered_key(self, body: str) -> str:
+        for line in body.splitlines():
+            if line.strip().startswith(UNREGISTERED_PLATFORM_KEY):
+                return line
+        raise AssertionError(
+            "那一段里找不到 %s 那一行：\n%s" % (UNREGISTERED_PLATFORM_KEY, body)
+        )
+
+    def test_the_record_is_shown_when_no_registered_platform_is_configured(self):
+        """⭐ 盘上只有那个未注册键时，那条记录必须显示，且**不许**说「不属于这些平台」。"""
+        self.record_a_failure_for_the_unregistered_key(recovered=False)
+
+        body = self.section_with(self.typo_only_config())
+        row = self.row_for_unregistered_key(body)
+
+        self.assertIn("上次出站失败", row)
+        self.assertIn("forbidden", row)
+        self.assertIn(UNRECORDED_FAILURE_DETAIL, row)
+        self.assertNotIn(
+            NOT_BELONGING_TO_THESE_PLATFORMS_TEXT, body,
+            "**盘上确实有一条出站失败记录**，而这句话让用户以为那些记录与自己无关"
+            "（它是这一段对「一条都没有」的**唯一**说法，⛔ 只有真的没有记录时才该出现）",
+        )
+        self.assertNotIn(health.NO_OUTBOUND_FAILURE_TEXT, body)
+
+    def test_a_configured_key_next_to_it_does_not_hide_the_record(self):
+        """⚠️ 另一半现场：``cfg`` 里另有**已配置**的 telegram。
+
+        ⇒ ``listed`` 非空，旧实现走的是「只剩『无记录』一行」那条路 —— **症状不同，
+        但记录同样一个字都不显示**。两条症状都要钉住，否则只修一条会在另一条上复发。
+        """
+        self.record_a_failure_for_the_unregistered_key(recovered=False)
+
+        body = self.section_with(Config(adapters={
+            "telegram": {"bot_token": "t"},
+            UNREGISTERED_PLATFORM_KEY: {"bot_token": "t"},
+        }))
+
+        self.assertIn(UNRECORDED_FAILURE_DETAIL, body)
+        self.assertNotIn(NOT_BELONGING_TO_THESE_PLATFORMS_TEXT, body)
+        # 已配置但**盘上没有它自己**的记录 ⇒ 那一行仍应是「无记录」，⛔ 不许被改成别的。
+        self.assertIn(health.NO_OUTBOUND_FAILURE_TEXT, body)
+
+    def test_the_recovered_wording_reaches_an_unregistered_key(self):
+        """⭐⭐ 这一段与探测结论那段的**实质差别**：三态必须对未注册键**各自走得到**。
+
+        ⚠️ ``recovered_at`` 落在**每个条目自己**身上，而"平台注册没注册"与"发送后来
+        成功没有"是两根**正交**的轴 ⇒ ⛔ 不许出现"只有已注册键才走得到"的分支
+        （那会让一个拼错的键**静默地**拿不到恢复状态，而它恰恰是用户最想知道的）。
+        ⇒ 三态逐条断言：**未恢复 / 已恢复 / 无记录**，每条都逐字比。
+        """
+        # ① 未恢复
+        self.record_a_failure_for_the_unregistered_key(recovered=False)
+        unrecovered = self.row_for_unregistered_key(
+            self.section_with(self.typo_only_config())
+        )
+        self.assertIn("此后没有观测到成功", unrecovered)
+        self.assertNotIn("已恢复于", unrecovered)
+
+        # ② 已恢复（换一套干净的盘，避免三态之间互相污染）
+        self.use_a_fresh_bridge_dir()
+        self.record_a_failure_for_the_unregistered_key(recovered=True)
+        recovered = self.row_for_unregistered_key(
+            self.section_with(self.typo_only_config())
+        )
+        self.assertIn("已恢复于", recovered)
+        self.assertNotIn(
+            "此后没有观测到成功", recovered,
+            "已经观测到成功了，还说「此后没有观测到成功」—— 那又是一句假话",
+        )
+
+        # ③ 无记录：⛔ 注意这一态的**形状与前两态不同**，而那是对的 ——
+        #    盘上**一个键都没有**时，那个未注册键压根没有记录可显示，而「只列已配置
+        #    或盘上有记录的平台」这条取舍（母类的 docstring 写了它）意味着它**不会**
+        #    被凭空列出来 ⇒ 走的是收尾那句「没有任何出站失败记录」。
+        #    ⚠️ 这**不是**缺陷：没有记录就没有内容可显示，而凭空列一行「无记录」会把
+        #    十三行「无记录」的全开清单塞回这一段。
+        self.use_a_fresh_bridge_dir()
+        without_record = self.section_with(self.typo_only_config())
+        self.assertIn(
+            "（没有已配置的平台，也没有任何出站失败记录）", without_record,
+        )
+        self.assertNotIn(NOT_BELONGING_TO_THESE_PLATFORMS_TEXT, without_record)
+        self.assertNotIn("上次出站失败", without_record)
+        # 同一句「无记录」文案在**键已注册且已配置**时逐行出现（母类那条用例守的形状）
+        self.assertIn(
+            health.NO_OUTBOUND_FAILURE_TEXT,
+            self.section_with(Config(adapters={"telegram": {"bot_token": "t"}})),
+            "已注册且已配置的键无记录时，那一行仍必须是「无记录」—— 这次改动不许动它",
+        )
+        # ⛔ 三态必须**互不相同**：两两同形就等于有一态没被说出来（AGENTS.md §7.1）
+        self.assertNotEqual(unrecovered, recovered)
+        self.assertNotEqual(unrecovered, without_record)
+
+    def test_the_missing_failure_time_wording_reaches_an_unregistered_key(self):
+        """⚠️ 同型：盘上缺 ``at`` 时那句「未记录失败时刻」也必须对该键成立。
+
+        ⚠️ 与 :meth:`StatusSectionWording.test_a_record_without_a_timestamp_never_gets_one_invented_for_it`
+        同型 —— 那一处证明"读路径不编时刻"对**已注册**键成立，这一处证明那句**占位
+        文案**不会因为键未注册而消失（否则用户看到的就是一行**没有时刻**的失败，
+        而他分不出"这条没记时刻"与"这个视图压根不显示时刻"—— 后者是假的）。
+        """
+        self.hand_write_a_record(
+            {UNREGISTERED_PLATFORM_KEY: {
+                "kind": "forbidden", "detail": UNRECORDED_FAILURE_DETAIL,
+            }},
+            recorded_at=time.time() - 86400,
+        )
+
+        row = self.row_for_unregistered_key(
+            self.section_with(self.typo_only_config())
+        )
+
+        self.assertIn(UNRECORDED_FAILURE_DETAIL, row)
+        self.assertIn(MISSING_FAILURE_TIME_TEXT, row)
+        self.assertNotRegex(row, r"\d\d-\d\d \d\d:\d\d:\d\d")
+
+    def test_the_three_time_disclaimers_still_hold_for_an_unregistered_key(self):
+        """⛔ 反向护栏：三句时效性免责**对未注册键也照样出现**（审查确认过它们逐字正确）。
+
+        ⚠️ 钉的是"它们不依赖键是否注册" —— ⛔ 不许出现"只有已注册键才有的分支"。
+        ⚛️ 这三条**一个字都没改**（缺陷只关于"记录看不见"），所以判据照抄既有断言的
+        逐字判据：不是"有免责就算过"，而是那三句**各自**必须在。
+        """
+        self.record_a_failure_for_the_unregistered_key(recovered=False)
+
+        body = self.section_with(self.typo_only_config())
+
+        # ① 时间戳说的是那一刻，不是现在的连接状态
+        self.assertIn("现在的连接状态", body)
+        self.assertIn("不是", body)
+        # ② 「没有观测到成功」≠「现在还坏着」
+        self.assertIn("现在还坏着", body)
+        # ③ 「已恢复」且「不会补发」
+        self.assertIn("不会补发", body)
 
 
 # ======================================================================

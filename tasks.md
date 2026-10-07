@@ -2843,7 +2843,89 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 ⇒ **改写后逐项核对**：**tree 逐字相同**（`3094e319c510` ⇒ 文件内容一个字节没动）· 提交数 226/226 · 远端复扫只剩那 1 处 · `--force-with-lease`（⛔ 不是 `--force`）。
 ⇒ ⭐ **而根因已修在闸门上**（这才是这条留着的理由）：上一轮 `finalize_msg.py` 把消息路径**写死**在 `__main__` 里 ⇒ 我提交 `msg_narrow_rule.txt` 时，闸门收尾的**是另一个文件** ⇒ 而闸门与提交**是两条命令** ⇒ 「闸门作用在错误的文件上」**没有任何机制会告诉我** ⇒ 2 个字符就这么进了历史。
 ⇒ **新闸门三条，缺一条就退回原样**：① 路径来自 `sys.argv`，⛔ **不给默认路径**（默认路径就是「我以为的那个文件」）；② **收尾与校验在同一个函数里**，⛔ 不分两条命令；③ **打印里必须含它正在处理哪个文件**，⛔ 不然看不见「作用错了对象」。 |
-| **`inbox_recovery._replay_one`：启动重放时 dispatch 异常仍记成 `failed`** |  高 · 认领人=编排者 · **2026-10-08 起（可达性已量）**  | 1 下一步 |  **2026-10-07 可达性已量（编排者亲自读源码）⇒ 结论：【可达】，而且根因与投递侧那条【同型】。**
+~~**`inbox_recovery._replay_one`：启动重放时 dispatch 异常仍记成 `failed`**~~ | |  中 · 认领人=编排者 · **2026-10-07 已闭合**  |  ✅ 已落地（2026-10-07 · `fix-300`） | |  **2026-10-07 已落地**（`fix-300`）⇒ 根因 = §8 第 3 条**第二次**同型：
+⇒ ⭐⭐ **2026-10-07 第二轮（同一件缺陷的续，`fix-300` 复用同一会话）：普查推翻了我给的清单两条、证实一条。**
+　**输入侧普查（贴命中数）**：
+　　生产侧写 `state` 列的 SQL **恰好 7 条、全部在 `inbox.py`**；DDL 是 `state TEXT NOT NULL`
+　　**无 DEFAULT、无 TRIGGER** ⇒ 每个 state 必来自那 7 条之一或 `record` 的 INSERT
+　　⇒ **`failed` 的唯一写入口 = `mark_failed`（调用点 3 处）**、`outcome_unknown` 的唯一入口（调用点 3 处）
+　　⚠️ 而探针报了 **1 处误报**（某模块 docstring 命中正则）⇒ 按 §7.1 先怀疑探针。
+　⇒ ⚠️ **它推翻了我派单里的两条假设**：① 我说「别只看 `mark_failed(` 调用点、还要查直接 SQL」
+　　⇒ 实测**那些直接 SQL 全在 `inbox.py` 内部**，外部**够不到**；
+　　② 我说「`status` 可能是主要判据」⇒ 实测**恢复路径上它没有输入**
+　　（两抛的 `status` 实测都是 `None`）⇒ 真正分开两档的是那个**盖戳**，而它在**盘上**。
+　⇒ ⚠️ 而「凡落 `failed` 的 reason 必须带 status」这条守门保证的是**可诊断**，⛔ **不是**分档依据 —— 分档依据在 `state` 本身。
+⇒ **F1（已修）记不下 `attempting` 仍然照投 ⇒ 双跑**：
+　触发 = 一行 `pending`/到期 `failed` + **一次持续的**写盘故障（盘满/库被锁），使 `mark_attempting` 与 `mark_delivered` 都失败、而 dispatch **成功**；
+　实测修复前：`dispatch` 被调用、盘上仍 `pending` ⇒ 下次启动重放 ⇒ **跑两遍**；
+　⇒ ⭐ 而**单靠 `mark_attempting` 失败并不危险**（后续写成功时行会落到别的档）
+　　——**是它把「行留在可重放状态」与「请求已发出」凑到了一起**；
+　⇒ ⭐ 而**两侧本来就不一致**：实况路径早已 fail-closed（`mark_attempting` 在 try 之外
+　　⇒ 冒到 `_drain` 的 except ⇒ 队列中止），而**恢复路径此前与它不一致，　　而那一侧正是会重放的地方** ⇒ 修法是让它与实况路径同为 fail-closed。
+⇒ **F2（已修）`dispatch_recovered` 的缺省分支方向是反的**：
+　触发 = `_dispatch_prompt` 新增一个返回值、作者没改 `dispatch_recovered`
+　　⇒ 落进 `!= "ok"` 那支 ⇒ 盖「压根没提交」的戳 ⇒ **可重放** ⇒ 双跑；
+　⇒ ⚠️ **为什么没有行为用例会红**：新增返回值**不改变任何现有用例的走向**
+　　（既有用例在那条路径一条都不经过）⇒ **只有形状守门能抓** ⇒ 又一次印证那条纪律。
+⇒ **定向验证（编排者亲自跑，⛔ 未跑 discover）**：9 个模块 **510** 全绿
+　（`test_inbox_recovery` 38 · `test_inbox` 48 · `test_inbound_gateway` 117 ·
+　 `test_core` 101 · `test_platform_health` 39 · `test_outbound_failure_channel` 77 ·
+　 `test_inbox_wiring` 15 · `test_channel_profile` 34 · `test_platform_pairing` 41）。
+⇒ **反向证明 2 条**（注入**生产侧缺陷**）：F1 删掉 guard 里那一行 `return` ⇒ **恰好 2** 红、
+　其余 153 绿；F2 把枚举改回 `!= "ok"` ⇒ **恰好 4** 红（两条形状守门 + 两条行为）。
+⇒ ⚠️ **而它自己的两次探针/注入出错都记下了**：
+　① F1 第一版行为探针在 `recover_pending` 之前就 `close()` 了收件箱 ⇒ `pending_prompts()` 成空操作
+　　⇒ 它量的是「没读到行」而不是「读到了但不投」⇒ 按 §7.1 重写后才拿到真结果；
+　② F1 第一版注入是 `or True` ⇒ guard 恒假 ⇒ **33 条红** ⇒ 那只证明「这条 guard 承重」，
+　　⛔ **不算针对 F1 的反向证明** ⇒ 改成只删那一行 `return` 后才是恰好 2 条。 |
+　`_dispatch_prompt` **判出了分档，却把它压成一个字符串交给恢复层**
+　⇒ 判定所需的信息压根没被记录 ⇒ 任何处置都在猜 ⇒ 正确做法是**记录**它。
+⇒ ⭐⭐ **而本行最该留的不是「已修」，是【编排者的派单前提是错的】**：
+　`fix-299` 量的是 `_replay_one` 的 `except`，⛔ **没量 `dispatch` 在恢复路径上抛什么**
+　⇒ 而 `dispatch_recovered` 的 `raise OpenCodeError(f"… returned {outcome!r}")`
+　　**没有传 `status=`**，而 `opencode_client.py:48` 的默认值就是 `None`
+　⇒ ⇒ **恢复路径上每一次非 ok（409 busy / 503 / 任何）都是 `status` 恒为 `None`**
+　⇒ ⇒ 而我派单写的是「判 `status is None` ⇒ 落 `outcome_unknown`」
+　⇒ ⇒ **那会让所有重放失败都落 `outcome_unknown`，退避阶梯在恢复路径上彻底失效**
+　⇒ ⇒ **一个比所修缺陷更糟的回归** —— 是实现者当场驳回的，⛔ 不是事后补的。
+⇒ ⇒ **所以它的第 4 处改动是必需的，不是顺手扩范围**（缺了它，我那条指令就会造成那个回归）。
+⇒ **两处恢复层分档**：`_replay_one` 的 `except` 分「可能已跑过 ⇒ `outcome_unknown`」
+　与「明确失败 ⇒ `mark_failed`」；判据是新增的 `_agent_may_have_run(exc)` ——
+　**盖戳优先**（`mark_prompt_never_sent(exc)` 由**唯一知道那件事**的投递侧盖）
+　**否则** `getattr(exc, "status", None) is None`；**缺省一律按「可能已跑过」处理**（fail-safe）。
+⇒ ⚠️ **而选 duck typing 而不是 `isinstance` 的理由**（它自己判断并写明的）：
+　`isinstance` 会把**裸异常**（`RuntimeError`/`OSError`，dispatch 抛得出来）判成
+　「明确失败 ⇒ 可重放」⇒ **那正是要修的 bug 换个入口**；而裸异常意味着**什么都没学到**。
+　⇒ 且已用一条用例把这个选择**钉住**（替身**不是** `OpenCodeError` ⇒ 改成 `isinstance` 那条会红）。
+⇒ ⚠️ **为什么还要盖戳那一层**：`create_session` 阶段的传输失败**也是** `status=None`，
+　而那一刻 prompt **从没**交出去 ⇒ 它是**明确失败、该重放**
+　⇒ 只看 `status` 会把它判成「不知道」⇒ 用户收到一句**假话**（「已提交给 agent」——
+　　那一刻它根本没提交）⇒ 而这条现实触发条件很常见（启动时 opencode 还没起来）。
+⇒ ⭐ **守门**：AST 扫**生产侧全部 `.py`**，凡落 `failed` 的路径 `reason` 必须含 status 线索
+　（命中数：生产侧 `mark_failed` 调用点 **3** 处，违规 **0**）
+　⇒ 且含**三条判据自证**（喂坏样本必须报错 / 喂好样本必须不报 / 只跟一跳调用且只在同模块）
+　⇒ ⭐ **一条恒真的守门比没有守门更危险**（§9）⇒ 它**先证明了辨别力**：
+　注入「reason 去掉 `status=`」⇒ **只有那条守门红，其余 47 条照样绿**。
+⇒ ⭐ **而告警那里它做了一个正确的取舍**：**没有**在 `_replay_one` 里自己发
+　⇒ 因为 `recover_pending` 第 3 步的 `uncertain_prompts()` 跑在第 1/2 步**之后**
+　⇒ 刚写下的那一行**当轮**就被取出、发出一条**带「请重新发送一次」**的告警
+　⇒ 已在**同一次** `recover_inbox` 里用两条用例钉住。
+⇒ ⚠️ **知情代价（属「代价已知且刻意不做」，⛔ 不是「未做」）**：恢复路径上服务端**真正的**
+　status 没跨过边界（`last_error` 的 `status=` 恒为 `None`）⇒ **分档不受影响**
+　（`agent_may_have_run` 在盘上），丢的只是**排查用的那个数字**。
+　⇒ ⛔ 想带回来必须让 `_dispatch_prompt` 在恢复路径上**重抛原始异常**，
+　　而那会改掉它 `ok`/`busy`/`error` 的返回契约（`test_inbound_gateway` 有两条用例钉着）
+　⇒ ⇒ **⛔ 不许在缺陷修复里顺手做**（是否改那个契约 = 另一个决策）。
+⇒ **定向验证（编排者亲自跑，⛔ 未跑 discover）**：11 个模块 **545** 全绿
+　（`test_inbox_recovery` 35 · `test_inbox` 48 · `test_inbound_gateway` 112 ·
+　 `test_core` 101 · `test_platform_health` 39 · `test_outbound_failure_channel` 77 ·
+　 `test_inbox_wiring` 15 · `test_channel_profile` 34 ·
+　 `test_progress_handle_handoff_race` 13 · `test_inbound_merge` 37 ·
+　 `test_opencode_client` 34，skipped=1 预先存在）。
+⇒ **反向证明 4/4**（注入**生产侧缺陷**、⛔ 不是「改回去会红」）：去掉 `status=` ⇒
+　**只有守门那条红** · `_agent_may_have_run` 退回 `return False` ⇒ **6** 条红 ·
+　`dispatch_recovered` 合回一个 `raise` ⇒ **2** 条红 · 去掉 `mark_prompt_never_sent` ⇒ **3** 条红。
+
 ⇒ **量到的三件事**（非采信）：
 　① `inbox.mark_failed(delivery_id, error)` 把 `error` **原样**写进 `last_error`⇒ 它自己不判断、不加工；
 　② 落 `failed` 的**生产**调用点只有两处：`inbound_gateway.py` 的

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -974,3 +975,227 @@ class TestSqliteSubstrateContract(InboxTestCase):
                 self.assertIs(inbox._connection.row_factory, sqlite3.Row,
                               "转发来的连接必须仍是配置好的那一条")
         recorded.assert_called_once_with(database_path)
+
+
+# ----------------------------------------------------------------------
+# 守门：凡落 ``failed`` 的路径，``last_error`` 都必须带 status 线索
+# ----------------------------------------------------------------------
+#: 理由表达式里出现 status 线索的判据。**按词**匹配（不是子串）——
+#: ``"restart"`` 里那三个字母不算线索。
+_STATUS_CLUE = re.compile(r"\bstatus\b")
+
+#: 生产侧的包根（⛔ 只扫生产侧：测试替身里那些 ``mark_failed("d1", "boom")``
+#: 压根不是「落 failed 的生产路径」，把它们算进来会让这条守门恒红）。
+_PRODUCTION_PACKAGE_ROOT = os.path.join(_REPOSITORY_ROOT, "opencode_bridge")
+
+
+def production_python_sources() -> list[str]:
+    """生产侧全部 ``.py`` 源文件（跳过 ``__pycache__``）。
+
+    ⚠️ 刻意**不**按文件维护清单：那份清单一旦漏了新文件，这条守门就静默地对那个
+    文件失效，而「漏掉」正是它要防的东西（§7.1：空集 ≠ 不存在）。
+    """
+    found: list[str] = []
+    for directory, subdirectories, file_names in os.walk(_PRODUCTION_PACKAGE_ROOT):
+        subdirectories[:] = [name for name in subdirectories if name != "__pycache__"]
+        found.extend(
+            os.path.join(directory, file_name)
+            for file_name in sorted(file_names) if file_name.endswith(".py")
+        )
+    return found
+
+
+def read_production_text(path: str) -> str:
+    """读一个生产源文件（关句柄）。
+
+    ⚠️ 单独抽出来是因为 ``open(...)`` 不写 ``with`` 会漏句柄，而 ``ResourceWarning``
+    会在别的用例的输出里冒出来 ⇒ 读盘的那条判据就变得难复核（§7.1：判据本身也要受审）。
+    """
+    with open(path, encoding="utf-8") as source_file:
+        return source_file.read()
+
+
+def _mark_failed_calls(tree: ast.Module) -> list[ast.Call]:
+    """源码里每一次 ``<任意对象>.mark_failed(...)`` 调用。
+
+    认的是**属性调用**而不是同名字符串：行级正则认不出跨行写法，而这类判据最典型
+    的失效方式就是「只认同一行」（本仓库已为此栽过，见 AGENTS.md §7.1 那张表）。
+    """
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "mark_failed"
+    ]
+
+
+def _last_assignment_of(tree: ast.Module, name: str) -> ast.expr | None:
+    """源码里**最后**一次给 ``name`` 赋值的那条表达式（找不到就是 ``None``）。
+
+    只按源码顺序取最后一次：同一个函数体里靠前的赋值不可能是调用点用的那一个。
+    ⚠️ 而另一个函数里的同名局部变量会**盖住**它 ⇒ 那会产生误报 —— 误报可复核，
+    所以这里报出来让人看，不悄悄放过（§7.1 第 4 条：误报制造无用工作）。
+    """
+    latest: ast.expr | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(isinstance(target, ast.Name) and target.id == name
+                   for target in node.targets):
+                latest = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.target.id == name and node.value is not None:
+                latest = node.value
+    return latest
+
+
+def _reason_carries_a_status_clue(
+    source: str, tree: ast.Module, argument: ast.expr,
+    helper_bodies: dict[str, list[str]],
+) -> bool:
+    """这个 ``reason`` 实参里有没有 status 线索（最多跟三跳）。
+
+    三跳就是全部够用的形状：``f"…{exc.status}…"`` 直接命中；``reason`` 这样的
+    变量先追到它的赋值；赋值是一次调用时再看那个 helper 的函数体（恢复层就是
+    这么写的：``reason = _replay_failure_reason(exc)``）。
+
+    ⛔ **只跟一跳调用、且只在同模块**。跟到别的模块就得做跨模块解析 —— 那正是
+    §7.1 说的「判据比被审对象更宽松」的来源 ⇒ 这里宁可**报出来**，也不让一条
+    查不到的路径静默通过（恒真的守门比没有守门更危险，§9）。
+    """
+    node: ast.expr | None = argument
+    for _hop in range(3):
+        if node is None:
+            return False
+        if isinstance(node, ast.Name):
+            node = _last_assignment_of(tree, node.id)
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            bodies = helper_bodies.get(node.func.id)
+            if not bodies:
+                return False
+            # 同名函数不止一个时**全部**都得有线索，否则先到的会把后来的盖住 ⇒
+            # 又是一条恒真的守门（§9）。全称量化是保守的那一侧。
+            return all(_STATUS_CLUE.search(body) is not None for body in bodies)
+        return _STATUS_CLUE.search(ast.get_source_segment(source, node) or "") is not None
+    return False
+
+
+def failed_reasons_without_a_status_clue(source: str) -> list[tuple[int, str]]:
+    """这个源文件里**理由不含 status 线索**的那些 ``mark_failed(...)`` 调用点。
+
+    :return: ``[(行号, 实参原文)]``；**空列表 = 每一个调用点都合规**。
+    """
+    tree = ast.parse(source)
+    helper_bodies: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            helper_bodies.setdefault(node.name, []).append(
+                ast.get_source_segment(source, node) or ""
+            )
+    offenders: list[tuple[int, str]] = []
+    for call in _mark_failed_calls(tree):
+        if len(call.args) < 2:
+            # 位置实参不足两个 = 理由压根没写进盘上 ⇒ 那比「没有线索」更糟，
+            # 照样报出来。⛔ 别用 ``else: continue`` 把它静默跳过。
+            offenders.append((call.lineno, "<只给了 %d 个位置实参>" % len(call.args)))
+        elif not _reason_carries_a_status_clue(
+            source, tree, call.args[1], helper_bodies
+        ):
+            offenders.append(
+                (call.lineno, ast.get_source_segment(source, call.args[1]) or "")
+            )
+    return sorted(offenders)
+
+
+class TestEveryFailedRowCarriesAStatusClue(unittest.TestCase):
+    """⭐ **覆盖面守门**：盘上那一行只有 ``last_error`` 能分辨两类。
+
+    :meth:`~opencode_bridge.inbox.InboundInbox.mark_failed` 把 ``error`` **原样**写进
+    ``last_error``，它自己不判断、不加工 ⇒ 所以「凡落 ``failed`` 的路径，理由里必须
+    带 status 线索」这条规矩**只能**在每一个调用点上钉。
+
+    它治的是 AGENTS.md §8 第 3 条第二次同型：**判定所需的信息压根没有被记录**，
+    而下一个读盘的人只能靠猜 ⇒ 猜出来的方案必然在某些情况下错（「传输层失败」与
+    「服务端给了 500」在盘上是同一种形状，而它们的处置正相反）。
+    """
+
+    def test_the_criteria_rejects_a_reason_without_a_status_clue(self):
+        """判据的**辨别力**自证：喂一个不带 status 的理由，它必须报错。
+
+        ⛔ 只证明「它现在是绿的」是不够的 —— 一条恒真的守门看起来永远是绿的（§9）。
+        """
+        offenders = failed_reasons_without_a_status_clue(
+            'def go(inbox, exc):\n'
+            '    inbox.mark_failed("d1", f"prompt failed: {exc}")\n'
+        )
+
+        self.assertEqual([line for line, _ in offenders], [2],
+                         "判据要是恒真的，这条守门比没有守门更危险（§9）")
+
+    def test_the_criteria_accepts_a_reason_that_carries_a_status_clue(self):
+        self.assertEqual(
+            failed_reasons_without_a_status_clue(
+                'def go(inbox, exc):\n'
+                '    inbox.mark_failed("d1", f"prompt failed (status={exc.status}): {exc}")\n'
+            ),
+            [],
+        )
+
+    def test_the_criteria_follows_one_helper_call_but_only_one(self):
+        """理由是变量或 helper 调用时也要看得见线索 —— 否则恢复层那条会被误报。"""
+        self.assertEqual(
+            failed_reasons_without_a_status_clue(
+                'def _reason(exc):\n'
+                '    return f"{type(exc).__name__}(status={exc.status})"\n'
+                'def go(inbox, exc):\n'
+                '    reason = _reason(exc)\n'
+                '    inbox.mark_failed("d1", reason)\n'
+            ),
+            [],
+        )
+        self.assertEqual(
+            [line for line, _ in failed_reasons_without_a_status_clue(
+                'from elsewhere import _reason\n'
+                'def go(inbox, exc):\n'
+                '    inbox.mark_failed("d1", _reason(exc))\n'
+            )],
+            [3],
+            "helper 在**别的模块**时判据查不到 ⇒ 报出来让人看，而不是让它静默通过"
+            "（那正是恒真守门的形状）",
+        )
+
+    def test_every_production_call_site_carries_a_status_clue(self):
+        offenders: list[str] = []
+        for path in production_python_sources():
+            source = read_production_text(path)
+            for line, argument in failed_reasons_without_a_status_clue(source):
+                offenders.append(
+                    "%s:%d 的理由不带 status 线索：%s"
+                    % (os.path.relpath(path, _REPOSITORY_ROOT), line, argument)
+                )
+
+        self.assertEqual(
+            offenders, [],
+            "落 failed 的理由必须带 status 线索 —— 盘上只有 last_error 能分辨"
+            "「明确失败（可重放）」与「结果未知（绝不重放）」，少了它就只能靠猜"
+            "（AGENTS.md §8 第 3 条）",
+        )
+
+    def test_there_is_at_least_one_call_site_so_the_criteria_is_not_vacuous(self):
+        """前提守卫：判据不许在空集上恒真（§7.1 第 1 条：报 0 命中先怀疑判据）。
+
+        这一条同时把**调用点数**钉下来：把三处调用点删掉两条，上面那条照样全绿
+        ⇒ 而「覆盖面」守门真正的失效方式正是调用点被挪走/被删掉。
+        """
+        call_sites = [
+            os.path.relpath(path, _REPOSITORY_ROOT)
+            for path in production_python_sources()
+            for _call in _mark_failed_calls(ast.parse(read_production_text(path)))
+        ]
+
+        self.assertGreaterEqual(
+            len(call_sites), 3,
+            "生产侧 mark_failed 调用点少于 3 处 —— 三处是实际存在的（投递侧两处 + "
+            "恢复层一处），少一处意味着有人挪走或删了它，而上面那条守门会照样全绿",
+        )
+        self.assertIn(os.path.join("opencode_bridge", "inbox_recovery.py"), call_sites)

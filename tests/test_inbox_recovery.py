@@ -30,13 +30,40 @@ import tempfile
 import unittest
 
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
-from opencode_bridge.inbox_recovery import MAX_ATTEMPTS, RecoveryOutcome, recover_pending
+from opencode_bridge.inbox_recovery import (
+    MAX_ATTEMPTS,
+    RecoveryOutcome,
+    mark_prompt_never_sent,
+    recover_pending,
+)
 
 _REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: 仓库内的临时目录：即便 TEMP/TMP 指向机器别处，测试也不可能写到仓库之外。
 _REPOSITORY_TEMP = os.path.join(_REPOSITORY_ROOT, ".tmp")
 
-_ALWAYS_UNREACHABLE = "opencode 不可达"
+#: 「服务端**明确**给了答复」那一档失败的理由文案（配合 :class:`_ServerRefusal`）。
+_SERVER_REFUSED = "服务端明确拒收"
+
+
+class _ServerRefusal(Exception):
+    """服务端**明确**给了答复（``status`` 非 None）⇒ 明确失败，agent 没跑过。
+
+    ⚠️ 为什么下面那些量**重试预算**的用例不能继续用裸 ``RuntimeError``：
+    恢复层判「这一行能不能重放」靠的是两条信息 —— 「服务端给了什么答复」与
+    「prompt 有没有真的交出去」（:func:`~opencode_bridge.inbox_recovery.mark_prompt_never_sent`）
+    —— 而**裸异常两条都没有** ⇒ 它落 ``outcome_unknown``（只告警、绝不重放），
+    预算一级都不动 ⇒ 那些用例会量到**另一件事**上（§7.1：「测了 A、没测 B」，
+    而缺陷恰恰活在这条缝里）。
+
+    ⛔ 它**不是** :class:`~opencode_bridge.opencode_client.OpenCodeError`：
+    恢复层刻意不认识那个类型（duck typing，见
+    :func:`~opencode_bridge.inbox_recovery._agent_may_have_run`），所以这里用一个
+    只带 ``status`` 的本地类型反而更严 —— 它逼那条判据真的只看 ``status``。
+    """
+
+    def __init__(self, message: str, status: int = 503) -> None:
+        super().__init__(message)
+        self.status = status
 
 #: ``DeliveryState`` 的全集 —— **从类上读出来的**，⛔ 不是手维护的清单。
 _EVERY_DELIVERY_STATE = tuple(
@@ -358,6 +385,255 @@ class TestOutcomeUnknownIsNeverReplayed(unittest.TestCase):
         self.assertEqual(inbox.settled_changes, [])
 
 
+class TestAReplayFailureIsClassifiedNotGuessed(unittest.TestCase):
+    """⭐ 承重的判据：重放失败落**哪一档**是**记下来的**，不是猜的。
+
+    这正是 :func:`~opencode_bridge.inbox_recovery._replay_one` 那处同型缺口：
+    它原先把 ``dispatch`` 抛出来的**任何**异常一律记成 ``failed`` ⇒ 而 ``failed``
+    会被下一次恢复按退避阶梯**重放** ⇒ 那一刻请求**已经**交出去（传输层失败）时，
+    agent 就会对同一条指令跑两遍（AGENTS.md §8 第 3 条：恢复一份没被记录的信息 = 猜）。
+
+    判据只有两条，**缺省方向必须保守**：
+
+    * **有** ``status``（服务端给了答复）⇒ 明确失败 ⇒ 落 ``failed``，可以重放；
+    * **没有** ``status``，也没被投递侧显式标成「压根没提交」⇒ **不知道** ⇒ 落
+      ``outcome_unknown`` ⇒ **只告警、绝不重放**。
+    """
+
+    _PENDING_ROW = "telegram:100200:20"
+
+    def _one_pending_row(self) -> FakeInbox:
+        inbox = FakeInbox()
+        inbox.add(make_prompt(self._PENDING_ROW), DeliveryState.PENDING)
+        return inbox
+
+    def _one_due_failed_row(self) -> FakeInbox:
+        """摆一行**已到期**的 ``failed``（走第 2 步那条重放入口）。
+
+        ⚠️ 为什么明确失败那几条要这么摆：假收件箱的 ``due_failed_prompts`` 不看退避
+        期限，所以一行 ``pending`` 若在第 1 步失败成 ``failed``，**同一轮**的第 2 步
+        会再投它一次（真收件箱不会 —— ``mark_failed`` 刚排的期限还没到）。⇒ 那是假
+        收件箱的宽松，不是被测行为，要量「一次失败落哪一档」就该只走一步。
+        """
+        inbox = FakeInbox()
+        inbox.add(make_prompt(self._PENDING_ROW), DeliveryState.FAILED)
+        return inbox
+
+    def test_a_statusless_failure_is_an_unknown_outcome_rather_than_a_failure(self):
+        """裸异常（连 ``status`` 都没有）⇒ **不知道** ⇒ 绝不记 ``failed``。"""
+        inbox = self._one_pending_row()
+
+        outcome = recover_pending(
+            inbox,
+            dispatch=RecordingDispatcher(error=OSError("连接被重置")),
+            notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(
+            states_of(inbox, self._PENDING_ROW),
+            [DeliveryState.ATTEMPTING, DeliveryState.OUTCOME_UNKNOWN],
+            "记 failed 就是把「不知道」说成「一定没送到」，而重放它 = 跑两遍",
+        )
+        self.assertEqual(outcome.replayed, [])
+        self.assertEqual([prompt.delivery_id for prompt in outcome.uncertain],
+                         [self._PENDING_ROW])
+
+    def test_an_unknown_outcome_is_never_dispatched_again(self):
+        """⭐ 这一条才是缺陷的**后果**：再跑一轮恢复，那一行**不许**被投递。
+
+        「记成 failed」本身只是盘上的字不对；**下一次启动把它重放出去**才是
+        agent 对同一条指令跑两遍。所以判据落在**第二轮的 ``dispatched``** 上。
+        """
+        inbox = self._one_pending_row()
+        recover_pending(
+            inbox,
+            dispatch=RecordingDispatcher(error=OSError("连接被重置")),
+            notify=RecordingNotifier(),
+        )
+
+        second_round = RecordingDispatcher()
+
+        outcome = recover_pending(inbox, dispatch=second_round,
+                                  notify=RecordingNotifier())
+
+        self.assertEqual(second_round.dispatched, [],
+                         "结果未知的一行绝不许进重放集合 —— 它可能**已经**跑过了")
+        self.assertEqual(outcome.replayed, [])
+        self.assertEqual([prompt.delivery_id for prompt in outcome.uncertain],
+                         [self._PENDING_ROW])
+
+    def test_a_failure_carrying_an_http_status_stays_a_definite_failure(self):
+        """反向对照：有 ``status`` ⇒ 服务端**明确**给了答复 ⇒ 那一档仍可重放。
+
+        ⭐ 这条同时把**duck typing** 那个选择钉住：:class:`_ServerRefusal` **不是**
+        :class:`~opencode_bridge.opencode_client.OpenCodeError`，恢复层压根不认识那个
+        类型 ⇒ 它只可能是在读 ``status``。少了这条，上面那条可能是「因为什么都记成
+        了未知才绿的」。
+        """
+        inbox = self._one_due_failed_row()
+
+        outcome = recover_pending(
+            inbox,
+            dispatch=RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED)),
+            notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(states_of(inbox, self._PENDING_ROW),
+                         [DeliveryState.ATTEMPTING, DeliveryState.FAILED])
+        self.assertEqual(outcome.uncertain, [],
+                         "明确失败不归「只告警」那一档")
+        self.assertIn("status=503", inbox.last_errors[self._PENDING_ROW],
+                      "盘上只靠 last_error 分辨两类 ⇒ 理由必须带 status 线索")
+
+    def test_only_the_explicit_mark_makes_a_statusless_failure_replayable(self):
+        """⭐ 「压根没提交」必须由**投递侧**说出来 —— 这是 ``status`` 表达不了的那一半。
+
+        ``create_session`` 阶段的传输失败**也**是「没有 status」，而那一刻 prompt
+        **从没**离开过本机 ⇒ 它是**明确失败**，该按退避阶梯重放。只看 ``status``
+        会把它误判成「不知道」，用户因此收到一句**假话**（"请求已经提交给 agent"
+        —— 那一刻它根本没提交）。⇒ 那条信息由
+        :func:`~opencode_bridge.inbox_recovery.mark_prompt_never_sent` **记**下来。
+        """
+        inbox = self._one_due_failed_row()
+
+        recover_pending(
+            inbox,
+            dispatch=RecordingDispatcher(
+                error=mark_prompt_never_sent(OSError("opencode 不可达"))
+            ),
+            notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(states_of(inbox, self._PENDING_ROW),
+                         [DeliveryState.ATTEMPTING, DeliveryState.FAILED],
+                         "prompt 压根没提交 ⇒ 明确失败，重放安全")
+        retrying = RecordingDispatcher()
+
+        recover_pending(inbox, dispatch=retrying, notify=RecordingNotifier())
+
+        self.assertEqual([prompt.delivery_id for prompt in retrying.dispatched],
+                         [self._PENDING_ROW],
+                         "明确失败的那一档必须在下一轮被重试 —— 否则退避阶梯成了摆设")
+
+
+class TestAnUnknownOutcomeBurnsNoRetryBudget(unittest.TestCase):
+    """⭐ ``outcome_unknown`` **不碰** ``attempts`` —— 本档没有「下次」。
+
+    白花一级预算只会把 :meth:`~opencode_bridge.inbox.InboundInbox.mark_failed` 的
+    算术搅浑（它按 ``attempts`` 决定什么时候转 ``abandoned``）。用**真**收件箱量：
+    预算那一列在盘上，假收件箱断言等于断言假货。
+    """
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        self.inbox = InboundInbox(self.database_path)
+        self.addCleanup(self.inbox.close)
+        self.inbox.record(make_prompt("telegram:100200:21"))
+
+    def test_the_attempt_budget_is_left_untouched(self):
+        recover_pending(
+            self.inbox,
+            dispatch=RecordingDispatcher(error=OSError("连接被重置")),
+            notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(_read_state(self.database_path), DeliveryState.OUTCOME_UNKNOWN)
+        self.assertEqual(_read_column(self.database_path, "attempts"), 0,
+                         "不重放的一档没有「下次」⇒ 预算一级都不该花")
+
+
+class WritesThatFail:
+    """只让点名的写入口失败，其余（含四个读取入口）**全部转发**给被包的收件箱。
+
+    ⛔ 它**不是**假收件箱：里面那个是真 :class:`~opencode_bridge.inbox.InboundInbox`，
+    被让失败的也只是那几次写 —— 所以「盘上那一行最终是什么状态」量的是真盘。
+    """
+
+    def __init__(self, inbox: InboundInbox, failing: set[str]):
+        self._inbox = inbox
+        self._failing = failing
+        #: 实际被调用过的写入口（用来确认注入真的走到了那条路）。
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._inbox, name)
+        if name not in self._failing:
+            return attribute
+
+        def failing_write(*_args, **_keywords):
+            self.calls.append(name)
+            raise sqlite3.OperationalError("database is locked")
+
+        return failing_write
+
+
+class TestARowThatCannotBeMarkedAttemptingIsNeverReplayed(unittest.TestCase):
+    """⭐ **记不下 ``attempting`` 就不投** —— 那是"结果不可知"的唯一来源。
+
+    :meth:`~opencode_bridge.inbox.InboundInbox.mark_attempting` 的 docstring 写着：
+    这一行是结果不可知的唯一来源，**写在它之前**，崩溃就落在"还没试"，而那一档
+    :func:`~opencode_bridge.inbox_recovery.recover_pending` 会**重放**。
+
+    ⇒ 所以「写失败还照样投」就是在**重新打开那个窗口**：盘上那一行仍是 ``pending``/
+    ``failed``（可重放），而请求可能**已经**交出去 ⇒ 下次启动重放 ⇒ **双跑**。
+
+    ⚠️ 触发条件不是「两次独立的坏运气」，而是**一次持续的写盘故障**（盘满 / 库被锁
+    —— 那种故障让后面几次写一起失败）。用**真**收件箱量：这是唯一能量到「盘上最终
+    是什么状态」的办法。
+    """
+
+    _DELIVERY_ID = "telegram:100200:22"
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        self.inbox = InboundInbox(self.database_path)
+        self.addCleanup(self.inbox.close)
+        self.inbox.record(make_prompt(self._DELIVERY_ID))
+
+    def test_a_row_whose_attempting_write_failed_is_not_dispatched(self):
+        broken = WritesThatFail(self.inbox, {"mark_attempting"})
+        dispatch = RecordingDispatcher()
+
+        recover_pending(broken, dispatch=dispatch, notify=RecordingNotifier())
+
+        self.assertEqual(broken.calls, ["mark_attempting"],
+                         "前提：注入真的走到了 mark_attempting 那一次写")
+        self.assertEqual(dispatch.dispatched, [],
+                         "记不下 attempting 还投 ⇒ 请求可能已交出去，而盘上那一行"
+                         "仍可重放 ⇒ 下次启动让它跑第二遍")
+
+    def test_the_unmarked_row_is_left_alone_and_never_replayed_on_the_next_boot(self):
+        """⭐ 判据落在**下一轮**：那一行必须原样留在盘上，且**不再**被投一次。"""
+        recover_pending(
+            WritesThatFail(self.inbox, {"mark_attempting"}),
+            dispatch=RecordingDispatcher(), notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(_read_state(self.database_path), DeliveryState.PENDING,
+                         "盘上仍是 pending（= 从没投过）⇒ 没有谎报成已投过")
+        self.assertEqual(_read_column(self.database_path, "attempts"), 0)
+
+        # 故障消失后再跑一轮：这时才真的该投（它确实从没投出去过）。
+        second = RecordingDispatcher()
+
+        recover_pending(self.inbox, dispatch=second, notify=RecordingNotifier())
+
+        self.assertEqual([prompt.delivery_id for prompt in second.dispatched],
+                         [self._DELIVERY_ID],
+                         "写恢复了之后这一行必须能投出去 —— 否则就是「永久搁浅」")
+        self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
+
+    def test_a_healthy_run_still_dispatches(self):
+        """反向对照：注入没有生效时**必须**照常投 —— 否则上面两条只是「压根没读出行」。"""
+        dispatch = RecordingDispatcher()
+
+        recover_pending(self.inbox, dispatch=dispatch, notify=RecordingNotifier())
+
+        self.assertEqual([prompt.delivery_id for prompt in dispatch.dispatched],
+                         [self._DELIVERY_ID])
+        self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
+
+
 class TestEveryStateHasExactlyOneTreatment(unittest.TestCase):
     """⚠️ **覆盖面守门**：每一档状态在恢复层都必须有且只有一个处置。
 
@@ -494,7 +770,7 @@ class TestFailedRowsRespectTheBackoffDeadline(unittest.TestCase):
     def test_a_replay_that_fails_again_is_not_counted_as_replayed(self):
         inbox = FakeInbox()
         inbox.add(make_prompt("telegram:100200:7"), DeliveryState.FAILED)
-        dispatch = RecordingDispatcher(error=RuntimeError("prompt 超时"))
+        dispatch = RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED))
 
         outcome = recover_pending(inbox, dispatch=dispatch, notify=RecordingNotifier())
 
@@ -503,7 +779,10 @@ class TestFailedRowsRespectTheBackoffDeadline(unittest.TestCase):
                          ["telegram:100200:7"])
         self.assertEqual(states_of(inbox, "telegram:100200:7"),
                          [DeliveryState.ATTEMPTING, DeliveryState.FAILED])
-        self.assertIn("prompt 超时", inbox.last_errors["telegram:100200:7"])
+        self.assertIn(_SERVER_REFUSED, inbox.last_errors["telegram:100200:7"])
+        self.assertIn("status=503", inbox.last_errors["telegram:100200:7"],
+                      "凡落 failed 的路径 reason 都必须带 status 线索 —— 盘上只有"
+                      "last_error 能分辨「明确失败」与「结果未知」")
 
 
 class TestRetryBudgetIsExhaustedAgainstARealInbox(unittest.TestCase):
@@ -523,7 +802,7 @@ class TestRetryBudgetIsExhaustedAgainstARealInbox(unittest.TestCase):
         """跑一轮恢复（投递必失败），并把退避期限抹平以备下一轮。"""
         outcome = recover_pending(
             self.inbox,
-            dispatch=RecordingDispatcher(error=RuntimeError(_ALWAYS_UNREACHABLE)),
+            dispatch=RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED)),
             notify=notify or RecordingNotifier(),
         )
         expire_backoff_deadlines(self.database_path)
@@ -637,7 +916,7 @@ class TestARowRewoundByBusyIsStillBudgetBounded(unittest.TestCase):
 
             recover_pending(
                 self.inbox,
-                dispatch=RecordingDispatcher(error=RuntimeError(_ALWAYS_UNREACHABLE)),
+                dispatch=RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED)),
                 notify=RecordingNotifier(),
             )
 
@@ -656,7 +935,7 @@ class TestARowRewoundByBusyIsStillBudgetBounded(unittest.TestCase):
             self._rewind_like_a_busy_answer()
             recover_pending(
                 self.inbox,
-                dispatch=RecordingDispatcher(error=RuntimeError(_ALWAYS_UNREACHABLE)),
+                dispatch=RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED)),
                 notify=RecordingNotifier(),
             )
         self.assertEqual(_read_state(self.database_path), DeliveryState.ABANDONED)
@@ -743,18 +1022,34 @@ class TestAnEvictedUncertainRowWouldBeASilentLoss(unittest.TestCase):
 class TestRecoveryNeverRaises(unittest.TestCase):
     """恢复失败**绝不能**让桥起不来 —— 这是它被允许存在的唯一前提。"""
 
-    def test_a_raising_dispatch_is_swallowed_and_recorded_as_a_failure(self):
+    def test_a_raising_dispatch_is_swallowed_and_recorded_as_an_unknown_outcome(self):
+        """⭐「不抛」这个前提之外，这条同时钉住**落哪一档**。
+
+        裸 ``OSError`` 既没有 ``status``（服务端给了什么答复）也没有盖上
+        「prompt 压根没提交」的戳 ⇒ 恢复层**无从知道**请求出去没有
+        ⇒ 按「可能已经跑过」处理 ⇒ 落 ``outcome_unknown``、**只告警、绝不重放**。
+        记成 ``failed`` 就是把"不知道"说成"一定没送到"，而重放它就是让 agent
+        对同一条指令跑两遍（AGENTS.md §8 第 3 条）。
+        """
         inbox = FakeInbox()
         inbox.add(make_prompt("telegram:100200:9"), DeliveryState.PENDING)
+        notify = RecordingNotifier()
 
         outcome = recover_pending(
             inbox,
             dispatch=RecordingDispatcher(error=OSError("连接被重置")),
-            notify=RecordingNotifier(),
+            notify=notify,
         )
 
         self.assertEqual(outcome.replayed, [])
+        self.assertEqual(states_of(inbox, "telegram:100200:9"),
+                         [DeliveryState.ATTEMPTING, DeliveryState.OUTCOME_UNKNOWN])
         self.assertIn("OSError", inbox.last_errors["telegram:100200:9"])
+        self.assertEqual([prompt.delivery_id for prompt in outcome.uncertain],
+                         ["telegram:100200:9"])
+        self.assertEqual(len(notify.alerts), 1)
+        self.assertIn("请重新发送一次", notify.alerts[0][1],
+                      "⛔ 只告警不给方法 = 把负担转给用户却不告诉他该做什么")
 
     def test_a_raising_notify_does_not_stop_the_replay(self):
         inbox = FakeInbox()

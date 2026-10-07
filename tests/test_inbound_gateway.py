@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
+import io
 import os
 import sqlite3
 import tempfile
@@ -1735,12 +1737,115 @@ class RecoverInboxTests(InboundGatewayTestCase):
         self.assertIn(CONVERSATION, "\n".join(captured.output))
 
     def test_recovery_never_raises(self):
+        """恢复层**绝不**把投递侧的异常抛出去 —— 不抛就是这一条的全部断言。
+
+        ⚠️ 落哪一档是第二件事，而这一条顺手把它钉住了：``prompt`` 抛的是裸
+        ``RuntimeError``（连 ``status`` 都没有）⇒ **不知道**请求出去没有
+        ⇒ 落 ``outcome_unknown``、**只告警、绝不重放**，而不是 ``failed``
+        （记成 ``failed`` 就是猜，而重放它 = agent 对同一条指令跑两遍）。
+        """
         self.inbox.record(queued("d1", "x"))
         self.client.prompt_errors.append(RuntimeError("socket died"))
 
         self.gateway.recover_inbox()      # 不抛就是这一条的全部断言
 
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+
+    def test_a_replay_that_hits_the_transport_layer_is_never_dispatched_again(self):
+        """⭐ **缺陷的端到端那一格**：重放时传输层失败 ⇒ 绝不重放，agent 不跑两遍。
+
+        缺陷活在这条链的**接缝**上：投递侧已经判出「结果未知」（落第三档），而恢复
+        侧原先把 ``dispatch_recovered`` 抛出来的任何异常一律记成 ``failed`` ⇒ 那一行
+        下次启动按退避阶梯再投一遍 ⇒ **同一条指令跑两遍**。
+
+        ⇒ 判据落在**第二轮**的 ``client.prompts`` 上：那是缺陷真正发作的地方。
+        """
+        self.inbox.record(queued("d1", "改一下 README"))
+        self.client.prompt_errors.append(OpenCodeError("POST /session/x -> timed out"))
+
+        self.gateway.recover_inbox()
+
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+        self.assertTrue(
+            any("请重新发送一次" in sent.text for sent in self.send_text.outgoing),
+            "⛔ 只告警不给方法 = 把负担转给用户却不告诉他该做什么"
+            "（这里可能有两条：投递侧那句与恢复层按会话合并的那句，两条都必须给方法）",
+        )
+        # 换一轮：下面那些断言都属于"下一次启动"。
+        self.client.prompts.clear()
+        self.send_text.outgoing.clear()
+
+        self.gateway.recover_inbox()
+
+        self.assertEqual(self.client.prompts, [],
+                         "结果未知的一行绝不许重放 —— 它可能**已经**跑过了")
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+
+    def test_a_replay_refused_with_an_http_status_is_retried_on_the_next_boot(self):
+        """反向对照：服务端**明确**给了答复 ⇒ 明确失败 ⇒ 仍按退避阶梯重试。
+
+        没有这一条，上面那条可能是「因为什么都记成了未知才绿的」—— 而那会让整条
+        退避阶梯在恢复路径上**彻底失效**（每一次明确失败都变成要用户手动重发）。
+        """
+        self.inbox.record(queued("d1", "改一下 README"))
+        self.client.prompt_errors.append(OpenCodeError("server said no", status=503))
+
+        self.gateway.recover_inbox()
+
         self.assertEqual(self.states_of(), {"d1": DeliveryState.FAILED})
+        # ⚠️ 这里断言的是**合成**异常的 status（``None``），而**不是**服务端的 503 ——
+        # 那一个 :meth:`InboundGateway._dispatch_prompt` 知道却没有带出来（见
+        # ``dispatch_recovered`` 那段 docstring：⛔ 不许在这里编一个 status）。
+        # 盘上真正分开两类的是 ``agent_may_have_run=False``，而它确实在。
+        self.assertIn("status=None", self.inbox.failures["d1"])
+        self.assertIn("agent_may_have_run=False", self.inbox.failures["d1"],
+                      "「prompt 压根没提交」必须落在盘上 —— 那是分档的依据，"
+                      "而 status 表达不了它")
+        self.assertEqual(self.inbox.attempts, {"d1": 1},
+                         "明确失败要**恰好**烧掉一级预算")
+
+        self.inbox.make_failure_due("d1")
+
+        self.gateway.recover_inbox()
+
+        # 两轮各投一次：第一轮被服务端 503 拒掉，第二轮（期限已到）重试并送达。
+        self.assertEqual(self.prompt_bodies,
+                         [("ses_fake0001", "改一下 README")] * 2,
+                         "明确失败的那一档必须在下一轮被重试 —— 否则退避阶梯成了摆设")
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.DELIVERED})
+
+    def test_a_create_session_failure_during_a_replay_is_a_definite_failure(self):
+        """⭐ ``create_session`` 阶段的传输失败也是「没有 status」，但它**不是**未知。
+
+        那一刻 prompt **压根没提交**给 agent ⇒ 重放**安全** ⇒ 该落 ``failed`` 并按
+        退避阶梯重试。只看 ``status`` 会把它判成「结果未知」⇒ 用户收到一句**假话**
+        （"请求已经提交给 agent" —— 那一刻它根本没提交），而本该自动送达的消息变成
+        要他手动重发。
+
+        ⚠️ 这条现实触发条件很常见：启动时 opencode 还没起来（见
+        :meth:`InboundGateway.recover_inbox` 里那句 "replays will most likely fail too"）。
+        """
+        self.inbox.record(queued("d1", "改一下 README"))
+        self.ensure_session_errors.append(OpenCodeError("POST /session -> 拒绝连接"))
+
+        self.gateway.recover_inbox()
+
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.FAILED},
+                         "prompt 没提交 ⇒ 明确失败，绝不是「结果未知」")
+        self.assertIn("status=None", self.inbox.failures["d1"])
+        self.assertEqual(self.inbox.attempts, {"d1": 1})
+        self.assertEqual(len(self.send_text.outgoing), 1)
+        self.assertIn("创建会话失败", self.send_text.outgoing[0].text,
+                      "恢复路径上照样告诉用户「建会话没成」—— 只记档不吭声等于"
+                      "把失败说成没有发生")
+
+        self.inbox.make_failure_due("d1")
+
+        self.gateway.recover_inbox()
+
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "改一下 README")],
+                         "这一档必须在下一轮被重试 —— 否则退避阶梯成了摆设")
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.DELIVERED})
 
 
 # ----------------------------------------------------------------------
@@ -1799,6 +1904,193 @@ class RealInboxWiringTests(unittest.TestCase):
 
         self.assertEqual(built.delivery_id, same_again.delivery_id)
         self.assertNotIn(":", built.delivery_id)
+
+
+# ----------------------------------------------------------------------
+# 守门：``_dispatch_prompt`` 的返回值必须被 ``dispatch_recovered`` 逐个点名
+# ----------------------------------------------------------------------
+_GATEWAY_MODULE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "opencode_bridge", "inbound_gateway.py",
+)
+
+#: ``_dispatch_prompt`` 允许返回的**全集**。新增一档必须先在这里登记 ——
+#: 登记的动作本身就是提醒「去把 ``dispatch_recovered`` 也改了」。
+_DISPATCH_OUTCOMES = frozenset({"ok", "busy", "error", "outcome_unknown"})
+
+
+def _returned_literals_in_source(source: str, function_name: str) -> set:
+    """这个源文件里那个函数 ``return`` 出去的**字符串字面量**集合。
+
+    ⚠️ 用 AST 而不是行级正则：``return`` 与那个字面量可以隔着任意多行，
+    而本仓库为「只认同一行」栽过（AGENTS.md §7.1 那张表）。
+    """
+    tree = ast.parse(source)
+    literals: set = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == function_name):
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Return)
+                and isinstance(inner.value, ast.Constant)
+                and isinstance(inner.value.value, str)
+            ):
+                literals.add(inner.value.value)
+    return literals
+
+
+def _string_literals_in_function(source: str, function_name: str) -> set:
+    """那个函数体里出现的**全部**字符串字面量。"""
+    tree = ast.parse(source)
+    literals: set = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == function_name):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                literals.add(inner.value)
+    return literals
+
+
+def _stamp_guard_is_a_catch_all(source: str) -> bool:
+    """盖「压根没提交」那个戳的分支，它的条件是不是**兜住一切**的形状。
+
+    ⭐ 这是**形状**判据，不是「某个词还在不在」：查的是「那个 ``if`` 的判定里
+    有没有否定/不等/不在」，因为**否定式**条件天然是兜住一切的
+    （``!= "ok"`` / ``not in (...)`` / ``not x``）。
+
+    :return: ``True`` = 兜住了不该兜的（缺陷形状）；``False`` = 是逐个枚举。
+    :raises AssertionError: 找不到那个分支 —— 那说明 :func:`mark_prompt_never_sent`
+        的调用点变了（挪了位置或不止一处），判据必须先跟着改，不能默默放过。
+    """
+    tree = ast.parse(source)
+    recovered = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "dispatch_recovered"
+    )
+    guards: list = []
+    for node in ast.walk(recovered):
+        if not isinstance(node, ast.If):
+            continue
+        stamps = [
+            inner for inner in ast.walk(node)
+            if isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "mark_prompt_never_sent"
+        ]
+        if stamps:
+            guards.append(node.test)
+    if len(guards) != 1:
+        raise AssertionError(
+            "dispatch_recovered 里盖戳的 if 分支恰好 %d 个（要求恰好 1 个）—— "
+            "调用点挪了位置或不止一处，判据得先改" % len(guards)
+        )
+    return any(
+        isinstance(inner, (ast.UnaryOp, ast.NotEq, ast.NotIn))
+        for inner in ast.walk(guards[0])
+    )
+
+
+class TestEveryDispatchOutcomeIsClassified(unittest.TestCase):
+    """⭐ **覆盖面守门**：盖「可重放」那个戳的分支必须**逐个枚举**，不能兜住一切。
+
+    为什么必须是形状而不是「某几个词还在不在」：恢复层判「能不能重放」的唯一
+    凭据是 :func:`~opencode_bridge.inbox_recovery.mark_prompt_never_sent` 盖的那个戳
+    ⇒ **谁落进盖戳的分支，谁就被判成可重放**。而上一版 ``dispatch_recovered`` 用
+    的是 ``if outcome != "ok":`` ⇒ 任何**新增**的、含义为「结果未知」的返回值都会
+    被悄悄当成可重放 ⇒ 双跑 ⇒ 而**没有任何行为用例会红**（既有用例在那条路径一条都
+    不经过 —— 本仓库实测过的形状）。
+
+    ⚠️ 判据问的是「什么算好」（盖戳那一支必须枚举），不是「我以为会看到什么」。
+    """
+
+    def source(self) -> str:
+        with io.open(_GATEWAY_MODULE_PATH, encoding="utf-8") as source_file:
+            return source_file.read()
+
+    def test_the_criteria_flags_a_catch_all_guard(self):
+        """判据的**辨别力**自证（正反两面）：⛔ 只证明「它现在是绿的」是不够的（§9）。"""
+        self.assertTrue(
+            _stamp_guard_is_a_catch_all(
+                "def dispatch_recovered(q):\n"
+                "    outcome = q()\n"
+                "    if outcome != 'ok':\n"
+                "        raise mark_prompt_never_sent(RuntimeError('x'))\n"
+            ),
+            "否定式条件天然兜住一切 ⇒ 它必须被判成缺陷形状",
+        )
+        self.assertFalse(
+            _stamp_guard_is_a_catch_all(
+                "def dispatch_recovered(q):\n"
+                "    outcome = q()\n"
+                "    if outcome in ('busy', 'error'):\n"
+                "        raise mark_prompt_never_sent(RuntimeError('x'))\n"
+            ),
+            "逐个枚举的形状不该被误报 —— 误报制造无用工作（§7.1 第 4 条）",
+        )
+
+    def test_the_stamping_branch_is_not_a_catch_all(self):
+        self.assertFalse(
+            _stamp_guard_is_a_catch_all(self.source()),
+            "盖「压根没提交」那个戳的分支**兜住了一切** —— 那正是本条缺陷的形状："
+            "一个 dispatch_recovered 认不出来的返回值会被判成「明确失败、可以重放」"
+            "⇒ agent 对同一条指令跑两遍。逐个枚举，缺省留给「不知道」那一侧。",
+        )
+
+    def test_the_stamping_branch_still_names_the_definite_failure_outcomes(self):
+        """反向对照：枚举的那一档**必须真的被枚举**（空分支会把明确失败变成不重放）。"""
+        named = _string_literals_in_function(self.source(), "dispatch_recovered")
+
+        for outcome in ("busy", "error"):
+            self.assertIn(outcome, named,
+                          "%r 那一档是「明确失败、可以重放」⇒ 必须在盖戳的分支里"
+                          "被点名" % outcome)
+        self.assertIn("ok", named)
+
+    def test_every_returned_outcome_is_inside_the_known_set(self):
+        returned = _returned_literals_in_source(self.source(), "_dispatch_prompt")
+
+        self.assertTrue(returned, "一个字面量都没量到 ⇒ 判据坏了，不是目标不在（§7.1）")
+        self.assertEqual(
+            returned - _DISPATCH_OUTCOMES, set(),
+            "_dispatch_prompt 新增了返回值 %s 而没登记 ⇒ 那一档的语义没人确认过，"
+            "而 dispatch_recovered 的缺省分支会替它做决定"
+            % sorted(returned - _DISPATCH_OUTCOMES),
+        )
+
+    def test_the_fall_through_branch_still_raises(self):
+        """⭐ 缺省那一支**必须真的抛** —— 否则「枚举之外」就等于「静默丢弃」。
+
+        枚举之外的那一档要么被当成「不知道」（抛、记第三态、只告警），要么就
+        **什么都没做**：那一行既不重放也不告警，而恢复层随后把它当成已处理完 ⇢
+        静默丢弃 —— 正是这个模块存在的理由所反对的那件事。
+        """
+        source = self.source()
+        tree = ast.parse(source)
+        recovered = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "dispatch_recovered"
+        )
+        raises_outside = [
+            node for node in ast.walk(recovered)
+            if isinstance(node, ast.Raise)
+        ]
+
+        self.assertTrue(
+            len(raises_outside) >= 2,
+            "dispatch_recovered 只有 %d 个 raise ⇒ 「枚举之外」那一档没有被表达出来"
+            % len(raises_outside),
+        )
+        stamped = [node for node in raises_outside
+                   if any(isinstance(inner, ast.Call)
+                          and isinstance(inner.func, ast.Name)
+                          and inner.func.id == "mark_prompt_never_sent"
+                          for inner in ast.walk(node))]
+        self.assertEqual(len(stamped), 1,
+                         "盖戳的那个 raise 必须恰好一个（多处 = 有分支被判成可重放）")
+        self.assertEqual(len(raises_outside) - len(stamped), 1,
+                         "必须有**另一个**不带戳的 raise = 缺省那一支「不知道」")
 
 
 if __name__ == "__main__":

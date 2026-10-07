@@ -42,7 +42,7 @@ from .inbound_merge import (
     ConversationMerger,
 )
 from .inbox import InboundInbox, QueuedPrompt, RecordOutcome
-from .inbox_recovery import recover_pending
+from .inbox_recovery import mark_prompt_never_sent, recover_pending
 from .normalize import _clean, trim_outer_whitespace
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .permission_ledger import (
@@ -745,7 +745,14 @@ class InboundGateway:
     def _dispatch_prompt(
         self, queued: QueuedPrompt, *, recording_delivery: bool = True,
     ) -> str:
-        """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error``.
+        """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error`` /
+        ``outcome_unknown``.
+
+        ⭐ 第四个返回值是本方法的**分档契约**：恢复层只会拿到一个字符串，所以
+        「prompt 有没有真的交出去」必须由**这里**说出来 ——
+        :func:`~.inbox_recovery.recover_pending` 靠猜是得不出来的（§8 第 3 条）。
+        ⚠️ 增删返回值时必须同步 :meth:`recover_inbox` 里那个 ``dispatch_recovered``
+        —— 它是唯一的读方，而漏改的后果是「只告警」那一档被记成 ``failed``。
 
         Every inbox write on this path lives here and nowhere else, because only
         this method can tell *which* of the outcomes happened — ``delivered`` /
@@ -780,7 +787,14 @@ class InboundGateway:
                 adapter=adapter,
             )
             if inbox is not None:
-                inbox.mark_failed(queued.delivery_id, f"create_session failed: {exc}")
+                # ⚠️ ``status`` **必须**进这句话：盘上这一行之后只有 ``last_error``
+                # 能说明「明确失败」与「结果未知」的区别，而少了它下一个读盘的人
+                # 只能靠猜（§8 第 3 条）。判据：tests/test_inbox.py 有一条 AST
+                # 覆盖面守门钉住「凡落 failed 的路径，reason 都含 status 线索」。
+                inbox.mark_failed(
+                    queued.delivery_id,
+                    f"create_session failed (status={getattr(exc, 'status', None)}): {exc}",
+                )
             return "error"
 
         if inbox is not None:
@@ -831,7 +845,11 @@ class InboundGateway:
                     inbox.mark_outcome_unknown(
                         queued.delivery_id, f"prompt outcome unknown: {exc}"
                     )
-                return "error"
+                # ⚠️ 实况那一轮记档就够了；但**恢复路径**上 ``inbox`` 是 ``None``，
+                # 落档的职责整个归 :mod:`inbox_recovery` ⇒ 那时它只会拿到一个字符串，
+                # 而这一档必须**能分辨出来**，否则它会把「可能已经跑过」记成
+                # ``failed`` 并在下次启动重放 ⇒ agent 对同一条指令跑两遍。
+                return "outcome_unknown"
             logger.warning("prompt failed: %s", exc)
             self._send_text(
                 conversation_id,
@@ -840,7 +858,12 @@ class InboundGateway:
                 adapter=adapter,
             )
             if inbox is not None:
-                inbox.mark_failed(queued.delivery_id, f"prompt failed: {exc}")
+                # ⚠️ 这里的 ``exc.status`` **保证非 None**（上面那一支先判过了）
+                # ⇒ 所以这一行落 ``failed`` 是**明确失败**，那正是它该落的档。
+                # 句子里仍要带 status：盘上只靠 ``last_error`` 分辨两类（§8 第 3 条）。
+                inbox.mark_failed(
+                    queued.delivery_id, f"prompt failed (status={exc.status}): {exc}"
+                )
             return "error"
         except Exception as exc:
             # ⚠️ 非 ``OpenCodeError``（连 status 都没有）⇒ 我们**同样**不知道请求发出
@@ -862,7 +885,7 @@ class InboundGateway:
                 inbox.mark_outcome_unknown(
                     queued.delivery_id, f"prompt outcome unknown: {exc}"
                 )
-            return "error"
+            return "outcome_unknown"
 
         if inbox is not None:
             inbox.mark_delivered(queued.delivery_id)
@@ -963,15 +986,59 @@ class InboundGateway:
             so a second ``mark_failed`` from inside the dispatch would burn two
             retry-budget steps for one failure.
 
-            Anything other than ``ok`` raises so recovery records ``failed`` and
-            the next boot retries on the backoff ladder. ``busy`` included: at
-            startup there is no in-memory queue to fall back into.
+            Anything other than ``ok`` raises so recovery records the row and
+            the next boot decides. ``busy`` included: at startup there
+            is no in-memory queue to fall back into.
+
+            ⚠️⚠️ 抛出去的**是哪一档**决定恢复层记 ``failed`` 还是 ``outcome_unknown``
+            ⇒ 而**这一层是唯一知道「prompt 有没有真的交出去」的地方**：
+            :meth:`_dispatch_prompt` 判完了，异常本身却把两档压成同一个字符串。
+            ⇒ 所以**两档不许合成同一个异常**，判据在
+            :func:`~.inbox_recovery._agent_may_have_run`：
+
+            * ``outcome_unknown`` ⇒ 抛**不带 status** 的
+              :class:`~opencode_bridge.opencode_client.OpenCodeError`
+              ⇒ 恢复层判成「可能已经跑过」⇒ **只告警、绝不重放**；
+            * ``busy`` / ``error`` ⇒ 那两档 prompt **压根没提交**，重放**安全**，与实况
+              路径把行记成 ``failed`` 完全一致 ⇒ 用
+              :func:`~.inbox_recovery.mark_prompt_never_sent` 盖上那一档的戳。
+
+            ⛔ **不许**在这里自己编一个 status 出来（服务端到底答了什么，只有
+            :meth:`_dispatch_prompt` 看得见），⛔ 也不许把「认不出来的返回值」一律
+            当成明确失败 —— 缺省必须是**不知道**那一侧。判据：
+            :mod:`tests.test_inbound_gateway` 两条用例分别走这两档，外加一条守门
+            钉住「每个明确失败的返回值都必须在这里被点名」。
+
+            ⚠️ **知情代价**：那一抛把服务端**真正的** status 丢了 ⇒ 恢复路径落
+            ``failed`` 时 ``last_error`` 里的 ``status=`` 恒为 ``None``（而实况路径
+            会记下真实的 4xx/5xx）。分档**不受影响**（真正分开两档的是
+            ``agent_may_have_run``，它在盘上），丢的只是排查时能看到的那个数字。
+            ⛔ 想把它带回来就得让 :meth:`_dispatch_prompt` 在恢复路径上重抛原始
+            异常，而那会改掉它 ``ok``/``busy``/``error`` 的返回契约
+            （:mod:`tests.test_inbound_gateway` 有两条用例钉着那个契约）——
+            ⇒ 那是**设计改动**，不在缺陷修复里顺手做。
             """
             outcome = self._dispatch_prompt(queued, recording_delivery=False)
-            if outcome != "ok":
-                raise OpenCodeError(
-                    f"replay of {queued.delivery_id} returned {outcome!r}"
+            if outcome == "ok":
+                return
+            # ⚠️ 下面那两个字面量是 ``_dispatch_prompt`` **每一个**「明确失败」的
+            # 返回值，必须与那边的集合逐字对齐 ⇒ 判据是
+            # ``TestEveryDispatchOutcomeIsClassified`` 那几条（它查的是**形状**：
+            # 盖戳那一支的判定里不许有否定式条件）。
+            if outcome in ("busy", "error"):
+                raise mark_prompt_never_sent(
+                    OpenCodeError(f"replay of {queued.delivery_id} returned {outcome!r}")
                 )
+            # ⛔ **这一支是 fail-safe 的缺省**：任何**认不出来**的返回值都按
+            # 「可能 agent 已经跑过」处理 ⇒ 只告警、绝不重放。
+            # ⇒ 上一版的形状是反的（``!= "ok"`` 一律盖「压根没提交」的戳）⇒ 那样
+            # 一个**新增**的、含义为「结果未知」的返回值会被当成可重放 ⇒ 双跑。
+            # ⇒ 误判方向也必须是保守的那一侧：宁可丢一条消息（用户被告知重新发送），
+            # 不可让 agent 对同一条指令跑两遍。
+            raise OpenCodeError(
+                f"replay of {queued.delivery_id} ended with an UNKNOWN outcome"
+                f" ({outcome!r})"
+            )
 
         def notify_recovered(conversation_id: str, alert_text: str) -> None:
             """Send one user-visible recovery alert; never let it vanish."""

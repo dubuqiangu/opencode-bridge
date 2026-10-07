@@ -65,9 +65,36 @@ import threading
 import time
 from typing import Any, Callable
 
-__all__ = ["Transport", "ReconnectNow", "NOTHING"]
+__all__ = ["Transport", "ReconnectNow", "NOTHING", "MIN_BACKOFF_SECONDS"]
 
 logger = logging.getLogger("opencode_bridge.transport.base")
+
+
+#: ``min_backoff`` 的**正下限**（秒）。⛔ ``0`` 不是合法下限：退避为 0 时
+#: :meth:`Transport._run` 每次会话失败都「不等就重连」，而**下一次等待仍是 0**
+#: ⇒ 紧循环空转。实测（``min_backoff=0``、``_open`` 立即失败）**7.5~8.0 万次
+#: 重连/秒、CPU 秒 ≈ 墙钟秒**；而 ``min_backoff=1.0`` 是 4.03 s 内**恰好 5 次**。
+#:
+#: **取值依据（三条，全部可复核）**：
+#:
+#: 1. **它是仓库里最小的一个真实取值**：生产侧九个适配器传的全是
+#:    ``1.0 / 2.0 / 3.0 / 5.0``（模块常量），而测试侧 24 处传 ``0.01``
+#:    ⇒ 取 ``0.01`` 意味着「**只有仓库里真的有人在用的值**能通过」。
+#: 2. **同子系统已有同款先例**：:mod:`.tcp_lines` 对另一个时间类旋钮用的正是
+#:    ``max(0.01, float(io_timeout))`` ⇒ 「时间类旋钮的下限定在 10 ms 量级」
+#:    这件事在本层不是新发明。
+#: 3. ⛔ **刻意不取 1.0**（哪怕它是生产侧的最小值）：实测取 1.0 会钳住 28 个
+#:    既有测试实参、**两条既有用例变红**，套件从 3.6 s 涨到 27.6 s；更糟的是
+#:    那两条断言的正是「退避 ×2 增长后被重置」的**数列**，下限 1.0 会让它们的
+#:    ``min_backoff`` 追上 ``max_backoff`` ⇒ 数列退化成常数 ⇒ **失去覆盖**。
+#:    「下限」要解决的是「``0`` 让重连循环无节流」这**一个**缺陷，
+#:    ⛔ 不顺带发明一条限流策略 —— 那是产品决策、不是缺陷修复。
+#:
+#: ⚠️ **只改这一个旋钮**：``reset_after``（``0`` = 只要连上过就重置）与
+#: ``tick_interval``（``<= 0`` = 循环驱动）的 ``0`` **各自都有文档化的含义**
+#: （见 :meth:`Transport.__init__` 的参数说明）⇒ ⛔ 不许跟着一起改成正下限 ——
+#: 那会改掉既有行为。
+MIN_BACKOFF_SECONDS = 0.01
 
 
 # ----------------------------------------------------------------------
@@ -133,8 +160,12 @@ class Transport(abc.ABC):
 
     :param name: 日志前缀（给适配器传平台名即可，便于按平台过滤日志）。
     :param min_backoff: 首次失败后的等待秒数，也是重置后的下限。
+        ⛔ **下限是正数**（:data:`MIN_BACKOFF_SECONDS`）：传 ``0`` 或更小的值会被
+        钳到那个下限并打一条 WARNING —— 退避为 0 会让重连紧循环空转。
     :param max_backoff: 等待上限（封顶后不再增长）。
     :param reset_after: 连接存活超过这么久就认为"稳定"，退避重置回下限。
+        ⚠️ 与 ``min_backoff`` 不同，**这里的 ``0`` 是合法的**（= 只要连上过就重置，
+        既有语义，见下面那句注释）。
     :param on_tick: 可选的**周期钩子**（无参可调用）。见模块 docstring「周期钩子」。
         ``None`` = 完全关闭（不额外起线程、循环里只有一次 ``is None`` 判断）。
     :param tick_interval: 周期钩子的间隔秒数。``<= 0`` = 循环驱动（每次取下一条
@@ -156,7 +187,20 @@ class Transport(abc.ABC):
             raise TypeError("on_tick 必须可调用")
         self.name = str(name or "")
         # 夹逼一下，免得 min > max 这种手滑配置让退避第一次就"封顶"在错误值上。
-        self.min_backoff = max(0.0, float(min_backoff))
+        #
+        # ⚠️ **下界是正数**（:data:`MIN_BACKOFF_SECONDS`），⛔ 不是 0：
+        # 退避为 0 ⇒ :meth:`_run` 每次失败都「不等就重连」、下一次等待**仍是 0**
+        # ⇒ 紧循环空转（实测 7.5~8.0 万次/秒、CPU 打满）。详见该常量。
+        # ⚠️ 告警**只打在显式传了非法值时** —— 生产侧九个适配器传的全是
+        # 1.0/2.0/3.0/5.0 ⇒ 一次都不会触发；而「每次构造都喊一遍」会让真正
+        # 需要看的那条被淹掉。
+        self.min_backoff = max(MIN_BACKOFF_SECONDS, float(min_backoff))
+        if float(min_backoff) < MIN_BACKOFF_SECONDS:
+            logger.warning(
+                "transport[%s]: min_backoff=%r 小于下限 %r，已按 %r 处理"
+                "（退避为 0 会让重连紧循环空转）",
+                self.label, min_backoff, MIN_BACKOFF_SECONDS, MIN_BACKOFF_SECONDS,
+            )
         self.max_backoff = max(self.min_backoff, float(max_backoff))
         # 默认 0 =「只要连上过就重置退避」——这是迁移前 8 个适配器的既有语义，
         # 默认取它才能保证迁移行为不变。传正数才启用"需稳定存活 N 秒"的保守模式。

@@ -75,6 +75,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
+from .transport.base import MIN_BACKOFF_SECONDS
+
 __all__ = [
     "FIRST_RECONNECT_DELAY_SECONDS",
     "MAX_RECONNECT_DELAY_SECONDS",
@@ -118,12 +120,29 @@ class ReconnectBackoff:
     ``delivered_frames`` 由**调用点**判定（见
     :meth:`SubscriptionSupervisor._back_off_and_announce` 里那句
     ``self._frames_this_subscription``）—— 本类只看这个数，所以它不依赖任何时钟。
+
+    ⚠️ ``first_delay`` 与 :attr:`opencode_bridge.transport.base.Transport.min_backoff`
+    是**同一个下界**（只是名字不同）：同样的角色（首次失败后等多久 / 重置回的下限）、
+    同样的 ``Event.wait(wait)`` 消费、``0`` 同样让重连紧循环空转 ⇒ **共用同一个
+    常量** :data:`~opencode_bridge.transport.base.MIN_BACKOFF_SECONDS`，⛔ 不另写一份
+    数字（两处各写一个值正是它们会悄悄分叉的原因）。
     """
 
     def __init__(self, first_delay: float, max_delay: float) -> None:
         # 夹逼一下，免得 min > max 这种手滑配置让第一次就「封顶」在错误值上
         # （与 Transport.__init__ 同一道夹逼）。
-        self.first_delay = max(0.0, float(first_delay))
+        #
+        # ⚠️ **下界是正数**（:data:`~opencode_bridge.transport.base.MIN_BACKOFF_SECONDS`），
+        # ⛔ 不是 0：``_back_off_and_announce`` 末尾是 ``self._stop.wait(wait)``，
+        # ``wait == 0`` 时它立刻返回、而**下一次等待仍是 0** ⇒ 紧循环空转
+        # （CPU 打满、一帧也收不到）。⚠️ 告警只在显式传了非法值时打。
+        self.first_delay = max(MIN_BACKOFF_SECONDS, float(first_delay))
+        if float(first_delay) < MIN_BACKOFF_SECONDS:
+            logger.warning(
+                "first_delay=%r 小于下限 %r，已按 %r 处理"
+                "（退避为 0 会让重新订阅紧循环空转）",
+                first_delay, MIN_BACKOFF_SECONDS, MIN_BACKOFF_SECONDS,
+            )
         self.max_delay = max(self.first_delay, float(max_delay))
         self._next_wait = self.first_delay
 

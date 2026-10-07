@@ -70,6 +70,8 @@ from opencode_bridge.subscription_supervisor import (
     SubscriptionStatus,
     SubscriptionSupervisor,
 )
+from opencode_bridge.transport import NOTHING, PollingTransport
+from opencode_bridge.transport.base import MIN_BACKOFF_SECONDS
 from tests.bridge_dir_isolation_scan import (
     dotted_name,
     enclosing_function_and_class,
@@ -510,6 +512,81 @@ class ReconnectBackoffTests(unittest.TestCase):
 
         self.assertEqual(backoff.max_delay, 5.0)
         self.assertEqual(backoff.take(delivered_frames=0), 5.0)
+
+    def test_a_zero_first_delay_is_clamped_instead_of_spinning(self):
+        """⭐ ``first_delay`` 与 ``Transport.min_backoff`` 是**同一个下界**。
+
+        判据是「**显式传的那个值被钳到了哪个数**」＋「退避数列第一项就是它」，
+        ⛔ 不是「它是不是正数」—— 后者在「忽略实参只读默认值」的实现下恒真。
+
+        ⚠️ 为什么这条必须存在：``_back_off_and_announce`` 末尾是
+        ``self._stop.wait(wait)``，``wait == 0`` 时它立刻返回、而**下一次等待
+        仍是 0** ⇒ 紧循环空转（同一个调用点，本文件 :meth:`test_a_subscribe_that_
+        raises_before_yielding_is_still_caught` 的注释也逐字写着「退避 0 会让
+        这个替身在测试主线程被调度到之前紧密空转」）。
+        """
+        backoff = ReconnectBackoff(0.0, 5.0)
+
+        self.assertEqual(
+            backoff.first_delay, MIN_BACKOFF_SECONDS,
+            "first_delay=0 必须被钳到正下限，否则重新订阅紧循环空转。",
+        )
+        # 真正决定「等多久」的是数列本身，不是那个被存下来的属性
+        self.assertEqual(backoff.take(delivered_frames=0), MIN_BACKOFF_SECONDS)
+        # 负数同样非法（此前 ``max(0.0, -1.0)`` → 0）
+        self.assertEqual(ReconnectBackoff(-1.0, 5.0).first_delay, MIN_BACKOFF_SECONDS)
+
+    def test_a_first_delay_above_the_floor_passes_through_unchanged(self):
+        """⭐ 反面对照：证明上一条不是「构造器忽略实参、只读默认值」。"""
+        above = MIN_BACKOFF_SECONDS * 4
+
+        self.assertEqual(ReconnectBackoff(above, 5.0).first_delay, above)
+        self.assertEqual(
+            ReconnectBackoff(MIN_BACKOFF_SECONDS, 5.0).first_delay, MIN_BACKOFF_SECONDS)
+
+    def test_the_two_layers_agree_on_the_floor(self):
+        """⭐ 形状守门：两处夹逼**共用同一个下限** ⇒ 它们不会悄悄分叉。
+
+        ⛔ 不是「某个常量还在不在」那种标识符检查；这里比的是**两处算出来的数**。
+        同型两处各写一个数字，正是它们会各自漂移的原因（§7.1）。
+        """
+        from opencode_bridge.transport import PollingTransport
+
+        self.assertEqual(
+            ReconnectBackoff(0.0, 5.0).first_delay,
+            PollingTransport(lambda: NOTHING, min_backoff=0.0).min_backoff,
+            "SSE 侧与传输层对「0 不是合法下限」给出了不同的下限。",
+        )
+
+    def test_an_illegal_first_delay_logs_one_warning_naming_the_knob(self):
+        """⚠️ 告警必须点名旋钮；合法值则一条都不许打。"""
+        with self.assertLogs("opencode_bridge.subscription_supervisor",
+                             level="WARNING") as captured:
+            ReconnectBackoff(0.0, 5.0)
+        min_backoff_mentions = [
+            record.getMessage() for record in captured.records
+            if "first_delay" in record.getMessage()
+        ]
+        self.assertEqual(
+            len(min_backoff_mentions), 1,
+            "显式传了非法值却打了 %d 条 first_delay 告警。" % len(min_backoff_mentions),
+        )
+        for expected in (repr(0.0), repr(MIN_BACKOFF_SECONDS)):
+            self.assertIn(expected, min_backoff_mentions[0])
+
+        recorder = _SignallingLogHandler("first_delay", threading.Event())
+        target = logging.getLogger("opencode_bridge.subscription_supervisor")
+        previous_level = target.level
+        target.addHandler(recorder)
+        target.setLevel(logging.WARNING)
+        try:
+            ReconnectBackoff(MIN_BACKOFF_SECONDS * 4, 5.0)
+        finally:
+            target.removeHandler(recorder)
+            target.setLevel(previous_level)
+        self.assertEqual(
+            [text for text in recorder.messages if "first_delay" in text], [],
+            "合法取值也打了 first_delay 告警。")
 
 
 class TheSupervisorKeepsOneSubscriptionTests(unittest.TestCase):

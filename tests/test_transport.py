@@ -39,6 +39,7 @@ from opencode_bridge.transport import (  # noqa: E402  (先装 NullHandler 再 i
     Transport,
     WebSocketTransport,
 )
+from opencode_bridge.transport.base import MIN_BACKOFF_SECONDS  # noqa: E402
 from opencode_bridge.transport.base import _NothingSentinel  # noqa: E402
 
 _NAME_SEQ = itertools.count()
@@ -61,6 +62,21 @@ def wait_until(predicate, timeout: float = 3.0, interval: float = 0.004) -> bool
 
 #: 脚本里的"等一下"占位（让消费线程有机会先跑一轮）。
 PAUSE = object()
+
+
+class _RecordingHandler(logging.Handler):
+    """把告警正文攒起来的 handler。
+
+    ⚠️ 存在的理由：``assertLogs`` 要求「至少有一条」，而「不该打告警」那条
+    判据要的正是「一条都没有」⇒ ⛔ 不能用 ``assertLogs`` 表达。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record) -> None:
+        self.messages.append(record.getMessage())
 
 
 class _Hang:
@@ -783,6 +799,138 @@ class TestTcpLineTransport(TransportTestCase):
         self.assertTrue(wait_until(lambda: b"NICK bot\r\n" in bytes(server.received)))
         tcp_transport.stop()
         self.assertEqual(tcp_transport.connection, None)
+
+
+# ----------------------------------------------------------------------
+# ``min_backoff`` 的正下限（⛔ 0 不是合法下限）
+# ----------------------------------------------------------------------
+class TestMinBackoffFloor(unittest.TestCase):
+    """⭐ 判据是「**显式传的那个值被钳到了哪个数**」，⛔ 不是「它是不是正数」。
+
+    ⚠️ 为什么不能只断言正数：``Transport.__init__`` 的**默认值**本身就是 ``1.0``
+    ⇒ 「传 0 之后它是正数」这条断言，在「构造器把实参整个忽略、只读默认值」的
+    实现下**照样成立** ⇒ 是一条恒真的断言（§9）。所以每条都断言**具体那个数**，
+    并且配一条「高于下界的值原样通过」的反面对照 —— 两条合起来才证明
+    实参**真的**被用了。
+    """
+
+    def _transport(self, **kw) -> Transport:
+        """造一个最小可用的 ``Transport`` 子类（不启动线程，纯测构造期夹逼）。"""
+        class _Bare(Transport):
+            def _open(self):
+                return None
+
+            def _next(self, conn):
+                return NOTHING
+
+        return _Bare(name=uniq_name("floor"), **kw)
+
+    def test_the_floor_value_itself_is_pinned(self):
+        """⭐ 钉住**那个数本身**，⛔ 不是「它等于 ``MIN_BACKOFF_SECONDS``」。
+
+        ⚠️ 这条是反向证明逼出来的：把 :data:`MIN_BACKOFF_SECONDS` 从 ``0.01``
+        改成 ``0.01 + 1e-9`` 时，**其余每一条用例照样全绿** —— 因为它们全都拿
+        导入进来的常量当期望值 ⇒ 那是**一整组恒真的断言**（§9）。要抓住这种改动，
+        判据必须是**字面量**。
+        （做法照本仓库既有先例：``test_the_first_wait_is_half_a_second_and_each_
+        failure_doubles_it`` 断言 ``FIRST_RECONNECT_DELAY_SECONDS == 0.5``。）
+
+        **为什么是 0.01**：它是仓库里**最小的一个真实取值** —— 测试侧 24 处
+        ``min_backoff=0.01``，而生产侧九个适配器传的是 ``1.0/2.0/3.0/5.0``
+        ⇒ 取 0.01 意味着「只有真的有人在用的值能通过」。
+        ⛔ 刻意**不取 1.0**（哪怕它是生产最小值）：实测会钳住 28 个既有测试实参、
+        两条既有用例变红，且那两条断言的「×2 后被重置」数列会退化成常数
+        ⇒ 失去覆盖。
+        """
+        self.assertEqual(MIN_BACKOFF_SECONDS, 0.01)
+
+    def test_a_zero_min_backoff_is_clamped_to_the_floor(self):
+        """传 ``0`` ⇒ 落到 :data:`MIN_BACKOFF_SECONDS`（逐个值断言，不是「正数」）。"""
+        self.assertEqual(self._transport(min_backoff=0.0).min_backoff,
+                         MIN_BACKOFF_SECONDS,
+                         "min_backoff=0 必须被钳到正下限，否则重连循环紧循环空转。")
+        # 负数同样非法（它此前也被判为合法：``max(0.0, -3)`` → 0）。
+        self.assertEqual(self._transport(min_backoff=-3.0).min_backoff,
+                         MIN_BACKOFF_SECONDS)
+
+    def test_the_clamp_also_shows_up_in_the_backoff_state_machine(self):
+        """⭐ 光断言属性不够 —— 断言**退避数列的第一项**就是那个下限。
+
+        ``min_backoff`` 只是被存下来；真正决定「等多久」的是
+        :meth:`Transport._next_backoff`。这条断言走的是**纯状态机**，
+        不启线程、不拿墙钟做判定（本机 ``monotonic`` 只有 16 ms 分辨率）。
+        """
+        transport = self._transport(min_backoff=0.0, max_backoff=10.0)
+        self.assertEqual(transport._next_backoff(survived=False), MIN_BACKOFF_SECONDS)
+        # 且「收到过帧就重置回下限」那条路径也必须是同一个下限
+        self.assertEqual(transport._next_backoff(survived=True), MIN_BACKOFF_SECONDS)
+
+    def test_a_value_at_or_above_the_floor_passes_through_unchanged(self):
+        """⭐ 反面对照：证明上一条不是「构造器忽略实参、只读默认值」。"""
+        above = MIN_BACKOFF_SECONDS * 3
+        self.assertEqual(self._transport(min_backoff=above).min_backoff, above)
+        # 恰好等于下限也不该被改（``max`` 的边界语义）
+        self.assertEqual(self._transport(min_backoff=MIN_BACKOFF_SECONDS).min_backoff,
+                         MIN_BACKOFF_SECONDS)
+
+    def test_an_illegal_min_backoff_logs_one_warning_naming_the_knob(self):
+        """⚠️ 告警必须**点名旋钮**：否则适配器构造失败时没人知道是哪个旋钮。
+
+        判据取**形状**（消息里有旋钮名、有原值、有回落到哪个数），
+        ⛔ 不是「某个标识符还在不在」。
+        """
+        with self.assertLogs("opencode_bridge.transport.base", level="WARNING") as captured:
+            self._transport(min_backoff=0.0)
+        self.assertEqual(len(captured.records), 1,
+                         "显式传了非法值却只打了 %d 条告警。" % len(captured.records))
+        message = captured.records[0].getMessage()
+        for expected in ("min_backoff", repr(0.0), repr(MIN_BACKOFF_SECONDS)):
+            self.assertIn(expected, message,
+                          "告警必须点名旋钮/原值/回落目标，实得：%s" % message)
+
+    def test_a_legal_min_backoff_logs_nothing(self):
+        """⚠️ 反面对照：合法值**一次都不许喊** —— 否则真需要看的那条会被淹掉。
+
+        ⚠️ 这里⛔ **不用** ``assertLogs``：它要求「至少有一条」，而本条要断言的正是
+        「一条都没有」⇒ 用它会得到 ``no logs of level WARNING or higher triggered``，
+        也就是**判据与被测行为正好相反**（§7.1 的「恒空/恒真」同族）。
+        """
+        recorder = _RecordingHandler()
+        target = logging.getLogger("opencode_bridge.transport.base")
+        previous_level = target.level
+        target.addHandler(recorder)
+        target.setLevel(logging.WARNING)
+        try:
+            self._transport(min_backoff=MIN_BACKOFF_SECONDS * 3)
+        finally:
+            target.removeHandler(recorder)
+            target.setLevel(previous_level)
+        self.assertEqual(
+            [record for record in recorder.messages if "min_backoff" in record], [],
+            "合法取值也打了 min_backoff 告警 —— 这条噪音会淹没真正要看的告警。")
+
+    def test_the_floor_leaves_reset_after_zero_legal(self):
+        """⛔ 反向护栏：``reset_after=0`` 是**文档化的合法语义**，不许跟着被钳。
+
+        「把所有 0 都变成非法」是最省事也最错的改法 —— 它会顺手改掉
+        「只要连上过就重置退避」这条既有语义（IRC 等适配器依赖它）。
+        """
+        transport = self._transport(min_backoff=MIN_BACKOFF_SECONDS, reset_after=0.0)
+        self.assertEqual(transport.reset_after, 0.0,
+                         "reset_after=0 是合法语义（下限只针对 min_backoff）。")
+
+    def test_the_floor_leaves_tick_interval_zero_legal(self):
+        """⛔ 同上：``tick_interval <= 0`` = 循环驱动，是另一种合法语义。
+
+        ⚠️ 循环驱动模式要**同时**有 ``on_tick`` 才会被选中（见 ``__init__`` 的
+        ``_loop_ticks``）⇒ 这里必须一并给钩子，否则这条会因「压根没配钩子」
+        而假通过。
+        """
+        loop_driven = self._transport(min_backoff=MIN_BACKOFF_SECONDS,
+                                      on_tick=lambda: None, tick_interval=0.0)
+        self.assertEqual(loop_driven.tick_interval, 0.0)
+        self.assertTrue(loop_driven._loop_ticks,
+                        "tick_interval=0 必须仍然选中「循环驱动」模式。")
 
 
 # ----------------------------------------------------------------------

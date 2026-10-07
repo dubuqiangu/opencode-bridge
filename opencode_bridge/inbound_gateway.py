@@ -381,6 +381,23 @@ class InboundGateway:
         self._queues: dict[str, list[QueuedPrompt]] = {}
         #: 正在排空某个会话的 conversation_id —— 同一会话同时只允许一个排空者。
         self._draining: set[str] = set()
+        #: 「有人请求过唤醒，但当时排空权不在我手里」的会话。
+        #:
+        #: ⚠️ **为什么需要它（丢唤醒）**：:meth:`flush_queue` 看到 ``_draining``
+        #: 命中就 ``return``，它的心智模型是「当前那个排空者会顺手取走」。
+        #: ⚠️ 而那个排空者**可能正准备放弃**：`_dispatch_prompt` 拿到 **409**
+        #: 时会把消息塞回队首、``discard(_draining)`` 并返回，等**下一次**
+        #: :meth:`flush_queue`。⇒ 若那次 flush 恰好落在 ``prompt()`` **在途**的
+        #: 窗口里（终止事件与 409 响应走两条不同连接），唤醒就被吞了 ⇒
+        #: 此后**没有任何东西会再排它** ⇒ 消息滞留 RAM（收件箱那行是 ``pending``，
+        #: **内容不丢**，但读者一个字都看不到）。
+        #:
+        #: ⇒ 本集合就是那条被吞掉的唤醒的**记录**：记下来，由排空者在**自己还握着
+        #: 排空权**的时候兑现（见 :meth:`_drain` 的 ``busy`` 分支）。
+        #: ⛔ **不能反过来**在 :meth:`flush_queue` 里直接再排一次 —— 那会让两个
+        #: 排空者同时发同一个会话（:meth:`_enqueue` / :meth:`flush_queue` 都靠
+        #: ``_draining`` 防这个，`tests/test_inbound_gateway.py` 有用例钉住）。
+        self._flush_requested: set[str] = set()
 
     # ------------------------------------------------------------------
     # Hooks: inbound
@@ -684,9 +701,16 @@ class InboundGateway:
         self._drain(conversation_id)
 
     def flush_queue(self, conversation_id: str) -> None:
-        """Called after a turn finalises (or on ``session.idle``)."""
+        """Called after a turn finalises (or on ``session.idle``).
+
+        ⚠️ **「排空权不在我手里」时不等于「什么都不用做」**：那次唤醒记进
+        :attr:`_flush_requested`，由当前排空者在**仍握着排空权**时兑现。
+        ⛔ 这里**不**自己再去排一次 —— 那会造成同一会话两个排空者并发。
+        详见 :attr:`_flush_requested` 上面那段丢唤醒的时序。
+        """
         with self._lock:
             if conversation_id in self._draining:
+                self._flush_requested.add(conversation_id)
                 return
             if not self._queues.get(conversation_id):
                 return
@@ -716,6 +740,17 @@ class InboundGateway:
                     with self._lock:
                         queue = self._queues.setdefault(conversation_id, [])
                         queue.insert(0, queued)
+                        # ⚠️ 上面那句「等 flush_queue」有个前提：那次 flush 发生在
+                        # **我交出排空权之后**。若它落在我 prompt() 在途的窗口里，
+                        # :meth:`flush_queue` 只会记进 ``_flush_requested`` 就返回
+                        # ⇒ 而此刻我正要交出排空权、此后无人会再来 ⇒ 消息滞留 RAM。
+                        # ⇒ 这里把那次记下来的唤醒**兑现掉**：`_draining` 全程没离开
+                        # 我手里，所以 `continue` 不会引入第二个排空者。
+                        # ⛔ 兑现前先清标记：第二次 409 就该正常交出排空权，
+                        # 否则一个反复 409 的服务端会被这个重试喂成热循环。
+                        if conversation_id in self._flush_requested:
+                            self._flush_requested.discard(conversation_id)
+                            continue
                         self._draining.discard(conversation_id)
                     return
         except Exception as exc:

@@ -1370,6 +1370,12 @@ class QueueTests(InboundGatewayTestCase):
         self.assertEqual(self.gateway._draining, set())
 
     def test_flushing_while_another_drainer_owns_the_conversation_does_nothing(self):
+        """⚠️ 本条仍成立：``flush_queue`` **不许**起第二个排空者。
+
+        但它**要**把那次唤醒记下来 —— 见
+        :meth:`test_a_flush_landing_while_a_prompt_is_in_flight_is_not_lost`。
+        「不并发」与「不丢唤醒」是两件事，只有后者是新行为。
+        """
         self.gateway._draining.add(CONVERSATION)
         self.deliver("排队中")
 
@@ -1377,6 +1383,121 @@ class QueueTests(InboundGatewayTestCase):
 
         self.assertEqual(self.client.prompts, [])
         self.assertEqual(self.queued_texts(), ["排队中"])
+        self.assertEqual(self.gateway._flush_requested, {CONVERSATION},
+                         "唤醒必须被记下来，否则它会被吞掉")
+
+    # ------------------------------------------------------------------
+    # 丢唤醒（台账第 12 行 / 第 19 行那条时序）
+    # ------------------------------------------------------------------
+    #: 死锁守卫用的超时（本文件不用等时长做时序判定，只用它防挂死）。
+    JOIN_GUARD_SECONDS = 10.0
+
+    def _stage_a_prompt_in_flight(self, *, busy_calls: int = 1):
+        """把第一条消息的 ``prompt()`` 停在半路，并把第二条排到它后面。
+
+        返回 ``(drain_thread, release_prompt, prompt_entered)``；两个 Event 是
+        **同步点**（⛔ 不用 ``time.sleep``）。
+        """
+        prompt_entered = threading.Event()
+        release_prompt = threading.Event()
+        calls = {"count": 0}
+        original_prompt = self.client.prompt
+
+        def blocking_prompt(session_id, text):
+            calls["count"] += 1
+            original_prompt(session_id, text)          # 记账走真替身
+            prompt_entered.set()
+            release_prompt.wait(self.JOIN_GUARD_SECONDS)   # 死锁守卫
+            if calls["count"] <= busy_calls:
+                raise OpenCodeError("busy", status=409)
+
+        self.client.prompt = blocking_prompt
+        self.addCleanup(setattr, self.client, "prompt", original_prompt)
+
+        drain_thread = threading.Thread(
+            target=self.gateway._enqueue, args=(queued("d1", "第一条"),), daemon=True)
+        drain_thread.start()
+        self.assertTrue(prompt_entered.wait(self.JOIN_GUARD_SECONDS),
+                        "第一条的 prompt() 从没被调用 —— 交错没搭起来")
+        self.assertIn(CONVERSATION, self.gateway._draining,
+                      "prompt 在途时排空权必须在位，否则测的不是这条时序")
+        # 第二条排在它后面（_enqueue 看到 _draining 就直接 return）
+        self.gateway._enqueue(queued("d2", "第二条"))
+        return drain_thread, release_prompt, calls
+
+    def _join_drain(self, drain_thread) -> None:
+        drain_thread.join(self.JOIN_GUARD_SECONDS)
+        self.assertFalse(drain_thread.is_alive(), "排空线程没退出")
+
+    def test_a_flush_landing_while_a_prompt_is_in_flight_is_not_lost(self):
+        """⭐ 台账第 12 行：**丢唤醒 ⇒ 消息滞留 RAM**。
+
+        丢在哪一步：适配器线程正卡在 ``client.prompt()``（``_draining`` 仍含该会话）
+        ⇒ turn 收尾事件到达、``flush_queue`` 命中 ``_draining`` 直接返回、**唤醒被丢弃**
+        ⇒ 随后那次 dispatch 拿到 **409**、``_drain`` 把消息塞回队首并 ``discard(_draining)``
+        ⇒ 此后**没有任何东西会再排它**。
+
+        判据 = **那条交错下消息确实回来了**（队列排空 + 两条都送出去）。
+        ⛔ 「第二次 flush 发生在第一次之后」这种断言在**没丢唤醒时也成立** ⇒ 不算判据。
+        ⛔ 不用 ``time.sleep``：交错由两个 Event 钉死。
+        """
+        drain_thread, release_prompt, calls = self._stage_a_prompt_in_flight()
+        # ⭐ 台账那条时序：终止事件在 prompt 在途时到达
+        self.gateway.flush_queue(CONVERSATION)
+        release_prompt.set()                 # prompt 现在返回 409
+        self._join_drain(drain_thread)
+
+        self.assertEqual(calls["count"], 3,
+                         "409 之后必须兑现那次被丢下的唤醒：第一条重试一次 + 第二条一次")
+        self.assertEqual(
+            self.prompt_bodies,
+            [(SESSION_ID, "第一条"), (SESSION_ID, "第一条"), (SESSION_ID, "第二条")],
+            "被丢唤醒的那条消息**必须回到队列并被送出** —— 滞留 RAM 就是这条缺陷。"
+            "⚠️ 「第一条」出现两次是对的：第一次被 409 拒收（服务端压根没跑它），"
+            "收件箱那行也退回 pending，所以重发它是既有正确行为，不是重复投递。"
+            "（用 prompt_bodies 而不是 client.prompts：后者带渠道说明前缀。）")
+        self.assertEqual(self.queued_texts(), [])
+        self.assertEqual(self.gateway._draining, set())
+        self.assertEqual(self.gateway._flush_requested, set(),
+                         "唤醒兑现后必须清掉标记，否则下一次 409 会无限重试")
+
+    def test_the_control_interleaving_still_drains(self):
+        """⭐ 反面对照：flush 落在**排空权释放之后** ⇒ 照旧一次排空。
+
+        ⛔ 这条是为了证明上面那条不是「反正总能排空」：两组只差 flush 的落点。
+        """
+        drain_thread, release_prompt, calls = self._stage_a_prompt_in_flight()
+        release_prompt.set()
+        self._join_drain(drain_thread)
+        self.assertEqual(self.queued_texts(), ["第一条", "第二条"])   # 都退回队首了
+
+        self.gateway.flush_queue(CONVERSATION)
+
+        self.assertEqual(calls["count"], 3)
+        self.assertEqual(self.queued_texts(), [])
+        self.assertEqual(self.gateway._draining, set())
+
+    def test_a_second_busy_hands_over_instead_of_looping_forever(self):
+        """⭐ 兑现唤醒只多试**一次**：服务端持续 409 时必须交出排空权。
+
+        ⛔ 没有这条，「一次兑现就够不成热循环」是**没人看守**的 —— 而反复 409 的
+        服务端会被这个重试喂成打服务器的忙循环。
+        ⚠️ 必须有**真的排空者**去兑现：手工往 ``_draining`` 里塞一个会话 id
+        是**没有排空者**的，那样没人兑现、消息只会一直排着（那是上面那条用例的
+        场景，不是这条）。所以这里复用 :meth:`_stage_a_prompt_in_flight`。
+        """
+        drain_thread, release_prompt, calls = self._stage_a_prompt_in_flight(
+            busy_calls=2)                    # ⭐ 第一次与重试都 409
+        self.gateway.flush_queue(CONVERSATION)   # 在途 ⇒ 记下一次唤醒
+        release_prompt.set()
+        self._join_drain(drain_thread)
+
+        self.assertEqual(calls["count"], 2, "兑现 = 恰好多试一次；再多就是热循环")
+        self.assertEqual(self.queued_texts(), ["第一条", "第二条"],
+                         "两次都 409 ⇒ 第一条退回队首；第二条从未被尝试，仍排着")
+        self.assertEqual(self.gateway._draining, set(), "第二次 409 必须交出排空权")
+        self.assertEqual(self.gateway._flush_requested, set(),
+                         "标记已清 ⇒ 不会再因这次唤醒重试")
 
     def test_a_busy_session_is_not_a_failure_it_goes_back_to_the_front(self):
         self.client.prompt_errors.append(OpenCodeError("busy", status=409))

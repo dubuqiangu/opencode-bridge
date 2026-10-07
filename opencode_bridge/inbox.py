@@ -18,21 +18,28 @@
 没有任何代码路径跑得到「记一笔」。写前落盘把两类失败统一成同一件事 ——
 磁盘上有一行 ``pending``。
 
-五次写入，一一对应四个状态
---------------------------
+六个落盘状态：谁在什么时候写下哪一个
+-------------------------------------
 =========================  ====================  ==========================
 调用                       落盘的状态             为什么在这个位置
 =========================  ====================  ==========================
 :meth:`InboundInbox.record`  ``pending``            分发之前 —— 写前义务
 :meth:`InboundInbox.mark_attempting`  ``attempting``  紧贴 ``prompt()`` 之前
+:meth:`InboundInbox.mark_outcome_unknown`  ``outcome_unknown``  传输层失败 ⇒ 远端是否收到**没有被记录**
 :meth:`InboundInbox.mark_delivered`  ``delivered``    **仅在成功之后**
 :meth:`InboundInbox.mark_failed`     ``failed``       明确失败（可能自动转终态）
 :meth:`InboundInbox.mark_abandoned`  ``abandoned``    调用方自己判定预算耗尽
 =========================  ====================  ==========================
 
-落在 ``attempting`` 与 ``delivered`` 之间的崩溃是**唯一结果不可知**的窗口 ——
-opencode 可能已经处理了，也可能没有。这类行只告警、绝不重放（用户 2026-10-03 拍板，
-理由：下游是有副作用的 coding agent，重复执行副作用未必比丢一条消息轻）。
+（第七个写入口 :meth:`InboundInbox.mark_pending` 退回 ``pending`` 那一格，它服务 409 ——
+见下面那节。）
+
+落在 ``attempting`` 与 ``delivered`` 之间的崩溃、以及「传输层失败、拿不到 status」
+（:meth:`InboundInbox.mark_outcome_unknown`），是**两处**结果不可知的窗口 ——
+opencode 可能已经处理了，也可能没有。两档都**只告警、绝不重放**（用户 2026-10-03 与
+2026-10-07 拍板，理由：下游是有副作用的 coding agent，重复执行副作用未必比丢一条消息轻）。
+⚠️ 而第二处的代价**必须知情**：远端**真**没收到时那条指令就**丢了** ⇒ 那一档的告警
+**必须**同时写「请重新发送一次」，否则等于把负担转给用户却不告诉他该做什么。
 
 "丢了算谁的" —— 行数上限的规矩在 :mod:`opencode_bridge.inbox_row_cap`
 ------------------------------------------------------------------
@@ -338,6 +345,36 @@ class InboundInbox:
                 (DeliveryState.PENDING, time.time(), delivery_id),
             )
 
+    def mark_outcome_unknown(self, delivery_id: str, error: str) -> None:
+        """标记「结果不可知」：请求**已经**发出去了，而失败发生在传输层。
+
+        唯一调用点是 :meth:`~opencode_bridge.inbound_gateway.InboundGateway._dispatch_prompt`
+        判出「拿不到 status」的那一支 —— 而那一支**只**可能是
+        :class:`~opencode_bridge.opencode_client.OpenCodeError` 无 ``status`` 时
+        （超时 / 连接被拒 / 流中断）。有 status 意味着服务端**明确**给了答复，
+        那是 :meth:`mark_failed` 那一档。
+
+        规则与既有转移同源，不新造一套：
+
+        * **不碰** ``attempts``：恢复层对这一档**绝不重放**，所以"还能不能再试"对它
+          没有意义；让它白花一级预算只会把 :meth:`mark_failed` 的算术搅浑。
+        * ``not_before`` 清零（同 :meth:`mark_attempting` / :meth:`mark_delivered`）
+          —— 本档没有退避期限可排。
+        * ``last_error`` **要**写：那句原因正是告警与排查的唯一凭据，与
+          :meth:`mark_pending`（409 不是失败、不覆盖上一次真正的原因）正相反。
+
+        ⛔ 这一档**不是**「没送到」，而是「不知道送没送到」。把它并进 ``failed``
+        就是把不确定当成确定（AGENTS.md §8 第 3 条），而恢复层会照 ``failed``
+        重放 ⇒ agent 对同一条指令跑两遍。⛔ 也**不许**改判成 ``delivered`` ——
+        那是把同一个不确定换成相反方向的谎。
+        """
+        with self._lock:
+            self._write(
+                "UPDATE inbox SET state = ?, not_before = 0, last_error = ?,"
+                " updated_at = ? WHERE delivery_id = ?",
+                (DeliveryState.OUTCOME_UNKNOWN, error, time.time(), delivery_id),
+            )
+
     def mark_delivered(self, delivery_id: str) -> None:
         """标记投递成功。**只有** ``prompt()`` 真的成功才该调用。"""
         with self._lock:
@@ -401,11 +438,28 @@ class InboundInbox:
     # ------------------------------------------------------------------
     def pending_prompts(self) -> list[QueuedPrompt]:
         """从未尝试过的行。重启后可以**放心重放**（不可能重复）。"""
-        return self._prompts_in_state(DeliveryState.PENDING)
+        return self._prompts_in_states(DeliveryState.PENDING)
 
     def uncertain_prompts(self) -> list[QueuedPrompt]:
-        """结果不可知的行（崩溃落在投递过程中）。**只告警，绝不重放。**"""
-        return self._prompts_in_state(DeliveryState.ATTEMPTING)
+        """结果不可知的行。**只告警，绝不重放** —— 恢复层对这两档一视同仁。
+
+        两档都收，因为恢复层对它们的处置**逐字相同**（只告警、不重放），而分成两个
+        入口就多出一处"新加的那档忘了排除"的地方：
+
+        * :attr:`~opencode_bridge.inbox.DeliveryState.ATTEMPTING` —— 进程**死**在
+          ``prompt()`` 里面；
+        * :attr:`~opencode_bridge.inbox.DeliveryState.OUTCOME_UNKNOWN` ——
+          :meth:`mark_outcome_unknown` 写下的那一档（传输层失败，远端是否收到
+          **没有被记录**）。
+
+        ⚠️ 这一档的代价**必须知情**：不重放 ⇒ 远端**真**没收到时那条指令**丢了**
+        ⇒ 告警里写着「请重新发送一次」（见 :func:`opencode_bridge.inbox_recovery.recover_pending`）。
+        ⛔ 而重放**不**是"更好的选择"：那正是本档存在的理由
+        （下游是有副作用的 coding agent，重复跑一遍未必比丢一条轻）。
+        """
+        return self._prompts_in_states(
+            DeliveryState.ATTEMPTING, DeliveryState.OUTCOME_UNKNOWN
+        )
 
     def due_failed_prompts(self, now: float) -> list[QueuedPrompt]:
         """明确失败过、且退避期限已经到期的行。"""
@@ -422,7 +476,7 @@ class InboundInbox:
 
     def abandoned_prompts(self) -> list[QueuedPrompt]:
         """重试预算耗尽的行。终态，留着是为了状态输出里还看得见它们。"""
-        return self._prompts_in_state(DeliveryState.ABANDONED)
+        return self._prompts_in_states(DeliveryState.ABANDONED)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -462,15 +516,25 @@ class InboundInbox:
         ).fetchone()
         return None if row is None else int(row[0])
 
-    def _prompts_in_state(self, state: str) -> list[QueuedPrompt]:
+    def _prompts_in_states(self, *states: str) -> list[QueuedPrompt]:
+        """读出处于**给定若干档**的行，按 ``created_at`` 排（与单档读法同一个顺序）。
+
+        用具名占位符而不是一串位置 ``?``：``WHERE state IN (...)`` 里状态值的个数随
+        调用方变，逐个传位错序不报错（与 :mod:`.inbox_row_cap` 那条淘汰语句同因）。
+        """
+        if not states:  # 传空就是"不要任何一档" —— 返回空批，而不是拼出非法 SQL
+            return []
+        bindings = [("state_%d" % position, state)
+                    for position, state in enumerate(states)]
+        placeholders = ",".join(":" + name for name, _state in bindings)
         with self._lock:
             if self._connection is None:
                 return []
             rows = self._connection.execute(
                 "SELECT delivery_id, conversation_id, platform, message_id, text"
-                " FROM inbox WHERE state = ?"
-                " ORDER BY created_at ASC, delivery_id ASC",
-                (state,),
+                " FROM inbox WHERE state IN (%s)"
+                " ORDER BY created_at ASC, delivery_id ASC" % placeholders,
+                {name: state for name, state in bindings},
             ).fetchall()
         return [_prompt_from_row(row) for row in rows]
 
@@ -489,8 +553,8 @@ class InboundInbox:
         """把总行数压回上限，**只许丢已了结的行**（策略见 :mod:`.inbox_row_cap`）。
 
         无可淘汰的行时**不硬凑**：超限就超着并如实告警，把"保住了哪些行"写进日志。
-        不可重放的状态（``pending`` / ``attempting`` / ``failed``）被静默淘汰，
-        就是一次无失败记录、无告警的消息丢失。
+        不可重放的状态（``pending`` / ``attempting`` / ``outcome_unknown`` / ``failed``）
+        被静默淘汰，就是一次无失败记录、无告警的消息丢失。
         """
         with self._lock:
             if self._connection is None:

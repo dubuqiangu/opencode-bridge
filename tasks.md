@@ -2630,7 +2630,47 @@ STRING token，占位符里的改名会被误报成"改了字面量"）。
 | **telegram 重试的代价：`platform-health.json` 的 `failed` 在进程余下整个生命周期不变** | 高 · 认领人=编排者 · 与下条同批 | 4 代价已知 | 探测搬进传输层线程后，**恢复的事实只由日志承担、落盘值不改写** ⇒ 即使凭据早已恢复、入站早已自愈，`--status` 会**一直**说 telegram 起不来 ⇒ **状态视图说坏了、实际在好好工作**。⚠️ 这是**刻意**的取舍（改写那份记录会同时破坏整份替换语义、`recorded_at` 的含义、以及「排障记录绝不该决定桥的生死」那条不变量），但按 §4.1 属于「代价已知且刻意不做」，必须显式记着。⇒ 候选处置：① 维持现状（恢复只靠日志）② 给 `--status` 一个**新的**运行期状态通道（`outbound-failures.json` 是「另开一份文件」的先例，理由已论证过两次）③ 让那次成功**追加**一条 `ok` 而不动原条目（需先确认「整份替换」语义容不容得下）。⛔ **未拍板** |
 | **`dropped callback from non-whitelisted chat` 零钉** | 低 · 认领人=编排者 · 与上三条同批 | 1 下一步 | `tests/` 里对该句的检索命中 **0**（同一句 *message* 版有 2 处 needle 钉着）⇒ 它可无声漂移。补一条逐字包含断言即可，与 `test_private_rejection_wording.py` 同形。⛔ 它是**覆盖面缺口，不是行为缺陷** —— `ora-11` 实测该路径正确 |
 | ~~**`--status` 出站失败段的【同型】缺陷**~~ | — | ✅ 已修（2026-10-06） | **与已修那条同根因**，⛔ 不是新问题：`__main__._print_last_outbound_failures` 的 `listed` 过滤与刚修的 `_print_last_start_probes` **逐字同形**（`if configured or key in recorded_platforms`，而 `rows` **只含注册表平台名**）⇒ 盘上未注册键（如 `telegramm`）的出站失败记录被同样丢弃，并会打出「（盘上有记录，但没有属于这些平台的）」—— **而盘上确实有一条平台级记录**。⚠️ 已**从源码逐字核实**（两处行文与那句收尾文案），⛔ **不是**采信转述。⇒ **此刻不能派**：`tests/test_outbound_failure_channel.py` 正被 `fix-282` 持有，而那一段会 import `__main__` ⇒ 此刻改 `__main__.py` 会**污染它的验证**。修法与已修那条同构 |
-| **传输层失败被记成 `failed` ⇒ 下次启动重放 ⇒ agent 跑两遍** |  高 · 认领人=编排者 · **2026-10-08 起**  |  1 下一步（裁决已定）  |  **2026-10-07 用户已拍板** ⇒ **分出第三种状态「结果未知」，恢复层对它【不重放】**。
+~~**传输层失败被记成 `failed` ⇒ 下次启动重放 ⇒ agent 跑两遍**~~ | |  高 · 认领人=编排者 · **2026-10-08 起**  |  ✅ 已落地（2026-10-07 · `fix-299`） | |  **2026-10-07 用户已拍板并已落地**（`fix-299`）⇒ **第三态「结果未知」（`outcome_unknown`）只告警、绝不重放**；⛔ 明确否掉「重试时用别的手段去重」。
+⇒ **三处一起动**：
+　① `inbox_states.py` 状态词汇表加第三档 + `inbox.py` 新写入入口
+　　`mark_outcome_unknown()`（**不碰 `attempts`**、**写** `last_error`）
+　　+ `inbox_row_cap.py` 的 `UNSETTLED_STATES` 归进未了结（上限一格都丢不得）；
+　② `inbound_gateway._dispatch_prompt` 拆出 `if exc.status is None:` 一支落第三态
+　　（**有 status 仍走 `failed`** —— 服务端明确答复过）；
+　③ 两处告警**都**带「请重新发送一次」（恢复层 `_uncertain_alert_text` + 投递侧
+　　`UNKNOWN_OUTCOME_NOTICE`），各有断言钉住 ⇒ ⛔ 只记「结果未知」等于把负担
+　　转给用户却不告诉他该做什么。
+⇒ ⭐ **而 `uncertain_prompts()` 一张嘴收两档**（`attempting` + `outcome_unknown`）——
+　它们在恢复层**逐字同等待遇** ⇒ 分成两个入口就多一处「新加那档忘了排除」的地方。
+⇒ ⭐⭐ **判据（台账逐字要求的那条，已落地）**：`recover_pending` 的重放集合
+　= {`pending`, 到期的 `failed`}，**`outcome_unknown` 0 命中**
+　⇒ 由**两条守门**钉住：既有的穷举表那条（`…_is_either_settled_or_unsettled`）
+　+ ⭐ **新补的行为型覆盖面守门**（把 `DeliveryState` 全集逐档**真摆到盘上**跑一轮
+　真恢复，逐集合比、不比顺序）⇒ ⛔ 那条守门原本**没有**，是本条补上的
+　⇒ 而「判据要接到动作上，不是写上去就算」正是本仓库反复记的那条教训。
+⇒ ⚠️ **知情代价（不是缺陷）**：`outcome_unknown` 行**永久留在盘上**、每次启动再告警
+　一次（与 `attempting` 逐字同构）⇒ 那是「不重放」的直接后果。
+　⚠️ 而「请重新发送一次」有个**既有天花板**：平台**不给 `message_id`** 时去重键退回
+　`sha256(platform|conversation_id|text)` ⇒ **逐字节相同**的重发会被当去重挡掉
+　（telegram 等给 `message_id` 的平台不受影响）⇒ ⛔ 未改：改去重键会削弱 at-most-once 的另一半。
+⇒ ⛔ **那一支顺手改动请编排者裁决**：紧邻的 `except Exception`（非 `OpenCodeError`）
+　**也**落第三态，并**删掉**它的 `# pragma: no cover - defensive`
+　（理由：连 status 都没有 ⇒ 同样不知道请求发出没有；且该支现在**有用例真走**）。
+⇒ ⚠️ **而 `fix-299` 顺带查出一处【同型缺口】，已交回编排者裁决**：
+　`inbox_recovery._replay_one` 在**启动重放**时把 dispatch 抛的异常仍记成 `failed`
+　⇒ 那一刻请求**也**已经发出去了 ⇒ 与本条**同型** ⇒ ⛔ **未动**（会改恢复层的重试语义）
+　⇒ **下一步（编排者，2026-10-08 起）**：先量那条路径的**生产可达性**
+　　（启动重放时 dispatch 抛 OpenCodeError 且 status 为 None ⇒ 可能吗），
+　　量到再定是否也显式化。
+⇒ **定向验证（编排者亲自跑）**：`test_inbound_gateway` **109** · `test_core` **101** ·
+　`test_platform_health` **39** · `test_outbound_failure_channel` **77** ·
+　`test_inbox` **43** · `test_inbox_recovery` **30** · `test_inbox_wiring` **15** ⇒ 全绿。
+⇒ **反向证明 7/7**（注入**生产侧缺陷**、⛔ 不是「改回去会红」）⇒ 覆盖
+　「回落 `mark_failed`」两处 · 「第三档落成 failed」· 「`uncertain_prompts` 收不到第三档」·
+　两处告警各删「请重新发送一次」· 「穷举表漏掉第三档」⇒ 全部拦住。
+⇒ **§5.0 口径复算**（它自己跑的，口径表字面实现）：`inbox.py` 499→**563** 物理、
+　文档占比 48.5%→**51.7%**、SLOC 218→232 ⇒ **仍豁免，待拆数 22 不变**；
+　`inbound_gateway.py` 938→**997**（本来就在待拆名单里，**个数不变**）。
 ⇒ **为什么是这个（§8 第 3 条）**：方案的正确性依赖「远端收没收到」
 　而 `OpenCodeClient._request` 遇 `URLError`/`OSError`/`HTTPException` 抛的是
 　**无 status 的** `OpenCodeError` ⇒ POST **已发出**、超时/连接被拒/流中断

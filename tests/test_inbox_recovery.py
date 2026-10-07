@@ -14,6 +14,10 @@
 5. ``dispatch`` / ``notify`` / 收件箱自己抛异常时，:func:`recover_pending`
    **绝不**把异常抛出去 —— 恢复失败不该让桥起不来；
 6. ``prompt.text`` 原样交给 ``dispatch`` —— 告警文字绝不进 agent 的上下文。
+7. **每一档状态都有且只有一个处置**（:class:`TestEveryStateHasExactlyOneTreatment`）——
+   ``outcome_unknown``（请求已发出、拿不到答复 ⇒ 远端是否收到**没有被记录**）与
+   ``attempting`` 同样**只告警、绝不重放**，而告警**必须**写「请重新发送一次」：
+   不重放的代价是远端**真**没收到时那条指令**丢了**（用户 2026-10-07 拍板）。
 
 ⚠️ 用真收件箱的用例同样**先关连接再删临时目录**（Windows 的 ``WinError 32``）。
 """
@@ -33,6 +37,26 @@ _REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _REPOSITORY_TEMP = os.path.join(_REPOSITORY_ROOT, ".tmp")
 
 _ALWAYS_UNREACHABLE = "opencode 不可达"
+
+#: ``DeliveryState`` 的全集 —— **从类上读出来的**，⛔ 不是手维护的清单。
+_EVERY_DELIVERY_STATE = tuple(
+    value for name, value in vars(DeliveryState).items()
+    if not name.startswith("_") and isinstance(value, str)
+)
+
+#: 每一档状态在盘上的**摆法**（键就是状态字面量）。⛔ 生产侧加了新状态而忘了往这里
+#: 加一条时 :meth:`TestEveryStateHasExactlyOneTreatment.test_the_seeding_table_covers_every_state`
+#: 会红 —— 那一条是下面整个覆盖面守门的**前提**，没有它守门就会漏掉新加的那一档。
+_MOVE_INTO_THE_INBOX = {
+    DeliveryState.PENDING: lambda inbox, delivery_id: None,
+    DeliveryState.ATTEMPTING: lambda inbox, delivery_id: inbox.mark_attempting(delivery_id),
+    DeliveryState.OUTCOME_UNKNOWN: lambda inbox, delivery_id: inbox.mark_outcome_unknown(
+        delivery_id, "URLError: 连接被拒"),
+    DeliveryState.DELIVERED: lambda inbox, delivery_id: inbox.mark_delivered(delivery_id),
+    DeliveryState.FAILED: lambda inbox, delivery_id: inbox.mark_failed(delivery_id, "boom"),
+    DeliveryState.ABANDONED: lambda inbox, delivery_id: inbox.mark_abandoned(
+        delivery_id, "boom"),
+}
 
 
 def make_prompt(
@@ -113,6 +137,10 @@ class FakeInbox:
     def mark_pending(self, delivery_id: str) -> None:
         self._move(delivery_id, DeliveryState.PENDING)
 
+    def mark_outcome_unknown(self, delivery_id: str, error: str) -> None:
+        self.last_errors[delivery_id] = error
+        self._move(delivery_id, DeliveryState.OUTCOME_UNKNOWN)
+
     def mark_delivered(self, delivery_id: str) -> None:
         self._move(delivery_id, DeliveryState.DELIVERED)
 
@@ -128,7 +156,9 @@ class FakeInbox:
         return self._prompts_now_in(DeliveryState.PENDING)
 
     def uncertain_prompts(self) -> list[QueuedPrompt]:
-        return self._prompts_now_in(DeliveryState.ATTEMPTING)
+        # ⚠️ 必须**两档都收**，与真收件箱的同名入口一致：恢复层对它们的处置逐字相同，
+        # 分成两个入口就多一处"新加的那档忘了排除"的地方（理由见真收件箱的 docstring）。
+        return self._prompts_now_in(DeliveryState.ATTEMPTING, DeliveryState.OUTCOME_UNKNOWN)
 
     def due_failed_prompts(self, now: float) -> list[QueuedPrompt]:
         return self._prompts_now_in(DeliveryState.FAILED)
@@ -268,6 +298,157 @@ class TestUncertainIsNeverReplayed(unittest.TestCase):
         recover_pending(inbox, dispatch=RecordingDispatcher(), notify=RecordingNotifier())
 
         self.assertEqual(inbox.settled_changes, [])
+
+
+class TestOutcomeUnknownIsNeverReplayed(unittest.TestCase):
+    """``outcome_unknown``：请求**已经**提交给 agent，而我们**没拿到答复**。
+
+    这一档是用户 2026-10-07 拍板分出来的。它与 ``attempting`` 在恢复层**逐字同等待遇**
+    （只告警、绝不重放），差别只在"谁发现的"：那一行是**崩在里面**，这一行是**当场就
+    知道自己不知道**（超时 / 连接被拒 / 流中断 ⇒ 远端是否收到**没有被记录**）。
+    """
+
+    _OUTCOME_UNKNOWN_ONLY = "telegram:100200:13"
+
+    def _one_unknown_row(self) -> FakeInbox:
+        inbox = FakeInbox()
+        inbox.add(make_prompt(self._OUTCOME_UNKNOWN_ONLY),
+                  DeliveryState.OUTCOME_UNKNOWN)
+        return inbox
+
+    def test_a_row_whose_outcome_is_unknown_is_never_dispatched(self):
+        """⭐ 承重的是 ``dispatched`` 为空：结果未知的一行进重放集合，agent 就会对
+        同一条指令跑两遍（重复改文件、重复 ``git``、重复长构建）。
+        """
+        inbox = self._one_unknown_row()
+        dispatch = RecordingDispatcher()
+
+        outcome = recover_pending(inbox, dispatch=dispatch, notify=RecordingNotifier())
+
+        self.assertEqual(dispatch.dispatched, [],
+                         "结果未知的一行绝不许进重放集合")
+        self.assertEqual(outcome.replayed, [])
+        self.assertEqual([prompt.delivery_id for prompt in outcome.uncertain],
+                         [self._OUTCOME_UNKNOWN_ONLY])
+
+    def test_the_alert_for_an_unknown_row_tells_the_user_to_resend(self):
+        """⛔ 不重放的代价 = 远端**真**没收到时那条指令**丢了** ⇒ 告警必须给出下一步。
+
+        ⚠️ 这一条只摆**一档**状态（盘上没有 ``abandoned``）：``_abandoned_alert_text``
+        本来就带着「请重新发送一次」，混进来会让这条断言变成恒真（§9）。
+        """
+        notify = RecordingNotifier()
+
+        recover_pending(
+            self._one_unknown_row(), dispatch=RecordingDispatcher(), notify=notify
+        )
+
+        self.assertEqual(len(notify.alerts), 1,
+                         "前提：盘上只有一档状态，所以这条告警只可能来自结果未知那一档")
+        self.assertIn("状态未知", notify.alerts[0][1])
+        self.assertIn("请重新发送一次", notify.alerts[0][1],
+                      "只记一条「结果未知」等于把负担转给用户却不告诉他该做什么")
+
+    def test_an_alerted_unknown_row_is_left_untouched_for_the_next_boot(self):
+        """与 ``attempting`` 同一条规矩：告警后不挪走，用户可能还没看见。"""
+        inbox = self._one_unknown_row()
+
+        recover_pending(inbox, dispatch=RecordingDispatcher(), notify=RecordingNotifier())
+
+        self.assertEqual(inbox.settled_changes, [])
+
+
+class TestEveryStateHasExactlyOneTreatment(unittest.TestCase):
+    """⚠️ **覆盖面守门**：每一档状态在恢复层都必须有且只有一个处置。
+
+    为什么必须是"每一档"而不是"新加的那一档"：恢复层挑行靠的是四个**读取入口**，
+    不是一张按名字分派的表 ⇒ 新加一档而忘了让恢复层知道时，**没有任何东西会报警**，
+    而那一行既不重放也不告警 —— 静默丢弃，正是本模块存在的理由所反对的那件事。
+
+    同类先例：``fix-293`` 给 ``Outbound.kind`` 的穷举表配过一条 **AST 覆盖面守门**。
+    这里用**行为**做同一件事（把每一档真的摆到盘上跑一轮恢复），而不用 AST ——
+    因为"处置"本来就是运行时的事，逐档真跑比扫源码更接近被测的那件事。
+    """
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        self.inbox = InboundInbox(self.database_path)
+        self.addCleanup(self.inbox.close)
+
+    def _seed_one_row_per_state(self) -> None:
+        """盘上每档各摆一行（用**真**收件箱 + **真**写入口，摆法见 :data:`_MOVE_INTO_THE_INBOX`）。"""
+        for state in _EVERY_DELIVERY_STATE:
+            prompt = make_prompt("telegram:100200:s" + state)
+            self.inbox.record(prompt)
+            _MOVE_INTO_THE_INBOX[state](self.inbox, prompt.delivery_id)
+
+    def _recover(self):
+        return recover_pending(
+            self.inbox,
+            dispatch=RecordingDispatcher(),
+            notify=RecordingNotifier(),
+        )
+
+    def test_the_seeding_table_covers_every_state(self):
+        """前提守卫：判据自己不许有漏网的那一档（§7.1：空集 ≠ 不存在）。"""
+        self.assertEqual(
+            set(_MOVE_INTO_THE_INBOX), set(_EVERY_DELIVERY_STATE),
+            "生产侧新增了状态而摆法表里没有它 —— 下面两条断言会**静默地**漏掉它，"
+            "而漏掉正是这一整类要防的东西",
+        )
+
+    def test_exactly_pending_and_due_failed_are_replayed(self):
+        """⭐ 承重的正是那些"没被点名"的档：重放集合**恰好**是 ``pending`` 与
+        ``failed``，其余每一档** 0 命中**。
+
+        逐集合比而不比顺序：这些行的 ``created_at`` 会不会相同取决于机器的时钟
+        分辨率，顺序断言会变成一条测机器的断言。
+        """
+        self._seed_one_row_per_state()
+        expire_backoff_deadlines(self.database_path)   # 让 failed 那一档**到期**
+
+        outcome = self._recover()
+
+        self.assertEqual(
+            {prompt.delivery_id for prompt in outcome.replayed},
+            {"telegram:100200:spending", "telegram:100200:sfailed"},
+            "重放集合 = {pending, 到期的 failed}。多出来的任何一档都会让 agent 对"
+            "同一条指令跑两遍 —— 结果未知的那一档尤其贵：它可能**已经**跑过了",
+        )
+
+    def test_exactly_attempting_and_outcome_unknown_are_alerted_without_being_replayed(self):
+        """只告警那一档**恰好**是「结果不可知」的两档，而它们一次都没被重放。"""
+        self._seed_one_row_per_state()
+        expire_backoff_deadlines(self.database_path)
+
+        outcome = self._recover()
+
+        self.assertEqual(
+            {prompt.delivery_id for prompt in outcome.uncertain},
+            {"telegram:100200:sattempting", "telegram:100200:soutcome_unknown"},
+        )
+        self.assertEqual(
+            {prompt.delivery_id for prompt in outcome.replayed}
+            & {prompt.delivery_id for prompt in outcome.uncertain},
+            set(),
+            "两档交集必须为空：既重放又告警 = 同一行被算了两次",
+        )
+
+    def test_the_unknown_outcome_state_is_nowhere_in_the_replay_set(self):
+        """⭐ 台账逐字要求的判据：**重放集合**里「结果未知」必须 **0 命中**。
+
+        这一条直接量那两个"重放用的读取入口"——:mod:`inbox_recovery` 只从它们两个取
+        要重放的行（见 :func:`~opencode_bridge.inbox_recovery.recover_pending` 的第
+        1、2 步），所以它够不着就等于重放不到。
+        """
+        prompt = make_prompt("telegram:100200:14")
+        self.inbox.record(prompt)
+        self.inbox.mark_outcome_unknown(prompt.delivery_id, "URLError: 连接被拒")
+
+        self.assertEqual(self.inbox.pending_prompts(), [])
+        self.assertEqual(self.inbox.due_failed_prompts(1e12), [])
+        self.assertEqual(self.inbox.uncertain_prompts(), [prompt],
+                         "它必须落在**只告警**那一档，否则恢复层连告警都发不出来")
 
 
 class TestFailedRowsRespectTheBackoffDeadline(unittest.TestCase):

@@ -16,7 +16,7 @@
 * ``abandoned`` —— 放弃已记录，而且 :mod:`opencode_bridge.inbox_recovery` 在启动时
   **已经**为此告警过一次。
 
-其余三种状态都是**未了结**，每一行都还欠着用户点什么：
+其余四种状态都是**未了结**，每一行都还欠着用户点什么：
 
 ======================  ====================================================
 状态                    丢掉它意味着什么
@@ -24,13 +24,17 @@
 ``pending``             一笔还没兑现的处理义务（复现：崩溃在写前落盘之后、投递之前）
 ``attempting``          结果不可知的那一条**唯一**证据。它被丢掉，用户连"有 N 条状态
                         未知"这条告警都收不到 —— 消息静默消失，无失败记录、无告警
+``outcome_unknown``     同上，只是这条路是**当场**发现的（传输层失败，见
+                        :attr:`~opencode_bridge.inbox.DeliveryState.OUTCOME_UNKNOWN`）
+                        —— 恢复层对它同样**只告警、绝不重放**，淘汰换不来任何补偿
 ``failed``              退避期限一到就**会**被重放投递；丢掉等于丢掉一条本来能送达的
                         消息
 ======================  ====================================================
 
 ⚠️ ``attempting`` 那一格是本模块存在的理由：它是 :mod:`inbox_recovery` 唯一会
 **告警但绝不重放**的状态，所以淘汰它不会换来任何"补偿"，只会把一次本可以发现的
-不确定变成彻底的静默。
+不确定变成彻底的静默。⚠️ 而 ``outcome_unknown`` 现在**也是**那一类（只告警、绝不重放），
+所以它同样一格都丢不得（见 :attr:`~opencode_bridge.inbox.DeliveryState.OUTCOME_UNKNOWN`）。
 
 超出上限就**超着**，并且必须留下痕迹
 ------------------------------------
@@ -102,6 +106,7 @@ _EVICTION_ORDER: tuple[str, ...] = (
 UNSETTLED_STATES: tuple[str, ...] = (
     DeliveryState.PENDING,
     DeliveryState.ATTEMPTING,
+    DeliveryState.OUTCOME_UNKNOWN,
     DeliveryState.FAILED,
 )
 

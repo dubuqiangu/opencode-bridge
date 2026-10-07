@@ -215,6 +215,12 @@ class RecordingInbox:
         self.rows[delivery_id] = DeliveryState.PENDING
         self.writes.append((delivery_id, "pending"))
 
+    def mark_outcome_unknown(self, delivery_id: str, reason: str) -> None:
+        """传输层失败、拿不到 status ⇒ 结果不可知。**不是**失败，也不烧预算。"""
+        self.rows[delivery_id] = DeliveryState.OUTCOME_UNKNOWN
+        self.failures[delivery_id] = reason
+        self.writes.append((delivery_id, "outcome_unknown"))
+
     def mark_delivered(self, delivery_id: str) -> None:
         self.rows[delivery_id] = DeliveryState.DELIVERED
         self.writes.append((delivery_id, "delivered"))
@@ -229,17 +235,18 @@ class RecordingInbox:
         """把一行 ``failed`` 的退避期限调到已过（``not_before`` 已到）。"""
         self.due_failures.add(delivery_id)
 
-    def _prompts_now_in(self, state: DeliveryState) -> list[QueuedPrompt]:
+    def _prompts_now_in(self, *states: DeliveryState) -> list[QueuedPrompt]:
         return [
             queued for queued in self.recorded
-            if self.rows.get(queued.delivery_id) == state
+            if self.rows.get(queued.delivery_id) in states
         ]
 
     def pending_prompts(self) -> list[QueuedPrompt]:
         return self._prompts_now_in(DeliveryState.PENDING)
 
     def uncertain_prompts(self) -> list[QueuedPrompt]:
-        return self._prompts_now_in(DeliveryState.ATTEMPTING)
+        # ⚠️ 与真收件箱一致：**两档**都算"结果不可知"，恢复层只告警、不重放它们。
+        return self._prompts_now_in(DeliveryState.ATTEMPTING, DeliveryState.OUTCOME_UNKNOWN)
 
     def due_failed_prompts(self, now: float) -> list[QueuedPrompt]:
         return [
@@ -1517,6 +1524,59 @@ class DispatchPromptTests(InboundGatewayTestCase):
         self.assertIn("/new", self.send_text.last.text)
         self.assertEqual(self.states_of(), {"d1": DeliveryState.FAILED})
 
+    def test_a_prompt_failure_without_a_status_is_an_unknown_outcome_not_a_failure(self):
+        """⭐ 这就是本次分出第三态的那条判据：**有 status ⇒ 明确失败；没 status ⇒ 不知道**。
+
+        :meth:`OpenCodeClient._request` 在超时 / 连接被拒 / 流中断时抛的
+        :class:`OpenCodeError` **不带** ``status``（它压根没拿到 HTTP 答复），而那一刻
+        请求**已经**发出去了 ⇒ 远端是否收到**没有被记录**。
+
+        ⛔ 记 ``failed`` 就是把"不知道"说成"一定没送到"，恢复层会按退避阶梯重放它
+        ⇒ **agent 对同一条指令跑两遍**（AGENTS.md §8 第 3 条）。
+        """
+        self.client.prompt_errors.append(OpenCodeError("POST /session/x -> timed out"))
+
+        self.deliver()
+
+        self.assertEqual(
+            self.inbox.writes,
+            [("d1", "attempting"), ("d1", "outcome_unknown")],
+            "第三态写在这一行之后 —— 绝不能是 failed（``recorded`` 不在其中："
+            "``deliver`` 直接入队，绕过了 ``on_inbound`` 的写前落盘）",
+        )
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+        self.assertIn("结果未知", self.send_text.last.text)
+        self.assertIn("请重新发送一次", self.send_text.last.text,
+                      "不重放的代价 = 远端真没收到时那条指令丢了 ⇒ 必须告诉用户怎么办")
+        self.assertNotIn("发送失败", self.send_text.last.text,
+                         "「发送失败」是一句谎话 —— 用户会照它去 /new 重建会话，"
+                         "把一次可能成功的提交变成丢会话")
+        self.assertNotIn("/new", self.send_text.last.text)
+
+    def test_a_failure_that_carries_a_status_is_still_a_definite_failure(self):
+        """反向对照：有 status ⇒ 服务端**明确**给了答复 ⇒ 那一档仍然可重放。
+
+        没有这一条，上面那条可能是"因为什么都记成了未知才绿的"。
+        """
+        self.client.prompt_errors.append(OpenCodeError("server said no", status=503))
+
+        self.deliver()
+
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.FAILED})
+        self.assertNotIn("结果未知", self.send_text.last.text)
+
+    def test_a_non_opencode_error_from_prompt_is_also_an_unknown_outcome(self):
+        """连 status 都没有的异常：同样**不知道**请求发出没有 ⇒ 同一个第三态。
+
+        这一条也是生产侧那句 ``pragma: no cover`` 被删掉的理由 —— 它真的会被走到。
+        """
+        self.client.prompt_errors.append(RuntimeError("socket died"))
+
+        self.deliver()
+
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+        self.assertIn("请重新发送一次", self.send_text.last.text)
+
     def test_success_creates_the_turn_and_sends_one_progress_message(self):
         self.deliver()
 
@@ -1587,6 +1647,34 @@ class RecoverInboxTests(InboundGatewayTestCase):
         self.assertEqual(self.send_text.last.conversation_id, CONVERSATION)
         self.assertIn("状态未知", self.send_text.last.text)
         self.assertEqual(self.states_of(), {"d1": DeliveryState.ATTEMPTING})
+
+    def test_a_live_transport_failure_is_alerted_on_the_next_boot_and_never_replayed(self):
+        """⭐ 端到端：实况投递时传输层失败 ⇒ 落第三态 ⇒ 下次启动**只告警、绝不重放**。
+
+        这是本次修复的**全链路**那一格：单看任一端都成立（投递端落对了状态 / 恢复端
+        不重放），而缺陷恰恰在两者的接缝上 —— 状态记错一档，整条链就重新变成
+        "agent 对同一条指令跑两遍"。
+        """
+        self.inbox.record(queued("d1", "改一下 README"))
+        self.client.prompt_errors.append(OpenCodeError("POST /session/x -> timed out"))
+
+        self.gateway._enqueue(queued("d1", "改一下 README"))
+
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+        # 换一轮：接下来的断言全部属于"下一次启动"，所以先把实况那一轮清干净。
+        self.inbox.writes.clear()
+        self.send_text.outgoing.clear()
+        self.client.prompts.clear()
+
+        self.gateway.recover_inbox()
+
+        self.assertEqual(self.client.prompts, [],
+                         "结果未知的一行绝不许重放 —— 它可能**已经**跑过了")
+        self.assertEqual(self.inbox.writes, [],
+                         "只告警那一档不许被挪走，否则用户可能还没看见的那次告警就没了")
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.OUTCOME_UNKNOWN})
+        self.assertEqual(len(self.send_text.outgoing), 1)
+        self.assertIn("请重新发送一次", self.send_text.last.text)
 
     def test_a_replay_that_fails_is_recorded_by_the_recovery_layer(self):
         self.inbox.record(queued("d1", "重放会失败"))

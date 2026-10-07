@@ -3,13 +3,14 @@
 重点覆盖八类真实风险：
 
 1. **写前落盘** —— 接受一条消息时它**已经**在盘上，不依赖分发成功；
-2. **状态转换** —— 四个写入点各自落到对应状态（断言**盘上的行**，不只看返回值）；
+2. **状态转换** —— 每个写入点各自落到对应状态（断言**盘上的行**，不只看返回值）；
 3. **``INSERT OR IGNORE`` 去重** —— 同一个 ``delivery_id`` 记两次，第二次返回
    ``False`` 且**不新增行**；已送达的回执不会被重投覆盖掉；
 4. **退避是期限不是 sleep** —— ``not_before`` 写进盘上，且**跨重启还在**；
 5. **重试预算耗尽 → ``abandoned``** —— 绝不再排下一次重试；
 6. **回执保留期** —— ``delivered`` 行过期即删，短保留期内必须留着当回执；
-7. **行数上限的淘汰顺序** —— 先 ``delivered`` 再 ``abandoned``，``pending`` 永不淘汰；
+7. **行数上限的淘汰顺序** —— 先 ``delivered`` 再 ``abandoned``，``pending`` /
+   ``attempting`` / ``outcome_unknown`` / ``failed`` 永不淘汰；
 8. **关闭之后仍然安全** —— ``close()`` 可重复调用，之后所有公开方法是空操作。
 
 零真实网络、零真实 sleep。涉及"等了多久"的地方一律断言**盘上的期限**而不是真的
@@ -332,12 +333,47 @@ class TestStateTransitions(InboxTestCase):
 
         self.assertIsNone(read_inbox_rows(database_path)[0]["last_error"])
 
+    def test_outcome_unknown_moves_the_row_out_of_every_replayable_read(self):
+        """「结果不可知」那一档的落点：它必须离开**每一个**可重放的读取入口。
+
+        ⭐ 承重的是 ``pending_prompts()`` / ``due_failed_prompts()`` 两个空列表：
+        恢复层只从它们两个取要重放的行，所以它从那儿消失就等于**重放不到** ——
+        而它**必须**重放不到，因为请求可能**已经**被 agent 处理过了。
+
+        ``attempts`` 不动是同一件事的另一半：这一档没有"下次再试"，
+        白花一级预算只会把 :meth:`~opencode_bridge.inbox.InboundInbox.mark_failed`
+        的算术搅浑。
+        """
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("matrix:!room:9:15", conversation_id="matrix:!room:9",
+                             platform="matrix", message_id="15")
+        inbox.record(prompt)
+        inbox.mark_failed(prompt.delivery_id, "ConnectionResetError: 上一次真失败")
+        spent_before = _only_row(database_path)["attempts"]
+        inbox.mark_attempting(prompt.delivery_id)
+
+        inbox.mark_outcome_unknown(prompt.delivery_id, "URLError: 连接被拒")
+
+        self.assertEqual(inbox.pending_prompts(), [])
+        self.assertEqual(inbox.due_failed_prompts(1e12), [],
+                         "结果不可知的一行绝不许出现在可重放的那一档")
+        self.assertEqual(inbox.uncertain_prompts(), [prompt],
+                         "它必须落在只告警那一档，否则恢复层连告警都发不出来")
+        row = _only_row(database_path)
+        self.assertEqual(row["state"], DeliveryState.OUTCOME_UNKNOWN)
+        self.assertEqual(row["attempts"], spent_before,
+                         "这一档没有下一次，白烧一级预算只会把 mark_failed 的算术搅浑")
+        self.assertEqual(row["not_before"], 0.0, "本档没有退避期限可排")
+        self.assertEqual(row["last_error"], "URLError: 连接被拒",
+                         "那句原因是告警与排查的唯一凭据，必须留下来")
+
     def test_unknown_delivery_id_marks_are_silent_no_ops(self):
         """已被淘汰的行不该让清理路径炸掉。"""
         inbox, _database_path = self.open_inbox()
 
         inbox.mark_attempting("never-existed")
         inbox.mark_pending("never-existed")
+        inbox.mark_outcome_unknown("never-existed", "boom")
         inbox.mark_delivered("never-existed")
         inbox.mark_failed("never-existed", "boom")
         inbox.mark_abandoned("never-existed", "boom")
@@ -602,7 +638,36 @@ class TestUnsettledRowsAreNeverSilentlyEvicted(InboxTestCase):
         self.assertIn("attempting=5", "\n".join(captured.output),
                       "超限必须按状态说清留下了什么，否则读者无从判断是不是漏了消息")
 
-    def test_the_row_cap_keeps_failed_rows_too(self):
+    def test_the_row_cap_keeps_every_outcome_unknown_row_too(self):
+        """``outcome_unknown`` 与 ``attempting`` 同属"只告警不重放" ⇒ 一行都丢不得。
+
+        淘汰它换不来任何补偿（它**不会**被重放），只会让那条「请重新发送一次」的
+        告警**永远发不出去** —— 而用户看着"我明明发了"却什么都不知道，
+        正是收件箱要防的那件事。
+        """
+        database_path = self.database_path()
+        interrupted = InboundInbox(database_path)
+        for index in range(5):
+            prompt = make_prompt(f"telegram:100200:y{index}", message_id=f"y{index}")
+            interrupted.record(prompt)
+            interrupted.mark_outcome_unknown(prompt.delivery_id, "URLError: 连接被拒")
+        interrupted.close()
+
+        capped = InboundInbox(database_path, max_rows=5)
+        self.addCleanup(capped.close)
+        with self.assertLogs("opencode_bridge.inbox", level="WARNING") as captured:
+            capped.record(make_prompt("telegram:100200:new", message_id="new"))
+
+        self.assertEqual(
+            [row["delivery_id"] for row in read_inbox_rows(database_path)
+             if row["state"] == DeliveryState.OUTCOME_UNKNOWN],
+            [f"telegram:100200:y{index}" for index in range(5)],
+            "outcome_unknown 只告警不重放，淘汰它 = 静默丢消息",
+        )
+        self.assertIn("outcome_unknown=5", "\n".join(captured.output),
+                      "超限必须按状态说清留下了什么")
+
+    def test_failed_rows_are_also_kept_because_they_will_really_be_delivered(self):
         """``failed`` 到期就会**真的**被投递，淘汰它等于丢掉一条送得到的消息。"""
         database_path = self.database_path()
         builder = InboundInbox(database_path)
@@ -689,6 +754,7 @@ class TestLifecycleSafety(InboxTestCase):
         self.assertFalse(inbox.record(prompt))
         inbox.mark_attempting(prompt.delivery_id)
         inbox.mark_pending(prompt.delivery_id)
+        inbox.mark_outcome_unknown(prompt.delivery_id, "boom")
         inbox.mark_delivered(prompt.delivery_id)
         inbox.mark_failed(prompt.delivery_id, "boom")
         inbox.mark_abandoned(prompt.delivery_id, "boom")

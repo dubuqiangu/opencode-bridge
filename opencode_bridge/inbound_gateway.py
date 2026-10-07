@@ -73,6 +73,23 @@ HELD_NOT_DELIVERED_NOTICE = (
     "你敲的内容原样附在下面，需要的话请重发一次：\n%s"
 )
 
+#: 请求**已经**提交给 agent、而我们**没拿到答复**时告诉用户的话。
+#:
+#: ⚠️ 它**必须**带「请重新发送一次」，而这不是客套：不重放是用户拍板的（理由见
+#: :mod:`opencode_bridge.inbox_recovery` 模块开头），代价是远端**真**没收到时那条指令
+#: **丢了**。⛔ 只说"未知"而不告诉他该做什么，等于把负担转给用户却不给方法 ——
+#: 而收件箱存在的理由正是"别丢这条"。
+#:
+#: ⛔ 这里**不许**说「发送失败」：那是一句**谎话**（我们并不知道失败），而用户会照它
+#: 去 ``/new`` 重建会话 —— 把一次可能成功的提交变成一次丢会话。
+#: 判据：:mod:`tests.test_inbound_gateway` 有一条断言这句话在（删掉它，那条会红）。
+UNKNOWN_OUTCOME_NOTICE = (
+    "这一条的结果未知：请求已经提交给 agent，但没能确认它是否已经处理"
+    "（提交时连接中断或超时）。"
+    "为避免重复执行副作用（重复改文件、重复 git 操作、重复长时间构建），已不自动重发。"
+    "请检查该会话是否已经处理过；如果没有，请重新发送一次。"
+)
+
 #: Values accepted in ``perm:<sessionID>:<reqID>:<decision>`` callbacks.
 _PERM_DECISIONS = ("once", "always", "reject")
 
@@ -730,11 +747,18 @@ class InboundGateway:
     ) -> str:
         """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error``.
 
-        The four inbox writes live here and nowhere else, because only this
-        method can tell *which* of the three outcomes happened — and the
-        ``attempting`` write has to sit immediately against ``client.prompt()``:
+        Every inbox write on this path lives here and nowhere else, because only
+        this method can tell *which* of the outcomes happened — ``delivered`` /
+        ``failed`` / ``attempting`` / ``outcome_unknown`` / ``pending``(409) — and
+        the ``attempting`` write has to sit immediately against ``client.prompt()``:
         written earlier, a crash during ``create_session`` would leave a row
         that looks "outcome unknown" when in fact the agent never ran.
+
+        ⚠️ ``outcome_unknown`` 与 ``attempting`` 的分工：那一档是**崩在里面**，
+        这一档是**当场就知道自己不知道**（传输层失败、拿不到 status）。两者的
+        用户可见后果完全相同 —— 都只告警、绝不重放 —— 区别只在盘上有没有**留下**
+        那个"不知道"（见 :attr:`~opencode_bridge.inbox.DeliveryState.OUTCOME_UNKNOWN`
+        与 :mod:`opencode_bridge.inbox_recovery` 的分档表）。
 
         ``recording_delivery=False`` skips the writes for the startup recovery
         path, where :func:`~.inbox_recovery.recover_pending` is the sole bookkeeper.
@@ -783,6 +807,31 @@ class InboundGateway:
                 if inbox is not None:
                     inbox.mark_pending(queued.delivery_id)
                 return "busy"
+            if exc.status is None:
+                # ⚠️⚠️ **这一支就是本次分出第三态的地方**。请求**已经**交给 opencode，
+                # 而失败发生在**传输层**（超时 / 连接被拒 / 流中断，见
+                # ``OpenCodeClient._request``）⇒ 远端**是否收到从未被记录**。
+                # ⇒ ⛔ 绝不能记 ``failed``：那是把"不知道"说成"一定没送到"，而
+                # :mod:`inbox_recovery` 会按退避阶梯重放 ``failed`` ⇒ **agent 对同一条
+                # 指令跑两遍**（AGENTS.md §8 第 3 条：恢复一份没记录过的信息 = 猜）。
+                # ⇒ 落 ``outcome_unknown``：恢复层对它**只告警、绝不重放**。
+                logger.warning(
+                    "prompt outcome is UNKNOWN for %s (no HTTP status from the"
+                    " transport layer); not marking it failed, because the remote"
+                    " side may already have run it: %s",
+                    queued.delivery_id, exc,
+                )
+                self._send_text(
+                    conversation_id,
+                    f"{UNKNOWN_OUTCOME_NOTICE}（{exc}）",
+                    kind="error",
+                    adapter=adapter,
+                )
+                if inbox is not None:
+                    inbox.mark_outcome_unknown(
+                        queued.delivery_id, f"prompt outcome unknown: {exc}"
+                    )
+                return "error"
             logger.warning("prompt failed: %s", exc)
             self._send_text(
                 conversation_id,
@@ -793,16 +842,26 @@ class InboundGateway:
             if inbox is not None:
                 inbox.mark_failed(queued.delivery_id, f"prompt failed: {exc}")
             return "error"
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("prompt failed")
+        except Exception as exc:
+            # ⚠️ 非 ``OpenCodeError``（连 status 都没有）⇒ 我们**同样**不知道请求发出
+            # 没有。记 ``failed`` 仍然是猜 —— 而且是猜错方向最贵的那种：重放会让 agent
+            # 对同一条指令跑两遍。⇒ 与上面那一支落同一个第三态。
+            # ⛔ 而这一支**曾经**带 ``pragma: no cover``；现在
+            # ``tests/test_inbound_gateway`` 有一条用例真的走它（见
+            # ``DispatchPromptTests``），那个 pragma 已经不成立，所以一并去掉 ——
+            # 留着它等于对覆盖率工具说谎。
+            logger.exception("prompt failed with a non-OpenCodeError; treating the"
+                             " outcome as unknown rather than as a failure")
             self._send_text(
                 conversation_id,
-                f"发送失败: {exc}",
+                f"{UNKNOWN_OUTCOME_NOTICE}（{exc}）",
                 kind="error",
                 adapter=adapter,
             )
             if inbox is not None:
-                inbox.mark_failed(queued.delivery_id, f"prompt failed: {exc}")
+                inbox.mark_outcome_unknown(
+                    queued.delivery_id, f"prompt outcome unknown: {exc}"
+                )
             return "error"
 
         if inbox is not None:

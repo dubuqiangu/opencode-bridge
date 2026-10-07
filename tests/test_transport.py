@@ -39,7 +39,11 @@ from opencode_bridge.transport import (  # noqa: E402  (先装 NullHandler 再 i
     Transport,
     WebSocketTransport,
 )
-from opencode_bridge.transport.base import MIN_BACKOFF_SECONDS  # noqa: E402
+from opencode_bridge.transport.base import (  # noqa: E402
+    MIN_BACKOFF_SECONDS,
+    RECONNECT_NOW_MIN_INTERVAL_SECONDS,
+    ReconnectNowThrottle,
+)
 from opencode_bridge.transport.base import _NothingSentinel  # noqa: E402
 
 _NAME_SEQ = itertools.count()
@@ -437,15 +441,20 @@ class TestWebSocketTransport(TransportTestCase):
     def test_reconnect_now_skips_backoff(self):
         """on_message 抛 ReconnectNow → 立刻重连（min_backoff=5s 也无所谓）。
 
-        ⛔ **判据是「5 次连接在 3s 内发生」这一个事实，由 ``wait_until`` 的
-        ``timeout`` 承担**；⛔ 这里原来还有一条 ``assertLess(monotonic()-started, 3.0)``，
-        已删除 —— 它与紧邻的 ``wait_until(timeout=3.0)`` **同值同源**，
-        所以能红的唯一路径是「``wait_until`` 恰好在边界那一圈返回 True」（竞态），
-        ⛔ **不是**「ReconnectNow 没生效」这个被测行为。
-        实测（12 次）：``elapsed`` 恒为 0.000s，而把**被测行为**改坏
-        （``on_message`` 不抛 ReconnectNow ⇒ 每轮等满 ``min_backoff=5.0s``）时
-        ``wait_until`` 自己就超时返回 False ⇒ **辨别力全部来自 wait_until**。
-        ⇒ 删掉的是**重复表达**，不是判据（AGENTS.md §9：恒真的断言比没有断言更危险）。
+        ⚠️ **本用例的判据形状被用户 2026-10-07 的拍板改过（2026-10-07 lane 记录）**：
+        原文是「**5 次**连接在 3s 内发生」，而那条断言的正是**缺陷本身** ——
+        「零等待重连没有上界」。拍板给 :data:`RECONNECT_NOW_MIN_INTERVAL_SECONDS`
+        加了 5 秒上界（Discord 官方每 5 秒一次的 Identify 额度）⇒ 3s 内**不可能**
+        再有第 5 次连接 ⇒ 原文那条断言与拍板**直接冲突**，实测变红。
+        ⇒ 保留的是它的**意图**（「ReconnectNow 跳过 5.0s 的指数退避」），
+        判据改成「**第 2 次**连接在 3s 内发生」——
+        ⭐ 辨别力不变：若 ReconnectNow 失效、退避照走，``wait = 5.0`` ⇒
+        3s 内**只有 1 次**连接 ⇒ 一样会红。
+        「上界」那一半由 :class:`TestReconnectNowThrottle` 单独承重。
+
+        ⛔ 判据是「2 次连接在 3s 内发生」这一个**离散计数事实**，由 ``wait_until``
+        的 ``timeout`` 承担；⛔ 不拿墙钟断言「间隔 ≥ 5 s」—— 上界断言在机器负载下
+        没有豁免（§7.1），而「≥ 5 s」由注入时钟的数列断言负责。
         """
         made: list[FakeWs] = []
 
@@ -463,11 +472,11 @@ class TestWebSocketTransport(TransportTestCase):
         )
         self.start_transport(ws_transport)
         self.assertTrue(
-            wait_until(lambda: len(made) >= 5, timeout=3.0),
-            f"ReconnectNow 必须跳过 5.0s 的退避（5 次连接 3s 内就该发生）。"
+            wait_until(lambda: len(made) >= 2, timeout=3.0),
+            f"ReconnectNow 必须跳过 5.0s 的退避（第 2 次连接 3s 内就该发生）。"
             f"实际只连上 {len(made)} 次：{ws_transport.stats()}",
         )
-        self.assertGreaterEqual(ws_transport.stats()["sessions"], 4)
+        self.assertGreaterEqual(ws_transport.stats()["sessions"], 1)
 
     def test_close_code_from_peer_is_reported(self):
         ws = FakeWs([None], close_code=4002, close_reason="ratelimited")
@@ -799,6 +808,222 @@ class TestTcpLineTransport(TransportTestCase):
         self.assertTrue(wait_until(lambda: b"NICK bot\r\n" in bytes(server.received)))
         tcp_transport.stop()
         self.assertEqual(tcp_transport.connection, None)
+
+
+# ----------------------------------------------------------------------
+# ``ReconnectNow`` 的最小间隔闸门（对齐官方每 5 秒一次的 Identify 额度）
+# ----------------------------------------------------------------------
+class TestReconnectNowThrottle(unittest.TestCase):
+    """零等待重连**不再无上界**。
+
+    ⛔ 判据全部走**注入时钟**（:meth:`ReconnectNowThrottle.take` 的 ``now`` 实参），
+    ⛔ **不** ``sleep``、⛔ 不拿真实墙钟断言「≥ 5 s」：上界断言在机器负载下没有
+    豁免（§7.1 本机实测：``monotonic`` 只有 16 ms 分辨率）。
+    """
+
+    def test_the_cap_is_pinned_to_the_official_five_seconds(self):
+        """⭐ 钉住**那个数本身**，⛔ 不是「它等于 ``RECONNECT_NOW_MIN_INTERVAL_SECONDS``」。
+
+        ⚠️ 这条是上一轮同一个恒真陷阱：把 5.0 改成 ``5.0 + 1e-9`` 时，
+        **其余每一条用例照样全绿** —— 它们全都拿导入的常量当期望值
+        ⇒ 判据必须是**字面量**。做法照本仓库先例
+        （``assertEqual(FIRST_RECONNECT_DELAY_SECONDS, 0.5)`` /
+        ``assertEqual(MIN_BACKOFF_SECONDS, 0.01)``）。
+
+        5 秒的出处：Discord 官方 ``topics/gateway#Rate Limiting`` ——
+        「Apps also have a limit for concurrent Identify requests allowed per
+        5 seconds. If you hit this limit, the Gateway will respond with an
+        Invalid Session (opcode 9).」
+        """
+        self.assertEqual(RECONNECT_NOW_MIN_INTERVAL_SECONDS, 5.0)
+
+    def test_the_first_server_instructed_reconnect_is_still_immediate(self):
+        """⭐ 第一次**不受限** ⇒ 「服务端指令 → 立刻重连」这条有意的语义被保住。
+
+        对照 discord.js：它的 ``SimpleIdentifyThrottler`` 在构造时把
+        ``lastIdentify`` 初始化成 ``Date.now()`` ⇒ 连**第一次** identify 都要等；
+        ⛔ **不照抄那一点**，因为我们的「第一次」是一次**重连**（而不是首次连接），
+        而 Slack 的 WSS URL 过期 / Discord 的 op 7 都要求**立刻**换连接。
+        """
+        self.assertEqual(ReconnectNowThrottle(5.0).take(0.0), 0.0)
+
+    def test_a_second_one_right_after_is_capped_at_the_full_interval(self):
+        """⭐ 核心：间隔**不小于**那个上界 —— 断言**数列的第一项**，⛔ 不是「它是不是正数」。
+
+        ⚠️ 恒真风险（派单点名的那条）：若判据只检查「第二次重连发生在第一次之后」，
+        那**没有上界时它也成立** ⇒ 必须断言**具体那个数**。
+        """
+        throttle = ReconnectNowThrottle(RECONNECT_NOW_MIN_INTERVAL_SECONDS)
+
+        self.assertEqual(throttle.take(0.0), 0.0)            # 第一次：立刻
+        self.assertEqual(throttle.take(0.001), 4.999)        # 第二次：补足到 5.0
+
+    def test_it_slides_instead_of_always_sleeping_the_full_interval(self):
+        """⭐ 对齐 discord.js 的**滑动窗口**，⛔ 不是「每次 sleep(5)」。
+
+        「每次都等满 5 秒」会把延迟强加到**那些本来不冲突的重连**上（服务端主动
+        换连接常见于 URL 过期这类正常时刻）⇒ 那不是对齐官方，是自造惩罚。
+        """
+        throttle = ReconnectNowThrottle(RECONNECT_NOW_MIN_INTERVAL_SECONDS)
+        throttle.take(0.0)
+
+        # 距上一次零等待重连已过去 2 秒 ⇒ 只补剩下的 3 秒
+        self.assertAlmostEqual(throttle.take(2.0), 3.0, places=6)
+
+    def test_no_delay_once_the_window_has_elapsed(self):
+        """窗口已过 ⇒ 零延迟（否则「加上界」会退化成「每次都等」）。
+
+        ⚠️ 时刻是**上一次重连真正发生的时刻**（＝上次那个 ``now + wait``），
+        ⛔ 不是上一次 ``take()`` 的调用时刻 —— 否则稳态会退化成「5 秒放两次」。
+        """
+        throttle = ReconnectNowThrottle(RECONNECT_NOW_MIN_INTERVAL_SECONDS)
+        self.assertEqual(throttle.take(0.0), 0.0)     # 第一次落在 0.0
+        self.assertEqual(throttle.take(5.0), 0.0)     # 距上一次恰好 5.0 秒 ⇒ 不必等
+        self.assertEqual(throttle.take(10.0), 0.0)    # 同理
+
+    def test_a_partial_window_waits_only_the_remainder(self):
+        """⭐ 半个窗口 ⇒ **只补剩下的那一半**，⛔ 不是每次都等满 5 秒。
+
+        「每次都 sleep(5)」会把延迟强加到那些本来不冲突的重连上（服务端主动换连接
+        常见于 URL 过期这类正常时刻）⇒ 那不是对齐官方，是自造惩罚。
+        """
+        throttle = ReconnectNowThrottle(RECONNECT_NOW_MIN_INTERVAL_SECONDS)
+        throttle.take(0.0)
+
+        # 距上一次零等待重连已过去 2 秒 ⇒ 只补剩下的 3 秒
+        self.assertAlmostEqual(throttle.take(2.0), 3.0, places=6)
+        # 上一次落在 5.0；7.5 时距它 2.5 秒 ⇒ 补 2.5
+        self.assertAlmostEqual(throttle.take(7.5), 2.5, places=6)
+
+    def test_a_steady_hundred_identifies_stay_inside_the_official_budget(self):
+        """⭐ 用**整条数列**回答「这个闸门真的把速率压住了吗」。
+
+        模拟一个真实调用方：``take(now)`` → 等 ``wait`` → 花 1 ms 重连 → 再 ``take``。
+        ⛔ 全部用注入时刻（本机 ``monotonic`` 只有 16 ms 分辨率，且上界断言在机器
+        负载下没有豁免）。⇒ **每两个相邻 Identify 必须都 ≥ 那个上界**。
+
+        ⚠️ 这条抓出过第一版的真实缺陷：基线记「``take()`` 的调用时刻」而不是
+        「重连真正发生的时刻」⇒ 稳态数列是 [5.0, 0.001, 5.0, 0.001, …]
+        ⇒ **每 5 秒窗口里有 2 次 Identify**，仍然超额度。
+        """
+        throttle = ReconnectNowThrottle(RECONNECT_NOW_MIN_INTERVAL_SECONDS)
+        #: ⛔ 这是**浮点表示误差**（累加 100 次 5.0 与 0.001），不是判据放宽。
+        float_epsilon = 1e-9
+        now = 0.0
+        identify_times = []
+        for _ in range(100):
+            now = now + throttle.take(now) + 0.001   # 0.001 = 重连本身要花的
+            identify_times.append(now)
+
+        gaps = [b - a for a, b in zip(identify_times, identify_times[1:])]
+        for index, gap in enumerate(gaps):
+            self.assertGreaterEqual(
+                gap, throttle.min_interval - float_epsilon,
+                "第 %d 与第 %d 次 Identify 只隔了 %.6f 秒 —— 超了官方额度。"
+                % (index + 1, index + 2, gap))
+        # 首次那条不受限，所以总跨度正好是 99 个上界
+        self.assertAlmostEqual(identify_times[-1] - identify_times[0],
+                               99 * throttle.min_interval, places=6)
+
+    def test_a_normal_backoff_reconnect_does_not_consume_the_budget(self):
+        """⭐ 设计问题 1 的判据：计时起点是「上一次**零等待重连**」。
+
+        ⛔ 若基线取「上一次**任何**重连」，那么「一次正常的退避重连之后紧跟一次
+        服务端指令」也会被拖慢 ⇒ 「服务端指令 → 立刻重连」这条语义被抹掉。
+        ⇒ 本条钉住：退避重连**不写**闸门状态，闸门仍是「第一次」。
+        """
+        transport = _ScriptedBase(name=uniq_name("mix"))
+        # 走一次**正常退避**路径（survived=True ⇒ 取下限），不碰闸门
+        transport._next_backoff(survived=True)
+        transport._next_backoff(survived=False)
+
+        self.assertIsNone(
+            transport._reconnect_now_throttle._last_at,
+            "正常退避重连不得写闸门状态 —— 否则它会消耗零等待重连的额度。")
+        # ⇒ 于是随后的第一次零等待重连仍然是零延迟
+        self.assertEqual(transport._reconnect_now_throttle.take(123.0), 0.0)
+
+
+class _AlwaysReconnectNowConn:
+    """一连上就要求立刻重连 —— 与服务端下发 disconnect / op 7 / op 9 同形。"""
+
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    def recv(self):
+        raise ReconnectNow("server asked to reconnect")
+
+    def close(self, code=None) -> None:
+        pass
+
+
+class TestReconnectNowThrottleIsWired(unittest.TestCase):
+    """⭐ **接线**判据：``_run`` 的 ``immediate`` 分支真的走了闸门。
+
+    ⚠️ 为什么必须单独一条：上面那些数列断言全都直接调
+    :meth:`ReconnectNowThrottle.take` ⇒ ⛔ 它们**不覆盖**「基类到底有没有把
+    ``immediate`` 接到闸门上」。把 ``_run`` 改回 ``wait = 0.0 if immediate`` 时，
+    上面 7 条**照样全绿**（反向证明 M1 就是这么发现的）。
+
+    ⚠️ 判据取**离散计数**（``stats()["reconnect_now_throttled"]``），
+    ⛔ 不拿墙钟断言「≥ 5 s」（上界断言在负载下没有豁免）；同步点是**离散顺序**
+    —— 连接工厂每次被调都记一条，第 3 次连接置位一个 Event。
+    """
+
+    #: 第三次连接发生的上界守卫（闸门生效 ⇒ 必然 ≥ 5 s；给足余量）。
+    THIRD_CONNECT_GUARD = RECONNECT_NOW_MIN_INTERVAL_SECONDS * 3
+
+    def test_the_loop_actually_gates_the_second_server_instructed_reconnect(self):
+        connects: list[float] = []
+        third_connect = threading.Event()
+
+        def connect():
+            connects.append(time.monotonic())
+            if len(connects) >= 3:
+                third_connect.set()
+            return _AlwaysReconnectNowConn(len(connects))
+
+        transport = WebSocketTransport(
+            connect, min_backoff=0.01, name=uniq_name("rnwiring"),
+        )
+        self.addCleanup(transport.stop)
+        transport.start(lambda frame: None)
+
+        # 第 1 次零等待重连**不受限** ⇒ 第 2 次连接立刻发生（同步点）
+        self.assertTrue(
+            wait_until(lambda: len(connects) >= 2, timeout=3.0),
+            "第一次零等待重连必须不受限 —— 否则「服务端指令 → 立刻重连」被抹掉了。")
+        # 第 2 次零等待重连**必须被闸门限速** ⇒ 计数 +1（离散量）
+        self.assertEqual(
+            wait_until(lambda: transport.stats()["reconnect_now_throttled"] >= 1,
+                       timeout=3.0), True,
+            "第二次零等待重连没有被闸门限速 —— 接线没接上。")
+        # 死锁守卫：闸门生效时第 3 次连接必然要等满那个上界
+        self.assertTrue(
+            third_connect.wait(self.THIRD_CONNECT_GUARD),
+            "闸门生效时第 3 次连接应当仍然发生（只是被推迟了）。")
+        self.assertGreaterEqual(
+            transport.stats()["reconnect_now_throttled"], 1,
+            "计数必须是离散量而不是墙钟测量 —— 上界断言在负载下没有豁免。")
+
+    def test_a_plain_failure_loop_never_touches_the_gate(self):
+        """⭐ 反面对照：闸门**只**管零等待重连，普通失败的退避路径一次都不许碰它。
+
+        ⛔ 若闸门被误接到所有重连上，本条会红 —— 而那会改掉既有的退避数列
+        （``test_invariant2_backoff_doubles_and_caps`` 逐项钉着它）。
+        """
+        transport = _ScriptedBase(
+            open_script=[OSError("boom")] * 4, min_backoff=0.01, max_backoff=0.02,
+            name=uniq_name("plain"),
+        )
+        self.addCleanup(transport.stop)
+        transport.start(lambda item: None)
+
+        self.assertTrue(wait_until(lambda: transport.stats()["sessions"] >= 3, timeout=5.0),
+                        "普通失败循环没跑起来。")
+        self.assertEqual(transport.stats()["reconnect_now_throttled"], 0,
+                         "普通退避重连不该被零等待闸门计数。")
+        self.assertIsNone(transport._reconnect_now_throttle._last_at)
 
 
 # ----------------------------------------------------------------------

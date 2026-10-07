@@ -65,7 +65,8 @@ import threading
 import time
 from typing import Any, Callable
 
-__all__ = ["Transport", "ReconnectNow", "NOTHING", "MIN_BACKOFF_SECONDS"]
+__all__ = ["Transport", "ReconnectNow", "ReconnectNowThrottle", "NOTHING",
+           "MIN_BACKOFF_SECONDS", "RECONNECT_NOW_MIN_INTERVAL_SECONDS"]
 
 logger = logging.getLogger("opencode_bridge.transport.base")
 
@@ -97,6 +98,32 @@ logger = logging.getLogger("opencode_bridge.transport.base")
 MIN_BACKOFF_SECONDS = 0.01
 
 
+#: ``ReconnectNow``（服务端指令 → 零等待重连）两次之间的**最小间隔**（秒）。
+#:
+#: ⭐ **这个 5 秒不是我们拍的，它有出处** —— Discord 官方文档
+#: ``topics/gateway#Rate Limiting`` 与 ``#identifying``：
+#:
+#:     Clients are limited to 1000 IDENTIFY calls … in a 24-hour period.
+#:     Apps also have a limit for concurrent Identify requests allowed per 5 seconds.
+#:     If you hit this limit, the Gateway will respond with an Invalid Session (opcode 9).
+#:
+#: ⇒ **每一次重连都要重新 Identify**，而「零等待重连 → 超额度 → 服务端回 op 9
+#: → 再零等待重连」是**自维持回路**（速率由 RTT 决定）。官方同时写明 24 小时内
+#: 1000 次 IDENTIFY 的上限，撞穿后文档写的是「the bot token will be reset」
+#: ⇒ 代价不是烧 CPU，是**凭据失效**、要人工换 token。
+#:
+#: ⚠️ **三家都没有在文档里承诺「刚重连不会再立刻下发」** ⇒ 这个上界是唯一的护栏。
+#: ⛔ **不做成可配旋钮**：证据只支持这一个具体值，做成可选等于把一个有官方数字的
+#: 决策变成要长期维护的契约。
+#:
+#: ⚠️ **对齐 discord.js 的实现方式，不是「每次 sleep(5)」**：discord.js 的
+#: ``SimpleIdentifyThrottler`` 是**每 5 秒一个额度**的滑动窗口
+#: （``packages/ws/src/throttling/SimpleIdentifyThrottler.ts``），所以本实现
+#: 同样只在「距上一次**零等待重连**不足 5 秒」时才补足差额
+#: ⇒ 不冲突的那些重连**不受影响**。见 :class:`ReconnectNowThrottle`。
+RECONNECT_NOW_MIN_INTERVAL_SECONDS = 5.0
+
+
 # ----------------------------------------------------------------------
 # 契约里的两个特殊值
 # ----------------------------------------------------------------------
@@ -109,7 +136,49 @@ class ReconnectNow(Exception):
     ``_next`` / ``_on_open`` 里抛本异常，基类立即进入下一次 ``_open()``。
 
     在 ``_on_close`` 里抛也会被识别；其他位置的异常一律按"连接出错"退避。
+
+    ⚠️ **「立刻」有一个上界**：连续两次零等待重连之间至少隔
+    :data:`RECONNECT_NOW_MIN_INTERVAL_SECONDS`（Discord 官方每 5 秒一次的
+    Identify 额度，见该常量的出处）⇒ **第一次仍然立刻**，只有「上一次零等待
+    重连才刚过去不久」的那次会被补足差额。见 :class:`ReconnectNowThrottle`。
     """
+
+
+class ReconnectNowThrottle:
+    """零等待重连的**最小间隔闸门**（**纯状态机**：不睡眠、不碰线程、不读时钟）。
+
+    ⭐ 做成纯状态机是照 :class:`~opencode_bridge.subscription_supervisor.ReconnectBackoff`
+    的既有做法：**时刻由调用点传进来**，于是整条数列可以**逐项精确断言**，
+    而不必拿 ``sleep`` 去观测（本机 ``time.monotonic()`` 只有 16 ms 分辨率，
+    且上界断言在机器负载下没有豁免）。
+
+    判据是「**距上一次零等待重连**过了多久」，⛔ **不是**「距上一次任何重连」——
+    后者会把「一次正常的退避重连之后紧跟一次服务端指令」也拖慢 5 秒，
+    那正是「服务端指令 → 立刻重连」这条**被文档化的有意语义**（见
+    :class:`ReconnectNow`）。
+    """
+
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = max(0.0, float(min_interval))
+        #: 上一次零等待重连**真正发生**的时刻（即「上次那个 ``now + wait``」）；
+        #: ``None`` = 还没有过（⇒ **第一次不受限**）。
+        self._last_at: float | None = None
+
+    def take(self, now: float) -> float:
+        """返回「这次要等几秒」，并推进状态。``now`` 由**调用点**给（本类不读时钟）。"""
+        previous = self._last_at
+        if previous is None:
+            wait = 0.0          # 第一次零等待重连不受限（保住那条有意的语义）
+        else:
+            remaining = self.min_interval + previous - now
+            wait = remaining if remaining > 0.0 else 0.0
+        # ⚠️⚠️ 记的是「这次重连**真正发生**的时刻」``now + wait``，⛔ **不是** ``now``。
+        # 记 ``now`` 的话，被限速的那次会把**下一次**的窗口起点提前了整整一个 wait
+        # ⇒ 稳态数列退化成「5.0 秒放两次」（实测相邻间隔 [5.0, 0.001, 5.0, 0.001…]）
+        # ⇒ 那样每 5 秒窗口里有 **2 次 Identify**，仍然超 Discord 的官方额度。
+        # 这条不是推演：它是被「100 次 Identify 必须在额度内」那条数列断言抓出来的。
+        self._last_at = now + wait
+        return wait
 
 
 class _NothingSentinel:
@@ -228,6 +297,11 @@ class Transport(abc.ABC):
         self._on_event: Callable[[Any], None] | None = None
         #: 下一次要等的退避秒数（只被消费线程读写）。
         self._backoff = self.min_backoff
+        #: 「立刻重连」的最小间隔闸门（见 :class:`ReconnectNowThrottle` 与
+        #: :data:`RECONNECT_NOW_MIN_INTERVAL_SECONDS`）。⛔ 不是可配旋钮 ——
+        #: 那 5 秒有官方出处，不做成「用户可以改掉的数」。
+        self._reconnect_now_throttle = ReconnectNowThrottle(
+            RECONNECT_NOW_MIN_INTERVAL_SECONDS)
         #: 可观测计数（给测试与 /status 用；不是业务指标）。
         self._stats: dict[str, int] = {
             "connects": 0,     # _open 成功的次数
@@ -236,6 +310,10 @@ class Transport(abc.ABC):
             "errors": 0,       # 被吞掉的异常次数
             "idle": 0,         # 收到 NOTHING 的次数
             "ticks": 0,        # 周期钩子实际被调用的次数
+            # 零等待重连**真的被闸门限速**的次数（第一次与不冲突的那些都不计）。
+            # ⚠️ 它是**离散计数** ⇒ 判据可以只靠它，不必拿墙钟断言「≥ 5 s」
+            #    （上界断言在机器负载下没有豁免，§7.1）。
+            "reconnect_now_throttled": 0,
         }
 
     # --- 属性 ----------------------------------------------------------
@@ -425,9 +503,16 @@ class Transport(abc.ABC):
                     break
                 self._stats["sessions"] += 1
                 lived = time.monotonic() - opened_at if opened_at is not None else 0.0
-                wait = 0.0 if immediate else self._next_backoff(
-                    survived=lived >= self.reset_after
-                )
+                if immediate:
+                    # ⚠️ 「立刻」有一个上界（Discord 官方每 5 秒一次的 Identify
+                    # 额度，见 :data:`RECONNECT_NOW_MIN_INTERVAL_SECONDS`）：
+                    # ⛔ 不是每次都 sleep(5)，而是「距上一次**零等待重连**不足
+                    # 5 秒才补足差额」⇒ 不冲突的那些重连一点延迟都不加。
+                    wait = self._reconnect_now_throttle.take(time.monotonic())
+                    if wait > 0:
+                        self._stats["reconnect_now_throttled"] += 1
+                else:
+                    wait = self._next_backoff(survived=lived >= self.reset_after)
                 if wait > 0 and self._stop_event.wait(wait):
                     break              # 退避期间被 stop 打断
         finally:

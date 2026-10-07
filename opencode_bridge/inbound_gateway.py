@@ -100,6 +100,15 @@ def _positive_float(value: Any, default: float) -> float:
     **有界**的保护窗口；那里 ``0`` =「不节流」。⚠️ 而这里那个「有界」一旦被关掉，
     暴露窗口就变成**无界**（见 `tasks.md` 未完成项总表那一行的代价说明）
     ⇒ **正因为语义不同，混用判据会同时坏掉两边**。
+
+    ⚠️ **这条函数本身不打任何告警**，而「配 ``0`` 要有一条点名该键的 WARNING」
+    落在唯一那个调用点（:meth:`InboundGateway.__init__` 构造合并器的地方）——
+    因为**键名只有那里知道**：把这个键名写死进本函数，第二个调用点一出现，
+    那条告警就会**点名一个与实际无关的键**（谎报，正是本仓库反复记的那类错）。
+    ⇒ 新增调用点时，**它自己也得发一条点名自己那个键的**。
+    ⛔ 也不要为了"让告警离取值近一点"就把取值逻辑搬进来：判据是「算出来的值
+    是 0」，而**合并过默认值的配置字典里这个键永远在场**（见
+    :meth:`~opencode_bridge.config.Config._merge_bridge`）⇒「键在不在」是恒真的。
     """
     try:
         number = float(value)
@@ -319,11 +328,35 @@ class InboundGateway:
         )
         #: C3 的续行缓冲。**本类自己建**（只有入站这一侧读它），所以不注入。
         #: 保险丝到点的回调是本类的方法 —— 缓冲因此不需要知道任何出站的东西。
-        self._merger = ConversationMerger(
-            hold_timeout_seconds=_positive_float(
-                bridge_config.get("merge_continue_timeout_seconds"),
+        merge_continue_timeout_seconds = _positive_float(
+            bridge_config.get("merge_continue_timeout_seconds"),
+            DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
+        )
+        # ⚠️ ``0`` 是那种「**会被接受、但语义反直觉**」的配置值（AGENTS.md §4.1：
+        # 键被 ``start()`` 接受却不按字面直觉生效 ⇒ 必须有一条点名该键的 WARNING）
+        # ⇒ 这里点名它，理由与代价**同一条**说出去：只写好处会被读反。
+        #
+        # ⛔ 判据是「**算出来的值是 0**」，不是「键在不在」——
+        # :meth:`~opencode_bridge.config.Config._merge_bridge` 总把默认值补进去，
+        # 所以生产上这个键**永远在场**（没配时它的值是 15.0）。
+        # ⇒ 逐字对应关系：显式配 ``0`` ⇒ 合并后是 ``0.0`` ⇒ 落进这条分支；
+        # 没配 ⇒ ``15.0`` ⇒ 不落；配错（非数字 / 负数 / NaN）⇒ **被
+        # ``_merge_bridge`` 当场丢掉并回落成** ``15.0`` ⇒ 同样不落。
+        # ⚠️ 这条判据的前提是 :data:`DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS` **不为 0**
+        # —— 它若哪天变成 0，每次启动都会多出这条噪音告警。
+        if merge_continue_timeout_seconds == 0.0:
+            logger.warning(
+                "bridge.merge_continue_timeout_seconds=0 —— 立即返回、原样使用、"
+                "不改写（没有被改写成 %r）⇒ 续行缓冲不再装计时器，于是那条消息"
+                "一直等到下一条非 ``..`` 行为止。⛔ 但**配 0 并不比默认更安全**："
+                "缓冲是**纯内存**，而 ConversationMerger 的 flush / stop / "
+                "held_conversation_ids **生产零调用点** ⇒ 关停不排空、重启恢复不到 "
+                "⇒ G2 那个丢消息窗口由「≤ 15 秒、**有界**」变成「**无界**」"
+                "⇒ 文档措辞正确（关掉保险丝就是关掉保险丝）**不等于 0 更安全**。",
                 DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
-            ),
+            )
+        self._merger = ConversationMerger(
+            hold_timeout_seconds=merge_continue_timeout_seconds,
             on_hold_expired=self._deliver_expired_hold,
         )
 

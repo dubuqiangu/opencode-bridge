@@ -715,6 +715,7 @@ python -m opencode_bridge --setup --json          # 机器可读视图：{config
 | `pairing_secret` | `""` | `/pair` 授权码的派生密钥，**自己生成**（如 `python -c "import secrets; print(secrets.token_hex(32))"`）填在这里。⛔ **留空 = 不提供配对**（绝不等于「用空串派生」）。⚠️ 改这个值 = 让所有**未兑换**的码失效；**已完成的配对不受影响**（授权已物化进 `allowed_chat_ids`），所以换 secret **踢不掉已授权的人** |
 | `bridge.edit_interval_seconds` | `1.5` | 流式增量编辑同一条 IM 消息的最小间隔（秒），用于节流 |
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
+| `bridge.merge_continue_timeout_seconds` | `15` | 敲了 `..` 之后等下一行的**保险丝**上限（秒）。⚠️ 它**不是**合并窗口：没有 `..` 的消息根本不起计时器，所以普通消息的额外延迟可证明是 0。**配 `0` = 立即返回、原样使用、不改写**（不会被悄悄改写成 `15`）⇒ 续行缓冲不再装计时器 ⇒ 那条消息一直等到下一条非 `..` 行为止。⛔ **配 `0` 并不比默认更安全**：缓冲是**纯内存**，而 `ConversationMerger` 的 `flush` / `stop` / `held_conversation_ids` 三个出口**生产零调用点**（关停不排空、重启恢复不到）⇒ 崩溃或退出落在缓冲期内的丢消息窗口由「≤ 15 秒、**有界**」变成「**无界**」⇒ **「文档措辞正确」不等于「`0` 更安全」**。显式配 `0` 时启动会打一条点名该键的 `WARNING` |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
 | `adapters.telegram.poll_timeout` | `25` | `getUpdates` 的**长轮询挂起秒数**（Bot API 上限 50）。⚠️ **写错不会打死桥接**：非整数（`"25s"`、`"25.5"`）或**非正数**（`0`、`-5`）都会**回落为默认值 `25` 并打一条 WARNING**（`telegram: 配置项 poll_timeout=… 已回落为 25`），适配器照常启动。留空 = 静默用默认值 |

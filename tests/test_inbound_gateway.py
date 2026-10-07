@@ -50,6 +50,9 @@ CONVERSATION = "chat:55"
 OTHER_CONVERSATION = "chat:66"
 PLATFORM = "fake"
 SESSION_ID = "ses_fake0001"
+#: 本模块断言「配 0 要点名该键」时要看的那条 logger。逐字对应生产侧
+#: ``inbound_gateway.py`` 的 ``logger = logging.getLogger(...)``。
+INBOUND_GATEWAY_LOGGER = "opencode_bridge.inbound_gateway"
 
 #: 仓库内的临时目录：即便 TEMP/TMP 指向机器别处，测试也不可能写到仓库之外。
 _REPOSITORY_TEMP = os.path.join(
@@ -1243,6 +1246,84 @@ class MergeFuseTimeoutConfigurationTests(InboundGatewayTestCase):
         """
         self.assertEqual(_positive_float(0, 15.0), 0.0)
         self.assertEqual(_positive_int(0, 180), 0)
+
+    # --- 显式配 0 必须有一条点名该键的 WARNING -----------------------------
+    # 判据的来源是 AGENTS.md §4.1 那条**既有**纪律：键被 ``start()`` 接受却不按
+    # 字面直觉生效 ⇒ 必须有一条点名该键的 WARNING。``0`` 正是那种「**会被接受、
+    # 但语义反直觉**」的值（它把 G2 的丢消息窗口从有界变成无界）。
+    # ⚠️ 下面四条**各测一件不同的事** —— 任何一条单独存在都会被别的形态绕过：
+    # 只测「有没有告警」时，一条什么都不说的告警照样绿；只测「点名了键」时，
+    # 一条只写好处、把代价留给文档的告警照样绿。
+    def test_a_configured_zero_warns_and_names_the_key(self):
+        """判据①：告警存在，且**点名该键**。
+
+        缺陷形态（告警被删）⇒ 这里红，②③④ 全绿 ⇒ 覆盖是分开的。
+        """
+        with self.assertLogs(INBOUND_GATEWAY_LOGGER, level="WARNING") as caught:
+            self.build_with_timeout(0)
+
+        self.assertIn("merge_continue_timeout_seconds", "\n".join(caught.output))
+
+    def test_the_warning_also_states_that_zero_is_not_the_safer_setting(self):
+        """判据②：⛔ **代价必须与好处在同一条告警里** —— 只写好处会被读反。
+
+        缺陷形态（保留键名、删掉代价那半句）⇒ 只有本条红。
+        """
+        with self.assertLogs(INBOUND_GATEWAY_LOGGER, level="WARNING") as caught:
+            self.build_with_timeout(0)
+
+        warning = "\n".join(caught.output)
+        self.assertIn("配 0 并不比默认更安全", warning)
+        self.assertIn("无界", warning)
+
+    def test_the_warning_names_the_three_drain_paths_it_has_to_name(self):
+        """判据③：代价的**凭据**也得点名 —— 正是那三个出口零调用点，关停才不排空。
+
+        少点名一个，读者就得自己去查"那到底排不排空" ⇒ 三样都要在。
+        """
+        with self.assertLogs(INBOUND_GATEWAY_LOGGER, level="WARNING") as caught:
+            self.build_with_timeout(0)
+
+        warning = "\n".join(caught.output)
+        for drain_path in ("flush", "stop", "held_conversation_ids"):
+            with self.subTest(drain_path=drain_path):
+                self.assertIn(drain_path, warning)
+
+    def test_the_configured_default_is_silent(self):
+        """判据④：⛔ 用默认值（15）时**不许**发 —— 否则每次启动都有一条噪音。
+
+        缺陷形态（把判据写成「键在场就发」）⇒ 这里红。⚠️ 而那个形态在生产上
+        **恒真**：`Config._merge_bridge` 总把默认值补进 ``bridge`` 段，所以这个键
+        永远在场 ⇒ 只看"显式配 0 那条"根本抓不住这个缺陷。
+        """
+        with self.assertNoLogs(INBOUND_GATEWAY_LOGGER, level="WARNING"):
+            self.build_with_timeout(DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS)
+
+    def test_an_absent_key_falls_back_and_is_silent(self):
+        """「没配」与「配 0」必须分开：没配走的是**回落**那条路。
+
+        ⚠️ 这是判据④的另一半：网关这一侧拿到的可能是 ``None``（键缺），
+        也可能已经是合并过默认值的 ``15.0``（生产常态）—— 两条都不许发告警。
+        """
+        with self.assertNoLogs(INBOUND_GATEWAY_LOGGER, level="WARNING"):
+            gateway = self.build_gateway(bridge_config={})
+        self.addCleanup(gateway._merger.stop)
+
+        self.assertEqual(
+            gateway._merger._hold_timeout_seconds,
+            DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
+        )
+
+    def test_a_rejected_timeout_does_not_claim_it_was_a_configured_zero(self):
+        """配错（非数字 / 负数 / NaN）走的也是**回落** ⇒ 不许发那条 0 的告警。
+
+        ⚠️ 生产上这些值先被 ``Config._merge_bridge`` 当场丢掉并各自告警；这里直接
+        喂给网关，测的是**网关这一侧**的判据：回落出来的值不是 0 ⇒ 不落进告警分支。
+        """
+        for rejected_timeout in ("不是数字", -1, float("nan")):
+            with self.subTest(timeout=rejected_timeout):
+                with self.assertNoLogs(INBOUND_GATEWAY_LOGGER, level="WARNING"):
+                    self.build_with_timeout(rejected_timeout)
 
 
 # ----------------------------------------------------------------------

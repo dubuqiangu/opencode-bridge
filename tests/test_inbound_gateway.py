@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import sqlite3
@@ -39,7 +40,8 @@ from opencode_bridge.inbound_gateway import (
     _record_inbound,
 )
 from opencode_bridge.channel_profile import with_channel_hint
-from opencode_bridge.inbound_merge import BUFFERED_NOTICE
+from opencode_bridge.inbound_gateway import HELD_NOT_DELIVERED_NOTICE
+from opencode_bridge.inbound_merge import BUFFERED_NOTICE, HELD_EXPIRED_NOTICE
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.permission_ledger import REPEATED_ANSWER_ACK, PermissionLedger
@@ -1042,6 +1044,109 @@ class InboundMergeWiringTests(InboundGatewayTestCase):
 
 
 # ----------------------------------------------------------------------
+# 3c-续: 保险丝到点时那句「已把等到的内容原样发出」必须**说真话**
+# ----------------------------------------------------------------------
+# ⚠️ 缺陷在**生产侧**::_deliver_expired_hold 无条件先发那句回执，而
+# :meth:`_persist_and_enqueue` 有三条正当的「没有投递」的路（去重命中 / 收件箱
+# 已关 / 收件箱写失败）⇒ 用户被明确告知「原样发出」，然后**永远等不到答复**，
+# 而那一条也不会被重放。与 ``c41c3ae``（收件箱已关被报成去重命中）是同一个
+# 形状的谎报，只是这一次的受害者是读者本人而不是日志的读者。
+#
+# ⚠️ 而「同一条并集超时两次」**不是假想**：合成的那条 ``Inbound`` 没有
+# ``message_id`` ⇒ 去重键落到 ``sha256(platform|conversation_id|text)`` 兜底 ⇒
+# 同一会话里第二次超时**逐字**撞上，而「把同一段话重发一遍」是极常见的动作。
+#
+# ⚠️ 全类**不出现计时**：同步点是 ``Event``（等保险丝回调**跑完**），不是等时长。
+class ExpiredHoldNoticeHonestyTests(InboundGatewayTestCase):
+    """用户只在真的投递出去时才被告知「已发出」。"""
+
+    bridge_config = {"merge_continue_timeout_seconds": 0.05}
+
+    def setUp(self) -> None:
+        super().setUp()
+        # ⚠️ 基类那个壳是「先置信号、后投递」，照它断言会读到投递**之前**的快照 ⇒
+        # 这里再包一层：投递**跑完**之后才置信号，于是 Event 是同步点而不是计时判据。
+        deliver_then_signal = self.gateway._merger._on_hold_expired
+
+        def deliver_before_signalling(conversation_id: str, held_text: str) -> None:
+            try:
+                deliver_then_signal(conversation_id, held_text)
+            finally:
+                self.hold_expired.set()
+
+        self.gateway._merger._on_hold_expired = deliver_before_signalling
+
+    def expire_a_hold(self, text: str, *, message_id: str) -> None:
+        """送一行带 ``..`` 的入站，然后等到保险丝那一趟**跑完**。"""
+        self.hold_expired.clear()
+        self.gateway.on_inbound(message(text, message_id=message_id))
+        self.assertTrue(
+            self.hold_expired.wait(10.0),
+            "the hold fuse never fired for %r (deadlock guard, not a timing "
+            "assertion)" % text,
+        )
+
+    def what_the_reader_was_told(self) -> list[str]:
+        return [out.text for out in self.send_text.outgoing]
+
+    def test_the_first_expiry_does_say_that_the_held_text_was_sent(self):
+        self.expire_a_hold("帮我看下 README..", message_id="m1")
+
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "帮我看下 README")])
+        self.assertIn(
+            HELD_EXPIRED_NOTICE % "帮我看下 README", self.what_the_reader_was_told()
+        )
+
+    def test_the_same_union_expiring_twice_is_never_reported_as_sent(self):
+        """同一会话里第二次超时发出的同一段并集：没说发出，且说清了没发出去。
+
+        ⚠️ 为什么会撞上：保险丝合成的那条 ``Inbound`` **没有** ``message_id``
+        （它不是平台交付的一条消息）⇒ 去重键落到 ``sha256(platform|conversation_id|
+        text)`` 兜底 ⇒ 同一会话里同一段并集的第二次超时**逐字**同一个键。
+        这里把那个键**独立**算一遍（不调生产函数算），顺带把这条兜底钉住。
+        """
+        self.expire_a_hold("帮我看下 README..", message_id="m1")
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "帮我看下 README")])
+        self.send_text.outgoing.clear()
+
+        content_hash_key = hashlib.sha256(
+            ("%s|%s|%s" % (PLATFORM, CONVERSATION, "帮我看下 README")).encode("utf-8")
+        ).hexdigest()
+        # 第一次那一趟落下来的就是这一行（替身只对点名的 delivery_id 报去重）。
+        self.assertEqual(self.inbox.recorded[-1].delivery_id, content_hash_key)
+        self.assertIsNone(self.inbox.recorded[-1].message_id)
+        self.inbox.duplicate_of = content_hash_key
+
+        self.expire_a_hold("帮我看下 README..", message_id="m2")
+
+        self.assertEqual(self.prompt_bodies, [(SESSION_ID, "帮我看下 README")],
+                         "第二次不该再让 agent 跑一遍同一段并集")
+        told = self.what_the_reader_was_told()
+        self.assertNotIn(
+            HELD_EXPIRED_NOTICE % "帮我看下 README", told,
+            "⛔ 绝不能对一条没有投递的并集说「已把等到的内容原样发出」",
+        )
+        self.assertIn(HELD_NOT_DELIVERED_NOTICE % "帮我看下 README", told)
+        # 缓冲里的内容必须回到读者手上 —— 否则他既没发出去、也看不到自己敲了什么。
+        self.assertTrue(any("帮我看下 README" in text for text in told))
+
+    def test_an_inbox_that_cannot_be_written_says_the_message_was_not_delivered(self):
+        """写前落盘失败 ⇒ 盘上没回执、也发不出去 ⇒ 用户必须知道要自己重发。"""
+        self.inbox.record = mock.Mock(
+            side_effect=sqlite3.OperationalError("database or disk is full")
+        )
+
+        with self.assertLogs("opencode_bridge.inbound_gateway", level="ERROR"):
+            self.gateway.on_inbound(message("写不下来的那条", message_id="m1"))
+
+        self.assertEqual(self.client.prompts, [], "写前义务没履行就不许投递")
+        self.assertEqual(self.inbox.writes, [])
+        told = "".join(self.what_the_reader_was_told())
+        self.assertIn("没有发出去", told)
+        self.assertIn("请重新发送一次", told)
+
+
+# ----------------------------------------------------------------------
 # 3b-续: ``merge_continue_timeout_seconds`` 的判据 —— 配 0 就是配 0
 # ----------------------------------------------------------------------
 # ⚠️ 这一类测的是**上一个环节**，缺陷就住在那儿：
@@ -1250,6 +1355,34 @@ class QueueTests(InboundGatewayTestCase):
                 self.gateway._drain(CONVERSATION)
 
         self.assertEqual(self.gateway._draining, set())
+
+    def test_a_message_lost_to_a_drain_failure_is_told_it_was_never_sent(self):
+        """⛔ 排空途中抛异常时，那一条**已经不在队列里**了 ⇒ 不许静默。
+
+        ⚠️ 触发点是真的，而且很窄：``_dispatch_prompt`` 抛得出来的唯一现实成因是
+        收件箱那两次写入（``adapter_for`` 抛不出来；``send_text`` 永远不抛 ——
+        :meth:`~opencode_bridge.adapters.base.Adapter.send_observed` 把适配器的
+        异常交还而不是上抛）。这里**不** mock 被测方法：替身让真收件箱替身的那次
+        UPDATE 真的抛出来，走的是生产里同一条路。
+        """
+        self.inbox.mark_attempting = mock.Mock(
+            side_effect=sqlite3.OperationalError("database or disk is full")
+        )
+
+        with self.assertLogs("opencode_bridge.inbound_gateway", level="ERROR"):
+            self.gateway.on_inbound(message("坏消息", message_id="m1"))
+
+        self.assertEqual(self.gateway._draining, set())
+        self.assertEqual(self.client.prompts, [])
+        told = "".join(text for _, text in self.texts_of())
+        self.assertIn("没能提交给 agent", told)
+        self.assertIn("请重新发送一次", told)
+        self.assertEqual(
+            self.inbox.writes,
+            [(self.inbox.recorded[0].delivery_id, "recorded")],
+            "⛔ 不许替恢复层改账：抛在哪一步我们不知道，而把一个可能已经 delivered 的行"
+            "改成 failed 会让下次启动重放它 ⇒ agent 对同一条指令跑两遍",
+        )
 
     def test_two_conversations_are_drained_independently(self):
         self.deliver("甲", delivery_id="a1")

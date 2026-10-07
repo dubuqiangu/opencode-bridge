@@ -57,6 +57,22 @@ logger = logging.getLogger("opencode_bridge.inbound_gateway")
 
 PROGRESS_TEXT = "⏳ 处理中…"
 
+#: 保险丝到点、而那一行**根本没有被投递**时说的话。
+#:
+#: ⛔ 绝不说「已发出」：那一行若没进队列，用户会一直等一个**永远不来的答复**，
+#: 而他刚刚被明确告知「原样发出」—— 与 `c41c3ae` 修掉的「收件箱已关被报成去重
+#: 命中」是同一个形状的谎报，只是这一次的受害者是读者而不是日志的读者。
+#: ⚠️ 这里**不**说清是去重还是收件箱已关：这一帧拿不到
+#: :class:`~opencode_bridge.inbox.RecordOutcome`，而**猜**哪一个比说实话更糟
+#: （AGENTS.md §8「不要要求代码区分它唯一的输入无法区分的两种情况」）
+#: ⇒ 两个可能都写出来，两个都是真的；哪一条由 :func:`_record_inbound` 自己那行
+#: 日志（点名 delivery_id）说清。
+HELD_NOT_DELIVERED_NOTICE = (
+    "等待下一行超时，但这一行**没有发出去**"
+    "（收件箱里已经有同一行，或收件箱已关）—— "
+    "你敲的内容原样附在下面，需要的话请重发一次：\n%s"
+)
+
 #: Values accepted in ``perm:<sessionID>:<reqID>:<decision>`` callbacks.
 _PERM_DECISIONS = ("once", "always", "reject")
 
@@ -406,19 +422,49 @@ class InboundGateway:
         adapter: Adapter,
         inbound: Inbound,
         text: str,
-    ) -> None:
+    ) -> QueuedPrompt | None:
         """Acknowledge if long, write the inbox receipt, then queue for delivery.
 
         合并**已经**做完，这里只处理"怎么把它变成一次投递"。拆成独立方法是
         因为保险丝那条路要走同样的三步，而它拿到的是**并集**而不是一行 ——
         若让它去调 :meth:`_deliver_plain_text`，那份并集会被再过一次合并，
         末尾的 ``..`` 会让它重新进缓冲，形成自己喂自己的循环。
+
+        :returns: 真的进了队列的那一行；``None`` = **没有投递**（去重命中 /
+            收件箱已关 / 收件箱写失败）。⚠️ 这个返回值是给
+            :meth:`_deliver_expired_hold` **说真话**用的：那一帧对用户宣布
+            「已把等到的内容原样发出」，而它必须先知道这件事成不成立。
         """
         self._acknowledge_long_input(conversation_id, adapter, text)
-        queued = _record_inbound(self._inbox, inbound, text)
+        try:
+            queued = _record_inbound(self._inbox, inbound, text)
+        except Exception:
+            # ⛔ 落盘失败**不许**变成「静默消失」：这里恰恰是"盘上什么都没写、
+            # 消息也什么都没发"的那一种 —— 收件箱存在的理由（别丢这条）当场落空。
+            # 以前它一路冒到 :meth:`on_inbound` 那个兜底 ``except``，用户那边
+            # **一个字都看不到**，而那条消息就此消失（盘上没有回执 ⇒ 恢复层也
+            # 救不回来）。
+            #
+            # ⚠️ **不投递**：写前义务没履行，投出去就是"拿不到回执的一次发送"，
+            # 正是 :mod:`opencode_bridge.inbox` 要防的那件事。
+            # ⇒ 用户必须知道要自己重发 —— 那正是收件箱**没有**替他做到的事。
+            logger.exception(
+                "inbound: cannot write the inbox receipt for %s; the message was"
+                " NOT delivered and cannot be replayed -- the reader has to resend it",
+                inbound.message_id,
+            )
+            self._send_text(
+                conversation_id,
+                "这条消息没能落盘（收件箱写入失败），因此**没有发出去**，"
+                "也不会自动重放 —— 请重新发送一次。",
+                kind="text",
+                adapter=adapter,
+            )
+            return None
         if queued is not None:
             # None = 去重命中（已投递过）**或**收件箱已关（没落盘，见 _record_inbound）
             self._enqueue(queued)
+        return queued
 
     def _acknowledge_long_input(
         self, conversation_id: str, adapter: Adapter, text: str,
@@ -456,6 +502,15 @@ class InboundGateway:
         ``platform`` 取适配器自己的 ``name``，与各适配器构造 ``Inbound`` 时写的
         ``platform=self.name`` 是同一个值（见 :meth:`AdapterRouter.asking_platform`
         的说明：提问平台就是适配器自己报上来的名字）。
+
+        ⚠️ **那句「已把等到的内容原样发出」是**投递之后**才说的**，而且只在真的
+        投递出去的时候才说。⛔ 此前它无条件先发 —— 而 :meth:`_persist_and_enqueue`
+        有三条正当的「没有投递」的路（去重命中 / 收件箱已关 / 收件箱写失败）⇒
+        用户被明确告知「原样发出」，然后**永远等不到答复**，且那一条也不会被重放。
+        ⚠️ 那不是假想：同一个会话里第二次超时发出的**同一个并集**必然撞上
+        ``sha256`` 兜底（合成 Inbound 没有 ``message_id``）⇒ 确定性可复现，
+        而「用户把同一段话重发一遍」是极常见的动作。
+        ⇒ 所以顺序与条件都由 :meth:`_persist_and_enqueue` 的返回值决定。
         """
         adapter = self._adapter_for(conversation_id)
         inbound = Inbound(
@@ -470,13 +525,25 @@ class InboundGateway:
                 "anyway but nothing will be sent to the reader",
                 conversation_id,
             )
+        queued = self._persist_and_enqueue(
+            conversation_id, adapter, inbound, held_text
+        )
+        if queued is None:
+            # ⛔ 不许在这里说「已发出」（理由见 docstring）。把内容原样还给用户，
+            # 好让他看见自己敲了什么、决定要不要重发。
+            self._send_text(
+                conversation_id,
+                HELD_NOT_DELIVERED_NOTICE % held_text,
+                kind="text",
+                adapter=adapter,
+            )
+            return
         self._send_text(
             conversation_id,
             HELD_EXPIRED_NOTICE % held_text,
             kind="text",
             adapter=adapter,
         )
-        self._persist_and_enqueue(conversation_id, adapter, inbound, held_text)
 
     def on_callback(
         self, conversation_id: str, data: str, query_id: str
@@ -577,6 +644,10 @@ class InboundGateway:
         self._drain(conversation_id)
 
     def _drain(self, conversation_id: str) -> None:
+        # ⚠️ 预绑定：下面那个 ``except`` 要用它，而弹出它的那一行**在** ``try`` 里面。
+        # ``self._lock`` 是一条 RLock，拿它抛不出异常，所以真到 ``except`` 时它必然
+        # 已绑定 —— 预绑定只是让这一层不依赖那个前提。
+        queued: QueuedPrompt | None = None
         try:
             while True:
                 with self._lock:
@@ -597,10 +668,29 @@ class InboundGateway:
                         queue.insert(0, queued)
                         self._draining.discard(conversation_id)
                     return
-        except Exception:
+        except Exception as exc:
             logger.exception("queue drain failed for %s", conversation_id)
             with self._lock:
                 self._draining.discard(conversation_id)
+            # ⛔ 这一条**已经不在队列里**了（上面 pop 掉了），所以「记一笔日志、
+            # 释放会话」对读者等于**静默消失**：他发过一句话，屏幕上什么都没有。
+            # 唯一现实触发条件是收件箱那两次写入（``mark_attempting`` /
+            # ``mark_delivered``）撞上 sqlite3 错误（盘满 / 库损坏 / 被锁）——
+            # ``adapter_for`` 抛不出来，而 ``send_text`` 永远不抛
+            # （:meth:`~opencode_bridge.adapters.base.Adapter.send_observed`
+            # 把适配器的异常交还而不是上抛）。
+            #
+            # ⚠️ **刻意不碰收件箱**：抛在哪一步我们不知道，而把一个可能**已经
+            # delivered** 的行改成 failed 会让下次启动重放它 ⇒ agent 对同一条指令
+            # 跑两遍（那比多发一条消息贵得多）。盘上那一行维持原样，由恢复层
+            # 按它自己的分档去判断 —— 这正是它存在的理由。
+            if queued is not None:
+                self._send_text(
+                    conversation_id,
+                    "这一条没能提交给 agent：%s\n"
+                    "（它已离开队列。若之后没有答复，请重新发送一次。）" % exc,
+                    kind="text",
+                )
 
     def _dispatch_prompt(
         self, queued: QueuedPrompt, *, recording_delivery: bool = True,

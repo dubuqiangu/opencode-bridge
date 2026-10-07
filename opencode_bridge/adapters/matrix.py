@@ -297,17 +297,22 @@ class MatrixAdapter(Adapter):
             logger.warning("matrix: access_token missing; adapter not started")
             return
         # ⚠️ `user_id` 在 :attr:`required_tokens` 里、却**不在**上面那两道闸门里，
-        # 而它是 :meth:`_handle_event` 里过滤自己回声的**唯一**依据
-        # （`if self.user_id and sender == self.user_id`）⇒ 空值时整个条件短路，
-        # **回声一条都挡不住**，桥会无限自问自答。这里点名它，别让这个陷阱只在
-        # 症状里出现。
-        # ⛔ 只告警、**不改行为**：``user_id` 缺失时是否改成「失败关闭」
-        # （缺了就拒收）**尚未拍板** —— 那是行为变更，不是告警能顺带做的事。
+        # 而它是 :meth:`_handle_event` 里过滤自己回声的**唯一**依据。
+        # ⇒ 缺失时那条过滤**整个短路**，回声一条都挡不住、桥会无限自问自答。
+        # 这里点名它，别让这个陷阱只在症状里出现。
+        # ⚠️ **文案随行为一起改**：入站已改成**失败关闭**（见 :meth:`_handle_event`
+        # 那道闸门）⇒ 原文那句「the bridge will treat its own messages as inbound
+        # and keep talking to itself」现在是**假话**，留着会让用户按一个已不存在的
+        # 症状去排查。形状照 :mod:`~opencode_bridge.adapters.email` 那条点名
+        # ``password`` 的告警：**点名该键 + 说清后果**（⛔ 不是「有一条 warning」）。
+        # ⚠️ 这里**刻意不加第三道 start() 闸门**（那会让整个适配器不起 = 降级，
+        # 台账已明确否掉）；失败关闭落在入站那一层，线程照常起来。
         if not self.user_id:
             logger.warning(
-                "matrix: user_id missing; the adapter cannot filter its own "
-                "echoes — the bridge will treat its own messages as inbound "
-                "and keep talking to itself (fill in user_id = this bot's MXID)"
+                "matrix: user_id missing ⇒ cannot filter our own echoes, so "
+                "inbound is now **closed**: every inbound message is dropped "
+                "and logged with its reason. Nothing will arrive until you "
+                "fill in user_id (this bot's MXID)."
             )
         self._stop_event.clear()
         transport = self._make_transport()
@@ -427,7 +432,28 @@ class MatrixAdapter(Adapter):
         if content.get("msgtype") != TEXT_MSGTYPE:
             return  # m.notice / m.image / m.emote ...
         sender = str(event.get("sender") or "")
-        if self.user_id and sender == self.user_id:
+        # ⚠️⚠️ **失败关闭**（用户 2026-10-07 拍板）：``user_id`` 是过滤自己回声的
+        # **唯一**依据，缺了它就**分不出哪条是自己发的** ⇒ 整个入站停摆。
+        # ⛔ **不能照旧放行**：那正是原来的 fail-open —— 桥会把自己发出的消息再当成
+        # 入站收回来 ⇒ **无限自问自答**（与本仓库已修的两处同型：失败被报成
+        # 「什么都没有」）。⚠️ 知情代价：没填 ``user_id`` 的 matrix 用户会
+        # **一个消息也收不到** —— 这是拍板要的那个取舍，不是副作用。
+        # ⭐ 处置与 :meth:`~opencode_bridge.adapters.nextcloud.NextcloudAdapter.
+        # _handle_message` 第 0 步同一形状（「不知道自己的 uid，无法防回环」⇒ 不转发）。
+        if not self.user_id:
+            # 逐条记「为什么丢」：⛔ 不静默丢弃（用户会看到「配了却收不到」而
+            # 不知道原因）。级别 info —— 逐条打 warning 会变成常态噪音，
+            # 而**点名该键的那条 warning 在 :meth:`start` 里、启动时就说一次**。
+            logger.info(
+                "matrix: dropping inbound (user_id not configured ⇒ cannot "
+                "filter our own echo) room=%s sender=%s",
+                redactable_id(self.name, room_id),
+                redactable_id(self.name, sender),
+            )
+            return
+        if sender == self.user_id:
+            # ⚠️ 这里**故意不再写** ``self.user_id and ...``：上面那道失败关闭已经
+            # 保证它非空，而那个短路正是本缺陷的根因（空值 ⇒ 整个过滤失效）。
             return  # 自己的回声（含本适配器自己发出的编辑消息）
         if "m.relates_to" in content:
             # 编辑（m.replace）/ 回复（m.in_reply_to）/ 表情回应（m.annotation）

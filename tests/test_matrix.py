@@ -233,6 +233,35 @@ class TestMatrixLifecycle(unittest.TestCase):
             % "\n  ".join(warnings.messages),
         )
 
+    def test_the_user_id_warning_must_describe_the_actual_refusal(self):
+        """⭐ 那条告警必须说清**真实后果**，否则它把用户按一个已不存在的症状去排查。
+
+        ⚠️ **这条是刻意与措辞耦合的**（改文案就会红），取舍是明知的：
+        「原文那句『keep talking to itself』现在是**假话**」这件事没有别的可机械
+        判定的形式 —— 断言「不等于某个字符串」会被未来一次合法的改写误伤。
+        ⭐ 而漏掉它的代价**实测存在**：反向证明 V5（把这条告警改回原文）
+        **零红** ⇒ 那条一致性此前无人看守。
+        """
+        adapter, _ = make_matrix({"user_id": ""})
+        adapter._request = lambda method, path, payload=None, **kw: (
+            200, {"next_batch": "s1", "rooms": {}}
+        )
+        warnings = self.collect_warnings()
+        adapter.start()
+        self.addCleanup(adapter.stop)
+
+        named = [line for line in warnings.messages if "user_id" in line]
+        self.assertTrue(named, "点名 user_id 的告警不见了：\n  %s"
+                        % "\n  ".join(warnings.messages))
+        message = named[0]
+        self.assertTrue(
+            "closed" in message or "dropped" in message,
+            "告警必须说清「入站已被拒绝」这个真实后果：\n  %s" % message)
+        self.assertNotIn(
+            "keep talking to itself", message,
+            "⚠️ 原文那句在失败关闭之后已是**假话**（桥不再把自己的消息当入站）"
+            "—— 留着会把用户按一个不存在的症状去排查：\n  %s" % message)
+
     def collect_warnings(self) -> "_WarningCollector":
         """在 matrix logger 上挂一个收集器（由 ``addCleanup`` 摘掉）。
 
@@ -375,6 +404,114 @@ class TestMatrixInbound(unittest.TestCase):
         )
         adapter._sync_once()
         self.assertEqual([ib.text for ib in hooks.inbounds], ["真的来了"])
+
+    # ------------------------------------------------------------------
+    # 缺 user_id ⇒ 失败关闭（用户 2026-10-07 拍板）
+    # ------------------------------------------------------------------
+    def test_missing_user_id_closes_inbound_instead_of_letting_echoes_through(self):
+        """⭐ 缺 ``user_id`` ⇒ **一条都不转发**，且逐条记下「为什么丢」。
+
+        改之前是 **fail-open**：``if self.user_id and sender == self.user_id``
+        在空值时整个短路 ⇒ 回声**挡不住** ⇒ 桥无限自问自答。
+
+        ⛔ 判据不能只写「没转发」—— 那对一个**无脑实现**（连
+        ``homeserver`` 都不解析就 return）同样成立 ⇒ 正对面必须有
+        :meth:`test_a_configured_user_id_still_forwards`。
+        """
+        adapter, hooks = make_matrix({"user_id": ""})
+        collector = self._collect_matrix_records()
+        adapter._request = lambda *a, **k: (
+            200,
+            sync_payload(
+                [
+                    # ⭐ 这一条 sender 就是 bot 自己：改之前它会被当成入站收回来
+                    text_event(text="我的回声", sender=BOT, event_id="$self"),
+                    text_event(text="别人的话", sender="@alice:example.org",
+                               event_id="$other"),
+                ],
+                next_batch="s1",
+            ),
+        )
+        adapter._sync_once()
+
+        self.assertEqual([ib.text for ib in hooks.inbounds], [],
+                         "缺 user_id 时不许转发任何入站（失败关闭）")
+        dropped = [text for text in collector.messages if "dropping inbound" in text]
+        self.assertTrue(dropped, "⛔ 不许静默丢弃 —— 每条都要记下「为什么丢」：\n  %s"
+                    % "\n  ".join(collector.messages))
+        # 逐字点名那个键（⛔ 「有告警」不够：「配置错误」四个字也能通过）
+        self.assertTrue(any("user_id" in text for text in dropped),
+                        "丢弃原因必须点名 user_id 这个键：\n  %s"
+                        % "\n  ".join(dropped))
+        # ⚠️ 这里钉的是本仓库**实际**的约定，不是我想当然的那条：
+        # `redactable_id()` 给本地侧 id **加平台前缀**（C2：同一条会话仍跨行可关联），
+        # ⛔ **不是**哈希/遮蔽 ⇒ 断言「明文不出现」是错的（同族那条
+        # non-whitelisted drop 与 nextcloud 的 `_drop_inbound` 都是前缀形态）。
+        # ⇒ 这里钉的是「**与同族丢弃点同形**」：前缀形态。
+        self.assertTrue(
+            any("room=%s" % ("matrix:" + ROOM) in text for text in dropped),
+            "房间 id 必须按 redactable_id 的前缀形态记（与同族丢弃点同形）：\n  %s"
+            % "\n  ".join(dropped))
+
+    def test_a_configured_user_id_still_forwards(self):
+        """⭐⭐ 反面对照：**配齐** ``user_id`` ⇒ 照常转发，一条都不少。
+
+        ⚠️ 这一条才是守住「⛔ 没把正常配置也堵死」的那条 —— 少了它，
+        「缺 user_id 不转发」可以靠**无脑地拒绝一切**来满足。
+        """
+        adapter, hooks = make_matrix()          # 默认 user_id = BOT
+        collector = self._collect_matrix_records()
+        adapter._request = lambda *a, **k: (
+            200,
+            sync_payload(
+                [text_event(text="真的来了", event_id="$keep")], next_batch="s1",
+            ),
+        )
+        adapter._sync_once()
+
+        self.assertEqual([ib.text for ib in hooks.inbounds], ["真的来了"],
+                         "配了 user_id 时必须照常转发")
+        self.assertEqual([t for t in collector.messages if "dropping inbound" in t], [],
+                         "配了 user_id 时不许出现那条丢弃日志")
+
+    def test_a_configured_user_id_still_drops_its_own_echo(self):
+        """⭐ 回声过滤**本身**没被失败关闭顺手削掉：bot 自己那条仍然被丢。
+
+        ⛔ 这是防「把 ``if sender == self.user_id`` 整行删掉」那种无脑实现 ——
+        那样两条对照都会绿，而 bot 会开始自问自答。
+        """
+        adapter, hooks = make_matrix()
+        adapter._request = lambda *a, **k: (
+            200,
+            sync_payload(
+                [
+                    text_event(text="我的回声", sender=BOT, event_id="$self"),
+                    text_event(text="别人的话", event_id="$other"),
+                ],
+                next_batch="s1",
+            ),
+        )
+        adapter._sync_once()
+
+        self.assertEqual([ib.text for ib in hooks.inbounds], ["别人的话"],
+                         "bot 自己那条必须仍被回声过滤挡掉")
+
+    def _collect_matrix_records(self):
+        """收集 matrix logger 上的 INFO 及以上记录（逐条丢弃原因在 info 级）。
+
+        ⚠️ **必须把 logger 本身的 level 降到 INFO**：``logger.isEnabledFor()``
+        是在 logger 上判的，早于任何 handler ⇒ 只降 handler 的 level 的话，
+        INFO 记录压根不会被发出来（根 logger 默认 WARNING）。
+        """
+        collector = _WarningCollector()
+        collector.setLevel(logging.INFO)
+        logger = logging.getLogger(MATRIX_LOGGER)
+        previous_level = logger.level
+        logger.addHandler(collector)
+        logger.setLevel(logging.INFO)
+        self.addCleanup(logger.removeHandler, collector)
+        self.addCleanup(logger.setLevel, previous_level)
+        return collector
 
     def test_authorization_gate_runs_before_inbound(self):
         """授权闸门在最前：白名单外的房间不许进入上层。"""

@@ -31,6 +31,7 @@ from .allowlist import resolve_allowlist
 from .config import Config, DEFAULT_CONFIG_NAME, adapter_scoped_config
 from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
+from . import credential_health
 from . import health
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
@@ -1053,6 +1054,115 @@ def _print_last_outbound_failures(
         print("  " + _pad(label, name_w) + line)
 
 
+#: ``--status`` 凭据失效段的「无记录」逐字文案：⛔ 不在这里另写一份 ——
+#: 取 :data:`credential_health.NO_CREDENTIAL_FAILURE_TEXT`（那份同时是
+#: :func:`credential_health.describe_credential_failure` 的兜底文案），两处各写
+#: 一次就会漂，而「无记录」一旦漂成「正常」就是本任务要消灭的那类假话。
+NO_CREDENTIAL_FAILURE_TEXT = credential_health.NO_CREDENTIAL_FAILURE_TEXT
+
+_CREDENTIAL_FAILURE_SECTION_HEADER = "== 上次凭据失效（运行期记录） =="
+
+
+def _print_last_runtime_credential_failures(
+    rows: list[tuple[str, str, bool, bool, dict]],
+    bridge_dir: str,
+) -> None:
+    """打印「启动之后凭据有没有再失效过」—— 与「上次启动时的探测结论」**分开答**。
+
+    ⚠️ 这一段回答的问题上面两段**都答不了**：
+
+    * 「渠道配置与能力」答"凭据齐不齐"（纯本地可判）；
+    * 「上次启动时的探测结论」答"**上次启动那一刻**平台认不认这个凭据"
+      （platform-health.json，``start()`` 返回那一刻定稿、之后不再改）；
+    * **这一段**答"**启动之后**凭据又失效过没有"（credential-failures.json，
+      由轮询线程在观测到 401 的那一刻写）⇒ **启动失败与运行期失效是两个不同的
+      键、两份不同的文件**，谁也不许替谁说话。启动时是好的、运行中被吊销 ⇒
+      上面那段继续说"上次启动 ok"、这一段说出事实 —— 那正是**区分**要落地的地方。
+
+    ⚠️ 纯本地读盘：与其它段一样不联网、不构造适配器（``--status`` 必须是
+    "网络坏了也能看"的那条路）。
+
+    ⚠️ 措辞纪律与出站失败段同源：
+
+    * 有记录、``recovered_at`` 缺失 ⇒「此后**没有观测到** getMe 通过」。
+      ⛔ 不说"仍在失效"：盘上分不出"还坏着"与"重探已超限、不再有观测"
+      （:data:`opencode_bridge.adapters.telegram.RUNTIME_CREDENTIAL_REVERIFY_LIMIT`
+      —— 探满之后进程会**主动停止**重探，那之后没有新观测是**设计**，不是健康）。
+    * 有记录、``recovered_at`` 有值 ⇒「已恢复于 …」。
+    * 无记录 ⇒ :data:`NO_CREDENTIAL_FAILURE_TEXT`，⛔ 既不说"正常"也不说"失效"。
+
+    ⚠️ **盘上任何键都要能看见**（与 :func:`_print_last_outbound_failures` 同一处
+    2026-10-06 的病根与修法）：键未注册（用户把 ``telegram`` 拼成 ``telegramm``）
+    时照样成行 —— 记录自己说了什么，就是这一段唯一的输入。
+
+    :param rows: :func:`_channel_config_rows` 的行，**复用**它（平台清单只有一份）。
+    :param bridge_dir: :func:`_bridge_dir` 的推导结果 —— 记录就落在那里。
+    """
+    record = credential_health.read_credential_failures(bridge_dir)
+    recorded = credential_health.credential_failure_recorded_at(record)
+    recorded_platform_keys = tuple(
+        credential_health.credential_failures_in_record(record)
+    )
+    recorded_platforms = set(recorded_platform_keys)
+    registered_keys = {key for key, _label, _cfg, _inbound, _caps in rows}
+    listed = [
+        (key, label)
+        for key, label, configured, _inbound_ready, _caps in rows
+        if configured or key in recorded_platforms
+    ]
+    # 未注册键并入（label 取键本身）：与出站失败段同一处修法 —— 拼错的键是
+    # 唯一能解释「为什么没看到失效」的线索，⛔ 不许被「已配置与否」这层过滤吞掉。
+    listed += [
+        (key, key) for key in recorded_platform_keys if key not in registered_keys
+    ]
+    print("")
+    print(_CREDENTIAL_FAILURE_SECTION_HEADER)
+    print("  说明：以下是**运行期间**观测到的凭据失效（token 被吊销/过期等；落盘在")
+    print("        credential-failures.json）。与「上次启动时的探测结论」**是两份")
+    print("        记录、各答各的**：那一份答「上次**启动那一刻**平台认不认凭据」，")
+    print("        这一份答「**启动之后**凭据有没有再失效过」⇒ 启动时是好的、")
+    print("        运行中被吊销，两段会分别说，谁也不盖住谁。")
+    print("        ⚠ 时间戳说的是**那一刻**发生的事，**不是**现在的连接状态。")
+    print("        ⚠ 「此后没有观测到 getMe 通过」≠「现在仍坏着」：重探有次数上界，")
+    print("          探满停止后不再有新观测，那是设计，不是健康。")
+    if recorded is not None:
+        print(
+            "  记录时间 : "
+            + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded))
+            + "（这份文件最后一次被写入的时刻，不是失效发生的时刻）"
+        )
+    if not listed:
+        # 与出站失败段同一条判据：这一支**只在盘上真的没有任何记录时**才走得到
+        # （上面 ``listed`` 已并入未注册的键）⇒ 那句话是事实，不是断言。
+        if not recorded_platform_keys:
+            print(
+                "  （没有已配置的平台，也没有任何凭据失效记录）" if record is None
+                else "  （盘上有记录，但没有属于这些平台的）"
+            )
+        return
+    name_w = max(_dwidth("平台"), max(_dwidth(label) for label, _f in listed)) + 2
+    for key, label in listed:
+        failure = credential_health.credential_failure_from_record(record, key)
+        if failure is None:
+            print("  " + _pad(label, name_w) + NO_CREDENTIAL_FAILURE_TEXT)
+            continue
+        line = "运行期失效 " + credential_health.describe_credential_failure(failure)
+        at = failure.get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool):
+            line += "（%s）" % time.strftime("%m-%d %H:%M:%S", time.localtime(at))
+        else:
+            # ⛔ 不许整段沉默（与出站段同一条）：缺信息要说出来，不能靠不显示蒙混。
+            line += "（未记录失效时刻）"
+        recovered_at = failure.get("recovered_at")
+        if isinstance(recovered_at, (int, float)) and not isinstance(recovered_at, bool):
+            line += " · 已恢复于 %s" % time.strftime(
+                "%m-%d %H:%M:%S", time.localtime(recovered_at)
+            )
+        else:
+            line += " · 此后没有观测到 getMe 通过"
+        print("  " + _pad(label, name_w) + line)
+
+
 def run_status(
     cfg: Config,
     *,
@@ -1149,6 +1259,7 @@ def run_status(
 
     _print_last_start_probes(rows, bridge_dir)
     _print_last_outbound_failures(rows, bridge_dir)
+    _print_last_runtime_credential_failures(rows, bridge_dir)
     _print_event_subscription(subscription_status)
 
     print("")
@@ -1260,6 +1371,20 @@ def _run_bridge_locked(cfg: Config) -> int:
     except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
         logger.warning(
             "outbound-failures: 记录器未装配（%s: %s）—— 不影响桥的发送",
+            type(exc).__name__, exc,
+        )
+    # ⚠️ 同一条纪律、同一个时机（必须早于适配器启动）：telegram 的轮询线程在
+    # **运行期**观测到 401 就会写这份记录（``_invalidate_credentials``）⇒ 晚一步
+    # 装上，「启动之后 token 被吊销」这条事实就一个字都不落盘，而**没有任何东西会
+    # 报错**（:func:`credential_health.install_credential_failure_recorder` 的
+    # docstring 说的正是这一条）。
+    try:
+        credential_health.install_credential_failure_recorder(
+            credential_health.CredentialFailureRecorder(_bridge_dir())
+        )
+    except Exception as exc:  # noqa: BLE001 - 排障记录绝不该决定桥的生死
+        logger.warning(
+            "credential-failures: 记录器未装配（%s: %s）—— 不影响桥的轮询",
             type(exc).__name__, exc,
         )
     #: 「这个平台为什么没能进来」—— ``usable == 0`` 时它就是那条记录的 ``detail`` 来源。

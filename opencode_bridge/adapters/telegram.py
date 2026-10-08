@@ -122,14 +122,34 @@ CREDENTIAL_PROBE_MAX_BACKOFF = 60.0
 
 
 def _retry_after(data: Any) -> Optional[float]:
-    """Extract a 429 ``retry_after`` delay from a Telegram response body."""
+    """Extract a 429 ``retry_after`` delay from a Telegram response body.
+
+    ⚠️ **门控是 ``error_code == 429``，不是「``ok`` 为 false」**（2026-10-08 修）。
+    改之前的门控是「只要带得出 ``parameters.retry_after`` 就照等」，于是
+    ``{"error_code": 400, "parameters": {"retry_after": 7}}`` 会返回 **7.0** ——
+    而 400 是**请求本身不合法**，睡 7 秒再原样重试一次，100% 还是 400
+    ⇒ 纯浪费一轮墙钟，且那条 ``rate-limited`` 告警会指向一个根本没被限流的调用。
+
+    ⚠️ **为什么按语义收窄而不是「来者不拒」**：「非 429 却带 ``retry_after`` 的
+    响应在生产里会不会出现」**未核实** —— 本机无外网凭据、无法对真实平台取值。
+    正因为不知道，就更不该让一个**语义上与限流无关**的字段决定我们睡多久
+    （AGENTS.md §8 第 3 条：靠一个没被记录的事实去猜，必然在某些情况下猜错）。
+    ⇒ 门控答的是「这个码是不是限流」，而不是「来者不拒」。
+
+    ⛔ **畸形输入的安全行为逐项保留**（它们各自都有专测）：没有 ``parameters``
+    且码是 429 ⇒ **1.0**（默认等一秒）；``retry_after`` 是负数 / 布尔 / 字符串 /
+    非数值 ⇒ **``None``**（调用方**不许**当成 0 秒，那会变成立刻重试的紧循环）；
+    ``data`` 压根不是 dict ⇒ ``None``。
+    """
     if not isinstance(data, dict):
+        return None
+    if data.get("error_code") != 429:
         return None
     params = data.get("parameters")
     delay: Any = None
     if isinstance(params, dict):
         delay = params.get("retry_after")
-    if delay is None and data.get("error_code") == 429:
+    if delay is None:
         delay = 1
     if isinstance(delay, bool) or not isinstance(delay, (int, float)):
         return None
@@ -825,6 +845,51 @@ class TelegramAdapter(Adapter):
         # 非 dict 元素直接丢掉（迁移前循环里的 ``continue``）。
         self._pending = [u for u in (data.get("result") or []) if isinstance(u, dict)]
 
+    def _update_locator(self, update: dict) -> str:
+        """定位这条 update：``update_id`` / ``chat=`` / ``keys=``。**只记形状**。
+
+        ⚠️ **绝不记载荷本身** —— 改之前这一行是
+        ``logger.exception("... failed to handle update %r", update)``，
+        而 ``update`` 里有**用户自己那段正文**（``message.text``）、
+        ``username`` / ``first_name`` / ``last_name``，以及 ``chat.title``
+        ⇒ 任何上游异常（投递钩子抛、下游解析抛、按钮处理抛）都会把**别人的私聊
+        正文逐字搬进 ERROR 级日志**。§2.2 把「用户消息正文」列为敏感项。
+
+        ⚠️ **这条不是冷路径**：``except`` 包住的是 ``_advance_offset`` +
+        ``_dispatch_update``，**任何**上游异常都走这里，而它每次都带一条 update。
+
+        ⇒ 形状**逐字照抄** :meth:`_handle_callback` 那条「callback without chat
+        context」告警（``from=%s keys=%s`` · :func:`redactable_id` ·
+        ``tuple(sorted(...))``）—— 那条已有 ``tests/test_telegram_callback_log_shape.py``
+        9 个方法钉住形状，**不许在这里自创一套**。
+
+        ⛔ **绝不记** ``message.text`` / ``from.username`` / ``first_name`` /
+        ``last_name`` / ``chat.title`` / ``data`` 的值。
+
+        :attr:`~opencode_bridge.identity.Redactor` 之后的样子是
+        ``telegram:conv#<摘要>``（``redactable_id`` 只负责补前缀，摘要是 C2 在
+        ``RedactingFilter`` 里算的）⇒ 同一个会话跨行仍可关联，而正文一个字都不剩。
+        """
+        message = update.get("message")
+        chat_id = None
+        if isinstance(message, dict):
+            chat = message.get("chat")
+            if isinstance(chat, dict):
+                chat_id = chat.get("id")
+        if chat_id is None:
+            callback = update.get("callback_query")
+            if isinstance(callback, dict):
+                nested = callback.get("message")
+                if isinstance(nested, dict):
+                    chat = nested.get("chat")
+                    if isinstance(chat, dict):
+                        chat_id = chat.get("id")
+        return "update_id=%s chat=%s keys=%s" % (
+            update.get("update_id"),
+            redactable_id(self.name, chat_id),
+            tuple(sorted(update)),
+        )
+
     def _on_update(self, update: Any) -> None:
         """传输层交给我们的**一条** update。
 
@@ -832,6 +897,9 @@ class TelegramAdapter(Adapter):
         这一批 update 被无限重放（下一轮 ``getUpdates`` 已经带着新的 offset，
         服务端不会把那批再发一遍）。这段 try/except 与迁移前的循环体逐字一致：
         单条失败只记日志、继续处理同批的下一条。
+
+        ⚠️ **异常那行只记定位字段**（见 :meth:`_update_locator`）：改之前是
+        ``%r`` 整个 update ⇒ 用户正文逐字进 ERROR 日志。
         """
         if not isinstance(update, dict):
             return
@@ -839,7 +907,9 @@ class TelegramAdapter(Adapter):
             self._advance_offset(update)
             self._dispatch_update(update)
         except Exception:
-            logger.exception("telegram: failed to handle update %r", update)
+            logger.exception(
+                "telegram: failed to handle update: %s", self._update_locator(update)
+            )
 
     def _poll_once(self) -> bool:
         """跑完一轮（请求一批 → 逐条「先推进 offset 再分发」）。返回 True 表示成功。

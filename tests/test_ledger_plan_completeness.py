@@ -49,7 +49,8 @@ def normalize(text):
 
 
 PAIRS = [
-    # ⚠️ 29 条 = 2026-10-09 闭合 telegram 审计两条（answerCallbackQuery / channel_post）后的开放行数；台账行数一变必须人工同步（docstring 第 3 条）。
+    # ⚠️ 25 条 = 2026-10-09 再闭合四条（callback_data `912dbb1` · poll_timeout `cd295d0` ·
+    #   部分失败缺口标记 `bc926e8` · telegram 重试代价拍板①零代码）后的开放行数；台账行数一变必须人工同步（docstring 第 3 条）。
     # ⚠️ key 逐字取自表侧行名/正文里一段【两侧都出现】的连续字面，⛔ 不自己造短键 ——
     #   两侧都会被 normalize（剥 `**`/反引号、去空白），两边写法归一化后相同即可。
     # ⚠️ key 含 `【…】` 时那是行名的一部分 —— ⛔ 不要因为「括号看着像装饰」改成裸词。
@@ -64,8 +65,6 @@ PAIRS = [
     # 2026-10-07 outbound 审计结论新增三条（零 .py 编辑，实测数字见 tasks.md）：
     ("`outbound` 的失败可见性挂在【可被装配关掉的那个通道】上",
      "`outbound` 的失败可见性挂在"),
-    ("部分失败无回滚、无中止、无重发 ⇒ 读者拿到的是静默截断的答复",
-     "部分失败无回滚、无中止、无重发"),
     ("`discord.py` 的 429 单次重试用裸 `time.sleep` ⇒ `stop()` 打不断 ⇒ 一次关停最坏被拖住 60 秒",
      "的 429 单次重试用裸"),
     (":882 错误正文超长需第二条气泡", ":882错误正文超长"),
@@ -83,15 +82,11 @@ PAIRS = [
     #   清单里写「出站失败段的同型缺陷」—— 差一方括号就必然一边报缺（该行已闭合，教训仍在）。
     # 长输入回执（ora-14 查出的入站投递缺陷）：
     ("长输入回执发在去重之前", "长输入回执发在去重判定"),
-    ("telegram 重试的代价：failed 不变", "重试的代价"),
     ("占位消息飞行中的窄窗（孤儿气泡）", "飞行中的窄窗"),
-    # 2026-10-08 telegram 适配器审计新增八条，2026-10-09 已闭合两条（PAIRS 条目随之移出；
-    # 守门 = tests/test_telegram_answer_not_ok_warning.py 与
-    # tests/test_telegram_non_message_shape_info_log.py，证据见总表 ~~…~~ 闭合行）：
-    ("`callback_data` 【静默按字节截断】⇒ 点击回来的 data 与按钮绑定的不是同一个值",
-     "`callback_data` 【静默按字节截断】"),
-    ("`poll_timeout` 【无上界】⇒ 一个写错的旋钮造出约 31 年的 socket 超时",
-     "`poll_timeout` 【无上界】"),
+    # 2026-10-08 telegram 适配器审计新增八条，2026-10-09 已闭合四条（PAIRS 条目随之移出：
+    # answerCallbackQuery / channel_post（守门 = tests/test_telegram_answer_not_ok_warning.py 与
+    # tests/test_telegram_non_message_shape_info_log.py）· callback_data `912dbb1` ·
+    # poll_timeout `cd295d0`，证据见总表 ~~…~~ 闭合行）：
     ("telegram 的 `_last_send` 【永不淘汰】⇒ 纯内存、无界增长",
      "`_last_send` 【永不淘汰】"),
     ("`_advance_offset` 对畸形 `update_id` 【静默 return】⇒ 该条 offset 不推进 ⇒ 会被服务端重发",

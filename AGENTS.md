@@ -511,25 +511,30 @@ warning** 且掌握「不可重放」，而关停期间每个活着的适配器�
 　　—— 那属 `transport/base.py`）。
 　⇒ **标定它需要的那组数 = 一次真实的关停耗时** ⇒ **下一步：量一次真实的关停耗时**；
 　　⛔ **在量出来之前不许改**。
-· **telegram 的 `answerCallbackQuery` 返回 `ok:false` ⇒ WARNING 及以上 0 条
-⇒ 按钮转圈停不掉，而默认档位无迹** ⇒ **第 1 类「已确认缺陷」**
+· ~~**telegram 的 `answerCallbackQuery` 返回 `ok:false` ⇒ WARNING 及以上 0 条
+⇒ 按钮转圈停不掉，而默认档位无迹**~~ ⇒ **已闭合** ✅（2026-10-09 · `63d7434`）—— **第 1 类「已确认缺陷」**
 （高 · 认领人=编排者 · 2026-10-08 起）：`answer` 抓到 `ok is not True` 只打一条
 　`logger.debug` ⇒ **默认档位下零日志**；而转圈**只有** `answerCallbackQuery` 能停掉
 　⇒ 用户看到的就是「点了没反应、也永远转下去」。
 　⇒ **实测两臂只差「返回 ok:false」与「抛异常」**：ok:false ⇒ WARNING 及以上 **0** 条
 　（只有那一条 debug）；抛异常（**对照臂**）⇒ **1** 条 ⇒ **判据有辨别力**
 　（两臂都仍然调了 `on_callback`，`finally` 契约成立）。
-　⇒ **下一步（编排者，2026-10-08 起）**：提到 `warning` + 点名 `query_id`，**先加一条
-　行为型守门**钉住「ok:false ⇒ WARNING 及以上 ≥ 1 条」⇒ ⛔ 只改档位不加守门等于没改。
-· **telegram 的 `channel_post` / `edited_message` 等形状入站 ⇒ 投递 0 条 + 日志 0 条
-⇒ 频道发言者永不解释** ⇒ **第 1 类「已确认缺陷」**
+　⇒ **已落地（2026-10-09 · `63d7434`）**：提到 `warning` + 点名 `query_id`；行为型守门
+　`tests/test_telegram_answer_not_ok_warning.py` 三臂钉住「ok:false ⇒ 恰好 1 条
+　WARNING 及以上；ok:true ⇒ 0 条；抛异常 ⇒ 1 条 ERROR 不被碰掉」⇒ 反向证明
+　M1（降回 debug、去 `query_id`）⇒ 守门真红、还原后 SHA256 对基线。⛔ 未跑全量 ×3。
+· ~~**telegram 的 `channel_post` / `edited_message` 等形状入站 ⇒ 投递 0 条 + 日志 0 条
+⇒ 频道发言者永不解释**~~ ⇒ **已闭合** ✅（2026-10-09 · `63d7434`）—— **第 1 类「已确认缺陷」**
 （高 · 认领人=编排者 · 2026-10-08 起）：**两臂只差 update 里的键名、正文逐字相同** ——
 　`message` ⇒ 投递到上层 **1** 条 / 日志 **0** 条；`channel_post` ⇒ 投递 **0** 条 / 日志 **0** 条。
 　⇒ ⚠️ **零投递是设计、零解释不是**（源码注释写着「fall through and are ignored」）
 　⇒ 而两个臂日志都为空 ⇒ 从日志上**完全同形**。
 　⇒ ⭐ **必填件**：**频道里的发言永远不会被回答，而没有任何一句解释**。
-　⇒ **下一步（编排者，2026-10-08 起）**：先加一条守门钉住「非 message 形状进来 ⇒
-　至少一条 INFO 说明忽略了哪一类」⇒ ⛔ **不要**把它们接进入站（频道每条发言都触发 agent）。
+　⇒ **已落地（2026-10-09 · `63d7434`）**：fall-through 处补一条 INFO 只记形状（排序
+　顶层键名，⛔ 不记载荷）；守门 `tests/test_telegram_non_message_shape_info_log.py`
+　五用例钉住「无 message 键形状 ⇒ 投递 0 + 恰好 1 条 INFO；哨兵零泄漏；正常 message
+　与贴纸形状零条该 INFO」⇒ ⛔ 仍不接入站（频道每条发言都触发 agent）；反向证明
+　M2（拿掉 INFO）⇒ 守门真红、还原后 SHA256 对基线。⛔ 未跑全量 ×3。
 · **`callback_data` 【静默按字节截断】⇒ 点击回来的 data 与按钮绑定的不是同一个值**
 ⇒ **第 1 类「已确认缺陷」**（高 · 认领人=编排者 · 2026-10-08 起）：
 　`button.data.encode("utf-8")[:CALLBACK_DATA_LIMIT].decode("utf-8", errors="ignore")`

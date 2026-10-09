@@ -49,7 +49,7 @@ def normalize(text):
 
 
 PAIRS = [
-    # ⚠️ 31 条 = 2026-10-09 时的开放行数；台账行数一变必须人工同步（docstring 第 3 条）。
+    # ⚠️ 29 条 = 2026-10-09 闭合 telegram 审计两条（answerCallbackQuery / channel_post）后的开放行数；台账行数一变必须人工同步（docstring 第 3 条）。
     # ⚠️ key 逐字取自表侧行名/正文里一段【两侧都出现】的连续字面，⛔ 不自己造短键 ——
     #   两侧都会被 normalize（剥 `**`/反引号、去空白），两边写法归一化后相同即可。
     # ⚠️ key 含 `【…】` 时那是行名的一部分 —— ⛔ 不要因为「括号看着像装饰」改成裸词。
@@ -85,11 +85,9 @@ PAIRS = [
     ("长输入回执发在去重之前", "长输入回执发在去重判定"),
     ("telegram 重试的代价：failed 不变", "重试的代价"),
     ("占位消息飞行中的窄窗（孤儿气泡）", "飞行中的窄窗"),
-    # 2026-10-08 telegram 适配器审计新增八条（分类与实测数字见 tasks.md 总表）：
-    ("`answerCallbackQuery` 返回 `ok:false` ⇒ WARNING 及以上 0 条 ⇒ 按钮转圈停不掉",
-     "`answerCallbackQuery` 返回 `ok:false`"),
-    ("`channel_post` / `edited_message` 等形状入站 ⇒ 投递 0 条 + 日志 0 条 ⇒ 频道发言者永不解释",
-     "`channel_post` / `edited_message` 等形状入站"),
+    # 2026-10-08 telegram 适配器审计新增八条，2026-10-09 已闭合两条（PAIRS 条目随之移出；
+    # 守门 = tests/test_telegram_answer_not_ok_warning.py 与
+    # tests/test_telegram_non_message_shape_info_log.py，证据见总表 ~~…~~ 闭合行）：
     ("`callback_data` 【静默按字节截断】⇒ 点击回来的 data 与按钮绑定的不是同一个值",
      "`callback_data` 【静默按字节截断】"),
     ("`poll_timeout` 【无上界】⇒ 一个写错的旋钮造出约 31 年的 socket 超时",

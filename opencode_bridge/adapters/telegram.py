@@ -1410,8 +1410,24 @@ class TelegramAdapter(Adapter):
             return False
         payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": out.text}
         if out.buttons:
-            # Single column: one button per row (CONTRACT.md §2.2).
-            payload["inline_keyboard"] = [[_button_row(b)] for b in out.buttons]
+            # Single column: one button per row (CONTRACT.md §2.2)。
+            # 超限按钮【放弃该按钮】而不是截断（用户拍板 2026-10-09）：截断的
+            # data 会让点击触发另一个动作且 Telegram 不校验 —— 宁可不渲染。
+            keyboard_rows = []
+            for position, button in enumerate(out.buttons, start=1):
+                try:
+                    keyboard_rows.append([_button_row(button)])
+                except ValueError:
+                    encoded_length = len(button.data.encode("utf-8"))
+                    logger.warning(
+                        "telegram: 按钮被拒绝不渲染（第 %d/%d 个 label=%r）："
+                        "callback_data %d 字节 > 上限 %d —— Telegram 会按字节"
+                        "静默截断、点击触发另一个动作，绝不带截断的 data 上线",
+                        position, len(out.buttons), button.label,
+                        encoded_length, CALLBACK_DATA_LIMIT,
+                    )
+            if keyboard_rows:
+                payload["inline_keyboard"] = keyboard_rows
         data = self._api(handle.conversation_id, "editMessageText", payload)
         if not isinstance(data, dict):
             return False
@@ -1433,8 +1449,21 @@ class TelegramAdapter(Adapter):
 
 
 def _button_row(button: Button) -> dict:
-    """Serialize a Button to a Telegram inline keyboard button (<= 64 bytes)."""
-    data = button.data.encode("utf-8")[:CALLBACK_DATA_LIMIT].decode(
-        "utf-8", errors="ignore"
-    )
-    return {"text": button.label, "callback_data": data}
+    """Serialize a Button to a Telegram inline keyboard button.
+
+    ⚠️ Telegram 把 ``callback_data`` 按 **64 字节静默截断**（切在多字节字符中间
+    还会把半个字符丢掉），且**不校验、不报错** ⇒ 点击回来的 data 与按钮绑定的
+    不是同一个值，用户点了却**触发另一个动作**。所以这里绝不截断：
+
+    ``button.data`` 的 UTF-8 编码超过 :data:`CALLBACK_DATA_LIMIT` 即抛
+    ``ValueError`` —— 与 ``edit()`` 对超长正文的闸同一形态（不静默降级）。
+    调用方负责拒绝该按钮（本文件 ``edit()``：放弃该按钮 + WARNING，
+    绝不带截断的 data 上线）。
+    """
+    encoded = button.data.encode("utf-8")
+    if len(encoded) > CALLBACK_DATA_LIMIT:
+        raise ValueError(
+            "telegram callback_data too long: %d > %d bytes"
+            % (len(encoded), CALLBACK_DATA_LIMIT)
+        )
+    return {"text": button.label, "callback_data": button.data}

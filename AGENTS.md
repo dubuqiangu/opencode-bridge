@@ -434,20 +434,31 @@ warning** 且掌握「不可重放」，而关停期间每个活着的适配器�
 　　而自愈路径会**改变送达顺序** ⇒ ⛔ 不在缺陷修复里顺手做。
 　⇒ **判据（可复核）**：`flush_queue` 的「见 `_draining` 即返回」这条分支
 　　**必须有办法被确定性地触发一次** ⇒ 没有就说明它仍无覆盖。
-· **a2a：用户只敲 `..` / `!!`，对端就收到 `task completed`** ⇒ **第 1 类**
-（认领人=编排者 · 2026-10-08 起）。⚠️ **2026-10-07 由 `fix-297` 通读时顺带查出
-（此前台账里没有这一条）**：
-　`adapters/a2a.py:162` 把 `"text"` 映到 `STATE_COMPLETED`
-　⇒ 而 `BUFFERED_NOTICE` / `HELD_EXPIRED_NOTICE` / 本次新增的
-　`HELD_NOT_DELIVERED_NOTICE` **三个都是 `kind="text"`**
-　⇒ **agent 还没跑**，a2a 对端已收到 task completed。
-　⇒ ⚠️ **与已修那条形状不同、别混**：`fix-293` 修的是「**取消**被映成完成」，
-　　**本条是缓冲回执共用 `text`**，⛔ 不是取消那条的残留。
-　⇒ ⛔ **没动**：改它要动 `fix-293` 的穷举表，而那张表有 **AST 覆盖面守门**
-　　断言「生产里写出的每个 kind 字面量都在表里」⇒ ⛔ 改表要同时确认守门仍绿。
-　⇒ **判据（可复核）**：a2a 映射表里 `"text" → STATE_COMPLETED` 这一格
-　　**必须只由真正的最终答复到达**；任何「告知读者某条已被缓冲/未投递」的回执
-　　**都不该落到它** ⇒ 判据是「这三个 kind 在映射表里指向非终态」。
+· ~~**a2a：用户只敲 `..` / `!!`，对端就收到 `task completed`**~~ ⇒ **已闭合** ✅
+（2026-10-10 · `7721ed6`）—— **第 1 类「已确认缺陷」**（认领人=编排者）。
+⚠️ **2026-10-07 由 `fix-297` 通读时顺带查出（此前台账里没有这一条）**：
+三条缓冲回执（`BUFFERED_NOTICE` / `HELD_EXPIRED_NOTICE` / `HELD_NOT_DELIVERED_NOTICE`）
+共用 `kind="text"`，而 a2a 映射表把 `"text"` 判成 `TASK_STATE_COMPLETED` ⇒
+**agent 还没跑**，对端已收到 task completed（与 `fix-293`「取消被映成完成」形状不同、别混）。
+⇒ **已落地（2026-10-10 · `7721ed6`）**：三条回执各获独立 kind 字面量
+　（`buffered` / `held_expired` / `held_not_delivered`），映射表非终态档指向
+　`STATE_WORKING`（判据「指向非终态」成立）；`send()` 对非终态档**不走 `_finalize`** ——
+　不判终态、不唤醒阻塞的 SendMessage（提前唤醒 = 对端拿到非终态 Task 返回，违反 §3.1.1）、
+　不用回执覆盖 `task.reply`；真正的答复仍由 `text` / `final` 写入，或 `reply_timeout`
+　判 `TASK_STATE_FAILED`（响亮失败）。
+⇒ ⚠️ **知情代价**：阻塞语义没有「中途消息」通道（推送订阅未实现），回执文本
+　**不送达** a2a 对端 —— 它能感知的只有任务仍在 WORKING。
+⇒ ⭐ **守门名单自身的缺口（本条顺带量出）**：AST 覆盖面守门只收 `Outbound` /
+　`self.send_text` / `self.finalize` 的字面量，而真实调用点全叫 `self._send_text` /
+　`self._finalize`（core 注入的名字）、`self.finalize` 生产 **0 命中** ⇒ 此前守门对
+　回执调用点**失明**，「守门仍绿」是空转 ⇒ 名单已补（tests/test_a2a.py）；且守门对
+　「回退 `kind="text"`」恒绿（text 已登记），只有 tests/test_inbound_gateway.py
+　三处 kind 钉能抓（反向证明 M3 验过）。
+⇒ 守门 = test_a2a 新行为测试（三 kind × 不判终态 / 不写 reply + 对照臂）+ 表穷举 +
+　AST 守门扩名单 + test_inbound_gateway 三处 kind 钉；反向证明 M1（表项指回
+　COMPLETED）/ M2（拿掉非终态分支）/ M3（调用点回退）真红、SHA256 对基线。
+　⛔ 未跑全量 ×3（定向 tests.test_a2a + tests.test_inbound_gateway +
+　tests.test_inbound_merge + tests.test_outbound = 324/324 绿）。
 · **2026-10-07 已从本清单移出一条** —— `inbox_recovery._replay_one`：启动重放时 dispatch 异常仍记成 `failed`（`fix-300` 已落地）：
 　根因 = §8 第 3 条**第二次**同型：`_dispatch_prompt` **判出了分档，却把它压成一个
 　字符串交给恢复层** ⇒ 判定所需的信息压根没被记录 ⇒ 正确做法是**记录**它。

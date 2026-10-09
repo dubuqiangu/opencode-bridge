@@ -57,7 +57,10 @@ class Outbound:
 
     conversation_id: str
     text: str
+    # "text" | "progress" | "final" | "error" | "cancelled"，加上 inbound_merge 的
+    # 三条缓冲回执 kind —— a2a 把它们映射到非终态，⛔ 不许与 "text" 混用。
     kind: str = "text"  # "text" | "progress" | "final" | "error" | "cancelled"
+                        # | "buffered" | "held_expired" | "held_not_delivered"
     buttons: tuple[Button, ...] = field(default_factory=tuple)
     session_id: Optional[str] = None
 

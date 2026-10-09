@@ -148,16 +148,24 @@ TERMINAL_STATES = frozenset(
     {STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED}
 )
 
-#: ``Outbound.kind`` -> 本适配器判定的终态。**穷举**，**刻意不设兜底**
+#: ``Outbound.kind`` -> 本适配器据它判定的任务状态。**穷举**，**刻意不设兜底**
 #: （理由见 :meth:`A2aAdapter.send` 里那段注释）。
 #:
-#: ⛔ ``progress`` **不在**表里：它不是终态 —— 进 :meth:`A2aAdapter.send` 必须先返回
+#: ⛔ ``progress`` **不在**表里：它不碰状态 —— 进 :meth:`A2aAdapter.send` 必须先返回
 #: 句柄而**不**碰状态（core 拿那个句柄去改写占位消息），所以它由方法开头那一支处理。
-#: ⇒ 表的键恰好是"会判终态的那些 kind"。
 #:
-#: ⚠️ **新增 kind 时必须在这里加一行**：`tests/test_a2a.py` 里有一条断言把本表的键集
-#: 钉成一个字面集合，而 :mod:`opencode_bridge.outbound` 是唯一发 kind 的地方 ——
-#: 只改一边，那条断言会红并指出缺哪一行（比"静默变成 COMPLETED"好得多）。
+#: 表的键分两档：
+#: * **终态档**（值 ∈ :data:`TERMINAL_STATES`）：真正的答复 / 失败 / 取消，走
+#:   :meth:`_finalize` —— 判终态并唤醒阻塞中的 ``SendMessage``。
+#: * **非终态档**：``inbound_merge`` 的三条缓冲回执（用户只敲 ``..`` / ``!!``）——
+#:   它们只告知「已收到，答复还没开始」，⛔ 绝不判终态（判了 = 对端在 agent 还没跑
+#:   时就收到 task completed，2026-10-10 修复）。:meth:`A2aAdapter.send` 对非终态档
+#:   **不碰状态、不唤醒、不改写 ``task.reply``**。
+#:
+#: ⚠️ **新增 kind 时必须在这里加一行**：`tests/test_a2a.py` 里有一条断言把本表
+#: （含每个键映射到哪个状态）钉成一个字面集合，另有一条 AST 覆盖面守门把生产里
+#: 写出的每个 ``kind=`` 字面量对本表登记 —— 只改一边，那条断言会红并指出缺哪一行
+#: （比"静默变成 COMPLETED"好得多）。
 _TASK_STATE_BY_OUTBOUND_KIND = {
     "text": STATE_COMPLETED,
     "final": STATE_COMPLETED,
@@ -165,6 +173,13 @@ _TASK_STATE_BY_OUTBOUND_KIND = {
     #: 用户主动丢弃那一轮（``/new`` / ``/reset`` / ``/cd``）—— 既不是完成也不是失败，
     #: A2A 规范 §4.1.3 为此列了 ``TASK_STATE_CANCELED``。
     "cancelled": STATE_CANCELED,
+    #: ⬇ 非终态档：三条缓冲回执。2026-10-10 修复前它们共用 ``kind="text"`` ⇒ 对端在
+    #: agent 还没跑时就收到 task completed。值 = 任务此刻实际所处的非终态：工作仍在
+    #: 等真正的答复（``text`` / ``final``），或等 ``reply_timeout`` 到点判
+    #: ``TASK_STATE_FAILED``（响亮失败，而不是假成功）。
+    "buffered": STATE_WORKING,
+    "held_expired": STATE_WORKING,
+    "held_not_delivered": STATE_WORKING,
 }
 
 #: ``Message.role``（规范 §4.1.5）。
@@ -1364,10 +1379,15 @@ class A2aAdapter(Adapter):
         * ``progress`` —— **绝不**据此判定任务完成。core 在 ``prompt()`` 返回后会先发
           一条进度占位消息，而本适配器 ``edit()`` 恒 ``False``，所以最终答复一定
           是**另一次** ``send()``。若在这里就完成任务，对端只会收到"处理中…"。
-        * 其余走 :data:`_TASK_STATE_BY_OUTBOUND_KIND` 这张**穷举**表：
-          ``text`` / ``final`` -> ``TASK_STATE_COMPLETED``，
+        * 其余走 :data:`_TASK_STATE_BY_OUTBOUND_KIND` 这张**穷举**表，表分两档：
+          终态档 —— ``text`` / ``final`` -> ``TASK_STATE_COMPLETED``，
           ``error`` -> ``TASK_STATE_FAILED``，
-          ``cancelled`` -> ``TASK_STATE_CANCELED``（用户主动 ``/new`` 丢掉那一轮）。
+          ``cancelled`` -> ``TASK_STATE_CANCELED``（用户主动 ``/new`` 丢掉那一轮）；
+          非终态档 —— 三条缓冲回执 ``buffered`` / ``held_expired`` /
+          ``held_not_delivered``（``inbound_merge`` 的 ``..`` / ``!!`` 续行）映射
+          ``TASK_STATE_WORKING``：只确认「已收到，答复还没开始」，**不判终态**、
+          不唤醒阻塞者（2026-10-10 修复：此前三条回执共用 ``kind="text"`` ⇒ 对端在
+          agent 还没跑时就收到 task completed）。
         * ⛔ **表里没有的 kind 一律不判终态**，只记一次 ``bad_format`` 失败。
           此前这里是 ``STATE_FAILED if out.kind == "error" else STATE_COMPLETED``
           ⇒ 未知 kind **静默变成"完成"**（用户 2026-10-07 拍板改掉）。
@@ -1436,6 +1456,17 @@ class A2aAdapter(Adapter):
                 "unknown outbound kind: %r" % (out.kind,),
             )
             return None
+        if state not in TERMINAL_STATES:
+            # ⚠️ 表项指向非终态 = 缓冲回执（``inbound_merge`` 的 ``..`` / ``!!``）。
+            # ⛔ **不走** :meth:`_finalize`：它会 ``task.done.set()`` 唤醒阻塞中的
+            # ``SendMessage`` —— 对端就提前拿到一个非终态 Task 返回（违反 §3.1.1
+            # 「默认等终态」），且 ``task.reply`` 会被回执文本**覆盖**，真正的答复
+            # 到达时反而写不进已醒的等待者。
+            # ⇒ 什么都不碰：task 留在 WORKING，等 ``text`` / ``final`` 到达，或
+            # ``reply_timeout`` 到点判 ``TASK_STATE_FAILED``（响亮失败）。
+            # ⚠️ 知情代价：阻塞语义下没有「中途消息」通道（推送订阅未实现），回执
+            # 文本**不送达** a2a 对端 —— 它能感知的只有任务仍在 WORKING。
+            return MsgHandle(out.conversation_id, task.task_id, self.name)
         self._finalize(task, state, out.text or "")
         return MsgHandle(out.conversation_id, task.task_id, self.name)
 

@@ -937,6 +937,9 @@ class InboundMergeWiringTests(InboundGatewayTestCase):
         self.assertEqual(self.client.prompts, [])
         self.assertEqual(self.send_text.outgoing[-1].text,
                          BUFFERED_NOTICE)
+        # 回执的 kind 是它自己的 —— ⛔ 不许复用 "text"（a2a 把 "text" 判成
+        # TASK_STATE_COMPLETED，对端会在 agent 还没跑时就收到 task completed）。
+        self.assertEqual(self.send_text.outgoing[-1].kind, "buffered")
 
     def test_the_expired_hold_is_delivered_and_reported(self):
         self.gateway.on_inbound(message("敲完就走了..", message_id="m1"))
@@ -1108,6 +1111,12 @@ class ExpiredHoldNoticeHonestyTests(InboundGatewayTestCase):
         self.assertIn(
             HELD_EXPIRED_NOTICE % "帮我看下 README", self.what_the_reader_was_told()
         )
+        # 超时回执的 kind ⛔ 不许复用 "text"（a2a 会把 "text" 判成 COMPLETED）。
+        self.assertEqual(
+            [out.kind for out in self.send_text.outgoing
+             if out.text == HELD_EXPIRED_NOTICE % "帮我看下 README"],
+            ["held_expired"],
+        )
 
     def test_the_same_union_expiring_twice_is_never_reported_as_sent(self):
         """同一会话里第二次超时发出的同一段并集：没说发出，且说清了没发出去。
@@ -1141,6 +1150,12 @@ class ExpiredHoldNoticeHonestyTests(InboundGatewayTestCase):
         self.assertIn(HELD_NOT_DELIVERED_NOTICE % "帮我看下 README", told)
         # 缓冲里的内容必须回到读者手上 —— 否则他既没发出去、也看不到自己敲了什么。
         self.assertTrue(any("帮我看下 README" in text for text in told))
+        # 未投递回执的 kind ⛔ 不许复用 "text"（a2a 会把 "text" 判成 COMPLETED）。
+        self.assertEqual(
+            [out.kind for out in self.send_text.outgoing
+             if out.text == HELD_NOT_DELIVERED_NOTICE % "帮我看下 README"],
+            ["held_not_delivered"],
+        )
 
     def test_an_inbox_that_cannot_be_written_says_the_message_was_not_delivered(self):
         """写前落盘失败 ⇒ 盘上没回执、也发不出去 ⇒ 用户必须知道要自己重发。"""

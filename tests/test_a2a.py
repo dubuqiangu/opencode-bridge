@@ -837,17 +837,61 @@ class TestOutboundKindToTaskState(A2aServerTestCase):
                          "对端拿到的必须是出站那一侧真正发出去的那句")
 
     def test_each_kind_maps_to_the_state_the_a2a_spec_names(self):
-        """穷举这张表：规范 §4.1.3 的终态名与表里的键一一对上。
+        """穷举这张表：规范 §4.1.3 的状态名与表里的键一一对上。
 
-        ⚠️ ``progress`` **不在**表里（它不判终态，见 :meth:`A2aAdapter.send` 开头）。
+        ⚠️ ``progress`` **不在**表里（它不碰状态，见 :meth:`A2aAdapter.send` 开头）。
+        表分两档：终态档（text / final / error / cancelled）与**非终态档** —— 三条
+        缓冲回执（``inbound_merge`` 的 ``..`` / ``!!``）映射 ``STATE_WORKING``：它们
+        只确认「已收到」，⛔ 绝不判终态（2026-10-10 修复：此前三条回执共用
+        ``kind="text"`` ⇒ 对端在 agent 还没跑时就收到 task completed）。
         这条断言兼作"新增 kind 时要改两处"的强制点：只改 a2a 的表不改这里 ⇒ 红。
         """
         self.assertEqual(
             _TASK_STATE_BY_OUTBOUND_KIND,
             {"text": STATE_COMPLETED, "final": STATE_COMPLETED,
-             "error": STATE_FAILED, "cancelled": STATE_CANCELED},
-            "kind -> A2A 终态的映射变了：新增 kind 必须同时更新 a2a 的表与本断言",
+             "error": STATE_FAILED, "cancelled": STATE_CANCELED,
+             "buffered": STATE_WORKING,
+             "held_expired": STATE_WORKING,
+             "held_not_delivered": STATE_WORKING},
+            "kind -> A2A 状态的映射变了：新增 kind 必须同时更新 a2a 的表与本断言",
         )
+
+    def test_buffered_receipts_never_judge_a_terminal_state(self):
+        """⛔ 缺陷形态下这一条是红的：回执共用 ``kind="text"`` ⇒ ``COMPLETED``。
+
+        用户只敲 ``..`` / ``!!`` 时，桥发的是「已收到，答复还没开始」的回执 ——
+        a2a 对端此刻**绝不该**收到终态。判据（tasks.md）：这三个 kind 在映射表里
+        指向非终态，且 ``send`` 对它们不判终态、不唤醒阻塞者、不覆盖 ``task.reply``。
+        """
+        adapter, hooks = self.make(RecordingHooks())
+        task_id, conversation_id = self._running_task(adapter, hooks)
+
+        for receipt_kind in ("buffered", "held_expired", "held_not_delivered"):
+            with self.subTest(receipt_kind=receipt_kind):
+                handle = adapter.send(Outbound(
+                    conversation_id, "已收到这一行，还在等下一行",
+                    kind=receipt_kind))
+                # 回执不算发送失败 —— 与 progress 那一支同形，返回句柄。
+                self.assertIsInstance(handle, MsgHandle)
+                state, task = self._task_state(adapter, task_id)
+                self.assertEqual(
+                    state, STATE_WORKING,
+                    "回执 kind=%r 把任务判成了 %r —— 对端会在 agent 还没跑时"
+                    "就收到终态" % (receipt_kind, state))
+                self.assertNotIn(
+                    "artifacts", task,
+                    "回执写进了 task.reply —— 走了 _finalize，真正的答复会被它"
+                    "覆盖、阻塞的 SendMessage 还会被提前唤醒")
+
+        # 对照臂：真正的最终答复仍能把**同一个**任务推到 COMPLETED —— 证明回执
+        # 没有「消费」掉这个任务，也没有挡住终态那条路。
+        self.assertIsInstance(
+            adapter.send(Outbound(conversation_id, "真正的最终答复", kind="final")),
+            MsgHandle)
+        state, task = self._task_state(adapter, task_id)
+        self.assertEqual(state, STATE_COMPLETED)
+        self.assertEqual(task["artifacts"][0]["parts"][0]["text"],
+                         "真正的最终答复")
 
     def test_the_cancelled_kind_survives_the_blocking_send_message_path(self):
         """端到端：core 真实走的那条路（blocking ``SendMessage``）。"""
@@ -892,8 +936,15 @@ class TestOutboundKindToTaskState(A2aServerTestCase):
         """⚠️ 覆盖面守门（**AST**，不是行级正则 —— 后者匹配不到跨行的实参）。
 
         判据：把生产代码里真正给 ``Outbound`` / ``self.send_text`` / ``self.finalize``
-        写的 ``kind=<字面量>`` 全收集起来，每一个都必须在
-        ``{"progress"} | set(_TASK_STATE_BY_OUTBOUND_KIND)`` 里。
+        / ``self._send_text`` / ``self._finalize`` 写的 ``kind=<字面量>`` 全收集起来，
+        每一个都必须在 ``{"progress"} | set(_TASK_STATE_BY_OUTBOUND_KIND)`` 里。
+
+        ⚠️ 后两个名字是 2026-10-10 补上的：core 把 ``outbound.send_text`` /
+        ``outbound.finalize`` 注入成 ``self._send_text`` / ``self._finalize`` ——
+        ``commands`` / ``event_stream`` / ``inbound_gateway`` 的真实调用点全是带
+        下划线那两个名字，而 ``self.finalize`` 在生产里 0 命中 ⇒ 此前本守门对
+        缓冲回执的调用点**失明**（「守门仍绿」是空转）。补名单后它们才真的被
+        登记约束。
 
         ⇒ 新增 kind 却忘了在这里登记时，这一条会红 —— 而不登记的后果是「静默变成
         COMPLETED」，用户完全看不出来（那正是本缺陷）。
@@ -904,8 +955,9 @@ class TestOutboundKindToTaskState(A2aServerTestCase):
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                if ast.unparse(node.func) not in ("Outbound", "self.send_text",
-                                                  "self.finalize"):
+                if ast.unparse(node.func) not in (
+                        "Outbound", "self.send_text", "self.finalize",
+                        "self._send_text", "self._finalize"):
                     continue
                 for keyword in node.keywords:
                     if keyword.arg != "kind":

@@ -477,8 +477,11 @@ class InboundGateway:
         if merged.kind == HELD:
             # 回执是**必须**的：一行以 `..` 结尾的散文会被判成续行标记，没有这句
             # 它就是静默消失（AGENTS.md §8 点名最糟的那种代价）。
+            # ⚠️ kind ⛔ 不许复用 "text"：a2a 把 "text" 判成 TASK_STATE_COMPLETED ⇒
+            # 对端会在 agent 还没跑时就收到 task completed（2026-10-10 修复；新 kind
+            # 必须登记进 a2a 的穷举表，见 adapters/a2a.py 的非终态档）。
             self._send_text(
-                conversation_id, BUFFERED_NOTICE, kind="text", adapter=adapter
+                conversation_id, BUFFERED_NOTICE, kind="buffered", adapter=adapter
             )
             return
         self._persist_and_enqueue(conversation_id, adapter, inbound, merged.text)
@@ -598,17 +601,21 @@ class InboundGateway:
         if queued is None:
             # ⛔ 不许在这里说「已发出」（理由见 docstring）。把内容原样还给用户，
             # 好让他看见自己敲了什么、决定要不要重发。
+            # ⚠️ kind ⛔ 不许复用 "text"：a2a 把 "text" 判成 TASK_STATE_COMPLETED
+            #（见 BUFFERED 回执处那条注释 / a2a 穷举表的非终态档）。
             self._send_text(
                 conversation_id,
                 HELD_NOT_DELIVERED_NOTICE % held_text,
-                kind="text",
+                kind="held_not_delivered",
                 adapter=adapter,
             )
             return
+        # ⚠️ kind ⛔ 不许复用 "text"：a2a 把 "text" 判成 TASK_STATE_COMPLETED
+        #（见 BUFFERED 回执处那条注释 / a2a 穷举表的非终态档）。
         self._send_text(
             conversation_id,
             HELD_EXPIRED_NOTICE % held_text,
-            kind="text",
+            kind="held_expired",
             adapter=adapter,
         )
 

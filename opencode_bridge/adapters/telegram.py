@@ -1131,9 +1131,16 @@ class TelegramAdapter(Adapter):
             self._handle_callback(cq)
             return
         # edited_message / channel_post / edited_channel_post have no
-        # "message" key here -> they simply fall through and are ignored.
+        # "message" key here -> they are dropped **by design** (把它们接入
+        # 入站 = 频道每条发言都触发 agent)。但必须留一句解释：否则「零投递」
+        # 与「没收到」在日志上完全同形（2026-10-08 审计）。
+        # 只记形状（顶层键名）—— 与 _update_locator 同一条纪律，⛔ 绝不记载荷。
         message = update.get("message")
         if not isinstance(message, dict):
+            logger.info(
+                "telegram: ignoring update without message key: keys=%s",
+                tuple(sorted(key for key in update if key != "update_id")),
+            )
             return
         text = message.get("text")
         if not isinstance(text, str) or text == "":
@@ -1248,7 +1255,14 @@ class TelegramAdapter(Adapter):
                 logger.exception("telegram: answer failed for query %s", query_id)
 
     def answer(self, query_id: str, text: str = "") -> None:
-        """Acknowledge a callback query (``answerCallbackQuery``). Never raises."""
+        """Acknowledge a callback query (``answerCallbackQuery``). Never raises.
+
+        ⚠️ 应答被服务端拒收（``ok:false``）时打 **WARNING** 并点名 ``query_id``：
+        转圈**只有** ``answerCallbackQuery`` 能停掉，静默降级 ⇒ 用户看到的是
+        「点了没反应、也永远转下去」，而默认档位下零日志（2026-10-08 审计）。
+        ``query_id`` 是 Telegram 派生的不透明 id，不是用户内容 —— 与上方
+        ``answer failed for query %s`` 同一条记法。
+        """
         if not query_id:
             return
         payload: dict = {"callback_query_id": query_id}
@@ -1260,8 +1274,10 @@ class TelegramAdapter(Adapter):
             logger.exception("telegram: answerCallbackQuery failed")
             return
         if isinstance(data, dict) and data.get("ok") is not True:
-            logger.debug(
-                "telegram: answerCallbackQuery not ok: %s", data.get("description")
+            logger.warning(
+                "telegram: answerCallbackQuery not ok for query %s: %s",
+                query_id,
+                data.get("description"),
             )
 
     # ------------------------------------------------------------------

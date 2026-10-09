@@ -89,6 +89,11 @@ API_HOST = "api.telegram.org"
 API_PORT = 443
 MESSAGE_LIMIT = 4096          # Telegram max message length in characters
 CALLBACK_DATA_LIMIT = 64      # inline callback_data limit in bytes
+#: 部分发送（前段已上线、后段失败）时追加给读者的缺口标记 —— 用户拍板 2026-10-09
+#: 「加缺口标记」：读者必须知道拿到的答复不完整，不能只有日志与 ``--status`` 知道。
+SEND_GAP_MARKER_TEXT = (
+    "—— ⚠️ 以上回复不完整：后续部分发送失败，未送达。如需完整内容请重新提问。"
+)
 MIN_SEND_INTERVAL = 1.2       # per-conversation send/edit throttle (seconds)
 BACKOFF_INTERVAL = 2.0        # 一次 getUpdates 失败后的重试间隔（秒，恒定）
 POLL_LONG_TIMEOUT = 25        # getUpdates long-poll seconds
@@ -1372,6 +1377,27 @@ class TelegramAdapter(Adapter):
                     self._note_send_failure(SendError.UNKNOWN, str(desc))
                 if handle is None:
                     return None
+                # 部分失败（用户拍板 2026-10-09「加缺口标记」）：前段已上线、
+                # 后段没了 ⇒ 读者拿到的是静默截断的答复。追加一条缺口标记让
+                # 读者知道不完整；标记本身失败只留 WARNING（缺口可见性此时退
+                # 回由日志与 --status 承担，不给失败路径再叠一层失败处理）。
+                marker_response = self._api(
+                    out.conversation_id,
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": SEND_GAP_MARKER_TEXT,
+                        "disable_web_page_preview": True,
+                    },
+                )
+                if (
+                    not isinstance(marker_response, dict)
+                    or marker_response.get("ok") is not True
+                ):
+                    logger.warning(
+                        "telegram: 部分发送的缺口标记也失败了 —— 读者看到的"
+                        "是静默截断的答复（与上方 sendMessage failed 同因）"
+                    )
                 return handle  # partial send: keep the last good handle
             result = data.get("result") or {}
             message_id = result.get("message_id")

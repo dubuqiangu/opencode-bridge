@@ -92,6 +92,7 @@ CALLBACK_DATA_LIMIT = 64      # inline callback_data limit in bytes
 MIN_SEND_INTERVAL = 1.2       # per-conversation send/edit throttle (seconds)
 BACKOFF_INTERVAL = 2.0        # 一次 getUpdates 失败后的重试间隔（秒，恒定）
 POLL_LONG_TIMEOUT = 25        # getUpdates long-poll seconds
+POLL_TIMEOUT_UPPER_LIMIT = 50  # Bot API 的服务端挂起上限（50s）：超过即回落默认并告警
 POLL_SOCKET_TIMEOUT = 40.0    # socket timeout must be > POLL_LONG_TIMEOUT
 #: 空轮（``ok`` 但 ``result`` 为空）后的防御性节流（秒）。
 #: 迁移前是 :meth:`TelegramAdapter._poll_once` 末尾的 ``_stop_event.wait(0.05)``：
@@ -283,6 +284,12 @@ class TelegramAdapter(Adapter):
         「没有任何可用适配器」—— **一个字都不提 ``poll_timeout`` 非法**。
         也就是说，一个旋钮写错会打死这条零容错关键路径，而真正的死因不在错误
         信息里、只在日志的一行 ``failed to build adapter`` 里。
+
+        ⚠️ **上侧同形闸**：``poll_timeout`` 超过 :data:`POLL_TIMEOUT_UPPER_LIMIT`
+        （Bot API 的服务端挂起上限 50s）同样回落并告警 —— 越界一律回落默认、
+        **不静默采纳**（纪律照抄 nextcloud 的 ``_config_int_value``：服务端会拒的
+        值不钳位、不截断）。⭐ 没有这道闸时，配 ``10**9`` 会让 socket 超时
+        （``poll_timeout + 15``）变成约 31 年，``stop()`` 拖到天荒地老。
         """
         raw = self.config.get("poll_timeout")
         if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -299,6 +306,13 @@ class TelegramAdapter(Adapter):
             logger.warning(
                 "telegram: 配置项 poll_timeout=%r 非法（非正数），已回落为 %d",
                 raw, POLL_LONG_TIMEOUT,
+            )
+            return POLL_LONG_TIMEOUT
+        if seconds > POLL_TIMEOUT_UPPER_LIMIT:
+            logger.warning(
+                "telegram: 配置项 poll_timeout=%r 超出上界 %d"
+                "（Bot API 服务端挂起上限），已回落为 %d",
+                raw, POLL_TIMEOUT_UPPER_LIMIT, POLL_LONG_TIMEOUT,
             )
             return POLL_LONG_TIMEOUT
         return seconds

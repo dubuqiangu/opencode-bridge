@@ -12,6 +12,9 @@
    ``int(...)`` 抛 ``ValueError`` ⇒ ``build()`` 把它包成 ``AdapterError`` ⇒ 适配器
    被跳过 ⇒ 整个桥 ``usable == 0``，而用户看到的报错是「没有任何可用适配器」，
    **一个字都不提 ``poll_timeout``**。现在解析失败回落默认值并告警。
+   上侧同款（2026-10-09 用户拍板上界 50s）：超过 Bot API 的服务端挂起上限
+   同样回落并告警 —— 改之前配 ``10**9`` 会让 socket 超时（``poll_timeout + 15``）
+   变成约 31 年、``stop()`` 拖到天荒地老，而日志里**零告警**。
 
 ⚠️ 本文件**不联网**：全部用替换 ``_post`` 的办法。
 """
@@ -25,7 +28,11 @@ import unittest
 logging.getLogger("opencode_bridge").addHandler(logging.NullHandler())
 
 from opencode_bridge.adapters import build
-from opencode_bridge.adapters.telegram import POLL_LONG_TIMEOUT, TelegramAdapter
+from opencode_bridge.adapters.telegram import (
+    POLL_LONG_TIMEOUT,
+    POLL_TIMEOUT_UPPER_LIMIT,
+    TelegramAdapter,
+)
 from opencode_bridge.health import VERDICT_FAILED, VERDICT_OK, VERDICT_SKIPPED
 from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 
@@ -264,6 +271,43 @@ class TestPollTimeoutIsNotFatal(unittest.TestCase):
         )
         with self.assertNoLogs("opencode_bridge.adapters.telegram", level="WARNING"):
             make_adapter({})
+
+    def test_oversized_poll_timeout_falls_back_with_a_warning(self):
+        """⭐ 配 ``10**9``：回落默认值 + **恰好一条**点名 ``poll_timeout`` 的告警。
+
+        改之前这个值原样通过 ⇒ socket 超时（``poll_timeout + 15``）约 31 年、
+        ``stop()`` 拖到天荒地老，而日志里零告警 —— 下限有闸、上限没有的那个
+        不对称正是缺陷本体。
+        """
+        with self.assertLogs("opencode_bridge.adapters.telegram",
+                             level="WARNING") as captured:
+            adapter = make_adapter({"poll_timeout": 10 ** 9})
+        self.assertEqual(adapter.poll_long_timeout, POLL_LONG_TIMEOUT)
+        self.assertLessEqual(adapter.poll_long_timeout, POLL_TIMEOUT_UPPER_LIMIT)
+        warnings = [line for line in captured.output if "poll_timeout" in line]
+        self.assertEqual(len(warnings), 1, f"该有一条 warning。实际：{captured.output!r}")
+        # 告警必须说清收到的值、上界、回落到多少 —— 只说"超限"等于让用户自己找。
+        self.assertIn("1000000000", warnings[0])
+        self.assertIn(str(POLL_TIMEOUT_UPPER_LIMIT), warnings[0])
+        self.assertIn(str(POLL_LONG_TIMEOUT), warnings[0])
+
+    def test_poll_timeout_just_over_the_upper_limit_falls_back(self):
+        """边界外侧一档（51）也要拦 —— 只拦天文数字等于没拦。"""
+        with self.assertLogs("opencode_bridge.adapters.telegram",
+                             level="WARNING") as captured:
+            adapter = make_adapter({"poll_timeout": POLL_TIMEOUT_UPPER_LIMIT + 1})
+        self.assertEqual(adapter.poll_long_timeout, POLL_LONG_TIMEOUT)
+        self.assertTrue(any("poll_timeout" in line for line in captured.output))
+
+    def test_poll_timeout_at_the_upper_limit_is_kept_and_silent(self):
+        """边界本身（50，Bot API 服务端挂起上限）**照旧生效、零告警** ——
+        防的是把合法边界值也回落掉的那种过宽闸。"""
+        logging.getLogger("opencode_bridge.adapters.telegram").addHandler(
+            logging.NullHandler()
+        )
+        with self.assertNoLogs("opencode_bridge.adapters.telegram", level="WARNING"):
+            adapter = make_adapter({"poll_timeout": POLL_TIMEOUT_UPPER_LIMIT})
+        self.assertEqual(adapter.poll_long_timeout, POLL_TIMEOUT_UPPER_LIMIT)
 
 
 class TestAdapterContractDefaults(unittest.TestCase):

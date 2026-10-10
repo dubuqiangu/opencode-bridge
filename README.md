@@ -715,6 +715,8 @@ python -m opencode_bridge --setup --json          # 机器可读视图：{config
 | `pairing_secret` | `""` | `/pair` 授权码的派生密钥，**自己生成**（如 `python -c "import secrets; print(secrets.token_hex(32))"`）填在这里。⛔ **留空 = 不提供配对**（绝不等于「用空串派生」）。⚠️ 改这个值 = 让所有**未兑换**的码失效；**已完成的配对不受影响**（授权已物化进 `allowed_chat_ids`），所以换 secret **踢不掉已授权的人** |
 | `bridge.edit_interval_seconds` | `1.5` | 流式增量编辑同一条 IM 消息的最小间隔（秒），用于节流 |
 | `bridge.max_message_chars` | `4000` | 单条消息编辑的长度上限；定稿超过该长度时改为**直接发送**（交给适配器分块） |
+| `bridge.webhook_port` | `0` | A3 单端口共享 webhook server 的端口。`0` = 由操作系统分配（本地/测试够用）；接真平台时**必须**配稳定端口（重启变端口对端找不到我们）。⚠️ **零路由 ⇒ 不绑端口**：没有适配器贡献 `webhook_routes` 时这个键不起作用（现有部署行为零变化） |
+| `bridge.webhook_host` | `"127.0.0.1"` | 共享 webhook server 的绑定地址，默认仅本机回环。配非回环 = 显式放宽可达性，绑定时另打一条 WARNING（hub 层无统一鉴权，每条路由的 handler 必须自验平台签名） |
 | `bridge.merge_continue_timeout_seconds` | `15` | 敲了 `..` 之后等下一行的**保险丝**上限（秒）。⚠️ 它**不是**合并窗口：没有 `..` 的消息根本不起计时器，所以普通消息的额外延迟可证明是 0。**配 `0` = 立即返回、原样使用、不改写**（不会被悄悄改写成 `15`）⇒ 续行缓冲不再装计时器 ⇒ 那条消息一直等到下一条非 `..` 行为止（**等待无界**）。⚠️ 缓冲**不是**纯内存：2026-10-10 起每次变异都整份快照进 `held-buffer.json`（与 `state.json` 同目录），启动时重灌找回并回一句告知（`kind="buffered"`，非终态）—— 崩溃/退出不再丢缓冲，且这份保险**不依赖计时器**（配 `0` 也在）。⛔ 但**配 `0` 仍不比默认更安全**：可重灌回去的那行同样在等一条可能永远不来的下一行 —— 关掉保险丝就是关掉保险丝。显式配 `0` 时启动会打一条点名该键的 `WARNING` |
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |

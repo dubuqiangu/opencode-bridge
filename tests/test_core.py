@@ -49,6 +49,10 @@ DEFAULT_BRIDGE = {
     "long_input_ack_chars": 180,
     # C3：续行保险丝秒数（15）—— 不是合并窗口，普通消息不碰它
     "merge_continue_timeout_seconds": 15.0,
+    # A3：共享 webhook server 端口（0 = 操作系统分配；零路由 ⇒ 不绑端口）
+    "webhook_port": 0,
+    # A3：共享 webhook server 绑定地址（默认仅本机回环；换地址 = 显式放宽）
+    "webhook_host": "127.0.0.1",
 }
 
 

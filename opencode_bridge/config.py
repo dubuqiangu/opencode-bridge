@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from .httpsrv import DEFAULT_BIND_HOST
 from .pairing import CONFIG_VERSION_KEY, PAIRING_SECRET_KEY
 
 __all__ = [
@@ -94,13 +95,31 @@ _BRIDGE_DEFAULTS: dict[str, Any] = {
     # ⇒ 文档措辞正确（关掉保险丝就是关掉保险丝）**不等于 0 更安全**。
     # 显式配 0 时 ``inbound_gateway`` 会另发一条点名该键的 WARNING。
     "merge_continue_timeout_seconds": 15.0,
+    # A3 单端口共享 webhook server（拓扑拍板 2026-10-10）：归属者是
+    # :mod:`opencode_bridge.webhook_hub`（唯一持 server 的地方）。端口键
+    # ``0`` = 由操作系统分配 —— 本地/测试够用；接**真**平台时要配稳定端口
+    # （重启变端口对端找不到我们，与 a2a ``bind_port`` 必填同一理由）。
+    # ⚠️ **零路由 ⇒ 不绑端口**：没有适配器经 ``Adapter.webhook_routes``
+    # 贡献路由时这个键不起作用 —— 现有 13 个适配器的部署行为零变化。
+    "webhook_port": 0,
+    # 绑定地址，默认回环（与 :data:`opencode_bridge.httpsrv.DEFAULT_BIND_HOST`
+    # 共用同一常量 —— ⛔ 不各写一份字面量，各写一份正是悄悄分叉的原因）。
+    # 绑非回环是部署者的显式决定；hub 侧会另发 WARNING（hub 层无统一鉴权，
+    # 各 handler 必须自验平台签名）。
+    "webhook_host": DEFAULT_BIND_HOST,
 }
 
-#: ``bridge`` 段里要取整的键。``0`` 对这两个键都是**合法值**（= 关掉该功能），
+#: ``bridge`` 段里要取整的键。``0`` 对这几个键都是**合法值**
+#: （``webhook_port`` 的 ``0`` = 操作系统分配；另两个 = 关掉该功能），
 #: 所以取整后只挡负数，不像 ``max_message_chars`` 那样要求至少 1。
 _BRIDGE_INTEGER_KEYS = frozenset(
-    {"max_message_chars", "long_input_ack_chars"}
+    {"max_message_chars", "long_input_ack_chars", "webhook_port"}
 )
+
+#: ``bridge`` 段里**字符串**值的键。``_merge_bridge`` 默认把一切值过
+#: ``float()`` 并拒收字符串 —— 这组键是例外（A3 为 ``webhook_host`` 加：
+#: 绑定地址本来就不是数）。非法值（非字符串 / 空串）回落默认并点名告警。
+_BRIDGE_STRING_KEYS = frozenset({"webhook_host"})
 
 _ENV_OVERRIDES: dict[str, str] = {
     "OPENCODE_URL": "opencode_url",
@@ -239,6 +258,19 @@ class Config:
         for key, value in raw.items():
             if key not in merged:
                 logger.warning("ignoring unknown bridge config key: %r", key)
+                continue
+            if key in _BRIDGE_STRING_KEYS:
+                # 字符串键（A3 的 ``webhook_host``）：非空字符串合法、
+                # 其余回落默认并点名告警 —— 键名只有这个调用点知道
+                # （fix-298 判据 ②：⛔ 不把键名写死进通用 helper）。
+                if isinstance(value, str) and value.strip():
+                    merged[key] = value
+                else:
+                    logger.warning(
+                        "ignoring bridge config key %r with invalid value %r",
+                        key,
+                        value,
+                    )
                 continue
             try:
                 number = float(value)

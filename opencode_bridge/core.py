@@ -84,6 +84,7 @@ from .session_model import SessionModelCommand
 from .session_registry import SessionRegistry, ruleset_for
 from .state import StateStore
 from .stream_cursor import StreamCursorStore
+from .webhook_hub import WebhookHub
 
 __all__ = [
     "BridgeCore",
@@ -236,6 +237,11 @@ class BridgeCore:
             1, int(self._positive_float(bridge_cfg.get("max_message_chars"),
                                         DEFAULT_MAX_MESSAGE_CHARS))
         )
+        # 共享 webhook server 的归属者（A3 单端口拓扑，拍板 2026-10-10）。
+        # 这里只构造、不绑端口 —— 只有至少一个适配器经
+        # :meth:`Adapter.webhook_routes` 贡献路由时才绑（见 :meth:`start`
+        # 的接线顺序说明）；构造永不失败（非法值在 hub 侧回落默认并告警）。
+        self.webhook_hub = WebhookHub(bridge_cfg)
 
         #: 适配器挂载表与归属判定（AGENTS.md §5.1）。它拥有 ``_adapters`` /
         #: ``_adapter_by_name`` / ``_conv_adapter``，并**第一个**构造 ——
@@ -405,6 +411,14 @@ class BridgeCore:
         # ⚠️ 位置有意义：SSE 线程**之后**、适配器**之前**（理由见
         # InboundGateway.recover_inbox）。
         self.inbound_gateway.recover_inbox()
+        # A3 共享 webhook server：**先于适配器**起 —— webhook 适配器可能要在
+        # 自己的 ``start()`` 里把回调地址（含实际端口；``webhook_port: 0``
+        # 时由 OS 分配、只有这里能拿到）告诉平台。hub 不抛异常（零路由不绑、
+        # 绑定失败记 ERROR），失败也不阻塞其余适配器的启动。
+        try:
+            self.webhook_hub.start(self.adapters)
+        except Exception:  # pragma: no cover - 防御：契约上 start 不抛
+            logger.exception("webhook hub start failed")
         probes: dict[str, dict] = {}
         for adapter in self.adapters:
             key = platform_key(adapter)
@@ -434,6 +448,13 @@ class BridgeCore:
                 adapter.stop()
             except Exception:
                 logger.exception("adapter %s failed to stop", adapter.name)
+        # A3：适配器停完再关共享 webhook server —— 适配器的 stop 先唤醒阻塞中
+        # 的 handler，hub.stop 再等在途 HTTP handler 收尾，让它们仍能在客户端
+        # 关闭前干净走完那一轮（与下方「先叫停看护者，再关客户端」同族纪律）。
+        try:
+            self.webhook_hub.stop()
+        except Exception:  # pragma: no cover - 防御：stop 自身也不抛
+            logger.exception("webhook hub stop failed")
         # ⚠️ 顺序：**先叫停看护者，再关客户端**。反过来时，处于退避等待中的 SSE
         # 看护者不会被客户端关闭唤醒（它等的是自己那个 Event），于是
         # ``join(5.0)`` 有可能刚好等不满、平白打一行 "did not exit within 5s"。

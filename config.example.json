@@ -10,7 +10,9 @@
   "config_version": 0,
   "bridge": {
     "edit_interval_seconds": 1.5,
-    "max_message_chars": 4000
+    "max_message_chars": 4000,
+    "webhook_port": 0,
+    "webhook_host": "127.0.0.1"
   },
   "adapters": {
     "telegram": { "bot_token": "", "allowed_chat_ids": [] },

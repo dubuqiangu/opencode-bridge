@@ -10,7 +10,7 @@ import os
 import pkgutil
 import re
 import threading
-from typing import Dict, Optional, Type
+from typing import TYPE_CHECKING, Dict, Optional, Type
 
 from ..allowlist import (
     AllowlistResolution,
@@ -28,6 +28,11 @@ from ..pairing import (
     reads_pairing_trigger,
     warn_if_pairing_unavailable,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型标注用；运行期不 import httpsrv
+    from typing import Iterable
+
+    from ..httpsrv import Route
 
 logger = logging.getLogger("opencode_bridge.adapters.base")
 
@@ -584,6 +589,29 @@ class Adapter(abc.ABC):
     def running(self) -> bool:
         thread = self._thread
         return thread is not None and thread.is_alive()
+
+    # --- 共享入站 webhook（A3：适配器只交 routes，不持 server）------------
+    def webhook_routes(self) -> "Iterable[Route]":
+        """交给**共享 webhook server** 的入站路由（单端口拓扑，拍板 2026-10-10）。
+
+        默认 = 空（现有 13 个适配器一个不用改、部署行为零变化）。想要
+        共享 server 入站的适配器覆写本方法；契约恰好三条：
+
+        1. **只交 routes、不持 server** —— 端口绑定、线程与优雅关闭全归
+           :class:`opencode_bridge.webhook_hub.WebhookHub`，适配器 ⛔ 不得
+           自建 :class:`~opencode_bridge.httpsrv.HttpServer`。
+        2. **验签在各自 handler 里做** —— 路由带 ``require_auth=False``，
+           handler 自验平台签名（Telegram secret token / Twilio HMAC…），
+           验不过就拒绝（fail-closed，纪律对齐 hermes sms；见
+           ``docs/platform-design-reference.md`` Part 11 结论 3）。hub 层
+           **没有**统一的平台鉴权。
+        3. **路由名要能认主** —— :attr:`name` 用
+           ``f"{self.name}-webhook"`` 这一族，冲突时 hub 能点名双方。
+
+        a2a **不是**这类适配器：它是请求/应答方（不是 webhook 推送），
+        自持 server 是被否的模板、不是迁移对象，保留原样。
+        """
+        return ()
 
     # --- 启动探测上报（契约在本类，落盘在 opencode_bridge.health）----------
     def report_startup_probe(

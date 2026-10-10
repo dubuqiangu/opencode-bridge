@@ -33,9 +33,11 @@ from .channel_profile import with_channel_hint
 from .commands import _SETUP_ALIASES, _setup_guide
 # 建 turn 用 :class:`Turn`，类型归事件流所有；这里只 import，不复制。
 from .event_stream import Turn
+from .held_buffer_store import HeldBufferStore
 from .hooks import Inbound, MsgHandle
 from .inbound_merge import (
     BUFFERED_NOTICE,
+    BUFFERED_RESTORED_NOTICE,
     HELD,
     HELD_EXPIRED_NOTICE,
     IGNORED,
@@ -296,6 +298,7 @@ class InboundGateway:
         lock: threading.RLock,
         turns: dict[str, Turn],
         inbox: InboundInbox | None,
+        held_buffer_store: HeldBufferStore | None,
         stream_confirmed: threading.Event,
         adapter_for: AdapterFor,
         answer_callback: AnswerCallback,
@@ -313,6 +316,14 @@ class InboundGateway:
         同一个对象，所以互斥关系与 dict 身份都没变。
 
         ``inbox`` 是 ``None`` 时写前收件箱整个关掉 —— 投递照走，只是不留收据。
+
+        ``held_buffer_store`` 是续行缓冲的落盘快照层（G2）。``None`` = 纯内存
+        旧行为：不写快照、启动不重灌 —— 与 ``inbox`` 同为"可选注入 ⇒ 漏接线
+        不会有任何测试变红"，所以 ``__main__`` 那一侧由装配守卫盯着
+        （tests/test_inbox_wiring.py）。注入时：合并器每次变异把整份缓冲快照
+        出去（:meth:`_persist_held_snapshot` 写失败只记 WARNING、绝不上抛），
+        启动时 :meth:`_recover_held_buffer` 把崩溃前的半行重灌回缓冲并回一句
+        找回告知。
 
         ``stream_confirmed`` 是事件流那个"订阅已建立"的信号；恢复要等它（有上限），
         但**不归本类拥有**：设它的是事件流。
@@ -332,6 +343,7 @@ class InboundGateway:
         self._lock = lock
         self._turns = turns
         self._inbox = inbox
+        self._held_buffer_store = held_buffer_store
         self._stream_confirmed = stream_confirmed
         self._adapter_for = adapter_for
         self._answer = answer_callback
@@ -365,16 +377,23 @@ class InboundGateway:
             logger.warning(
                 "bridge.merge_continue_timeout_seconds=0 —— 立即返回、原样使用、"
                 "不改写（没有被改写成 %r）⇒ 续行缓冲不再装计时器，于是那条消息"
-                "一直等到下一条非 ``..`` 行为止。⛔ 但**配 0 并不比默认更安全**："
-                "缓冲是**纯内存**，而 ConversationMerger 的 flush / stop / "
-                "held_conversation_ids **生产零调用点** ⇒ 关停不排空、重启恢复不到 "
-                "⇒ G2 那个丢消息窗口由「≤ 15 秒、**有界**」变成「**无界**」"
-                "⇒ 文档措辞正确（关掉保险丝就是关掉保险丝）**不等于 0 更安全**。",
+                "一直等到下一条非 ``..`` 行为止（**等待无界**）。⛔ 但**配 0 并不比"
+                "默认更安全**：等的那一半没变；变的是崩的那一半 —— 2026-10-10 起缓冲"
+                "每次变异都落盘快照、启动会重灌找回（不依赖计时器），可重灌回去的"
+                "那行同样在等一条可能永远不来的下一行。⇒ 文档措辞正确（关掉保险丝"
+                "就是关掉保险丝）**不等于 0 更安全**。",
                 DEFAULT_MERGE_CONTINUE_TIMEOUT_SECONDS,
             )
         self._merger = ConversationMerger(
             hold_timeout_seconds=merge_continue_timeout_seconds,
             on_hold_expired=self._deliver_expired_hold,
+            # G2：只有真的注入了落盘层才接快照回调 —— ``None`` 时保持纯内存
+            # 旧行为（直构 gateway 的既有测试零改动）。
+            on_held_state_changed=(
+                self._persist_held_snapshot
+                if held_buffer_store is not None
+                else None
+            ),
         )
 
         #: conversation_id -> 该会话排队等发的消息。**只有本类读写**。
@@ -470,6 +489,11 @@ class InboundGateway:
         "这几行是一件事"的判断），而落盘必须在投递前（那是"别丢这条"）。两件事
         刻意由两个模块各管各的：缓冲**不**写进收件箱（见
         :mod:`opencode_bridge.inbound_merge` 的模块 docstring）。
+
+        ⚠️ HELD 在这里早退，**早于**写前收件箱 —— 缓冲的崩溃保险因此不在收件箱，
+        而在合并器自己的落盘快照（G2：:meth:`_persist_held_snapshot`，每次变异
+        一份；启动时 :meth:`_recover_held_buffer` 重灌）。恢复语义是**重灌**不是
+        立即投递，找回告知用 ``kind="buffered"``（⛔ 不许复用 "text"）。
         """
         merged = self._merger.ingest(conversation_id, text)
         if merged.kind == IGNORED:
@@ -977,6 +1001,59 @@ class InboundGateway:
         return "ok"
 
     # ------------------------------------------------------------------
+    # held buffer snapshot & recovery (G2)
+    # ------------------------------------------------------------------
+    def _persist_held_snapshot(self, snapshot: dict[str, str]) -> None:
+        """Merger in-lock callback: write the whole buffer out (G2).
+
+        在合并器的**锁内**被调（:data:`~opencode_bridge.inbound_merge.OnHeldSnapshotChanged`
+        契约）：必须快、⛔ 不许抛 —— 文件写失败只记 WARNING、绝不上抛（上抛会把
+        一次普通入站变成投递失败）。空快照也照写：那是"弹空了"的**显式清档**，
+        不清的话下次启动会把已投递的内容重灌一遍。
+        """
+        try:
+            self._held_buffer_store.write(snapshot)
+        except Exception:
+            logger.warning(
+                "续行缓冲快照写盘失败（held-buffer.json）—— 这次变异没落盘；"
+                "进程若在此后崩溃，重启将找不到这一行缓冲。",
+                exc_info=True,
+            )
+
+    def _recover_held_buffer(self) -> None:
+        """Startup: pour crashed-pending lines back into the merger (G2).
+
+        由 :meth:`recover_inbox` 在**最前**调用（此刻还没有实况入站，与收件箱
+        重放也互不交错 —— 时序论证见 recover_inbox）。语义 = **重灌**，⛔ 绝不
+        立即投递：半行回缓冲继续等下一行 —— 替用户发一句没敲完的话，才是真的
+        丢消息。每条重灌后经 ``_send_text`` 回一句找回告知
+        （``BUFFERED_RESTORED_NOTICE``，``kind="buffered"`` —— 与进缓冲回执同属
+        非终态，a2a 穷举表零改动）；发不出去由 ``_send_text`` 自己记 WARNING：
+        **缓冲已经重灌**，告知丢了不等于状态丢了。``store`` 为 ``None``（直构 /
+        未接线）时直接 return —— 纯内存旧行为，无档可恢复、也无话可说。
+        """
+        if self._held_buffer_store is None:
+            return
+        snapshot = self._held_buffer_store.read()
+        if not snapshot:
+            return
+        for conversation_id, held_text in snapshot.items():
+            self._merger.restore(conversation_id, held_text)
+            logger.info(
+                "已重灌崩溃前的续行缓冲（会话 %s，共 %d 字）",
+                conversation_id,
+                len(held_text),
+            )
+            # ⚠️ kind ⛔ 不许复用 "text"：a2a 把 "text" 判成 TASK_STATE_COMPLETED
+            #（见 BUFFERED 回执处那条注释 / a2a 穷举表的非终态档）。
+            self._send_text(
+                conversation_id,
+                BUFFERED_RESTORED_NOTICE % held_text,
+                kind="buffered",
+                adapter=self._adapter_for(conversation_id),
+            )
+
+    # ------------------------------------------------------------------
     # inbox recovery (startup)
     # ------------------------------------------------------------------
     def recover_inbox(self) -> None:
@@ -1001,7 +1078,12 @@ class InboundGateway:
 
         ``uncertain`` / ``abandoned`` **已经**被 :func:`recover_pending`
         告警过，这里只记日志，绝不重发。
+
+        **第一件事是重灌续行缓冲**（G2：:meth:`_recover_held_buffer`）——
+        放在收件箱重放之前：重灌只碰合并器、不进队列，先后不会交错；它发出的
+        找回告知同样走纯出站 ``_send_text``（上面那段告警论证对它一样成立）。
         """
+        self._recover_held_buffer()
         inbox = self._inbox
         if inbox is None:
             logger.info(

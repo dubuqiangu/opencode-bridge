@@ -282,6 +282,13 @@ telegram `dropped callback from non-whitelisted chat` **零钉** ⇒ **覆盖面
 `fix-292` 已让代码回到它**自己 docstring 写下的契约**。
 ⚠️ 而**本次修复带出一个新事实**：配 `0` 会把 G2 的暴露窗口从「≤ 15 秒、**有界**」
 换成「**无界**」（`_held` 是纯内存、`flush`/`stop`/`held_conversation_ids` **零生产调用点**）⇒ **`0` 不等于更安全** —— 已作为独立一行登记，⛔ 文案层面未拍板）
+　（**2026-10-10 更新（G2 已修）**：上句里「`_held` 是纯内存」这一**事实**已过期 ——
+　缓冲每次变异都整份快照进 `held-buffer.json`、启动重灌找回
+　（`held_buffer_store.py` + `InboundGateway._recover_held_buffer`），**不依赖计时器**，
+　崩溃/退出不再丢缓冲；而「`0` 不等于更安全」的**结论仍成立**、只是换了依据的
+　那一半：**等待仍无界** —— 可重灌回去的那行同样在等一条可能永远不来的下一行。
+　WARNING 文案已随 G2 重写并钉在 tests/test_inbound_gateway.py
+　（`test_the_warning_names_the_unbounded_wait_and_the_snapshot_net`））
 · **提交消息的替换字符（U+FFFD）：向前的闸门已装，历史已清 8 条** ⇒ **第 1 类**
 （认领人=编排者 · 2026-10-08 起）。⚠️ **2026-10-07 全历史扫描出 9 条 / 28 个**
 　（⛔ 而我上一轮只报了「2 条 / 5 个」⇒ **汇报的前提本身是错的**，已更正）：

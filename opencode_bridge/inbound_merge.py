@@ -34,16 +34,29 @@ C3。**这一段的功能名与实现都来自对 `zhuiyueya/dsh-im-gateway` 的
    （人打完一行再发出来要好几秒）；真正被它救到的只有"敲了 ``..`` 然后走开"的人。
 3. **拼接用换行，不是空串。** dsh 是 ``existing + text``（``merge.ts`` 的
    ``ingest``）—— 那是把两行代码接成一行。逐行粘贴的语义是**换行**。
-4. **不用 ``snapshots()`` 落盘。** 见下方"为什么不落盘"。
+4. **缓冲落盘，但落的是自己的整份快照，不进收件箱。**（本条原先写
+   「不用 ``snapshots()`` 落盘」——2026-10-10 推翻，当初的依据与推翻的证据
+   一并记在下面，依据 AGENTS.md §8。）
 
-**为什么不落盘**：缓冲里是**用户已经被告知"收到了、在等续行"**的内容，而它的
-存活期只跨两条入站消息（毫秒级，且要求进程一直活着）。dsh 做了 ``snapshots()``
-但**自己没接通**（``snapshots()`` 零调用方，``docs/platform-design-reference.md:131``
-也记了这条"merge 快照恢复未接通"）。落盘还会引出更糟的一问：崩在合并中途时，
-那条残缺的并集算"一条完整消息"吗？算就等于替用户编了一句他没说的话。
-**要持久化的是"别丢这条"，那是 `InboundInbox` 的活**（一个 `QueuedPrompt` 就是
-一条已落盘的完整消息）。把并集塞进那条队列正是"别丢"与"这是一件事"被混为一谈 ——
-所以本模块的缓冲**刻意不落盘、且刻意在 `InboundInbox` 之前**。
+**为什么（曾经）不落盘、为什么 2026-10-10 改了**：当初的理由是两条：
+① 缓冲里是用户已被告知「收到了、在等续行」的内容，而它的存活期只跨两条入站
+消息（毫秒级，且要求进程一直活着）；② dsh 做了 ``snapshots()`` 但**自己没接通**
+（零调用方，``docs/platform-design-reference.md:131`` 也记了这条「merge 快照恢复
+未接通」）——抄一个没接通的 API 不如不抄。落盘还会引出更糟的一问：崩在合并
+中途时，那条残缺的并集算「一条完整消息」吗？算就等于替用户编了一句他没说的话，
+而把并集塞进 `InboundInbox` 的队列正是「别丢这条」与「这是一件事」被混为一谈。
+
+**推翻它的证据**（G1 实测：进程在 669 秒内死了一次）：``_held`` 只活在内存里，
+而 HELD 早退发生在写前收件箱落盘**之前** ⇒ 收件箱救不了它、恢复层也找不到它
+⇒ 用户被告知「已收到、在等续行」的那几行**静默消失**——下面那句「任何路径都不会
+无声消失」的原自评被证伪。**现在的做法绕开的正是当初反对的那件事**：落盘的是
+「还在等续行」这个**状态**（conversation_id -> 原文，经
+:class:`~opencode_bridge.held_buffer_store.HeldBufferStore` 整份原子覆盖写），
+⛔ **不是**塞进 `InboundInbox` 的「一条待投递的完整消息」——两种持久化不共用
+键空间，本模块依旧**刻意在 `InboundInbox` 之前**。恢复语义是**重灌**
+（:meth:`ConversationMerger.restore`——名字与 set 语义照抄 dsh ``merge.ts`` 的
+``restore(key, buffer)``：dsh 建了 API 没接线，这里把恢复端接到磁盘与启动恢复）：
+半行回缓冲继续等下一行，**绝不当完整消息发出去**。
 
 ⚠️ **残留风险（明确记下来，不假装解决了）**：判据是"末尾是不是 ``..``"，所以
 一句正好以 ``..`` 结尾的散文（``等等..``）会被当成续行标记而**暂时不发**。
@@ -64,6 +77,7 @@ __all__ = [
     "ConversationMerger",
     "IngestResult",
     "OnHoldExpired",
+    "OnHeldSnapshotChanged",
     "DELIVER",
     "HELD",
     "IGNORED",
@@ -73,6 +87,7 @@ __all__ = [
     "split_off_directive",
     "BUFFERED_NOTICE",
     "HELD_EXPIRED_NOTICE",
+    "BUFFERED_RESTORED_NOTICE",
 ]
 
 logger = logging.getLogger("opencode_bridge.inbound_merge")
@@ -111,10 +126,26 @@ BUFFERED_NOTICE = "已收到这一行，还在等下一行（续行用 ..，立�
 #: 保险丝超时后回给用户的那句：说清"发出去了"以及"发出去的是什么"。
 HELD_EXPIRED_NOTICE = "等待下一行超时，已把等到的内容原样发出：\n%s"
 
+#: 启动重灌之后回给用户的那句（G2 找回告知）：说清"崩溃前那行还在"，
+#: 以及它**不会被自动发出**——与进缓冲的回执一样，等的是下一行。
+#: ⚠️ kind 复用 ``"buffered"``（同属"还在等续行"的非终态回执，
+#: a2a 穷举表与 hooks.py 零改动；kind 钉同形，见 tests/test_inbound_gateway.py）。
+BUFFERED_RESTORED_NOTICE = (
+    "上次崩溃前，这一行还留在续行缓冲里，已找回并继续等下一行"
+    "（续行用 ..，立刻发送用 !!）：\n%s"
+)
+
 
 #: 保险丝到点时的回调：``(conversation_id, held_text) -> None``。
 #: 传进来的 ``held_text`` **已经被摘走**了（回调失败也不会有第二次机会）。
 OnHoldExpired = Callable[[str, str], None]
+
+#: 缓冲内容每次变异（进缓冲 / 弹出 / 重灌）之后的快照回调：
+#: ``(snapshot) -> None``，``snapshot`` 是**整份缓冲的拷贝**
+#: （conversation_id -> 正文）。⚠️ 在**锁内**调用（对比：
+#: :data:`OnHoldExpired` 在锁外）—— 它要的是一致快照，职责只有落盘。
+#: 回调必须快、⛔ 不许发消息、⛔ 不许再调本对象。
+OnHeldSnapshotChanged = Callable[[dict[str, str]], None]
 
 
 @dataclass(frozen=True)
@@ -164,13 +195,21 @@ class ConversationMerger:
         *,
         hold_timeout_seconds: float,
         on_hold_expired: OnHoldExpired,
+        on_held_state_changed: OnHeldSnapshotChanged | None = None,
     ) -> None:
         """``on_hold_expired(conversation_id, held_text)`` 收到的是**已经被摘走**的内容。
 
         回调在**锁外**调用，所以它可以再去发消息、可以再调本对象。
+
+        ``on_held_state_changed(snapshot)`` 收到的是**整份缓冲的拷贝**，在
+        **锁内**调用（对比：``on_hold_expired`` 在锁外）—— 它要的是一致快照，
+        职责只有落盘（G2：HELD 早退发生在写前收件箱之前，盘上这份快照是
+        崩溃后唯一的踪迹）。``None`` = 纯内存旧行为，两参直构仍可用
+        （既有测试零改动）。
         """
         self._hold_timeout_seconds = max(0.0, float(hold_timeout_seconds))
         self._on_hold_expired = on_hold_expired
+        self._on_held_state_changed = on_held_state_changed
         self._lock = threading.Lock()
         #: conversation_id -> 缓冲正文。
         self._held: dict[str, str] = {}
@@ -194,6 +233,9 @@ class ConversationMerger:
                     return IngestResult(kind=IGNORED)
                 self._held[key] = merged
                 self._rearm_fuse(key)
+                # G2：进缓冲也是一次状态变异 ⇒ 快照出去（HELD 早退发生在写前
+                # 收件箱之前，盘上这份快照是崩溃后唯一的踪迹）。
+                self._notify_held_state()
                 return IngestResult(kind=HELD, held=merged)
 
             # `!!` 与裸文本都**立刻**发出去。差别只在"有没有在等的东西"。
@@ -202,6 +244,10 @@ class ConversationMerger:
             merged = self._join(held, body)
             if not merged:
                 return IngestResult(kind=IGNORED)
+            if held:
+                # G2：从"在等"变成"不在等"也是一次状态变异 ⇒ 空快照也照写
+                # （旧档不清掉，下次启动会把已投递的内容重灌一遍）。
+                self._notify_held_state()
             return IngestResult(kind=DELIVER, text=merged)
 
     def flush(self, conversation_id: str) -> str:
@@ -213,7 +259,28 @@ class ConversationMerger:
         with self._lock:
             held = self._held.pop(key, "")
             self._cancel_fuse(key)
+            if held:
+                self._notify_held_state()
             return held
+
+    def restore(self, conversation_id: str, held_text: str) -> None:
+        """Put one crashed-pending line back into the buffer (idempotent **set**).
+
+        启动恢复（G2）专用：名字与 set 语义照抄 dsh ``merge.ts`` 的
+        ``restore(key, buffer)`` —— dsh 建了 API 没接线，这里把恢复端接到
+        磁盘与启动恢复。恢复语义 = **重灌**，不是立即投递：半行回缓冲继续
+        等下一行，⛔ 绝不当完整消息发出去（替用户发一句没敲完的话）。
+        该会话已有缓冲时**覆盖**（set 语义）；空 key / 空文本直接 return
+        （没有可恢复的状态）。重灌后同样重臂保险丝：它等的从来是
+        「下一行」，不是「从盘上回来的那一刻」。
+        """
+        key = str(conversation_id or "")
+        if not key or not held_text:
+            return
+        with self._lock:
+            self._held[key] = held_text
+            self._rearm_fuse(key)
+            self._notify_held_state()
 
     def held_text(self, conversation_id: str) -> str:
         """What is held right now, without taking it (``""`` if nothing)."""
@@ -266,12 +333,27 @@ class ConversationMerger:
         if fuse is not None:
             fuse.cancel()
 
+    def _notify_held_state(self) -> None:
+        """Caller holds ``self._lock``. Push a copy of the whole buffer out.
+
+        ⚠️ 拷贝必须在**锁内**做（调用方拿到手的才是一致快照），回调里**落盘** ——
+        文件写有宽度，若拆到锁外，「弹出」与「快照清档」就成了两个窗口，
+        崩在中间会把已投递的内容在下次启动时重灌一遍。
+        ``None`` 回调 = 纯内存旧行为，直接 return（不出锁、不落盘）。
+        """
+        if self._on_held_state_changed is None:
+            return
+        self._on_held_state_changed(dict(self._held))
+
     def _fuse_fired(self, key: str) -> None:
         """Fuse thread body: take the text out, then report it **outside** the lock."""
         with self._lock:
             # 竞态：这一行可能已经被 ``ingest`` 取走并发了 —— 那就不该再发一遍。
             held = self._held.pop(key, "")
             self._fuses.pop(key, None)
+            if held:
+                # G2：保险丝到点弹出同样是状态变异 ⇒ 快照出去。
+                self._notify_held_state()
         if not held:
             return
         logger.info(

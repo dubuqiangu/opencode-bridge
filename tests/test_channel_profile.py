@@ -464,6 +464,7 @@ class InjectionIsWiredIntoTheSinglePromptCallTests(unittest.TestCase):
             lock=threading.RLock(),
             turns={},
             inbox=rows,
+            held_buffer_store=None,
             stream_confirmed=type(
                 "Confirmed", (), {"wait": lambda self, timeout=None: True}
             )(),

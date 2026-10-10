@@ -154,7 +154,7 @@ createXxxChannel(config, log, stateDir?): ChannelAdapter | undefined   // 凭据
 |---|---|
 | `toTelegramHtml` 死码，且 telegram 仍用 `parse_mode:'HTML'` 发送**已去 markdown 的纯文本** —— 残留 `<`/`&` 触发实体非法，靠 `.catch` 兜底重发 | `format.ts:41`、`telegram.ts:98` |
 | `ChannelRuntime`（含 `ready` 位）声明即废弃，全仓零引用 | `types.ts:77-83` |
-| merge 快照恢复**未接通**：`snapshots()` 零调用，启动遍历刚 new 的空 Map | `merge.ts:91-95`、`gateway.ts:155,163` |
+| merge 快照恢复**未接通**：`snapshots()` 零调用，启动遍历刚 new 的空 Map（⚠️ 本仓库已把这条链接通：2026-10-10 G2 —— `held_buffer_store.py` 整份快照落盘 + `InboundGateway._recover_held_buffer` 启动重灌，守门 `tests/test_held_buffer_recovery.py`） | `merge.ts:91-95`、`gateway.ts:155,163` |
 | 默认 `allowAllUsers: true` | `index.ts:57` |
 | 审批应答在白名单**之前**处理 → 未授权用户能打"批准" | `gateway.ts:401-409` vs `:411` |
 | 4000 是"猜的默认值"而非各平台真实上限（13 家都是 4000） | 各 `channels/*.ts` |

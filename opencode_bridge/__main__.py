@@ -33,6 +33,7 @@ from .core import BridgeCore, setup_platforms, setup_reply
 from .diagnostics import ProcessDiagnostics, describe_environment
 from . import credential_health
 from . import health
+from .held_buffer_store import HELD_BUFFER_FILE_NAME, HeldBufferStore
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
@@ -620,6 +621,21 @@ def _inbox_path(cfg: Config) -> str:
     return os.path.join(
         os.path.dirname(os.path.abspath(cfg.state_path)) or _bridge_dir(),
         "inbox.db",
+    )
+
+
+def _held_buffer_path(cfg: Config) -> str:
+    """续行缓冲崩溃快照的落盘位置：与 ``state.json`` **同一个目录**，文件名
+    ``held-buffer.json``（G2）。
+
+    与 :func:`_inbox_path` 同一条纪律、同一个理由：跟着 ``cfg.state_path``
+    走 —— "还没兑现的处理义务"必须跟着状态一起搬家（这份快照装的正是
+    另一类还没兑现的义务：敲了 ``..`` 的半行）。文件与两份既有状态文件
+    各自独立、键不互混（这里只放 ``{conversation_id: 正文}``）。
+    """
+    return os.path.join(
+        os.path.dirname(os.path.abspath(cfg.state_path)) or _bridge_dir(),
+        HELD_BUFFER_FILE_NAME,
     )
 
 
@@ -1359,7 +1375,17 @@ def _run_bridge_locked(cfg: Config) -> int:
             "subscription-health: 记录器未装配（%s: %s）—— 不影响桥的订阅",
             type(exc).__name__, exc,
         )
-    core = BridgeCore(cfg, client, state, inbox)
+    # G2：续行缓冲的崩溃快照层，**无条件启用**。它的构造不碰盘（读写失败
+    # 各自只记 WARNING、绝不上抛，见 held_buffer_store 与
+    # InboundGateway._persist_held_snapshot），所以没有 inbox 那个「打开失败
+    # 降级」分支；启用与否照 inbox 的纪律**说出来**，不让人去翻代码。
+    held_buffer_path = _held_buffer_path(cfg)
+    held_buffer_store = HeldBufferStore(held_buffer_path)
+    logger.info(
+        "续行缓冲快照：已启用（%s）—— 崩溃后重启会把半行重灌回缓冲并告知",
+        held_buffer_path,
+    )
+    core = BridgeCore(cfg, client, state, inbox, held_buffer_store=held_buffer_store)
 
     usable = 0
     # ⚠️ **装在 `core.start()` 之前**：适配器一启动就可能发信（探针回复、启动时

@@ -298,7 +298,8 @@ def queued(delivery_id: str, text: str,
 # 基类：造一套 InboundGateway（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class InboundGatewayTestCase(unittest.TestCase):
-    """每个用例一套全新的十三个协作者。"""
+    """每个用例一套全新的十四个协作者（第 14 个 held_buffer_store 默认
+    ``None``= 纯内存旧行为；接线的守门在 tests/test_held_buffer_recovery.py）。"""
 
     #: C3 的两个配置项在这里要显式给 0 / 极短，否则那些用例会去抢真实的计时器
     #: 与真实的门槛值（测试不该依赖默认值）。需要它们的用例自己覆盖。
@@ -343,6 +344,7 @@ class InboundGatewayTestCase(unittest.TestCase):
             "lock": self.lock,
             "turns": self.turns,
             "inbox": self.inbox,
+            "held_buffer_store": None,
             "stream_confirmed": self.stream_confirmed,
             "adapter_for": self._adapter_for,
             "answer_callback": self.answer,
@@ -422,11 +424,12 @@ class InboundGatewayTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(InboundGatewayTestCase):
-    def test_the_constructor_takes_the_thirteen_injected_dependencies(self):
+    def test_the_constructor_takes_the_fourteen_injected_dependencies(self):
         parameters = inspect.signature(InboundGateway.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
-            ["client", "lock", "turns", "inbox", "stream_confirmed",
+            ["client", "lock", "turns", "inbox", "held_buffer_store",
+             "stream_confirmed",
              "adapter_for", "answer_callback", "ensure_session",
              "handle_command", "remember_platform", "send_text",
              "permission_ledger", "bridge_config"],
@@ -1300,18 +1303,28 @@ class MergeFuseTimeoutConfigurationTests(InboundGatewayTestCase):
         self.assertIn("配 0 并不比默认更安全", warning)
         self.assertIn("无界", warning)
 
-    def test_the_warning_names_the_three_drain_paths_it_has_to_name(self):
-        """判据③：代价的**凭据**也得点名 —— 正是那三个出口零调用点，关停才不排空。
+    def test_the_warning_names_the_unbounded_wait_and_the_snapshot_net(self):
+        """判据③：代价的**凭据**也得点名 —— 只写「立即返回」会被读成「0 没代价」。
 
-        少点名一个，读者就得自己去查"那到底排不排空" ⇒ 三样都要在。
+        钉四样，缺一样读者就得自己去查：
+        * ``0`` 的语义本身（立即返回、原样使用、不改写 —— fix-298 的措辞）；
+        * **等待无界** —— 0 关掉的是计时器，不是等待：那条消息一直等到下一条
+          非 ``..`` 行为止；
+        * **落盘快照 + 重灌（不依赖计时器）** —— G2 之后「崩溃丢缓冲」已经是
+          被修掉的事实，⛔ 告警不许再拿它吓唬人；改说真话：可重灌回去的那行
+          同样在等一条可能永远不来的下一行；
+        * **不等于 0 更安全** —— 反直觉结论必须明说（只写好处会被读反）。
         """
         with self.assertLogs(INBOUND_GATEWAY_LOGGER, level="WARNING") as caught:
             self.build_with_timeout(0)
 
         warning = "\n".join(caught.output)
-        for drain_path in ("flush", "stop", "held_conversation_ids"):
-            with self.subTest(drain_path=drain_path):
-                self.assertIn(drain_path, warning)
+        for phrase in ("立即返回、原样使用、不改写",
+                       "等待无界",
+                       "落盘快照、启动会重灌找回（不依赖计时器）",
+                       "不等于 0 更安全"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, warning)
 
     def test_the_configured_default_is_silent(self):
         """判据④：⛔ 用默认值（15）时**不许**发 —— 否则每次启动都有一条噪音。

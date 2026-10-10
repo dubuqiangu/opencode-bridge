@@ -66,6 +66,7 @@ from .config import Config
 from .conversation_keys import ConversationState
 from .event_stream import EventStream, Turn
 from .health import platform_key, probe_after_start
+from .held_buffer_store import HeldBufferStore
 from .hooks import Inbound  # BridgeCore implements Hooks
 # 入站那一整块（适配器进来的两个 hook、每会话队列、写前收件箱与启动重放）搬进了
 # :mod:`opencode_bridge.inbound_gateway`，连同只有它才写的状态一起（AGENTS.md §5.1）。
@@ -186,8 +187,15 @@ class BridgeCore:
         client: OpenCodeClient,
         state: StateStore,
         inbox: InboundInbox | None = None,
+        held_buffer_store: HeldBufferStore | None = None,
     ) -> None:
         """``inbox`` enables the write-ahead inbox; ``None`` switches it off.
+
+        ``held_buffer_store`` does the same for the C3 merge buffer's crash
+        snapshot (G2): ``None`` keeps the pure-memory old behavior — restore
+        is a no-op and nothing is written. Same reasoning as ``inbox``:
+        optional and last, so ``__main__`` decides and
+        ``tests/test_inbox_wiring.py`` guards the wiring.
 
         Optional and last so that every existing construction site keeps working
         untouched — which also means a wiring bug would be invisible (nothing
@@ -313,9 +321,11 @@ class BridgeCore:
         )
 
         #: 适配器进来的两个 hook、每会话的 prompt 队列、写前收件箱与启动重放。
-        #: 十二个依赖**显式注入**（见
+        #: 十三个依赖**显式注入**（见
         #: :class:`~opencode_bridge.inbound_gateway.InboundGateway`）—— 其中
-        #: ``lock`` / ``turns`` 是共用的状态（同上），``inbox`` 从构造参数透传。
+        #: ``lock`` / ``turns`` 是共用的状态（同上），``inbox`` 与
+        #: ``held_buffer_store`` 从构造参数透传（G2：后者是续行缓冲的崩溃
+        #: 快照层，``None`` = 纯内存旧行为，镜像 inbox 的可选注入先例）。
         #: 入站这一侧不碰事件流的状态，只等它的 ``stream_confirmed``（AGENTS.md §5.1）。
         #: ⚠️ 构造点必须在 ``event_stream`` **之后**：``stream_confirmed`` 归事件流所有。
         self.inbound_gateway = InboundGateway(
@@ -323,6 +333,7 @@ class BridgeCore:
             lock=self._lock,
             turns=self._turns,
             inbox=inbox,
+            held_buffer_store=held_buffer_store,
             stream_confirmed=self.event_stream.stream_confirmed,
             adapter_for=self.routing.adapter_for,
             answer_callback=self.outbound.answer,

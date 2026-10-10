@@ -40,6 +40,7 @@ from opencode_bridge import inbox as inbox_module
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.core import BridgeCore
+from opencode_bridge.held_buffer_store import HELD_BUFFER_FILE_NAME, HeldBufferStore
 from opencode_bridge.hooks import Inbound
 from opencode_bridge.inbox import BACKOFF_LADDER_SECONDS, InboundInbox
 from opencode_bridge.opencode_client import Endpoint, OpenCodeError
@@ -608,8 +609,10 @@ class CliWiresTheInbox(unittest.TestCase):
         recorded: dict = {}
 
         class RecordingCore:
-            def __init__(self, config, client, state, inbox=None) -> None:
+            def __init__(self, config, client, state, inbox=None,
+                         held_buffer_store=None) -> None:
                 recorded["inbox"] = inbox
+                recorded["held_buffer_store"] = held_buffer_store
 
             def attach(self, adapter) -> None:
                 return None
@@ -701,6 +704,20 @@ class CliWiresTheInbox(unittest.TestCase):
                 "而其它所有测试都跑在 inbox=None 上、照样全绿",
             )
             self.assertIsInstance(inbox, InboundInbox)
+            held_buffer_store = recorded.get("held_buffer_store")
+            self.assertIsNotNone(
+                held_buffer_store,
+                "__main__ 必须注入续行缓冲快照层：它不注入的话，G2 的崩溃窗口"
+                "原样存在（缓冲只活在内存），而其它所有测试都跑在"
+                " held_buffer_store=None 上、照样全绿",
+            )
+            self.assertIsInstance(held_buffer_store, HeldBufferStore)
+            self.assertEqual(
+                held_buffer_store.path,
+                os.path.join(directory, HELD_BUFFER_FILE_NAME),
+                "快照必须与 state.json / inbox.db 同目录（%s）"
+                % os.path.join(directory, HELD_BUFFER_FILE_NAME),
+            )
             inbox.close()
         self.assertEqual(exit_code, 0)
 

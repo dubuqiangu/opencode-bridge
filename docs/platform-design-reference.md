@@ -465,3 +465,44 @@ A4 配对码（要开放给陌生人时）· E4 TUI 面板
   配对命令 `/pair` 在**未授权**的 chat 上就能用 ⇒ **没人被困死**；而 `--pair` 成功时会顺手写上
   `config_version: 2`，所以配过对的用户立刻拿到新语义。⚠️ 诚实代价：未配对用户的暴露**仍然存在**，
   且因为没强制，**暴露只会随时间慢慢收窄，不会一天归零**。Part 6 那条 P0 因此**已完整落地**。
+
+---
+
+## Part 11 · A3 webhook 平台验签/回调形状对照（2026-10-10 供数）
+
+> 来源：两份本地快照（文件名含 commit SHA `8a5edab282632443`，锁定参考版本）。
+> 起因：`tasks.md`「A3 inbound-push 的真实剩余工作」行的拍板供数——7 家 webhook-only
+> 平台（line / teams / sms / synology / zalo / google_chat / whatsapp 官方）在
+> `opencode_bridge/adapters/` 全无适配器。用户 2026-10-10 拍板：**A3 拓扑 = 单端口共享
+> server**；第二个 adapter 暂不选。本节只取证、不实现。
+
+### 11.1 逐平台形状
+
+| 平台 | 入站回调（参考形状） | 验签（参考实现里实际做的） | 出站 | 出处 |
+|---|---|---|---|---|
+| LINE | dsh：`/line-webhook`（路径可配），POST，注释明写「要求尽快 200」；hermes：端口 8646 | hermes 文档明写「HMAC-SHA256 signature verification」（适配器本体不在快照）；**dsh 读 `channelSecret` 但零使用（死配置，全快照 5 处命中全是声明+赋值）** | `api.line.me/v2/bot/message/push` + Bearer channelToken（dsh）；hermes 优先免费 reply token、过期退 Push API | dsh `lib/channels/line.js`；hermes `plugins/platforms/line/plugin.yaml` |
+| Teams | hermes：SDK（microsoft-teams-apps）的 `POST /api/messages`；dsh：裸 `/teams-webhook`，POST，注释明写「需要 202 且不能处理过慢」 | hermes 由 SDK + Entra client credentials（CLIENT_ID / SECRET / TENANT_ID）；dsh 零验签 | Bot Framework connector：STS 换 bearer（缓存到过期前约 5 min）、按 conversation 存引用 | hermes `plugins/platforms/teams/adapter.py`；dsh `lib/channels/msteams.js` |
+| sms（Twilio） | aiohttp webhook（默认 `127.0.0.1:8080`）；响应 = 空 TwiML，回复永不内联 | `X-Twilio-Signature` = HMAC-SHA1(auth_token, URL + 按键排序的键值拼接) 的 base64；带/不带默认端口的 URL **双变体都试**；`compare_digest` 字节比较；**fail-closed：没配公网 `SMS_WEBHOOK_URL` 拒绝启动**（`SMS_INSECURE_NO_SIGNATURE=true` 仅开发用） | REST `api.twilio.com/…/Messages.json`，HTTP Basic(sid:token)，From/To/Body 表单 | hermes `plugins/platforms/sms/adapter.py` |
+| whatsapp 官方 | hermes：`webhook_port` 默认 8090；**适配器本体不在快照** | 配置键 `WHATSAPP_CLOUD_APP_SECRET`，setup 明写「App Secret (required for webhook signature verification)」；**验签头形状在快照零命中** ⇒ 选型时须查 Meta 官方文档 | 未见（本体缺席） | hermes `hermes_cli/setup_whatsapp_cloud.py`；⚠️ dsh 的 whatsapp 是 baileys 扫码配对，**不是**官方 API，不能当参考 |
+| google_chat | dsh 自造 `/googlechat-webhook`（POST，零验签） | 两家都没有可抄的验签实现（hermes 的 `GoogleChatAdapter` adapter.py 本体不在快照） | dsh：POST webhookUrl（「服务账号方式待实现」） | dsh `lib/channels/googlechat.js`；hermes `plugins/platforms/google_chat/`（仅 stub + oauth/cards） |
+| synology | 仅 dsh：`/synology-webhook`（POST，零验签），chatId 硬编码 `'synology'`（单通道） | 无（hermes 无此平台） | incoming webhook URL POST | dsh `lib/channels/synology.js` |
+| zalo | 仅 dsh：`/zalo-webhook`（POST，零验签），事件 `user_send_text` + `message.text` | 无（官方 OA 验签形状快照内无实现） | `openapi.zalo.me/v3.0/im/oa/message` + `access_token` header | dsh `lib/channels/zalo.js` |
+
+### 11.2 跨平台结论（供 A3 拍板与基建用）
+
+1. **dsh 的 6 个 webhook 渠道全部零入站验签**（含 LINE 的 `channelSecret` 死配置）⇒ 照抄
+   dsh = 开一个谁都能注入的本地端口。唯一有真验签可抄的参考实现是 hermes sms（Twilio），
+   且它是 **fail-closed**（没有验签所需的公网 URL 就拒绝启动）——与 a2a
+   `_resolve_bind_host`「非回环须有凭据」同一纪律方向。
+2. **单端口共享拓扑有现成参考**：hermes `gateway/platforms/shared_ingress.py` 的
+   `bind_listener` / `publish_shared_ingress`，sms / teams 适配器以
+   `serves_profile_prefix = True` 挂到默认监听器的 `/p/<profile>/…` 路径——与用户拍板的
+   「单端口共享 server」同构。
+3. **验签形状各家各样**（Twilio HMAC-SHA1 表单排序 / LINE HMAC-SHA256（hermes 文档）/
+   WhatsApp app secret 验签（算法细节快照内无）），而参考实现**全部**在各自
+   handler/适配器内做验签、没有一家走「服务器级单一 authenticate」⇒ A3 取
+   「`require_auth=False` + 验签进各自 handler」分支即可，不需要为异构验签扩
+   httpsrv 的 per-route 鉴权。
+4. **可抄实现覆盖度**：sms / teams 完整可抄；line / whatsapp 官方 / google_chat 在
+   hermes 快照里只有配置键与文档描述（适配器本体缺席）⇒ 选这三家任何一家都要先查
+   官方文档补验签细节；synology / zalo 仅 dsh 有（零验签）⇒ 选这两家等于没有验签参考。

@@ -1,0 +1,314 @@
+"""Key migration for ``state.json`` (A2b) — pure key-rewrite logic.
+
+Provenance
+----------
+Moved verbatim from ``state.py`` (its ``键迁移（A2b）`` docstring section
+and the migration code). The split is structural only — §5: ``StateStore``
+(persistence) stays in ``state.py``, the key-migration domain lives here.
+``STATE_SCHEMA_VERSION`` / ``MigrationReport`` / ``migrate_document`` /
+``_classify_key`` / ``_legacy_alias`` are re-exported from ``state.py``
+so no import path changes.
+
+The logger channel keeps its historical name ``opencode_bridge.state``:
+tests filter on it with ``assertLogs`` and operators filter logs by it,
+so the split must not change the channel (zero behavior change).
+
+This module has **no runtime import** of ``opencode_bridge.state`` — the
+dependency stays one-directional (``state`` → ``state_migration``).
+
+键迁移（A2b）
+============
+统一 ``platform:local_id`` 之后，历史上五个平台用的前缀是**别名**而不是平台键
+（``identity.LEGACY_PREFIXES``）：
+
+===================  =====================  ==========================
+legacy 前缀           指向                    用它的平台
+===================  =====================  ==========================
+``chat:``            ``telegram``           telegram
+``room:``            ``matrix``             matrix
+``channel:``         **歧义（值为 None）**   slack / discord / mattermost
+===================  =====================  ==========================
+
+切前缀会改变键的**字符串格式**，而已落盘的 ``state.json`` 里的旧键会全部变成孤儿 ——
+用户一次性丢失会话映射，而且**不报错**（只表现为"agent 突然记错上下文"）。
+所以这不是格式美化，是**数据迁移**：本模块在**加载时**把旧键重写成新键。
+
+歧义 ``channel:`` 键怎么办（本模块最重要的一个决定）
+--------------------------------------------------
+:func:`identity.normalize` 对歧义前缀且没有 ``platform_hint`` 时**抛**
+:class:`~opencode_bridge.identity.AmbiguousConversationId`，而 ``StateStore`` 拿到的
+只是一个**不透明字符串**，它无从判断那是 slack、discord 还是 mattermost。
+
+策略：**只迁移能无歧义判定的键**（``chat:`` → ``telegram:``、``room:`` →
+``matrix:``），歧义的 ``channel:`` 键**原样保留**。
+
+理由：
+
+1. **猜错比不迁更糟**。三家任选其一都会把一部分用户的会话映射指向**别人的会话**，
+   而症状是"agent 记错了上下文"，不报错、难复现、且会污染已经建立的会话。
+2. **保留的代价很小**。``channel:`` 键继续走各适配器现有的旧路径 —— 功能完全
+   不受影响，缺的只是"键格式统一"这一个属性。
+3. **迁移侧绝不用形状猜**。本模块**绝不**用 local id 的形状（Slack 以 ``C``/``D``
+   开头、Discord 纯数字、Mattermost 26 位 base32）、"哪个适配器已挂载"之类的巧合
+   去决定某个键**属于谁**。:meth:`identity.normalize` 在缺 ``platform_hint`` 时抛错，
+   本模块只做**捕获**，绝不给 ``platform_hint`` —— 那等于伪造一条自己都不知道真假的
+   线索。**这条对"改盘上的键"是绝对的**：迁移要么确定、要么不改。
+
+4. **读侧可以用形状，但只许当"不相交划分"，且必须由适配器声明**。见下节。
+
+读侧兼容：为什么"划分"不是"猜"
+--------------------------------
+``channel:`` 键**不改盘**（理由 3 是绝对的），但**读**要能把它取回来，否则
+存量用户的会话白白丢失。所以读侧有一条兼容路径，判据是**各平台自己的 id 文法**：
+
+============  ==========================  ==========================
+平台          合法 local id 文法           字母表
+============  ==========================  ==========================
+slack         ``^[A-Z][A-Z0-9]{5,}$``      首字符是大写字母
+discord       ``^[0-9]{17,20}$``           纯数字，**上限 20 是承重项**
+mattermost    ``^[a-z0-9]{26}$``           恰好 26 位小写字母/数字
+============  ==========================  ==========================
+
+三行**互不相交**：slack 的首字符是大写字母，discord 全是数字，mattermost 全小写
+—— 而 26 位纯数字又超出 discord 20 位的上限，所以后两者也不会撞。
+
+不相交**只依赖首字符/字母表那一条**，**与长度下限无关**。所以 slack 的下限取得
+**故意偏松**（6 字符，真实 id 是 9~11 位）：收紧它不会增强安全性，只会让一批真实
+会话静默读不回来 —— 那是"丢上下文"而不是"猜错"，但依然是回归。
+⚠️ 本表最初把 slack 写成 ``{7,}``，而同一节的例子 ``channel:C01ABC`` 只有 6 字符，
+**表与自己的例子互相矛盾**；已按实现修正为 ``{5,}``。
+
+同理 ``channel:C1`` 这类占位符**不**被任何平台认领 —— 它不是真实 id 形状。
+测试夹具要用真实形状（如 ``C01ABCDEFGH`` / 18 位雪花号），否则断言的是假的性质。
+
+正因为不相交，"这个 local id 属不属于我"是**可以确定的判断**，不是猜测。
+``channel:C01ABC`` 只可能是 slack 的，``channel:123456789012345678`` 只可能是
+discord 的。于是**三家同时挂载时，三份 ``channel:`` 会话全部存活、互不串**。
+
+**为什么这个方案比前三个都强**：先前考虑过"恰好一个适配器申报才读"（唯一申报者
+才认领）。那个方案**自己的前提就会漏**——用户曾经同时跑 slack 和 discord、后来
+删掉 discord，剩下的 slack 会**认领** discord 的键；而"曾经是否共存过"这件事在
+``state.json`` 里根本没记过，无从验证。按划分就不存在这个洞：认不认只看形状。
+
+**放宽的边界（别再往外扩）**：
+
+- 文法由**适配器自己**声明，因为它描述的是那个平台的 API，不是本模块的知识。
+- 只用于**读**，**永不**用于改盘上的键。
+- **绝不**拿形状在"已挂载的适配器"之间做仲裁 —— 一旦那样用，就退化成"猜"。
+- 只在**查询方**自己的文法上判断：``ConversationState`` 必须拿到发起查询的平台，
+  而不是自己去遍历已挂载适配器。
+
+实现见 :mod:`opencode_bridge.conversation_keys`；各平台的文法声明在对应适配器里。
+
+什么时候做（``migrate_keys`` 开关）
+----------------------------------
+迁移**默认关闭**，由构造参数显式开启::
+
+    StateStore(path, migrate_keys=True)
+
+原因：**本模块的默认值必须保持关闭**，打开与否是调用方的决定。
+
+发版顺序必须是**同一个变更里**同时（a）给适配器切前缀、（b）打开本开关、
+（c）改写那几条编码"迁移前键会成孤儿"的用例 —— 只做一半就会让仓库停在
+"半迁移"状态，而那正是"agent 记错上下文"的温床。
+
+**当前进度（2026-10-04，分两步走）**：
+
+- **第一步已完成**：``telegram``（``chat:`` -> ``telegram:``）与
+  ``matrix``（``room:`` -> ``matrix:``）已切前缀，且 ``__main__`` 在同一个
+  commit 里传了 ``migrate_keys=True``。存量 ``chat:`` / ``room:`` 键会在加载时
+  被重写，会话映射不丢。``__main__`` 打开开关而**本模块默认仍关闭** ——
+  这样库本身不替调用方做决定，单测也因此能覆盖关闭态。
+- **第二步未做**：``slack`` / ``discord`` / ``mattermost`` 共用歧义前缀
+  ``channel:``，``normalize()``缺 ``platform_hint`` 无法归一，而线索**不在
+  ``state.json`` 里**。这一步需要单独的设计决定（按已挂载适配器逐个尝试归一），
+  所以本模块至今**不给任何 ``platform_hint``**，``channel:`` 键原样保留
+  （见 :attr:`MigrationReport.ambiguous_kept`）。
+
+对应用例已改名为 ``test_legacy_chat_key_survives_the_prefix_cutover_through_state_migration``
+与 ``test_legacy_room_key_survives_the_prefix_cutover_through_state_migration``
+（``tests/test_conversation_id_cutover.py`` 里另有``channel:`` 存活的覆盖）。
+
+迁移期的兼容读（``_legacy_alias``）
+----------------------------------
+即便开了开关，在适配器还没切完前缀的那段窗口里，适配器**查询用的**仍是旧键。
+:func:`_lookup` 因此做一次**无歧义别名回退**：先按精确键查，查不到再按
+:meth:`identity.normalize` 归一后的键查一次。它和迁移用同一个判定，所以
+**不会猜**（``channel:`` 永远没有别名可回退）。适配器全部切完之后这段回退恒不
+命中，可以删掉。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from . import identity
+
+logger = logging.getLogger("opencode_bridge.state")
+
+
+#: 键迁移完成后的 schema 版本。写进 ``state.json`` 有两个作用：可观测 + 短路扫描。
+#: ⚠️ **它不代表所有键都已是新格式** —— 歧义的 ``channel:`` 键是**故意**保留的。
+#: 真正的幂等保证来自内容判定（没有可迁的键 ⇒ 不备份、不写盘），不依赖这个标记。
+STATE_SCHEMA_VERSION: int = 2
+
+_NEW = "new"
+_MIGRATE = "migrate"
+_AMBIGUOUS = "ambiguous"
+_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    """一次加载期键迁移的**只读结果**。
+
+    存在的理由：用例应该断言**内部状态**（条数、备份路径），而不是去解析日志文本。
+    """
+
+    #: 参与判定的键数（``sessions`` 与 ``meta`` 的并集）。
+    scanned: int = 0
+    #: 实际改写的键数。
+    migrated: int = 0
+    #: 因前缀歧义而**原样保留**的键数（``channel:``）。
+    ambiguous_kept: int = 0
+    #: 无法识别、**原样保留**的键数。
+    invalid_kept: int = 0
+    #: 因目标键已被占用而放弃迁移的键数（两条都保留，绝不覆盖）。
+    collisions: int = 0
+    #: 迁移前的备份路径；没发生迁移或备份失败时为 ``None``。
+    backup_path: Optional[str] = None
+    #: 落盘时写入的 schema 版本。
+    schema_version: int = 0
+
+    @property
+    def changed(self) -> bool:
+        """是否真的改写了键（= 是否需要备份与落盘）。"""
+        return self.migrated > 0
+
+    def summary(self) -> str:
+        return (
+            f"scanned={self.scanned} migrated={self.migrated} "
+            f"ambiguous_kept={self.ambiguous_kept} "
+            f"invalid_kept={self.invalid_kept} collisions={self.collisions}"
+        )
+
+
+def _classify_key(key: object) -> tuple[str, Optional[str]]:
+    """判定一个键属于哪一类，返回 ``(类别, 新键或None)``。
+
+    判定**只**依赖 :meth:`identity.normalize`，且**永远不传** ``platform_hint`` ——
+    本模块没有资格知道一个不透明键来自哪个平台。
+    """
+    if not isinstance(key, str):
+        return _INVALID, None
+    try:
+        new_key = identity.normalize(key)
+    except identity.AmbiguousConversationId:
+        # 先接子类：歧义与"根本不认识"的处理不同 —— 前者等平台线索，后者没救。
+        return _AMBIGUOUS, None
+    except identity.InvalidConversationId:
+        return _INVALID, None
+    return (_NEW, None) if new_key == key else (_MIGRATE, new_key)
+
+
+def _resolve_collisions(
+    candidates: dict[str, str], present: set
+) -> tuple[dict[str, str], int]:
+    """从候选重写里挑出可以安全执行的，返回 ``(计划, 被放弃的候选数)``。
+
+    放弃而不是合并，理由和歧义前缀同源：**宁可两条都在，也不覆盖任何一条**。
+    """
+    plan: dict[str, str] = {}
+    owner: dict[str, str] = {}  # 新键 -> 旧键
+    blocked: set = set()
+    for old in sorted(candidates):
+        new = candidates[old]
+        if new in blocked:
+            continue  # 同一目标键已被判为冲突，整组作废
+        previous = owner.get(new)
+        if previous is not None or (new in present and new not in candidates):
+            blocked.add(new)
+            if previous is not None:
+                plan.pop(previous, None)
+                owner.pop(new, None)
+            continue
+        plan[old] = new
+        owner[new] = old
+    return plan, len(candidates) - len(plan)
+
+
+def migrate_document(
+    raw: dict
+) -> tuple[dict, MigrationReport]:
+    """纯函数：把 ``state.json`` 文档里的旧键改写成新键。
+
+    不碰磁盘、不记日志、不看平台 —— 于是可以单独测。不认识 / 歧义的键**原样保留**，
+    返回的条目数与输入严格一致（改的只是键名）。
+    """
+    sessions_in = raw.get("sessions")
+    meta_in = raw.get("meta")
+    sessions = dict(sessions_in) if isinstance(sessions_in, dict) else {}
+    meta = dict(meta_in) if isinstance(meta_in, dict) else {}
+    before = (len(sessions), len(meta))
+
+    present = set(sessions) | set(meta)
+    candidates: dict = {}
+    ambiguous = 0
+    invalid = 0
+    for key in sorted(present, key=str):  # 排序 ⇒ 冲突处理可复现
+        verdict, new_key = _classify_key(key)
+        if verdict == _MIGRATE:
+            candidates[key] = new_key
+        elif verdict == _AMBIGUOUS:
+            ambiguous += 1
+        elif verdict == _INVALID:
+            invalid += 1
+
+    plan, collisions = _resolve_collisions(candidates, present)
+
+    out_sessions = dict(sessions)
+    out_meta = dict(meta)
+    for old, new in plan.items():
+        if old in out_sessions:
+            out_sessions[new] = out_sessions.pop(old)
+        if old in out_meta:
+            out_meta[new] = out_meta.pop(old)
+
+    if (len(out_sessions), len(out_meta)) != before:
+        # 迁移只许改键名、不许增删条目。将来谁把逻辑改坏了，这里当场暴露而不是
+        # 悄悄少一条映射（症状同样是"agent 忘了一部分对话"，极难查）。
+        logger.error(
+            "key migration broke the entry-count invariant (%d/%d -> %d/%d); "
+            "keeping the document unchanged",
+            before[0], before[1], len(out_sessions), len(out_meta),
+        )
+        out_sessions, out_meta = sessions, meta
+        collisions += len(candidates)
+        plan = {}
+
+    document = dict(raw)
+    document["sessions"] = out_sessions
+    document["meta"] = out_meta
+    if plan:
+        document["schema_version"] = STATE_SCHEMA_VERSION
+    report = MigrationReport(
+        scanned=len(present),
+        migrated=len(plan),
+        ambiguous_kept=ambiguous,
+        invalid_kept=invalid,
+        collisions=collisions,
+        schema_version=STATE_SCHEMA_VERSION if plan else 0,
+    )
+    return document, report
+
+
+def _legacy_alias(key: object) -> Optional[str]:
+    """旧键 → 新键；**只对无歧义别名**成立（``chat:`` / ``room:``）。
+
+    迁移期适配器还在用旧键查询，没有这段回退就会在"键已迁、适配器未切"的窗口里
+    查不到映射 —— 用户看到的就是"agent 突然忘了一部分对话"。
+    """
+    verdict, new_key = _classify_key(key)
+    return new_key if verdict == _MIGRATE else None

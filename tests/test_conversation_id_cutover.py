@@ -306,7 +306,7 @@ class CorruptStateFileIsNeverOverwritten(LegacyStateFileTestCase):
 class _RecordingCore:
     """只记下构造函数收到的参数 —— 本文件不关心桥跑起来做什么。"""
 
-    def __init__(self, config, client, state, inbox=None) -> None:
+    def __init__(self, config, client, state, inbox=None, held_buffer_store=None) -> None:
         pass
 
     def attach(self, adapter) -> None:

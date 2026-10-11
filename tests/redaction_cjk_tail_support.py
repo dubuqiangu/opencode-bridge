@@ -258,8 +258,8 @@ ASCII_TAIL_NOTE_CASES = (
     ("telegram:12345&判据", "12345", "&判据"),
 )
 
-#: 13 个**已落地**适配器的 local-id 真实形状（清单见 ``_redactable_ids.py`` 的
-#: docstring「13 个平台的 id 形状」一段）：``(输入, 平台, local_id)``。
+#: 14 个**已落地**适配器的 local-id 真实形状（清单见 ``_redactable_ids.py`` 的
+#: docstring「14 个平台的 id 形状」一段）：``(输入, 平台, local_id)``。
 PLATFORM_SHAPES = (
     ("telegram:123456789", "telegram", "123456789"),
     ("telegram:-1001234567890", "telegram", "-1001234567890"),
@@ -276,6 +276,7 @@ PLATFORM_SHAPES = (
     ("a2a:local:127.0.0.1", "a2a", "local:127.0.0.1"),
     ("qqbot:group:B2C3xxxx", "qqbot", "group:B2C3xxxx"),
     ("homeassistant:light.kitchen", "homeassistant", "light.kitchen"),
+    ("sms:+15551234567", "sms", "+15551234567"),
 )
 
 

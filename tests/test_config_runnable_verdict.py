@@ -317,7 +317,7 @@ class TestTheOriginalFixStillHolds(unittest.TestCase):
 
 
 class TestEveryOtherPlatformIsUnchanged(unittest.TestCase):
-    """⭐ 13 个平台逐个断言：只有 a2a 的判定是"看配置"的。"""
+    """⭐ 14 个平台逐个断言：只有 a2a 的判定是"看配置"的。"""
 
     def test_only_a2a_answers_its_own_readiness(self):
         self_answered = [
@@ -326,8 +326,8 @@ class TestEveryOtherPlatformIsUnchanged(unittest.TestCase):
         ]
         self.assertEqual(self_answered, [], "只有 a2a 能被新判定说成能跑")
 
-    def test_the_other_twelve_keep_the_default_verdict(self):
-        """**一个都不许改**：基类默认 ``False`` 就是那十二个平台的行为。"""
+    def test_the_other_thirteen_keep_the_default_verdict(self):
+        """**一个都不许改**：基类默认 ``False`` 就是那十三个平台的行为。"""
         for name in registered_names():
             if name == "a2a":
                 continue
@@ -341,7 +341,7 @@ class TestEveryOtherPlatformIsUnchanged(unittest.TestCase):
                 self.assertFalse(getattr(cls, "config_optional", False))
 
     def test_every_platform_is_configured_when_its_own_keys_are_present(self):
-        """13 个平台逐个：按**它自己声明**的键配齐 ⇒ 预检与状态视图都必须说配好。"""
+        """14 个平台逐个：按**它自己声明**的键配齐 ⇒ 预检与状态视图都必须说配好。"""
         for name in registered_names():
             with self.subTest(platform=name):
                 entry = complete_entry(name)
@@ -355,7 +355,7 @@ class TestEveryOtherPlatformIsUnchanged(unittest.TestCase):
                 self.assertTrue(channel_row(name, entry)[0])
 
     def test_every_platform_is_unconfigured_when_its_keys_are_absent(self):
-        """反向：空条目 ⇒ 13 个平台**全部**未配置（a2a 现在也在内）。"""
+        """反向：空条目 ⇒ 14 个平台**全部**未配置（a2a 现在也在内）。"""
         for name in registered_names():
             with self.subTest(platform=name):
                 self.assertFalse(preflight(name, {}), f"{name} 空配置却说配好了")
@@ -370,7 +370,7 @@ class TestTheDeclarationShapeIsPinned(unittest.TestCase):
 
     def test_config_optional_is_still_a_plain_bool(self):
         """把它改成方法 ⇒ ``getattr(cls, ...)`` 取到未绑定函数（永远真值）
-        ⇒ 13 个平台同时变成"可省略配置"；而它还是 ``capabilities()`` 的输出项，
+        ⇒ 14 个平台同时变成"可省略配置"；而它还是 ``capabilities()`` 的输出项，
         方法对象会让 ``--setup --json`` 的 ``json.dumps`` 当场炸。"""
         for name in registered_names():
             cls = adapter_class(name)
@@ -548,7 +548,7 @@ class TestShippedTemplateStaysUnconfigured(unittest.TestCase):
 
     def test_template_still_parses_and_lists_every_platform(self):
         adapters = self.template["adapters"]
-        self.assertEqual(len(adapters), 13, "模板的平台数变了（新平台没进模板？）")
+        self.assertEqual(len(adapters), 14, "模板的平台数变了（新平台没进模板？）")
         self.assertIn("a2a", adapters)
         self.assertEqual(sorted(adapters), sorted(registered_names()))
 
@@ -571,7 +571,7 @@ class TestShippedTemplateStaysUnconfigured(unittest.TestCase):
         self.assertEqual(row["missing"], ["bind_port"])
 
     def test_the_template_is_never_served_as_a_working_configuration(self):
-        """模板里每个平台的凭据都是空 ⇒ 13 个平台逐个都必须是未配置。"""
+        """模板里每个平台的凭据都是空 ⇒ 14 个平台逐个都必须是未配置。"""
         for platform, entry in self.template["adapters"].items():
             with self.subTest(platform=platform):
                 self.assertFalse(preflight(platform, entry))

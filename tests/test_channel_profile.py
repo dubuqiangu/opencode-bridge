@@ -610,8 +610,8 @@ class TheProgressVisibilityClauseIsConditionalTests(unittest.TestCase):
     """
 
     def test_every_platform_is_covered(self):
-        """覆盖面守门：13 个已注册平台一个不漏。"""
-        self.assertEqual(len(every_registered_adapter()), 13)
+        """覆盖面守门：14 个已注册平台一个不漏。"""
+        self.assertEqual(len(every_registered_adapter()), 14)
 
     def test_an_editing_platform_still_says_the_placeholder_is_replaced(self):
         editing = [a for a in every_registered_adapter() if a.supports_message_edit]

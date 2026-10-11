@@ -207,7 +207,7 @@ class NickInAllowlistTests(unittest.TestCase):
 
     # -- 验收条件 5：只有 irc / twitch --------------------------------------
     def test_only_irc_and_twitch_carry_the_nick_checkpoint(self):
-        """13 个平台里，**只有** irc / twitch 的 ``nick`` 是带检查的 property。
+        """14 个平台里，**只有** irc / twitch 的 ``nick`` 是带检查的 property。
 
         这条同时是给下一个平台的**提示**：哪天有平台把「自己是谁」当成私聊
         principal，它必须像这两家一样主动挂上检查 —— 而这条断言会提醒有人补。

@@ -95,8 +95,8 @@ class GenuineCjkIdentifierTests(unittest.TestCase):
         )
 
 
-class ThirteenPlatformShapesTests(unittest.TestCase):
-    """13 个平台的 local-id 真实形状（清单见 ``_redactable_ids.py`` 的 docstring）逐字节不变。
+class FourteenPlatformShapesTests(unittest.TestCase):
+    """14 个平台的 local-id 真实形状（清单见 ``_redactable_ids.py`` 的 docstring）逐字节不变。
 
     ⚠️ 这是**回归闸**：改动前就全绿，改动后必须仍然全绿。
     """
@@ -115,7 +115,7 @@ class ThirteenPlatformShapesTests(unittest.TestCase):
     def test_every_registered_adapter_platform_is_covered_by_this_table(self):
         """清单不许比「已注册适配器的平台清单」少一个。
 
-        ⚠️ 参照物是 :data:`tests.inbound_log_support.ALL_PLATFORMS`（13 个**已落地**
+        ⚠️ 参照物是 :data:`tests.inbound_log_support.ALL_PLATFORMS`（14 个**已落地**
         适配器的 ``name``），**不是** :data:`identity.KNOWN_PLATFORMS` ——
         后者还含 5 个「路线图 B 波次、适配器尚未落地」的平台（feishu / wecom /
         dingtalk / wechat / nostr），那些没有 local-id 形状可列。

@@ -43,6 +43,7 @@ GATE_PRINCIPAL_BY_PLATFORM = {
     "ntfy": "topic",
     "qqbot": "target",
     "slack": "channel",
+    "sms": "from_number",
     "telegram": "chat_id",
     "twitch": "target",
 }

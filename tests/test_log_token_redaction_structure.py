@@ -222,7 +222,7 @@ class TelegramCallbackLogStructureTest(unittest.TestCase):
 
 
 class PlatformKeyLegalityTest(unittest.TestCase):
-    """13 个已注册适配器的 ``name`` 全是合法平台键。
+    """14 个已注册适配器的 ``name`` 全是合法平台键。
 
     这是 :data:`~opencode_bridge.adapters._redactable_ids.MISSING_ID` 的第二种成因
     （"平台键非法"）**结构上不可达**的保证 —— 否则日志里的 ``?`` 会同时意味着

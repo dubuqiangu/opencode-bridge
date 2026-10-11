@@ -56,6 +56,9 @@ KNOWN_PLATFORMS: Final[frozenset[str]] = frozenset(
         # 已实现（八个）
         "telegram", "slack", "discord", "matrix", "mattermost",
         "irc", "twitch", "nextcloud",
+        # A3 webhook 波次已实现：本地 id 是 E.164 电话号码（PII）——
+        # 必须在表里，否则 redaction 的会话 id 规则不认 ``sms:+1555…`` 这个形状。
+        "sms",
         # 路线图 B 波次
         "ntfy", "email", "a2a", "qqbot", "homeassistant",
         "feishu", "wecom", "dingtalk", "wechat", "nostr",

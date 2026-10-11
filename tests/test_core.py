@@ -1868,7 +1868,7 @@ class CoreLifecycleTests(unittest.TestCase):
 # 而一条**写错**的注释比没有注释更糟，因为下一个人会信它。所以下面每一条断言都
 # 在核**注释里的具体主张**，而不是核常量还在不在。
 # 顺带把两件容易被下一个读代码的人搞错的事钉住：
-# ① 4000 **超过** 6/13 个平台的真实上限，所以它不是"安全发送长度"；
+# ① 4000 **超过** 7/14 个平台的真实上限，所以它不是"安全发送长度"；
 # ② 它必须**每一处**都与平台上限取小者 —— 这一条以前只有 finalize 做到，
 #    流式闸门没做，于是两处读者漂了（见下面那条"反过来写"的用例）。
 #
@@ -1889,8 +1889,8 @@ class DocumentedDefaultConstantTests(unittest.TestCase):
         self.assertEqual(DEFAULT_BRIDGE["max_message_chars"],
                          DEFAULT_MAX_MESSAGE_CHARS)
 
-    def test_the_max_chars_default_exceeds_six_of_the_platform_limits(self):
-        """钉住注释里那句「**超过** 6/13 个平台的真实上限」。
+    def test_the_max_chars_default_exceeds_seven_of_the_platform_limits(self):
+        """钉住注释里那句「**超过** 7/14 个平台的真实上限」。
 
         反向价值更大：哪天有人**调小** ``DEFAULT_MAX_MESSAGE_CHARS`` 让这句话不再
         成立，或者某个平台的上限变了，这条会红 —— 那正是该回来改注释的时候。
@@ -1899,14 +1899,14 @@ class DocumentedDefaultConstantTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(below),
-            ["discord", "email", "irc", "qqbot", "twitch"],
+            ["discord", "email", "irc", "qqbot", "sms", "twitch"],
             "低于 4000 的平台清单变了，core.py 里的注释要跟着改",
         )
         self.assertEqual(
             sorted(coinciding), ["mattermost"],
             "与 4000 相等的平台清单变了，core.py 里的注释要跟着改",
         )
-        self.assertEqual(len(below) + len(coinciding), 6)
+        self.assertEqual(len(below) + len(coinciding), 7)
 
     def test_the_finalize_budget_is_narrowed_to_the_platform_limit(self):
         """钉住「收尾那条路被 min() 收窄」—— 4000 **不是**编辑预算的真值。
@@ -1980,7 +1980,7 @@ class DocumentedDefaultConstantTests(unittest.TestCase):
 
         之前两侧各写一遍 ``min(...)``（闸门那遍还漏了平台上限），于是它们漂了。
         现在两侧都调 ``one_message_budget``；这条断言它给出的数确实是"两条上限的
-        小者"，并且在 6/13 个平台上**确实小于**桥的预算 —— 也就是漂了就会出事的那
+        小者"，并且在 7/14 个平台上**确实小于**桥的预算 —— 也就是漂了就会出事的那
         些平台上，它不是一个恒等于 4000 的装饰函数。
         """
         for platform_limit in (2000, 400, 998, 4096, 40000):

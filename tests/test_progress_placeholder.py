@@ -3,8 +3,8 @@
 ## 这个 bug 长什么样
 
 桥在模型开始产出时发一条 ``⏳ 处理中…``，收尾时试图把它**原地改写**成最终答复。
-七个平台的 :meth:`~opencode_bridge.adapters.base.Adapter.edit` **恒返回 ``False``**
-（email / ntfy / a2a / homeassistant / irc / twitch / qqbot —— 各自的 docstring
+八个平台的 :meth:`~opencode_bridge.adapters.base.Adapter.edit` **恒返回 ``False``**
+（email / ntfy / a2a / homeassistant / irc / twitch / qqbot / sms —— 各自的 docstring
 都写明了为什么）。于是 ``finalize`` 退化成"再发一条"，而那条气泡**永远**清不掉：
 **每一轮**都留下一个僵尸"处理中" + 一条真正的答复。
 
@@ -36,6 +36,7 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -69,9 +70,9 @@ _REPOSITORY_TEMP = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".tmp"
 )
 
-#: 恒返回 ``False`` 的 :meth:`edit` —— 也就是**不发**占位消息的那七个。
+#: 恒返回 ``False`` 的 :meth:`edit` —— 也就是**不发**占位消息的那八个。
 PLATFORMS_WITHOUT_MESSAGE_EDIT = (
-    "a2a", "email", "homeassistant", "irc", "ntfy", "qqbot", "twitch",
+    "a2a", "email", "homeassistant", "irc", "ntfy", "qqbot", "sms", "twitch",
 )
 
 #: 真能原地改写的六个 —— 占位消息照发，而且会被顶掉。
@@ -459,6 +460,27 @@ def _ntfy() -> PlatformUnderTest:
     return under_test
 
 
+def _sms() -> PlatformUnderTest:
+    from opencode_bridge.adapters.sms import SmsAdapter
+
+    under_test = PlatformUnderTest(
+        "sms", SmsAdapter({"account_sid": "ACtest", "auth_token": "test-auth-token",
+                           "from_number": "+15550000001"}, _InertHooks()),
+        "sms:+15551234567",
+    )
+    counter = {"n": 0}
+
+    def fake_post_message(form_body):
+        counter["n"] += 1
+        under_test.wire.append(
+            urllib.parse.parse_qs(form_body.decode("utf-8"))["Body"][0]
+        )
+        return 201, {"sid": "SM%d" % counter["n"]}
+
+    under_test.adapter._post_message = fake_post_message
+    return under_test
+
+
 def _irc() -> PlatformUnderTest:
     from opencode_bridge.adapters.irc import IRCAdapter
 
@@ -611,6 +633,7 @@ _PLATFORM_SETUP = {
     "ntfy": _ntfy,
     "qqbot": _qqbot,
     "slack": _slack,
+    "sms": _sms,
     "telegram": _telegram,
     "twitch": _twitch,
 }
@@ -800,7 +823,7 @@ class TurnTestCase(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# 1. 七个清不掉的平台：占位消息**根本不发**
+# 1. 八个清不掉的平台：占位消息**根本不发**
 # ----------------------------------------------------------------------
 class NoStalePlaceholderTests(TurnTestCase):
     def test_every_platform_without_message_edit_declares_it(self):
@@ -808,7 +831,7 @@ class NoStalePlaceholderTests(TurnTestCase):
             with self.subTest(platform=name):
                 self.assertFalse(build_platform(name).adapter.supports_message_edit)
 
-    def test_no_progress_message_is_sent_at_all_on_those_seven(self):
+    def test_no_progress_message_is_sent_at_all_on_those_eight(self):
         """这就是修好的形态：**零**条进度消息，所以没有什么可变成僵尸。"""
         for name in PLATFORMS_WITHOUT_MESSAGE_EDIT:
             with self.subTest(platform=name):
@@ -894,11 +917,11 @@ class EditingPlatformsAreUnregressedTests(TurnTestCase):
 
 
 # ----------------------------------------------------------------------
-# 3. 十三个平台：答复恰好一次、逐字节相同
+# 3. 十四个平台：答复恰好一次、逐字节相同
 # ----------------------------------------------------------------------
 class TheAnswerArrivesExactlyOnceTests(TurnTestCase):
     def test_every_registered_platform_delivers_the_answer_exactly_once(self):
-        """⚠️ 覆盖面守门：13 个已注册平台**一个不漏**地跑完整一轮。"""
+        """⚠️ 覆盖面守门：14 个已注册平台**一个不漏**地跑完整一轮。"""
         self.assertEqual(
             sorted(registered_names()), sorted(_PLATFORM_SETUP),
             "新增平台必须在这里登记一份夹具，否则它不受任何断言保护",
@@ -949,10 +972,10 @@ class TheAnswerArrivesExactlyOnceTests(TurnTestCase):
                 )
 
     # ------------------------------------------------------------------
-    # 整条长度轴：四个边界 × 十三个平台
+    # 整条长度轴：四个边界 × 十四个平台
     # ------------------------------------------------------------------
     def test_every_length_boundary_delivers_the_whole_answer_in_order(self):
-        """短 / 正好装满 / 刚超 / 远超 —— 四个边界，十三个平台，逐字节。
+        """短 / 正好装满 / 刚超 / 远超 —— 四个边界，十四个平台，逐字节。
 
         判据是**读者最终看到的东西**：每条消息**最后**写入的文本，按消息出现的
         顺序拼起来。这一条同时否掉四种坏结果：

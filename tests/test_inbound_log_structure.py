@@ -52,7 +52,7 @@ _LOGGER_METHODS = frozenset({
     "debug", "info", "warning", "warn", "error", "exception", "critical", "log",
 })
 
-#: 闸门的**唯一**结构标记：13 个平台的闸门分支都写成
+#: 闸门的**唯一**结构标记：14 个平台的闸门分支都写成
 #: ``if not self.admits(p) and not self.answer_pairing_request(p, cid, text):``
 #: —— 所以判"这是闸门拒绝"只需要认这一个符号，**不认任何平台特有的写法**
 #: （telegram 走的是 ``self._allowed``，那是 ``admits`` 的委托；irc 用 ``target``；

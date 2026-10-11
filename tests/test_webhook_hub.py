@@ -356,7 +356,7 @@ class BridgeCoreWiringTests(unittest.TestCase):
 
     def test_core_without_webhook_adapters_binds_no_port(self):
         # 零路由纪律在接线层再钉一次：只有普通适配器时 hub 不绑端口 ——
-        # 现有 13 个适配器的部署行为零变化。
+        # 现有 14 个适配器的部署行为零变化。
         with tempfile.TemporaryDirectory() as td:
             core, _, _, _, _, _ = make_env(td)
             core.start()

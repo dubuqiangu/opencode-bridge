@@ -1,4 +1,4 @@
-"""13 个平台各跑一次**真实拒绝路径**，断言**落盘**的那一行。
+"""14 个平台各跑一次**真实拒绝路径**，断言**落盘**的那一行。
 
 每一类测试都在"闸门翻转后的场景"里站：``config_version >= 2`` + **空**清单 ⇒
 谁都不放行 ⇒ 一个陌生人的消息被丢弃 ⇒ 检查那一行日志。
@@ -30,9 +30,13 @@ qqbot 四条里的 :meth:`PerPlatformRejectionLogTests._assert_fields_survive`
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import unittest
+import urllib.parse
 
 from opencode_bridge import identity
 from opencode_bridge.adapters.a2a import A2aAdapter
@@ -46,8 +50,10 @@ from opencode_bridge.adapters.nextcloud import NextcloudAdapter
 from opencode_bridge.adapters.ntfy import NtfyAdapter
 from opencode_bridge.adapters.qqbot import QQBotAdapter
 from opencode_bridge.adapters.slack import SlackAdapter
+from opencode_bridge.adapters.sms import SmsAdapter, TWILIO_WEBHOOK_PATH
 from opencode_bridge.adapters.telegram import TelegramAdapter
 from opencode_bridge.adapters.twitch import TwitchAdapter
+from opencode_bridge.httpsrv import HttpRequest
 from opencode_bridge.redaction import Redactor
 from opencode_bridge.redaction_coverage import install_order_independent_coverage
 from tests.inbound_log_support import (
@@ -63,7 +69,7 @@ from tests.inbound_log_support import (
 # 3. 逐平台：跑真实拒绝路径，断言落盘的那一行
 # ======================================================================
 class PerPlatformRejectionLogTests(unittest.TestCase):
-    """13 个平台各一条：**空清单 + ``config_version>=2``** 下丢弃一条陌生人的消息。
+    """14 个平台各一条：**空清单 + ``config_version>=2``** 下丢弃一条陌生人的消息。
 
     每条都断言三件事：
 
@@ -388,6 +394,36 @@ class PerPlatformRejectionLogTests(unittest.TestCase):
         self._assert_drop_line("homeassistant", entity_id, handler,
                                HomeAssistantAdapter.conversation_id_for(entity_id))
         self._rejected("homeassistant")
+
+    # -- sms --------------------------------------------------------
+    def test_sms(self) -> None:
+        from_number = "+15559999999"
+        self.hooks = hooks = RecordingHooks()
+        adapter = SmsAdapter(
+            {"account_sid": "ACtest", "auth_token": "test-auth-token",
+             "from_number": "+15550000001",
+             "webhook_url": "http://127.0.0.1:8080/webhooks/twilio",
+             **FLIPPED_GATE_CONFIG}, hooks,
+        )
+        params = {"From": from_number, "Body": "hello there", "MessageSid": "SM123"}
+        signature = base64.b64encode(hmac.new(
+            b"test-auth-token",
+            ("http://127.0.0.1:8080/webhooks/twilio"
+             + "".join(key + params[key] for key in sorted(params))).encode("utf-8"),
+            hashlib.sha1,
+        ).digest()).decode("ascii")
+        request = HttpRequest(
+            method="POST", path=TWILIO_WEBHOOK_PATH, query={},
+            headers={"x-twilio-signature": signature},
+            body=urllib.parse.urlencode(params).encode("utf-8"),
+            client_host="127.0.0.1",
+        )
+        with CapturedLogs("sms") as handler:
+            response = adapter._on_twilio_webhook(request)
+        self.assertEqual(response.status, 200)
+        self._assert_drop_line("sms", from_number, handler,
+                               identity.format_id("sms", from_number))
+        self._rejected("sms")
 
     # -- 共享辅助 ---------------------------------------------------
     def _assert_fields_survive(self, lines: list[str], fields: tuple[str, ...]) -> None:

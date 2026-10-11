@@ -1,4 +1,4 @@
-"""审计**其余 11 个平台**：私聊 principal 是不是 :mod:`irc / twitch` 那种同型陷阱。
+"""审计**其余 12 个平台**：私聊 principal 是不是 :mod:`irc / twitch` 那种同型陷阱。
 
 拆出来的理由：本类的判据是**从适配器源码 AST 里重扫**得出的，与「起真适配器跑闸门」
 （:mod:`tests.test_nick_in_allowlist`）、「真起子进程看桥起不来」
@@ -25,7 +25,7 @@ from tests.nick_trap_support import (
 
 
 class GatePrincipalAuditTests(unittest.TestCase):
-    """审计**其余 11 个平台**：私聊 principal 是不是同型陷阱。**判据列在这里**。
+    """审计**其余 12 个平台**：私聊 principal 是不是同型陷阱。**判据列在这里**。
 
     ## 判据（不是「已确认」，是这四条可复跑的机械判据）
 
@@ -34,7 +34,7 @@ class GatePrincipalAuditTests(unittest.TestCase):
     1. 闸门 principal **可能等于「bot 自己的身份」** ⇒ ⛔ principal 不能是
        :data:`~tests.nick_trap_support.SELF_IDENTITY_SYMBOLS` 里的任何一个符号；
     2. principal **不能是适配器自己的配置字段** ⇒ ⛔ ``self.<principal>`` 在整个模块里
-       **不得**有任何赋值。**实测形态**：其余 11 家的 principal **全部**是从入站报文解析
+       **不得**有任何赋值。**实测形态**：其余 12 家的 principal **全部**是从入站报文解析
        出来的**局部变量**或**函数形参**，没有一个是 ``self.`` 属性 —— 这就是「平台权威
        分配」的可查形态；
     3. 判「这是私聊」与跑闸门**不能**用同一个字段 ⇒ 只有 irc / twitch 满足；
@@ -57,15 +57,16 @@ class GatePrincipalAuditTests(unittest.TestCase):
         "ntfy": "ntfy 主题名（发布者选的名字，不是 bot 的身份）",
         "qqbot": "group_openid / user_openid / channel_id（**按用户**各不相同）",
         "slack": "Slack 的 `C…`/`D…` 频道 id（服务器分配）",
+        "sms": "Twilio 载荷里的 From 号码（发件人）；本机号码才是 bot 自己",
         "telegram": "Telegram 的 chat id（**每个人的私聊各不相同**）",
     }
 
     def test_the_audit_covers_every_registered_platform(self):
-        """:data:`GATE_PRINCIPAL_BY_PLATFORM` 必须**恰好**覆盖 13 个平台。
+        """:data:`GATE_PRINCIPAL_BY_PLATFORM` 必须**恰好**覆盖 14 个平台。
 
         空集 ≠ 不存在（AGENTS.md §7.1）：少一家 = 审计漏了一家，而不是"没问题"。
         """
-        self.assertEqual(len(ALL_PLATFORMS), 13)
+        self.assertEqual(len(ALL_PLATFORMS), 14)
         self.assertEqual(sorted(GATE_PRINCIPAL_BY_PLATFORM), sorted(ALL_PLATFORMS))
 
     def test_each_platform_has_exactly_one_gate_principal_symbol(self):
@@ -84,7 +85,7 @@ class GatePrincipalAuditTests(unittest.TestCase):
                     f"表里写的是 {expected!r}）⇒「是否仍是同型陷阱」需要重新回答",
                 )
 
-    def test_the_other_eleven_never_gate_on_a_self_identity_symbol(self):
+    def test_the_other_twelve_never_gate_on_a_self_identity_symbol(self):
         """判据 1：principal 不是「自己是谁」。"""
         offenders = [
             f"{platform}: 闸门 principal 就是 {principal!r}"
@@ -94,7 +95,7 @@ class GatePrincipalAuditTests(unittest.TestCase):
         ]
         self.assertEqual(offenders, [], f"判据 1 被破了：{offenders}")
 
-    def test_the_other_eleven_principal_is_never_a_config_derived_attribute(self):
+    def test_the_other_twelve_principal_is_never_a_config_derived_attribute(self):
         """判据 2：``self.<principal>`` 在模块里**一次都不许被赋值**。"""
         offenders: list[str] = []
         for platform, principal in sorted(GATE_PRINCIPAL_BY_PLATFORM.items()):
@@ -122,12 +123,13 @@ class GatePrincipalAuditTests(unittest.TestCase):
         """判据 4：**逐平台实测**闸门真的按那个 principal 拒。
 
         白名单里放**该平台自己的身份字符串**，再拿一个**不同的**会话标识去过闸门 ——
-        必须被拒。这证明「把 bot 自己的身份写进白名单」在这 11 家里**不会**顺带授权
+        必须被拒。这证明「把 bot 自己的身份写进白名单」在这 12 家里**不会**顺带授权
         别人的私聊，因为它们的私聊 principal 不是同一个字符串。
         """
         own_identity = {
             "telegram": "bot-own-user-id",
             "slack": "B0OWNBOTUSERID",
+            "sms": "+15550000001",
             "discord": "0",
             "matrix": "@thebot:example.org",
             "email": "thebot@example.org",
@@ -153,6 +155,8 @@ class GatePrincipalAuditTests(unittest.TestCase):
             "qqbot": ({"app_id": "a", "secret": "s", "token": "t"},
                       "group-openid-from-wire"),
             "slack": ({"bot_token": "xoxb-x", "app_token": "xapp-x"}, "C0FROMWIRE"),
+            "sms": ({"account_sid": "ACtest", "auth_token": "test-auth-token",
+                     "from_number": "+15550000001"}, "+15559999999"),
             "telegram": ({"bot_token": "123:ABC"}, "-1009999999999"),
         }
         self.assertEqual(sorted(cases), sorted(self.PROVENANCE),

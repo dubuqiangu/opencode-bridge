@@ -264,7 +264,7 @@ class TestPreflightRefusalIsRecorded(_RefusalHarness):
         self.assertIsNotNone(a2a, "空模板被拒绝启动，却没有留下任何记录")
         self.assertEqual(a2a["verdict"], health.VERDICT_NOT_STARTED)
         self.assertIn("bind_port", a2a["detail"])
-        # 模板里 13 个平台全都没配 ⇒ 每一条都必须有记录，且**没有一条是 ok**
+        # 模板里 14 个平台全都没配 ⇒ 每一条都必须有记录，且**没有一条是 ok**
         self.assertEqual(len(self.verdicts_on_disk()), len(template["adapters"]))
         self.assertNotIn("ok", self.verdicts_on_disk().values())
 
@@ -806,7 +806,7 @@ class TestAnUnregisteredConfigKeyStaysVisible(_RefusalHarness):
         """⭐ 它必须**自己成行**，⛔ 不许被折进「桥这一轮没起来」那条全局 ⚠ 行。
 
         ⚠️ 折进去就等于**连原因一起吞掉**：那条 ⚠ 行只带**第一个** not_started 的
-        ``detail``（13 个平台全被拒时省掉一屏复读），而先到的是注册表里的键 ⇒
+        ``detail``（14 个平台全被拒时省掉一屏复读），而先到的是注册表里的键 ⇒
         拼错的那个键连那一行都轮不上。
         """
         # 再加一个**已注册**键的 not_started：它按注册表顺序排在前面，正是"抢走"

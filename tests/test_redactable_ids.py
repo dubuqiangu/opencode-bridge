@@ -1,6 +1,6 @@
 """:func:`opencode_bridge.adapters._redactable_ids.redactable_id` 自身的契约。
 
-**这一份只管那个函数**：空 local 段不抛、失败关闭、已带前缀幂等、13 个平台的
+**这一份只管那个函数**：空 local 段不抛、失败关闭、已带前缀幂等、14 个平台的
 ``name`` 全是合法平台键，以及它与各适配器自己的 ``conversation_id`` 产出同一个
 字符串。
 
@@ -71,7 +71,7 @@ class RedactableIdTests(unittest.TestCase):
         """把 ``redactable_id`` 那个"失败关闭"分支**结构上**堵死。
 
         :data:`MISSING_ID` 只有一种成因（平台侧没给 id）才讲得通；平台键非法是
-        它的第二个成因，而一个符号两种含义就是歧义。所以 13 个 ``name`` 必须是
+        它的第二个成因，而一个符号两种含义就是歧义。所以 14 个 ``name`` 必须是
         合法平台键 —— 这条断言就是那个前提。
         """
         names = list(registered_names())

@@ -31,10 +31,11 @@ FLIPPED_GATE_CONFIG = {"config_version": 2, "allowed_chat_ids": []}
 
 ADAPTERS_DIR = Path(__file__).resolve().parent.parent / "opencode_bridge" / "adapters"
 
-#: 13 个平台的 ``name``；逐平台测试与"每个平台都被改到了"那条断言都用它。
+#: 14 个平台的 ``name``；逐平台测试与"每个平台都被改到了"那条断言都用它。
 ALL_PLATFORMS = (
     "a2a", "discord", "email", "homeassistant", "irc", "matrix",
-    "mattermost", "nextcloud", "ntfy", "qqbot", "slack", "telegram", "twitch",
+    "mattermost", "nextcloud", "ntfy", "qqbot", "slack", "sms", "telegram",
+    "twitch",
 )
 
 

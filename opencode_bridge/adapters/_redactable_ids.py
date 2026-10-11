@@ -16,7 +16,7 @@
 ``conversation_id``"（原句：``要根治得让适配器改打 conversation_id，而
 adapters/** 本次不许动``）。本模块就是那句话的落地。
 
-它必须**只有一份**的理由与 C2 拒绝"逐个适配器打补丁"同源：让 13 个适配器各自
+它必须**只有一份**的理由与 C2 拒绝"逐个适配器打补丁"同源：让 14 个适配器各自
 记得加前缀，下一个适配器就会忘 —— 而"忘了"在这里的后果是静默的（测试全绿、
 日志照写明文）。
 
@@ -79,14 +79,14 @@ def redactable_id(platform: str, local_id: Any) -> str:
        抛）也返回 :data:`MISSING_ID`，**绝不**退回打原值。
        ⚠️ 所以 :data:`MISSING_ID` 有"平台没给 id"和"平台键非法"两种成因 ——
        同一个符号两种含义是不可接受的歧义，所以 ``tests/`` 里另有一条断言把
-       **13 个已注册适配器的 ``name`` 全是合法平台键**钉住，让第二种成因
+       **14 个已注册适配器的 ``name`` 全是合法平台键**钉住，让第二种成因
        **结构上不可达**。
     3. **已是 ``platform:`` 前缀的入参原样返回**，于是对已带前缀的值幂等：
        ``qqbot`` 的 conversation 段本身就是 ``qqbot:<scope>:<target>``，拼两次
        不能变成 ``qqbot:qqbot:group:...``。
-       （前提：平台侧 id 本身不会以 ``<platform>:`` 开头。13 个平台的 id 形状
+       （前提：平台侧 id 本身不会以 ``<platform>:`` 开头。14 个平台的 id 形状
        —— 数字 / 大写字母数字 / 邮箱 / URL / ``#chan`` / ``light.kitchen`` /
-       ``!abc:server`` / ``group:openid`` —— 都不满足这个前提；
+       ``!abc:server`` / ``group:openid`` / E.164 电话号码 —— 都不满足这个前提；
        ``tests/test_inbound_log_ids.py`` 把已注册的取值逐个喂过。）
     """
     prefix = str(platform or "").strip()

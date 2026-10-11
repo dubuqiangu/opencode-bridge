@@ -533,7 +533,7 @@ class ChokePointTests(_FilterHarness):
     )
 
     def test_one_installed_filter_covers_records_from_several_adapters(self):
-        """这是"一个卡口覆盖 13 个平台"那句话的**唯一**硬证据。
+        """这是"一个卡口覆盖 14 个平台"那句话的**唯一**硬证据。
 
         用 ``assertLogs("opencode_bridge")``（**父** logger）：子 logger 的记录
         propagate 上来、经过父 logger 上的 handler，所以装在那个 handler 上的

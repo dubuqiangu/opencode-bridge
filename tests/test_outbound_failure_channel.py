@@ -1008,7 +1008,7 @@ class UnregisteredKeyStaysVisible(unittest.TestCase):
         #    或盘上有记录的平台」这条取舍（母类的 docstring 写了它）意味着它**不会**
         #    被凭空列出来 ⇒ 走的是收尾那句「没有任何出站失败记录」。
         #    ⚠️ 这**不是**缺陷：没有记录就没有内容可显示，而凭空列一行「无记录」会把
-        #    十三行「无记录」的全开清单塞回这一段。
+        #    十四行「无记录」的全开清单塞回这一段。
         self.use_a_fresh_bridge_dir()
         without_record = self.section_with(self.typo_only_config())
         self.assertIn(

@@ -84,6 +84,16 @@ SOCKET_TIMEOUT = 30.0
 MAX_RETRY_AFTER = 60.0
 RECONNECT_DELAY = 3.0        # Socket Mode 断开后的重连间隔（秒）
 
+#: Block Kit 按钮的官方上限（docs.slack.dev「Button element」参考页，
+#: 2026-10-11 核）：``action_id`` ≤ **255**、按钮文本 ≤ **75**（且必须
+#: ``plain_text``）、``value`` ≤ **2000**。本适配器把 ``Button.data`` 同时写进
+#: ``action_id`` 与 ``value``，所以真正绑住的是 255 那条。
+#: 超限按钮**报错拒绝、绝不截断** —— 纪律照抄 telegram ``callback_data``
+#: 超限的拍板（``912dbb1``）：静默截断 = 用户点了却触发另一个动作。
+SLACK_ACTION_ID_LIMIT = 255
+SLACK_BUTTON_LABEL_LIMIT = 75
+SLACK_BUTTON_VALUE_LIMIT = 2000
+
 #: Slack local id 的文法：**首字符是大写字母**，其余大写字母或数字。
 #:
 #: Slack 的实体 id 一律大写，且用首字母区分类型（``C`` 公频 / ``D`` 私聊 /
@@ -137,7 +147,10 @@ class SlackAdapter(Adapter):
     #: principal = channel id：(a) 会话唯一且稳定，(b) 用户能直接看到它，
     #: (c) Slack 对发件人做过认证。三条都成立。
     pairing_supported = True
-    supports_inline_buttons = False            # blocks 未实现
+    #: Block Kit 按钮（``actions`` block）已实现：出站走 :meth:`edit` 附
+    #: ``blocks``，入站走 :meth:`_handle_block_actions`（Socket Mode 的
+    #: ``interactive`` 信封与事件共用同一条 WSS，无需新端口/新凭据）。
+    supports_inline_buttons = True
     supports_media = False
     #: ``chat.update`` 真能改写已发消息（见 :meth:`edit`），所以占位气泡发得。
     supports_message_edit = True
@@ -407,6 +420,12 @@ class SlackAdapter(Adapter):
         if env_type == "hello":
             return True
         payload = env.get("payload")
+        # 交互载荷（block_actions）不走 "event" 包装 —— payload 本身就是事件体。
+        # ack 铁律不变：上面的 envelope ack 已经发过，这里只做分发；本方法
+        # 抛异常也不会让 Slack 重发（那条 ack 不是对"处理成功"的确认）。
+        if isinstance(payload, dict) and payload.get("type") == "block_actions":
+            self._handle_block_actions(payload)
+            return True
         event = payload.get("event") if isinstance(payload, dict) else None
         if not isinstance(event, dict) or event.get("type") != "message":
             return True
@@ -446,6 +465,86 @@ class SlackAdapter(Adapter):
         except Exception as exc:
             logger.exception("slack: on_inbound failed: %s", exc)
         return True
+
+    def _handle_block_actions(self, payload: dict) -> None:
+        """按钮点击（``block_actions``）—— 与 telegram ``_handle_callback``
+        同一份行为契约：① 投递 ``kind="callback"`` 的 inbound → ② ``on_callback``。
+
+        顺序敏感：② 在 ``finally`` 里 —— 即使投递抛异常，回调也必须被触发
+        （telegram 在同一位置还要给服务端应答；Slack 的对应物 = 信封 ack，
+        :meth:`_handle_envelope` 已经先发过，所以这里没有第三步）。
+        文字反馈（``已打开接入引导`` 等）由网关经 :meth:`answer` 回给点击者。
+        """
+        actions_list = payload.get("actions")
+        first_action = (
+            actions_list[0]
+            if isinstance(actions_list, list) and actions_list
+            else None
+        )
+        data = ""
+        if isinstance(first_action, dict):
+            # 出站时 Button.data 同时写进 action_id 与 value（见
+            # :meth:`_action_buttons`）；value 优先，兼容只在 value 里携带的写法。
+            data = str(first_action.get("value") or first_action.get("action_id") or "")
+        channel_container = payload.get("channel")
+        channel_id = (
+            channel_container.get("id")
+            if isinstance(channel_container, dict)
+            else None
+        )
+        user_container = payload.get("user")
+        user_id = user_container.get("id") if isinstance(user_container, dict) else ""
+        if not data or not channel_id:
+            # 只记形状（排序顶层键名），不记载荷 —— 与 telegram 同一纪律。
+            logger.info(
+                "slack: ignoring block_actions with keys=%s",
+                sorted(str(key) for key in payload.keys()),
+            )
+            return
+        conversation_id = self._conversation_id(channel_id)
+        # 授权闸门与普通消息同一道、且在最前：未授权频道里点的按钮不许进上层
+        # （否则一个按钮就能绕过白名单触发命令）。
+        if not self.admits(channel_id) and not self.answer_pairing_request(
+            channel_id, conversation_id, None
+        ):
+            logger.info(
+                "slack: dropping callback from non-whitelisted channel %s",
+                redactable_id(self.name, channel_id),
+            )
+            return
+        message_container = payload.get("message")
+        message_id = (
+            message_container.get("ts")
+            if isinstance(message_container, dict)
+            else None
+        )
+        # query_id 编码 "<user_id>:<channel_id>" —— 两个字段都是 Slack id
+        # （[A-Z][A-Z0-9]{5,}，不含冒号），拆分无歧义；answer() 靠它定位
+        # chat.postEphemeral 的投递对象（Slack 没有 answerCallbackQuery 的对应物）。
+        query_id = f"{user_id}:{channel_id}" if user_id else ""
+        try:
+            self.hooks.on_inbound(
+                Inbound(
+                    conversation_id=conversation_id,
+                    text=data,
+                    kind="callback",
+                    user_id=user_id or None,
+                    message_id=str(message_id) if message_id else None,
+                    callback_query_id=query_id,
+                    platform=self.name,
+                    raw=payload,
+                )
+            )
+        except Exception as exc:
+            # 吞掉 + 记日志 —— 对齐本文件消息路径的既有契约（on_inbound 失败
+            # 也不掀掉会话）：信封 ack 已经发过、Slack 不会重发，这里再外溢只会
+            # 让传输层把一次投递失败误判成「需要重连」。
+            logger.exception("slack: on_inbound (callback) failed: %s", exc)
+        finally:
+            try:
+                self.hooks.on_callback(conversation_id, data, query_id)
+            except Exception:
+                logger.exception("slack: on_callback failed")
 
     # ------------------------------------------------------------------
     # Outbound
@@ -552,12 +651,28 @@ class SlackAdapter(Adapter):
         if not out.text:
             logger.warning("slack: refusing to edit with empty text")
             return False
+        actions = self._action_buttons(out.buttons)
+        # ⚠️ 只有带（且全部没被拒的）按钮时才发 blocks —— 进度改写（无按钮）
+        # 的 wire 形状一个字节都不动，由 tests/test_slack_buttons.py 的回归
+        # 守卫钉住。text 字段保留：blocks 的 fallback 与通知都靠它。
+        request_body: dict = {
+            "channel": channel,
+            "ts": handle.message_id,
+            "text": out.text,
+        }
+        if actions:
+            request_body["blocks"] = [
+                {
+                    "type": "section",
+                    # mrkdwn 与 chat.postMessage 的 text 字段同为 mrkdwn 渲染
+                    # （链接自动化、*加粗* 等），与改写前的纯 text 编辑保持同一
+                    # 解释行为；plain_text 会关掉这些。
+                    "text": {"type": "mrkdwn", "text": out.text},
+                },
+                {"type": "actions", "elements": actions},
+            ]
         self._throttle(handle.conversation_id)
-        status, data = self._request(
-            "POST",
-            "chat.update",
-            {"channel": channel, "ts": handle.message_id, "text": out.text},
-        )
+        status, data = self._request("POST", "chat.update", request_body)
         # 同上：ok:false 才是判据（HTTP 200 不代表成功）。
         if not data.get("ok"):
             logger.warning(
@@ -566,12 +681,84 @@ class SlackAdapter(Adapter):
             return False
         return True
 
-    def answer(self, query_id: str, text: str = "") -> None:
-        """Ack callback path —— Socket Mode 下 ack 已在 :meth:`_handle_envelope` 里发出。
+    def _action_buttons(self, buttons) -> list:
+        """把 :class:`~opencode_bridge.hooks.Button` 元组变成 Block Kit elements。
 
-        Slack 的交互确认走的是**信封 ack**（``{"envelope_id": ...}``，见
-        :meth:`_handle_envelope`），不是 Telegram 那种单独的 ``answerCallbackQuery``。
-        所以这里是 no-op，**不是**"漏实现"：按钮（``supports_inline_buttons``）
-        本来就没实现，``blocks`` 一旦落地，接缝是同一个 ``on_message`` 钩子。
+        超限按钮**逐个放弃 + WARNING**（点名位置/长度/上限），绝不截断 ——
+        telegram ``_button_row`` 超限抛 ``ValueError`` 那次拍板（``912dbb1``）
+        的 slack 面：静默截断会让点击回来的 data 与按钮绑定的不是同一个值。
+        全部被拒 ⇒ 返回空列表 ⇒ :meth:`edit` 不下发空的 ``actions`` block
+        （消息仍是可用的纯文本）。
         """
+        elements: list = []
+        for position, button in enumerate(buttons or ()):
+            label = str(button.label or "")
+            data = str(button.data or "")
+            if not data:
+                logger.warning(
+                    "slack: dropping button %d (empty data)", position
+                )
+                continue
+            if len(data) > SLACK_ACTION_ID_LIMIT:
+                logger.warning(
+                    "slack: dropping button %d (data %d chars exceeds limit %d)",
+                    position,
+                    len(data),
+                    SLACK_ACTION_ID_LIMIT,
+                )
+                continue
+            if len(label) > SLACK_BUTTON_LABEL_LIMIT:
+                logger.warning(
+                    "slack: dropping button %d (label %d chars exceeds limit %d)",
+                    position,
+                    len(label),
+                    SLACK_BUTTON_LABEL_LIMIT,
+                )
+                continue
+            elements.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label},
+                    "action_id": data,
+                    "value": data,
+                }
+            )
+        return elements
+
+    def answer(self, query_id: str, text: str = "") -> None:
+        """按钮文字反馈：``chat.postEphemeral`` —— Slack 版的 ``answerCallbackQuery(text)``。
+
+        信封 ack（:meth:`_handle_envelope`）只停交互指示、不承载文字；而网关对
+        每次点击都会回一句结果（``已打开接入引导`` / ``已处理`` / ``失败``），
+        Telegram 用 ``answerCallbackQuery(text)`` 送出，Slack 的对应物是只对
+        点击者可见的 ephemeral 消息。``query_id`` 由
+        :meth:`_handle_block_actions` 编码为 ``"<user_id>:<channel_id>"``。
+        本方法**永不抛**（网关已把全部反馈寄存在它身上）；``ok:false`` 必须
+        留 WARNING —— 纪律照抄 telegram answer 的拍板（``63d7434``）：反馈
+        通道静默失效 = 用户点了按钮却永远不知道结果。
+        """
+        if not query_id or not text:
+            return None
+        parts = str(query_id).split(":", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            logger.info("slack: answer target %r has no user:channel, skipping",
+                        query_id)
+            return None
+        user_id, channel_id = parts
+        try:
+            status, data = self._request(
+                "POST",
+                "chat.postEphemeral",
+                {"channel": channel_id, "user": user_id, "text": text},
+            )
+        except Exception as exc:
+            logger.warning("slack: postEphemeral failed for %s: %s", query_id, exc)
+            return None
+        if not data.get("ok"):
+            logger.warning(
+                "slack: postEphemeral not ok for %s (HTTP %s): %s",
+                query_id,
+                status,
+                data.get("error"),
+            )
         return None

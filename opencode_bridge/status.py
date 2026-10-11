@@ -40,15 +40,19 @@ Design notes
   branches on it.
 * Everything here is a pure function of its arguments — no I/O, no globals
   that mutate, trivially unit-testable.
+* Table *rendering* lives in :mod:`status_rendering` (presentation
+  only, no state logic); ``render_table`` and the width helpers
+  ``_display_width`` / ``_pad`` are re-exported here so existing
+  import paths do not change.
 """
 
 from __future__ import annotations
 
 import json
-import unicodedata
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Union
+from .status_rendering import _display_width, _pad, render_table
 
 __all__ = [
     "ChannelState",
@@ -365,72 +369,3 @@ def summarize(states: Iterable[ChannelState]) -> Dict[str, Any]:
         "disabled": disabled,
         "healthy": error == 0 and usable > 0,
     }
-
-
-# --------------------------------------------------------------------------
-# rendering (presentation only — no state logic lives here)
-# --------------------------------------------------------------------------
-
-#: Code points that terminals draw double-width although Unicode classifies
-#: them as narrow (they default to emoji presentation).  Without this the
-#: table's column borders would drift right of the CJK columns.
-_FORCE_WIDE = frozenset("\u2716\u23f8\u26a0")
-#: Variation selectors / ZWJ occupy no cell of their own.
-_ZERO_WIDTH = frozenset("\ufe0e\ufe0f\u200d")
-
-_HEADER = ("渠道", "状态", "入站", "说明")
-_GAP = "  "
-_MIN_LABEL_WIDTH = 6
-
-
-def _display_width(text: str) -> int:
-    """Terminal cell width of ``text`` (CJK and emoji count as two)."""
-    width = 0
-    for char in text:
-        if char in _ZERO_WIDTH or unicodedata.combining(char):
-            continue
-        if char in _FORCE_WIDE or unicodedata.east_asian_width(char) in ("W", "F"):
-            width += 2
-        else:
-            width += 1
-    return width
-
-
-def _pad(text: str, width: int) -> str:
-    return text + " " * max(0, width - _display_width(text))
-
-
-def render_table(statuses: List[ChannelStatus]) -> str:
-    """Render ``statuses`` as a fixed-width Chinese table.
-
-    Pure display: no verdict is computed here, the rows are whatever
-    :class:`ChannelStatus` objects the caller built.  Every line (header,
-    rule, rows) is padded to one identical display width, so the columns stay
-    aligned in a CJK terminal.  An empty input still yields the header plus
-    its rule.
-    """
-    rows: List[Tuple[str, str, str, str]] = [
-        (
-            status.label or status.platform,
-            f"{status.mark} {status.state_label}",
-            "是" if status.is_receiving else "否",
-            status.detail or "-",
-        )
-        for status in statuses
-    ]
-    widths = [
-        max(
-            [_display_width(_HEADER[index])]
-            + [_display_width(row[index]) for row in rows]
-        )
-        for index in range(len(_HEADER))
-    ]
-    widths[0] = max(widths[0], _MIN_LABEL_WIDTH)
-
-    def line(cells: Tuple[str, str, ...]) -> str:
-        return _GAP.join(_pad(cell, width) for cell, width in zip(cells, widths))
-
-    total = sum(widths) + len(_GAP) * (len(widths) - 1)
-    out = [line(_HEADER), "-" * total]
-    out.extend(line(row) for row in rows)
-    return "\n".join(out)

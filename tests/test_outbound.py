@@ -310,7 +310,9 @@ class CancelTurnTests(OutboundSenderTestCase):
                          "可改写的平台数变了：%s" % sorted(editable))
         self.assertEqual(
             sorted(set(registered_names()) - editable),
-            ["a2a", "email", "homeassistant", "irc", "ntfy", "qqbot", "twitch"],
+            # sms 于 A3（b4b5eaa）落地，本守门当时漏更新 —— 2026-10-11 补上
+            ["a2a", "email", "homeassistant", "irc", "ntfy", "qqbot", "sms",
+             "twitch"],
         )
 
 

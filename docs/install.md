@@ -451,8 +451,42 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 > 通配订阅**需要管理员**；两层保活方向相反（传输层由 aiohttp 发 ping、`ws.py` 自动回，
 > 应用层 JSON ping 必须客户端主动发）；出站走 `call_service`；**不支持编辑消息**。
 
+#### SMS（支持双向对话 · Twilio webhook，需要公网可达的回调地址）
+
+1. Twilio 控制台记下 Account SID 与 Auth Token，买一个能收发短信的号码（`from_number`）
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "sms": {
+     "account_sid": "AC...", "auth_token": "...",
+     "from_number": "+15551234567",
+     "webhook_url": "https://<你的公网可达地址>/webhooks/twilio",
+     "allowed_chat_ids": ["+15551234567"]
+   } },
+   "bridge": { "webhook_port": 8080 }
+   ```
+
+3. 执行 `opencode service restart`
+4. 用手机给 `from_number` 发一条短信，agent 应回复
+
+> ⚠️ **入站需要公网可达的回调地址**：webhook server 默认只绑回环（`bridge.webhook_host`
+> 默认 `127.0.0.1`），真实 Twilio 回调需要自备隧道或公网部署，并把**完整公网 URL（含
+> 固定路径 `/webhooks/twilio`）**填进 `webhook_url` —— 验签 `X-Twilio-Signature` 就是
+> 对这个 URL 做的（带/不带默认端口两个变体都接受）。`bridge.webhook_port` 配**稳定端口**
+> （默认 `0` = 操作系统随机分配，重启换端口对端就找不到我们）。
+>
+> ⚠️ **验签 fail-closed，没有旁路**：`auth_token` 与 `webhook_url` 缺任何一个，sms 路由
+> 根本不挂（宁可入站全无，也绝不挂一个不验签的路径）。无公网回调想自测：把 `webhook_url`
+> 配成回环地址即可走完整真验签链路。
+>
+> ⚠️ **号码可伪造 ⇒ 不做 `/pair` 配对**（`From` 是运营商转写、spoofing 协议层就可能发生）：
+> `allowed_chat_ids`（E.164，如 `+15551234567`）是唯一闸门，只填你自己的真实手机号。
+>
+> 其它：出站走 Twilio REST（HTTP Basic 认证），单条上限 1600 字符（更长自动分片）；
+> 回复一律走 REST、绝不 inline TwiML；**不支持编辑消息**；入站正文与号码不进日志（PII）。
+
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导（`/setup telegram`、`/setup slack`、`/setup discord` 可直达）。
-> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant / SMS 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按本节配置；配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 >
 > ⚠️ 但 `--status` 的「入站就绪」只代表**凭据齐备且入站已实现**，不代表"真的会收到消息"：
 > **Home Assistant** 默认**一个事件都不收**（必须另配 `entities`/`domains`/`accept_all`），

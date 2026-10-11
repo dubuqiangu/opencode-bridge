@@ -19,7 +19,7 @@ opencode V2 会**自动发现** `~/.config/opencode/plugins/<name>/` 下的插�
 | `package.json` | 插件清单（`{"name":"opencode-bridge",...,"exports":{".":"./index.ts"}}`） |
 | `config.example.json` | 配置模板（`bridgeDir` 留空，由安装器按脚本位置填充） |
 | `install.ps1` | 一键安装到 `~\.config\opencode\plugins\bridge\`（支持 `-Force`） |
-| `harness.ts` | 独立验证脚本（bun 运行，14 个断言） |
+| `harness.ts` | 独立验证脚本（bun 运行，25 个场景） |
 | `portable.spec.md` | bridgeDir 解析规则的简要规格 |
 | `README.md` | 本文件 |
 
@@ -72,8 +72,9 @@ opencode service restart
 - **a2a**：填 `adapters.a2a` 的 `bind_host` / `bind_port`（默认 `127.0.0.1`，**不需要任何 token**）；⚠️ **默认无鉴权**，需要被其它机器访问时**必须**配 `auth_token`。详见 [`docs/a2a.md`](https://github.com/dubuqiangu/opencode-bridge/blob/main/docs/a2a.md)。
 - **QQ Bot**：填 `adapters.qqbot` 的 `app_id` / `app_secret`；⚠️ 群里的**主动消息会被平台拒绝**，只能回复（被动窗口有时效与次数上限）。
 - **Home Assistant**：填 `adapters.homeassistant` 的 `url` 与长期访问令牌 `token`；⚠️ **还必须**给 `entities` / `domains` 或 `accept_all: true`，否则**默认一个事件都不收**（这是刻意设计：设备状态变更不等于"有人跟你说话"）。判据看 `--setup --json` 里 `platforms[].capabilities.inbound_accepts_anything`。
+- **SMS（Twilio）**：填 `adapters.sms` 的 `account_sid` / `auth_token` / `from_number` / `webhook_url`（入站需公网可达的回调地址：默认只绑回环，自备隧道，`bridge.webhook_port` 配稳定端口）；⚠️ **号码可伪造，不走 `/pair` 配对** —— `allowed_chat_ids`（你自己的 E.164 手机号）是唯一闸门。
 
-以上十三个平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
+以上平台**都支持双向对话**。哪些平台配齐了、哪些还缺哪个键，用 `--status` 一次看全（它会区分「配置齐备」与「入站就绪」）。
 
 > ⚠️ 注意「入站就绪」只代表**凭据齐备且入站已实现**，不代表"真的会收到消息"——
 > **Home Assistant** 是反例（默认全丢过滤器）。

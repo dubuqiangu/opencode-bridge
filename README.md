@@ -3,13 +3,14 @@
 [![CI](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/dubuqiangu/opencode-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-把 **13 个消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
+把 **Telegram、Slack、Discord 等消息平台**的消息桥接到本机 [opencode](https://opencode.ai) 服务：你在 IM 里发一句话，本机的 agent 就在你的目录里干活，过程与结果再流式回到同一个会话里。**纯 Python 标准库实现，零第三方依赖。**
 
-支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant —— **十三个全部支持双向对话**。
+支持的平台：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS（Twilio）—— **全部支持双向对话**；平台清单以本行为准，各平台的实时配置状态以 `python -m opencode_bridge --status` 实跑为准。
 
-> **a2a 是唯一方向相反的平台**：其余十二个都是我们主动连出去（长轮询 / WebSocket / IMAP），
+> **a2a 是唯一「整场会话都由对端调用驱动」的平台**：其余平台都是我们主动连出去（长轮询 / WebSocket / IMAP），
 > **a2a 是我们被调方** —— 起一个本机 HTTP 服务让外部 agent 调我们。因此它**默认无鉴权**，
 > 接入前请先读 [`docs/a2a.md`](docs/a2a.md) 的风险一节。
+> ⚠️ **SMS（Twilio）的入站方向也是「平台调我们」**（Twilio 把短信 POST 到本机共享 webhook server，出站仍是我们主动调 Twilio REST）—— 方向「半相反」，且入站需要公网可达的回调地址，详见下文 SMS 一节。
 
 ## 📖 文档
 
@@ -152,7 +153,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ## 接入平台引导
 
-各平台当前能力一览（**十三个平台全部支持双向对话**）：
+各平台当前能力一览（**全部支持双向对话**；权威平台清单与实时状态以 `--status` 实跑为准）：
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
@@ -169,12 +170,13 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | a2a | ✅ 本机 HTTP（**我们被调方**） | ✅ 回给等待方 | ❌ 无 | 默认 bind `127.0.0.1` + **默认无鉴权**；上限 1 MiB（规范未规定，自行声明） |
 | QQ Bot | ✅ WebSocket 网关 | ✅ REST | ❌ 无 | 上限 2000（**官方未给数字**，保守自定）；群/私聊/频道三种作用域；⚠️ **入站不做 @ 过滤**（见该节） |
 | Home Assistant | ✅ WebSocket 事件总线 | ✅ `call_service` | ❌ 无 | ⚠️ **默认一个事件都不收**，必须配 `entities`/`domains`/`accept_all`；上限 4096（官方未公布） |
+| SMS（Twilio） | ✅ webhook（**平台调我们**） | ✅ REST API | ❌ 无 | 单条上限 1600 字符（更长自动分片）；**验签 fail-closed**（`auth_token`/`webhook_url` 缺一即不挂路由）；**需公网可达的回调地址**（默认只绑回环）；⚠️ **号码可伪造 ⇒ 不走 `/pair` 配对**，`allowed_chat_ids`（E.164）是唯一闸门 |
 
 > 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
 >
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导；
 > `/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
-> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按下面各节配置；
+> **Matrix / Mattermost / IRC / Twitch / Nextcloud Talk / ntfy / email / a2a / QQ Bot / Home Assistant / SMS 暂未纳入 `/setup` 引导**（菜单是刻意维护的固定文案），请按下面各节配置；
 > 配置是否齐全一律用 `--status` 核对 —— 它会列出所有已注册平台，并区分「配置齐备」与「入站就绪」。
 
 ### 配置文件位置
@@ -451,7 +453,7 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 
 ### a2a（支持双向对话 · **我们是被调方**，无需公网地址）
 
-这是唯一**方向相反**的平台：其余十二个是我们主动连出去，a2a 是**起一个本机 HTTP 服务**
+这是唯一**整场会话都由对端调用驱动**的平台：其余平台是我们主动连出去，a2a 是**起一个本机 HTTP 服务**
 让外部 A2A agent 调我们。协议细节见 [`docs/a2a.md`](docs/a2a.md)。
 
 1. 编辑配置文件（路径见上面的「配置文件位置」）：
@@ -555,6 +557,42 @@ Matrix 没有 Slack 那种"建 App 再邀请进频道"的模型 —— 这里直
 >   会有自触发回声，靠 `ignore_entities` + 10 秒动作窗口压制。
 > - **不支持编辑消息**（HA 只有 create/dismiss，没有"改一条"），进度更新会退化成连续多条。
 > - 未与真实 HA 实例做过互操作验证（协议事实已逐条对照官方文档与源码）。
+
+### SMS（支持双向对话 · Twilio webhook，需要公网可达的回调地址）
+
+1. Twilio 控制台记下 Account SID 与 Auth Token，买一个能收发短信的号码（`from_number`）
+2. 编辑配置文件（路径见上面的「配置文件位置」）：
+
+   ```json
+   "adapters": { "sms": {
+     "account_sid": "AC...", "auth_token": "...",
+     "from_number": "+15551234567",
+     "webhook_url": "https://<你的公网可达地址>/webhooks/twilio",
+     "allowed_chat_ids": ["+15551234567"]
+   } },
+   "bridge": { "webhook_port": 8080 }
+   ```
+
+3. 执行 `opencode service restart`
+4. 用手机给 `from_number` 发一条短信，agent 应回复
+
+> ⚠️ **入站的前提是 Twilio 打得进本机**：webhook server 默认只绑回环（`bridge.webhook_host`
+> 默认 `127.0.0.1`），真实 Twilio 回调需要**公网可达**的地址 —— 自备隧道把公网 URL 转发到
+> 本机，并把**完整公网 URL（含固定路径 `/webhooks/twilio`）**填进 `webhook_url`（验签
+> `X-Twilio-Signature` 就是对这个 URL 做的，带/不带默认端口两个变体都接受）。
+> `bridge.webhook_port` 建议配**稳定端口**（默认 `0` = 操作系统随机分配，重启换端口对端就找不到我们）。
+>
+> ⚠️ **验签 fail-closed，没有旁路**：`auth_token` 与 `webhook_url` 缺任何一个，sms 路由
+> 根本不挂（宁可入站全无，也绝不挂一个不验签的路径）。想在无公网回调的前提下自测，
+> 把 `webhook_url` 配成回环地址即可走完整的真验签链路，不需要 insecure 逃逸口。
+>
+> ⚠️ **号码可伪造 ⇒ 不做 `/pair` 配对**：`From` 号码是运营商转写的，SMS spoofing 在协议层
+> 就可能发生 —— 配对码会发给一个可能被伪造的号码。所以这个平台**不走配对**，
+> `allowed_chat_ids`（E.164 格式，如 `+15551234567`）是唯一闸门，只填**你自己的真实手机号**。
+>
+> 其它要点：出站走 Twilio REST（HTTP Basic 认证），单条上限 **1600 字符**（约 10 个 SMS
+> segment，更长自动分片）；回复一律走 REST、绝不 inline TwiML；**不支持编辑消息**；
+> 入站正文与号码都不进日志（对 SMS 而言两者都是 PII）。
 
 ## npm 方式（占位 / 待发布）
 
@@ -804,6 +842,11 @@ python -m opencode_bridge --setup --json          # 机器可读视图：{config
 | `adapters.homeassistant.service_domain` | `"persistent_notification"` | 出站 `call_service` 的 domain。**别名 `domain`** |
 | `adapters.homeassistant.service_name` | `"create"` | 出站 `call_service` 的 service 名。**别名 `service`** |
 | `adapters.homeassistant.notification_title` | `"opencode-bridge"` | 出站通知的标题。**别名 `title`** |
+| `adapters.sms.account_sid` | `""` | Twilio Account SID（**必填**） |
+| `adapters.sms.auth_token` | `""` | Twilio Auth Token（**必填**）：入站验签（`X-Twilio-Signature`）与出站 REST（HTTP Basic）共用 |
+| `adapters.sms.from_number` | `""` | 出站短信的 Twilio 号码（**必填**）；入站 `From` 与它相同的一律当回声丢弃 |
+| `adapters.sms.webhook_url` | `""` | Twilio 回调的**完整 URL**（含固定路径 `/webhooks/twilio`）；**入站必填**。验签对它做；它或 `auth_token` 缺任一个 ⇒ sms 路由不挂（fail-closed） |
+| `adapters.sms.allowed_chat_ids` | `[]` | 发件人白名单（E.164，如 `+15551234567`）。⚠️ SMS **不走 `/pair` 配对**（`From` 可伪造）—— 这份名单是唯一闸门 |
 
 环境变量：`OPENCODE_URL` / `OPENCODE_PASSWORD` / `OPENCODE_DIRECTORY` 会覆盖配置文件中的同名项；`OPENCODE_BRIDGE_CONFIG` 指定配置文件路径。
 

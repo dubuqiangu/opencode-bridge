@@ -206,9 +206,7 @@ G1 桥每 5~7 分钟退出 ⇒ **第 2 类**（根因未证实；待查证据 =�
 拍板已定处置，那条事实仍未知）
 ~~telegram `dropped callback from non-whitelisted chat` **零钉**~~ ⇒ **已闭合** ✅（2026-10-11 · `0e3794c`，零生产改动）——「覆盖面缺口、非行为缺陷」的定性不变：守门 = tests/test_telegram_callback_drop_wording.py 渲染层逐字 + 白名单对照臂 + 源码锚点 + callback/message 两句措辞互钉，反向证明 2/2、SHA256 对基线，证据见总表 ~~…~~ 闭合行；
 ~~sms 平台文档缺位~~ ⇒ **已闭合** ✅（2026-10-11 · `e97bdd7`，零生产改动）——**登记即闭合**（A3 五件套从未含 docs ⇒ sms 落地后 README/plugin/README/install 文档面零覆盖），连同 plugin/README「14 个断言」过期（harness.ts 自述 25 个场景）与「a2a 是唯一方向相反」被 sms 入站 webhook 事实性打破一并修复（14 处替换各恰命中一次；「13 个」按 2626 钦定形状改为指向清单/`--status`，是执行拍板 ⛔ 非翻案）；定向 telegram 157/157 绿、⛔ 未跑全量 ×3，证据见总表 ~~sms 平台文档缺位~~ 闭合行；
-**`--status` 出站失败段的同型缺陷**（与已修那条**同根因**、⛔ 不是新问题：`listed` 过滤逐字同形
-⇒ 未注册键的出站失败记录同样被丢掉，并会打出「盘上有记录，但没有属于这些平台的」
-⇒ 而盘上确实有一条）⇒ **第 1 类**，已从源码逐字核实；
+~~**`--status` 出站失败段的同型缺陷**~~ ⇒ **已闭合** ✅（2026-10-06 · `77d439a`，2026-10-13 核对和解）——修法与已修那条（`_print_last_start_probes`）**同构**：`listed` 并入未注册键（label 取键本身）+「盘上有记录，但没有属于这些平台的」判据改问 `recorded_platform_keys`（记录自己说了什么，⛔ 不问混进「配没配」那层的 `listed`），第四刀随视图原样移植进 `status_failure_view.py`；守门 = tests/test_outbound_failure_channel.py `UnregisteredKeyStaysVisible`（判据自检：那个键必须真的未注册，否则整组恒真）；⚠️ 本节此前一直把它当开放项列着——修复与登记同落 `77d439a`，tasks.md 总表当日已 ~~划线~~ 闭合，而 2026-10-11 重算清单误按开放项抄入，今日逐字核对代码（`listed` 并入段 + `recorded_platform_keys` 判据俱在）与守门后和解，证据见总表 ~~…~~ 闭合行；
 **`inbound_gateway` 的四条入站投递缺陷**（`ora-14` 复查，⚠️ 全部落在**入站路径**）：
 **传输层失败被记成 `failed` ⇒ 下次启动重放 ⇒ agent 对同一条指令跑两遍**
 （⚠️ 它**推翻了本仓库一直写的「at-most-once」** —— 2026-10-07 用户已拍板

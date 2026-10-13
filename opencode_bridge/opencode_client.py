@@ -3,22 +3,31 @@
 Standard library only: ``urllib.request`` / ``http.client``.  All requests
 carry HTTP Basic auth (username ``opencode`` by default).  The event stream
 (``GET /api/event``) is consumed line-by-line — never buffered whole.
+
+Provenance: 2026-10-13 §5 第六刀（文件刀）：endpoint 发现域与 wire 契约域逐字
+移植 ``opencode_endpoint_discovery.py`` / ``opencode_wire.py``；客户端类与
+重连常量留守（测试 patch ``_RECONNECT_MIN/_MAX`` 钉在本模块）；顶部再进口
+块保既有 import 路径，行为零变化。
 """
 
 from __future__ import annotations
 
-import base64
 import http.client
 import json
 import logging
-import os
-import socket
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from typing import Any, Iterator
+
+from .opencode_endpoint_discovery import DEFAULT_SERVICE_URL, discover_endpoint
+from .opencode_wire import (
+    Endpoint,
+    OpenCodeError,
+    _force_close_stream,
+    _safe_read_body,
+)
 
 __all__ = [
     "DEFAULT_SERVICE_URL",
@@ -30,157 +39,12 @@ __all__ = [
 
 logger = logging.getLogger("opencode_bridge.opencode_client")
 
-DEFAULT_SERVICE_URL = "http://127.0.0.1:4096"
-
 #: socket timeout used while streaming ``GET /api/event``
 _STREAM_TIMEOUT = 300.0
 _RECONNECT_MIN = 0.5
 _RECONNECT_MAX = 30.0
 
 _PERMISSION_DECISIONS = frozenset({"once", "always", "reject"})
-
-
-class OpenCodeError(Exception):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status: int | None = None,
-        body: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.status = status
-        self.body = body
-
-
-@dataclass(frozen=True)
-class Endpoint:
-    url: str  # no trailing slash
-    password: str
-    username: str = "opencode"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "url", (self.url or "").rstrip("/"))
-
-    def auth_header(self) -> dict[str, str]:
-        raw = f"{self.username}:{self.password}".encode("utf-8")
-        token = base64.b64encode(raw).decode("ascii")
-        return {"Authorization": f"Basic {token}"}
-
-
-# ----------------------------------------------------------------------
-# endpoint discovery
-# ----------------------------------------------------------------------
-def _service_file_candidates() -> list[str]:
-    candidates: list[str] = []
-    env = os.environ.get("OPENCODE_SERVICE_FILE")
-    if env:
-        candidates.append(env)
-    xdg = os.environ.get("XDG_STATE_HOME")
-    if xdg:
-        candidates.append(os.path.join(xdg, "opencode", "service.json"))
-    candidates.append(
-        os.path.join(os.path.expanduser("~"), ".local", "state", "opencode", "service.json")
-    )
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        candidates.append(os.path.join(local_appdata, "opencode", "service.json"))
-    return candidates
-
-
-def _read_service_file(path: str) -> dict[str, Any] | None:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except (OSError, ValueError) as exc:
-        logger.warning("cannot read service file %s: %s", path, exc)
-        return None
-    if not isinstance(raw, dict):
-        logger.warning("service file %s is not a JSON object", path)
-        return None
-    return raw
-
-
-def discover_endpoint(
-    url: str = "", password: str = "", *, service_file: str | None = None
-) -> Endpoint:
-    """Resolve the OpenCode service address.
-
-    Priority:
-
-    1. explicit ``url`` + ``password`` (both non-empty)
-    2. each of ``url`` / ``password`` independently, non-empty value wins
-    3. environment ``OPENCODE_URL`` / ``OPENCODE_PASSWORD``
-    4. service registration file JSON ``{"url": ..., "password": ...}``
-       searched at ``$OPENCODE_SERVICE_FILE``,
-       ``$XDG_STATE_HOME/opencode/service.json``,
-       ``~/.local/state/opencode/service.json``,
-       ``%LOCALAPPDATA%/opencode/service.json``
-
-    Raises :class:`OpenCodeError` when nothing resolves.
-    """
-    final_url = (url or "").strip() or os.environ.get("OPENCODE_URL", "").strip()
-    final_password = (password or "").strip() or os.environ.get(
-        "OPENCODE_PASSWORD", ""
-    ).strip()
-
-    if not (final_url and final_password):
-        service_data: dict[str, Any] | None = None
-        if service_file is not None:
-            service_data = _read_service_file(service_file)
-        else:
-            for candidate in _service_file_candidates():
-                if os.path.isfile(candidate):
-                    service_data = _read_service_file(candidate)
-                    if service_data is not None:
-                        break
-        if service_data is not None:
-            if not final_url:
-                final_url = str(service_data.get("url") or "").strip()
-            if not final_password:
-                final_password = str(service_data.get("password") or "").strip()
-
-    if not final_url and final_password:
-        final_url = DEFAULT_SERVICE_URL
-
-    if not final_url or not final_password:
-        raise OpenCodeError("cannot resolve opencode endpoint")
-
-    return Endpoint(final_url, final_password)
-
-
-# ----------------------------------------------------------------------
-# helpers
-# ----------------------------------------------------------------------
-def _safe_read_body(exc: Any, limit: int = 8192) -> str:
-    try:
-        raw = exc.read()
-    except Exception:  # pragma: no cover - best effort
-        return ""
-    if isinstance(raw, bytes):
-        return raw[:limit].decode("utf-8", "replace")
-    return str(raw)[:limit]
-
-
-def _force_close_stream(resp: Any) -> None:
-    """Best-effort: unblock a thread sitting in ``resp.readline()``."""
-    try:
-        fp = getattr(resp, "fp", None)
-        raw = getattr(fp, "raw", None)
-        sock = getattr(raw, "_sock", None)
-        if sock is None:
-            sock = getattr(resp, "sock", None)
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-    except Exception:
-        pass
-    try:
-        resp.close()
-    except Exception:
-        pass
 
 
 class OpenCodeClient:

@@ -181,7 +181,7 @@ class DiscoverEndpointTests(unittest.TestCase):
     def test_password_without_url_uses_default_service_url(self) -> None:
         with mock.patch.dict(os.environ, {"OPENCODE_PASSWORD": "pw"}, clear=True):
             with mock.patch(
-                "opencode_bridge.opencode_client._service_file_candidates",
+                "opencode_bridge.opencode_endpoint_discovery._service_file_candidates",
                 return_value=[],
             ):
                 ep = discover_endpoint()
@@ -191,7 +191,7 @@ class DiscoverEndpointTests(unittest.TestCase):
     def test_total_failure_raises(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch(
-                "opencode_bridge.opencode_client._service_file_candidates",
+                "opencode_bridge.opencode_endpoint_discovery._service_file_candidates",
                 return_value=[],
             ):
                 with self.assertRaises(OpenCodeError) as cm:

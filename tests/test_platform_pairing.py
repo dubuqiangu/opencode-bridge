@@ -91,7 +91,7 @@ def outbound_texts(adapter: Any) -> list[str]:
 
 
 class TestEveryGateCallSiteOffersPairing(unittest.TestCase):
-    """⚠️ **结构断言**：15 处调用点每一处都必须改到了。
+    """⚠️ **结构断言**：16 处调用点每一处都必须改到了。
 
     这条防的是一类具体事故：将来有人新增一条入站路径（或在某个平台里再写一次
     闸门），只写 ``if not self.admits(x): return`` —— 那条路径上 ``/pair``
@@ -103,7 +103,7 @@ class TestEveryGateCallSiteOffersPairing(unittest.TestCase):
 
     #: 期望的调用点数。改动时**必须**同时改这里 —— 那正是"新增了一条入站路径，
     #: 你要决定它要不要支持配对"的时刻。
-    EXPECTED_GATE_CALL_SITES = 15
+    EXPECTED_GATE_CALL_SITES = 16
 
     @staticmethod
     def _gate_calls(source_path: str) -> list[tuple[int, str]]:
@@ -111,7 +111,7 @@ class TestEveryGateCallSiteOffersPairing(unittest.TestCase):
 
         ⚠️ 必须排除**私有转发包装**（``telegram._allowed`` 里的 ``return
         self.admits(chat_id)``）：那不是一条入站路径，而是基类闸门在 telegram
-        身上的一层壳。把它算进来会让本该是 15 的数字变成 16 —— 而**恒错的期望值
+        身上的一层壳。把它算进来会让本该是 16 的数字变成 17 —— 而**恒错的期望值
         比没有断言更坏**（它会让人以为"计数漂了"，于是下调期望值去迁就实现）。
 
         排除方式是"该调用所在函数的 ``return`` 直接返回它"，而不是按名字黑名单

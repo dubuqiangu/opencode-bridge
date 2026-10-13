@@ -1416,13 +1416,17 @@ class EmailOutboundFailureIsLogged(unittest.TestCase):
 # **别的一层**（记录器自身），它绿着却漏掉了接线。
 #
 # ⛔ 所以下面两条**不走运行时**、只走**结构**：判据直接在
-# ``opencode_bridge/__main__.py`` 的源码上找那次调用。形式照
-# ``tests/test_config_coerce.py`` 的 ``TestNoBareNumericCoercionInAdapterLifecycles``
+# 真实启动路径所在模块的源码上找那次调用。第七刀拆分后
+# ``_run_bridge_locked``（连同 ``core.start()`` 与装配语句）逐字搬进了
+# ``opencode_bridge/bridge_runner.py`` ⇒ 源码锚点随之重排到该模块。
+# （⭐ 源码扫描形态在拆分后是**响亮红**：空集断言当场失败，不像 mock 钉点
+# 经再进口块会静默失明——本组三红正是消费面基线以这个方式抓出来的。）
+# 形式照 ``tests/test_config_coerce.py`` 的 ``TestNoBareNumericCoercionInAdapterLifecycles``
 # （纯函数吃 ``source`` + 文件版包装 + 合成样本自守），⛔ 不自创第四种风格。
 
-MAIN_MODULE_PATH = (
+STARTUP_MODULE_PATH = (
     pathlib.Path(__file__).resolve().parent.parent
-    / "opencode_bridge" / "__main__.py"
+    / "opencode_bridge" / "bridge_runner.py"
 )
 
 #: 装记录器的那一步必须落在**这个函数**里 —— 真实启动路径。
@@ -1522,9 +1526,9 @@ def recorder_install_sites_in_source(source: str) -> list[tuple[str, int, str]]:
 
 
 def recorder_install_sites_on_disk() -> list[tuple[str, int, str]]:
-    """:func:`recorder_install_sites_in_source` 读真实 ``__main__.py`` 的版本。"""
+    """:func:`recorder_install_sites_in_source` 读真实启动路径模块的版本。"""
     return recorder_install_sites_in_source(
-        MAIN_MODULE_PATH.read_text(encoding="utf-8")
+        STARTUP_MODULE_PATH.read_text(encoding="utf-8")
     )
 
 
@@ -1586,7 +1590,7 @@ class BridgeStartupWiresTheRecorder(unittest.TestCase):
         return recorder_install_sites_on_disk()
 
     def test_the_real_startup_path_really_calls_the_installer(self):
-        """⭐ ① 删掉 ``__main__`` 里那次调用 ⇒ **必须变红**。
+        """⭐ ① 删掉启动路径模块里那次调用 ⇒ **必须变红**。
 
         判据点名 :data:`BRIDGE_STARTUP_FUNCTION`（真实启动路径）**且**要求它是
         **无条件路径**（第三项为空串）—— 只判「函数体内有调用」的话，把它挪进
@@ -1596,7 +1600,8 @@ class BridgeStartupWiresTheRecorder(unittest.TestCase):
 
         self.assertTrue(
             sites,
-            "__main__.py 里没有 %s(...) 调用 —— 真实启动路径上没人装配记录器，"
+            "启动路径模块（bridge_runner.py）里没有 %s(...) 调用 —— "
+            "真实启动路径上没人装配记录器，"
             "于是出站失败永远到不了 --status（删掉那行会让这个文件红）"
             % RECORDER_INSTALL_FUNCTION,
         )
@@ -1625,7 +1630,7 @@ class BridgeStartupWiresTheRecorder(unittest.TestCase):
         并不成立的事 —— 那样的断言第一次跑就会红，红久了就被"修"成恒真。
         """
         ok, reason = install_precedes_core_start_in_source(
-            MAIN_MODULE_PATH.read_text(encoding="utf-8")
+            STARTUP_MODULE_PATH.read_text(encoding="utf-8")
         )
 
         self.assertTrue(ok, reason)
@@ -1637,7 +1642,7 @@ class BridgeStartupWiresTheRecorder(unittest.TestCase):
         ``if not starts: return True`` 之类）—— 空集 ≠ 不存在（AGENTS.md §7.1）。
         """
         starts = core_start_lines_in_source(
-            MAIN_MODULE_PATH.read_text(encoding="utf-8")
+            STARTUP_MODULE_PATH.read_text(encoding="utf-8")
         )
 
         self.assertEqual(

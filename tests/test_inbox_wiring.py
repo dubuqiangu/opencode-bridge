@@ -36,6 +36,7 @@ import unittest
 from unittest import mock
 
 from opencode_bridge import __main__ as cli
+from opencode_bridge import bridge_runner
 from opencode_bridge import inbox as inbox_module
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
@@ -665,22 +666,22 @@ class CliWiresTheInbox(unittest.TestCase):
                 adapters={"telegram": {"bot_token": "token-not-real"}},
             )
             with mock.patch.object(
-                cli, "discover_endpoint",
+                bridge_runner, "discover_endpoint",
                 return_value=Endpoint("http://127.0.0.1:4096", "pw"),
             ), mock.patch.object(
-                cli, "OpenCodeClient",
+                bridge_runner, "OpenCodeClient",
                 lambda endpoint: types.SimpleNamespace(close=lambda: None),
             ), mock.patch.object(
-                cli, "build",
+                bridge_runner, "build",
                 lambda name, entry, hooks: types.SimpleNamespace(bot_token="token-not-real"),
             ), mock.patch.object(
-                cli, "BridgeCore", RecordingCore
+                bridge_runner, "BridgeCore", RecordingCore
             ), mock.patch.object(
-                cli, "ProcessDiagnostics", SilentDiagnostics
+                bridge_runner, "ProcessDiagnostics", SilentDiagnostics
             ), mock.patch.object(
-                cli, "InstanceLock", PermissiveInstanceLock
+                bridge_runner, "InstanceLock", PermissiveInstanceLock
             ), mock.patch.object(
-                cli, "threading", types.SimpleNamespace(Event=lambda: AlwaysStopping())
+                bridge_runner, "threading", types.SimpleNamespace(Event=lambda: AlwaysStopping())
             ), mock.patch.object(
                 # ⚠️ 必须钉住 ``_bridge_dir``：``run_bridge`` 会把
                 # ``health.OutboundFailureRecorder`` 装到 ``_bridge_dir()`` 上，而那个推导在
@@ -688,7 +689,7 @@ class CliWiresTheInbox(unittest.TestCase):
                 # ⇒ 不隔离的话 ``outbound-failures.json`` 会被写进仓库。手法抄
                 # ``tests/test_bridge_refusal_probe.py`` 的 ``_RefusalHarness``；⛔ **不许**
                 # 用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
-                cli, "_bridge_dir", lambda: directory
+                bridge_runner, "_bridge_dir", lambda: directory
             ):
                 exit_code = cli.run_bridge(config)
 

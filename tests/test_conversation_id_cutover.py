@@ -40,6 +40,7 @@ import unittest
 from unittest import mock
 
 from opencode_bridge import __main__ as cli
+from opencode_bridge import bridge_runner
 from opencode_bridge.adapters.matrix import MatrixAdapter
 from opencode_bridge.adapters.telegram import TelegramAdapter
 from opencode_bridge.config import Config
@@ -372,28 +373,28 @@ class CliOpensKeyMigration(LegacyStateFileTestCase):
             adapters={"telegram": {"bot_token": "token-not-real"}},
         )
         with mock.patch.object(
-            cli, "discover_endpoint",
+            bridge_runner, "discover_endpoint",
             return_value=Endpoint("http://127.0.0.1:4096", "pw"),
         ), mock.patch.object(
-            cli, "OpenCodeClient",
+            bridge_runner, "OpenCodeClient",
             lambda endpoint: types.SimpleNamespace(close=lambda: None),
         ), mock.patch.object(
-            cli, "build",
+            bridge_runner, "build",
             lambda name, entry, hooks: types.SimpleNamespace(bot_token="token-not-real"),
         ), mock.patch.object(
-            cli, "BridgeCore", _RecordingCore
+            bridge_runner, "BridgeCore", _RecordingCore
         ), mock.patch.object(
-            cli, "ProcessDiagnostics", _SilentDiagnostics
+            bridge_runner, "ProcessDiagnostics", _SilentDiagnostics
         ), mock.patch.object(
-            cli, "InstanceLock", _PermissiveInstanceLock
+            bridge_runner, "InstanceLock", _PermissiveInstanceLock
         ), mock.patch.object(
-            cli, "threading", types.SimpleNamespace(Event=lambda: _AlreadyStopping())
+            bridge_runner, "threading", types.SimpleNamespace(Event=lambda: _AlreadyStopping())
         ), mock.patch.object(
             # ⚠️ 必须钉住 ``_bridge_dir``：``run_bridge`` 会把 ``health.OutboundFailureRecorder``
             # 装到 ``_bridge_dir()`` 上，而那个推导在没有 ``OPENCODE_BRIDGE_CONFIG`` 时退回
             # **cwd**（跑测试时就是仓库根）⇒ 不隔离的话 ``outbound-failures.json`` 会被写进
             # 仓库。手法抄 ``tests/test_bridge_refusal_probe.py`` 的 ``_RefusalHarness``。
-            cli, "_bridge_dir", lambda: self.directory
+            bridge_runner, "_bridge_dir", lambda: self.directory
         ):
             return cli.run_bridge(config)
 
@@ -411,7 +412,7 @@ class CliOpensKeyMigration(LegacyStateFileTestCase):
             recorded.update(kwargs)
             return real_store(store_path, **kwargs)
 
-        with mock.patch.object(cli, "StateStore", recording_store):
+        with mock.patch.object(bridge_runner, "StateStore", recording_store):
             exit_code = self._run_bridge(path)
 
         self.assertEqual(exit_code, 0)

@@ -150,6 +150,18 @@ CLI_TOP_LEVEL_FUNCTION = "main"
 CLI_ENTRY_POINT_EXACT_NAMES = frozenset({CLI_TOP_LEVEL_FUNCTION})
 CLI_ENTRY_POINT_NAME_FRAGMENT = "run_bridge"
 
+#: 第七刀拆分后 ``main`` 的调用图横跨 **4 个模块**：留守的 ``__main__`` 只做装配，
+#: 落盘调用散在 bridge_runner / platform_status / setup_view 里 ⇒
+#: :func:`production_artifact_writing_entry_points` 的函数图取这 4 个文件的**并集**。
+#: ⛔ 顶层 def 名冲突 = 响亮断言失败，绝不静默取其一（那会让「从 ``main`` 可达」
+#: 沿错误的一层继续走，且没有任何东西报警）。
+CLI_ENTRY_FUNCTION_GRAPH_MODULES = (
+    "__main__",
+    "bridge_runner",
+    "platform_status",
+    "setup_view",
+)
+
 #: 认得出「这个作用域把 bridge 目录钉住了」的两个记号（结构判据，见模块 docstring）。
 BRIDGE_DIR_PIN_ATTRIBUTE = "_bridge_dir"
 BRIDGE_DIR_ENV_KEY = "OPENCODE_BRIDGE_CONFIG"
@@ -448,10 +460,12 @@ def called_bare_names(function: ast.FunctionDef) -> set[str]:
 
 
 def production_artifact_writing_entry_points() -> frozenset[str]:
-    """从**真源码**推出 ``__main__.py`` 里哪些模块层函数会（传递地）写运行期产物。
+    """从**真源码**推出 CLI 装配面 4 模块里哪些模块层函数会（传递地）写运行期产物。
 
-    判据是「从 :data:`CLI_TOP_LEVEL_FUNCTION` 出发传递可达 **且**能到达落盘入口」，
-    与**命名无关** ⇒ 改名或新增一层委托都不会漏。
+    第七刀拆分后 ``main`` 只做装配、落盘调用散在新模块里 ⇒ 函数图取
+    :data:`CLI_ENTRY_FUNCTION_GRAPH_MODULES` 4 个文件的**并集**（顶层重名 =
+    响亮断言）。判据是「从 :data:`CLI_TOP_LEVEL_FUNCTION` 出发传递可达 **且**能到达
+    落盘入口」，与**命名无关** ⇒ 改名或新增一层委托都不会漏。
 
     :return: 函数名集合。⛔ **源码读不到 / 解析不了时是空集** —— 那不是「没有入口」，
         所以 :class:`~tests.test_artifact_isolation_contract` 里有一条自守测试专门
@@ -463,11 +477,21 @@ def production_artifact_writing_entry_points() -> frozenset[str]:
     package_root = getattr(opencode_bridge, "__file__", None)
     if not package_root:
         return frozenset()
-    main_path = pathlib.Path(package_root).resolve().parent / "__main__.py"
-    if not main_path.is_file():
-        return frozenset()
-    tree = ast.parse(main_path.read_text(encoding="utf-8"))
-    functions = module_level_functions(tree)
+    package_dir = pathlib.Path(package_root).resolve().parent
+    functions: dict[str, ast.FunctionDef] = {}
+    for module_name in CLI_ENTRY_FUNCTION_GRAPH_MODULES:
+        module_path = package_dir / (module_name + ".py")
+        if not module_path.is_file():
+            return frozenset()
+        for name, function in module_level_functions(
+            ast.parse(module_path.read_text(encoding="utf-8"))
+        ).items():
+            assert name not in functions, (
+                "CLI 装配面 4 模块的顶层函数重名：%s 在 %s 里又定义了一遍 —— "
+                "并集函数图无法区分两者；静默取其一会让「从 main 可达」沿错误的"
+                "一层继续走（AGENTS.md §7.1）。" % (name, module_name)
+            )
+            functions[name] = function
     calls = {name: called_bare_names(function) for name, function in functions.items()}
 
     def reaches_artifact_writing(name: str, visited: frozenset[str]) -> bool:

@@ -18,6 +18,8 @@ from unittest import mock
 
 from opencode_bridge.adapters.base import Adapter
 from opencode_bridge import __main__ as cli
+from opencode_bridge import bridge_runner
+from opencode_bridge import platform_status
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.adapters.base import build, registered_names
@@ -2141,7 +2143,7 @@ class CliTests(unittest.TestCase):
         手法抄 :mod:`tests.test_bridge_refusal_probe` 的 ``_RefusalHarness``；⛔ **不许**
         用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
         """
-        with mock.patch.object(cli, "_bridge_dir", lambda: bridge_dir):
+        with mock.patch.object(bridge_runner, "_bridge_dir", lambda: bridge_dir):
             return cli.main(argv)
 
     def test_empty_adapter_tokens_exit_0_without_traceback(self):
@@ -2249,10 +2251,10 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "nope.json")
             with mock.patch.object(
-                cli,
+                platform_status,
                 "discover_endpoint",
                 return_value=Endpoint("http://127.0.0.1:4097", "pw"),
-            ), mock.patch.object(cli, "OpenCodeClient", FakeInfoClient):
+            ), mock.patch.object(platform_status, "OpenCodeClient", FakeInfoClient):
                 with redirect_stdout(stdout):
                     rc = cli.main(["--check", "--config", missing])
         self.assertEqual(rc, 0)
@@ -2267,7 +2269,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "nope.json")
             with mock.patch.object(
-                cli,
+                platform_status,
                 "discover_endpoint",
                 side_effect=OpenCodeError("cannot resolve opencode endpoint"),
             ):

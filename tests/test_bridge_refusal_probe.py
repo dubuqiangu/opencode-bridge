@@ -38,6 +38,9 @@ import unittest
 from unittest import mock
 
 from opencode_bridge import __main__ as cli
+from opencode_bridge import bridge_runner
+from opencode_bridge import platform_status
+from opencode_bridge import setup_view
 from opencode_bridge import health
 from opencode_bridge.config import Config
 
@@ -101,9 +104,16 @@ class _RefusalHarness(unittest.TestCase):
         # ``mock.patch.object(...)`` 传给 addCleanup 是**不会**启用补丁的 ——
         # 于是落盘会去真的 ``_bridge_dir()``（本仓库的 cwd），用例读到的是
         # 别人留下的记录，而"上一条 ok 被覆盖了没有"那条判据恒真。
-        patcher = mock.patch.object(cli, "_bridge_dir", lambda: self.bridge_dir)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # ⚠️ 拆分（第七刀）后 ``_bridge_dir`` 有三个运行期消费者：
+        # bridge_runner 的 ``run_bridge``、platform_status 的 ``run_status``、
+        # setup_view 的 ``_platform_status`` —— 各自的模块绑定互不镜像，
+        # 少钉一个则该入口落盘会去真的 ``_bridge_dir()``（本仓库 cwd）。
+        for module_holding_bridge_dir in (bridge_runner, platform_status, setup_view):
+            patcher = mock.patch.object(
+                module_holding_bridge_dir, "_bridge_dir", lambda: self.bridge_dir
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def seed_a_previous_ok_record(self) -> None:
         """先伪造一条「上一次**成功启动**」的 ``ok`` —— 缺陷的现场就是这个状态。"""
@@ -189,7 +199,7 @@ class TestPreflightRefusalIsRecorded(_RefusalHarness):
                 "而落盘必须在那之前发生"
             )
 
-        with mock.patch.object(cli, "discover_endpoint", explode_on_discovery):
+        with mock.patch.object(bridge_runner, "discover_endpoint", explode_on_discovery):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 exit_code = cli.run_bridge(cfg)
@@ -333,22 +343,22 @@ class TestNoUsableAdapterRefusalIsRecorded(_RefusalHarness):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(
-                cli, "discover_endpoint",
+                bridge_runner, "discover_endpoint",
                 return_value=Endpoint("http://127.0.0.1:4096", "pw"),
             ))
             stack.enter_context(mock.patch.object(
-                cli, "OpenCodeClient",
+                bridge_runner, "OpenCodeClient",
                 lambda endpoint: types.SimpleNamespace(close=lambda: None),
             ))
-            stack.enter_context(mock.patch.object(cli, "build", build_side_effect))
+            stack.enter_context(mock.patch.object(bridge_runner, "build", build_side_effect))
             stack.enter_context(
-                mock.patch.object(cli, "BridgeCore", self._StubCore)
+                mock.patch.object(bridge_runner, "BridgeCore", self._StubCore)
             )
             stack.enter_context(
-                mock.patch.object(cli, "ProcessDiagnostics", self._QuietDiagnostics)
+                mock.patch.object(bridge_runner, "ProcessDiagnostics", self._QuietDiagnostics)
             )
             stack.enter_context(
-                mock.patch.object(cli, "InstanceLock", self._PermissiveLock)
+                mock.patch.object(bridge_runner, "InstanceLock", self._PermissiveLock)
             )
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
@@ -444,10 +454,10 @@ class TestTheRefusalChannelNeverDecidesTheBridgesFate(_RefusalHarness):
     def test_a_raising_missing_keys_check_still_exits_cleanly(self):
         cfg = Config(adapters={"telegram": {"bot_token": ""}})
         with mock.patch.object(
-            cli, "_missing_required_keys",
+            bridge_runner, "_missing_required_keys",
             side_effect=RuntimeError("判定炸了"),
         ), self.assertLogs("opencode_bridge", level="WARNING") as caught:
-            with mock.patch.object(cli, "discover_endpoint") as discovery:
+            with mock.patch.object(bridge_runner, "discover_endpoint") as discovery:
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     exit_code = cli.run_bridge(cfg)
@@ -466,7 +476,7 @@ class TestTheRefusalChannelNeverDecidesTheBridgesFate(_RefusalHarness):
         """⚠️ 写不进去时那条 warning **不许**说"已记" —— 那是把失败报成成功。"""
         cfg = Config(adapters={"telegram": {"bot_token": ""}})
         unwritable = os.path.join(self.bridge_dir, "并不存在的目录")
-        with mock.patch.object(cli, "_bridge_dir", lambda: unwritable), \
+        with mock.patch.object(bridge_runner, "_bridge_dir", lambda: unwritable), \
                 self.assertLogs("opencode_bridge", level="WARNING") as caught:
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
@@ -486,7 +496,7 @@ class TestStatusWordingTellsTheThreeStatesApart(_RefusalHarness):
         return self.status_section(cfg)
 
     def section_with_a_refusal(self, cfg: Config) -> str:
-        with mock.patch.object(cli, "discover_endpoint", side_effect=OSError("不联网")):
+        with mock.patch.object(bridge_runner, "discover_endpoint", side_effect=OSError("不联网")):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 cli.run_bridge(cfg)
@@ -548,7 +558,7 @@ class TestSetupJsonCarriesTheRefusalVerdict(_RefusalHarness):
 
     def test_last_start_probe_is_not_started_with_a_reason(self):
         cfg = Config(adapters={"telegram": {"bot_token": ""}})
-        with mock.patch.object(cli, "discover_endpoint", side_effect=OSError("不联网")):
+        with mock.patch.object(bridge_runner, "discover_endpoint", side_effect=OSError("不联网")):
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 cli.run_bridge(cfg)

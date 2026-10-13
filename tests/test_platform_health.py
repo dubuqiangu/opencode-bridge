@@ -27,6 +27,7 @@ import unittest
 from unittest import mock
 
 from opencode_bridge import __main__ as cli
+from opencode_bridge import bridge_runner
 from opencode_bridge import health
 from opencode_bridge import subscription_health, subscription_status_view
 from opencode_bridge.adapters.base import Adapter
@@ -422,35 +423,35 @@ class _RunBridgeWithStubCore:
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(
-                cli, "discover_endpoint",
+                bridge_runner, "discover_endpoint",
                 return_value=Endpoint("http://127.0.0.1:4096", "pw"),
             ))
             stack.enter_context(mock.patch.object(
-                cli, "OpenCodeClient",
+                bridge_runner, "OpenCodeClient",
                 lambda endpoint: types.SimpleNamespace(close=lambda: None),
             ))
             # 构造出来的适配器**只上报不出声**：``report_startup_probe`` 的生产
             # 调用方只有 telegram，而它会真的调 ``getMe``（本用例绝不联网）。
             stack.enter_context(mock.patch.object(
-                cli, "build",
+                bridge_runner, "build",
                 lambda name, entry, hooks: types.SimpleNamespace(
                     name=name, bot_token="token-not-real",
                 ),
             ))
             stack.enter_context(mock.patch.object(
-                cli, "BridgeCore", self.stub_core_class(startup_probes),
+                bridge_runner, "BridgeCore", self.stub_core_class(startup_probes),
             ))
             stack.enter_context(mock.patch.object(
-                cli, "ProcessDiagnostics", self._QuietDiagnostics,
+                bridge_runner, "ProcessDiagnostics", self._QuietDiagnostics,
             ))
             stack.enter_context(mock.patch.object(
-                cli, "InstanceLock", self._PermissiveLock,
+                bridge_runner, "InstanceLock", self._PermissiveLock,
             ))
             stack.enter_context(mock.patch.object(
-                cli, "_bridge_dir", lambda: self.bridge_dir,
+                bridge_runner, "_bridge_dir", lambda: self.bridge_dir,
             ))
             stack.enter_context(mock.patch.object(
-                cli, "threading",
+                bridge_runner, "threading",
                 types.SimpleNamespace(Event=lambda: self._StopImmediately()),
             ))
             with contextlib.redirect_stdout(io.StringIO()):
@@ -963,18 +964,18 @@ class StartupSurvivesProbeRecordingFailure(unittest.TestCase):
                 adapters={"telegram": {"bot_token": "token-not-real"}},
             )
             patches = [
-                mock.patch.object(cli, "discover_endpoint",
+                mock.patch.object(bridge_runner, "discover_endpoint",
                                   return_value=Endpoint("http://127.0.0.1:4096", "pw")),
-                mock.patch.object(cli, "OpenCodeClient",
+                mock.patch.object(bridge_runner, "OpenCodeClient",
                                   lambda endpoint: types.SimpleNamespace(close=lambda: None)),
-                mock.patch.object(cli, "build",
+                mock.patch.object(bridge_runner, "build",
                                   lambda name, entry, hooks: types.SimpleNamespace(
                                       bot_token="token-not-real")),
-                mock.patch.object(cli, "BridgeCore", core_class),
-                mock.patch.object(cli, "ProcessDiagnostics", self._QuietDiagnostics),
-                mock.patch.object(cli, "InstanceLock", self._PermissiveLock),
-                mock.patch.object(cli, "_bridge_dir", lambda: directory),
-                mock.patch.object(cli, "threading",
+                mock.patch.object(bridge_runner, "BridgeCore", core_class),
+                mock.patch.object(bridge_runner, "ProcessDiagnostics", self._QuietDiagnostics),
+                mock.patch.object(bridge_runner, "InstanceLock", self._PermissiveLock),
+                mock.patch.object(bridge_runner, "_bridge_dir", lambda: directory),
+                mock.patch.object(bridge_runner, "threading",
                                   types.SimpleNamespace(Event=lambda: self._StopImmediately())),
             ]
             if record_patch is not None:

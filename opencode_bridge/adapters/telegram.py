@@ -53,7 +53,7 @@ Telegram 特有的四点
    :data:`POLL_SOCKET_TIMEOUT`），本轮逐字保留 —— 有专门的用例锁住这个大小关系。
 
 5. **凭据闸门：``getMe`` 探测是「会话建立」的一部分，而不是 ``start()`` 里的
-   终局闸门**（见 :meth:`TelegramAdapter._probe_until_credentials_verified`）。
+    终局闸门**（见 :meth:`TelegramCredentialLifecycle._probe_until_credentials_verified`，已随 §5.1 第一刀迁入 ``telegram_credential_lifecycle.py``）。
    其余 12 个适配器的 ``start()`` 里**没有任何凭据探测** —— 它们的鉴权在
    ``Transport._open`` 之后的握手里做，**抛异常 = 这次会话失败 → 退避重连**。
    ⚠️ 改之前的实现是 13 个里唯一一道**同步的、终局性**的凭据闸门：
@@ -91,6 +91,7 @@ from .telegram_protocol import (  # noqa: F401  再导出：消费面沿用旧�
     CREDENTIAL_PROBE_INITIAL_BACKOFF, CREDENTIAL_PROBE_MAX_BACKOFF,
     _button_row, _retry_after,
 )
+from .telegram_credential_lifecycle import TelegramCredentialLifecycle
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
 
@@ -146,27 +147,13 @@ class TelegramAdapter(Adapter):
         self._throttle_lock = threading.Lock()     # guards _last_send
         self._last_send: dict[str, float] = {}
         self._transport: Optional[PollingTransport] = None
-        #: 凭据闸门**已通过**（见 :meth:`_probe_until_credentials_verified`）。
-        #: :attr:`running` 与它取与 —— 线程活着但凭据没过**不算**在跑
-        #: （那正是入站一条都收不到的状态，报成"在跑"是假话）。
-        self._credentials_verified = False
-        #: 这一轮探测已尝试了几次（``start()`` 里那次同步探测**算第 1 次**）。
-        self._credential_probe_attempts = 0
-        #: 这一轮探测的**起点**（monotonic）—— 恢复行里的「历时 T 秒」用它算。
-        self._credential_probe_started_at = 0.0
-        #: ⭐ **运行期**凭据失效（启动之后 ``getUpdates`` 回过 401）。与
-        #: :attr:`startup_verdict`（**启动那一刻**的结论）是**两个不同的键** ——
-        #: 前者只由 :meth:`start` 写一次，后者由传输线程在**观测到 401 那一刻**置位。
-        #: ⇒ ``--status`` 因此能**分开说**"上次启动时是好的 / 但运行期失效过"
-        #: 而不是把两件事混成一个值（理由见
-        #: :mod:`opencode_bridge.credential_health` 模块 docstring）。
-        #: ⚠️ 只由**传输线程**读写（``_poll_round`` → :meth:`_invalidate_credentials`）。
-        self._runtime_credentials_invalid = False
-        #: 运行期那一轮重新探测已尝试了几次（上界
-        #: :data:`RUNTIME_CREDENTIAL_REVERIFY_LIMIT`）。⛔ **不给它设放弃点** ——
-        #: 放弃之后那一行必须**说清**"需要重启桥"，而 :attr:`_runtime_credentials_invalid`
-        #: 会**继续为真** ⇒ 入站继续不放行（理由见 :meth:`_reverify_runtime_credentials`）。
-        self._runtime_reverify_attempts = 0
+        # §5.1 第一刀（类手术）：凭据生命周期的 5 个状态属性已随 8 个方法迁入
+        # TelegramCredentialLifecycle（telegram_credential_lifecycle.py）。
+        # 本类经 _credentials_verified / _runtime_credentials_invalid 两个 property
+        # 与 4 个转发方法保住既有消费面（测试与留守调用点零改动）；新类侧的
+        # 8 个协作者（_post / _stop_event 等）以 property **逐调用**转发回本适配器
+        # —— 与手术前的动态解析语义一致，构造后替换 adapter._post 的打桩继续生效。
+        self._credential_lifecycle = TelegramCredentialLifecycle(adapter=self)
         #: 积压历史**已经丢弃过**。⛔ 每进程只该丢一次，理由见
         #: :meth:`_flush_history_once`。
         self._history_flushed = False
@@ -372,7 +359,7 @@ class TelegramAdapter(Adapter):
         ⚠️ ``on_open=self._credential_gate`` 就是「探测成为**会话建立的一部分**」
         那个接缝：钩子在 ``PollingTransport._open`` 里被调，而 ``_open`` 抛异常
         本来就等于"这次会话失败 → 退避重连"。我们让闸门自己在里面 park 到通过
-        （阶梯见 :meth:`_probe_until_credentials_verified`），所以传输层的退避
+        （阶梯见 :meth:`TelegramCredentialLifecycle._probe_until_credentials_verified`），所以传输层的退避
         **一次也不会**在凭据这条路上被触发。
         """
         # 三处间隔**逐字对齐迁移前**的 ``_poll_loop`` / ``_poll_once``：
@@ -414,7 +401,7 @@ class TelegramAdapter(Adapter):
         ⚠️ **传输线程里的重试不再改它** —— 运行器（``core.BridgeCore.start``）
         在 ``start()`` 返回**那一刻**同步读走 :attr:`startup_verdict`；让线程去改它
         会让落盘的值取决于线程调度（"上一次成功"与"最近一次失败"在那一刻不可分）。
-        恢复的事实由**日志**承担，见 :meth:`_announce_credential_recovery`。
+        恢复的事实由**日志**承担，见 :meth:`TelegramCredentialLifecycle._announce_credential_recovery`。
 
         ⚠️ 本方法里那两行 ``telegram: getMe failed ...`` **原文保留**：用户与文档
         （``docs/install.md`` / ``plugin/README.md``）都按这行字排障，改了会让
@@ -429,8 +416,8 @@ class TelegramAdapter(Adapter):
         # 下面这一次**同步**探测是第 1 次尝试（计数从 1 起，恢复行的 N 与 T 才诚实）。
         # ⚠️ 代价：它仍是最长 8s 的同步等待 —— 与改动之前**一样**，不是新引入的；
         # 而它换来的是 ``startup_verdict`` 在 ``start()`` 返回时就已确定（见上一段）。
-        self._credential_probe_started_at = time.monotonic()
-        self._credential_probe_attempts = 1
+        self._credential_lifecycle._credential_probe_started_at = time.monotonic()
+        self._credential_lifecycle._credential_probe_attempts = 1
         failure = self._probe_get_me_once()
         if failure is None:
             self.report_startup_probe(health.VERDICT_OK, detail="getMe 通过")
@@ -459,74 +446,44 @@ class TelegramAdapter(Adapter):
         logger.info("telegram: polling started (offset=%s)", self._offset)
 
     # ------------------------------------------------------------------
-    # 凭据闸门：``getMe`` 探测 + 退避重试（**不新增线程**）
+    # 凭据闸门的**转发面**（§5.1 第一刀：探测/自愈逻辑已随 8 个方法迁入
+    # ``TelegramCredentialLifecycle``；这里保 ``on_open`` 钩子、``start()``
+    # 同步探测与测试的既有读写面）
     # ------------------------------------------------------------------
+    @property
+    def _credentials_verified(self) -> bool:
+        """§5.1 第一刀：状态已迁入 :class:`TelegramCredentialLifecycle`。
+        这里保 :attr:`running`、``start()`` 与测试的既有读写面。"""
+        return self._credential_lifecycle._credentials_verified
+
+    @_credentials_verified.setter
+    def _credentials_verified(self, verified: bool) -> None:
+        self._credential_lifecycle._credentials_verified = verified
+
+    @property
+    def _runtime_credentials_invalid(self) -> bool:
+        """§5.1 第一刀：状态已迁入 :class:`TelegramCredentialLifecycle`。"""
+        return self._credential_lifecycle._runtime_credentials_invalid
+
+    @_runtime_credentials_invalid.setter
+    def _runtime_credentials_invalid(self, invalid: bool) -> None:
+        self._credential_lifecycle._runtime_credentials_invalid = invalid
+
     def _credential_gate(self) -> None:
-        """``PollingTransport`` 的 ``on_open`` 钩子：**凭据闸门**。
+        """转发（``PollingTransport`` 的 ``on_open`` 仍指这里；逻辑已迁走）。"""
+        self._credential_lifecycle._credential_gate()
 
-        它跑在 :meth:`~opencode_bridge.transport.base.Transport.start` 建的
-        **那条已经存在的 daemon 线程**里 ⇒ **新增线程数 = 0**，调用链与终止路径
-        与今天完全同一条（``stop()`` → 置停止位 → 关传输层 → join）⇒ 桥关闭时
-        不可能留下悬挂的探测线程，因为**根本没有新线程**。
+    def _probe_get_me_once(self) -> Optional[dict]:
+        """转发（``start()`` 里那次同步探测的调用点不变）。"""
+        return self._credential_lifecycle._probe_get_me_once()
 
-        ⛔ **绝不许**改成让 ``BridgeCore`` 反复驱动 ``adapter.start()``：
-        ``start()`` 是**一次性生命周期钩子**（它有 ``_stop_event.clear()``、
-        会走 :meth:`_flush_history_once`（里面那个 ``_pending.clear()``），且
-        **无条件**覆写 ``self._transport``）⇒ 重跑它要么重复丢历史，
-        要么在已经起来的适配器上**泄漏一条 transport 线程**。
+    def _log_credential_failure(self, failure: dict) -> None:
+        """转发（``start()`` 失败分支的调用点不变）。"""
+        self._credential_lifecycle._log_credential_failure(failure)
 
-        ⚠️ **运行期 401 走的是另一条分支**（:meth:`_reverify_runtime_credentials`）：
-        启动段那个阶梯**永不放弃**、而运行段**有次数上界**（理由与取舍见
-        :data:`RUNTIME_CREDENTIAL_REVERIFY_LIMIT`）。两条分支的判据不同，所以这里
-        **必须**按"这是不是运行期失效"分流，⛔ 不许把它们合成一条循环。
-        """
-        if self._runtime_credentials_invalid:
-            self._reverify_runtime_credentials()
-            return
-        self._probe_until_credentials_verified()
-
-    def _probe_until_credentials_verified(self) -> None:
-        """重试 ``getMe`` 到通过为止。**永不放弃**。
-
-        **为什么永不放弃**（理由与「代价有界」一起看）：改 ``config.json``
-        **不会**重启桥（``run_bridge`` 起完就 ``while stop_event.wait(1.0)`` 直到
-        Ctrl+C）⇒ 任何"放弃点"都会把用户**改完配置**这条唯一的自助修法变成
-        "必须重启进程"，那正是本次要修的缺陷在**确定性失败**那一档上原样保留。
-        代价有界：封顶 60s ⇒ 最坏每分钟一次 ``getMe``（可忽略）。
-
-        ⚠️ **阶梯由本适配器自己按尝试次数算**，park 在 ``_stop_event.wait()`` 上
-        （``stop()`` 一置位就立刻可打断，**不是** ``time.sleep``），**不落在**那个
-        ``PollingTransport`` 实例上 —— 理由见 :meth:`_make_transport` 末尾那段。
-
-        抛 :class:`~opencode_bridge.transport.ReconnectNow` 表示"这次会话作废"：
-        传输层会立刻重连而**不退避**。它只在 ``stop()`` 已请求时抛出（本次会话
-        永远不会通过）⇒ 借它把中止变成一次干净的会话结束，而不是让 ``_open()``
-        返回后继续往下跑 ``getUpdates``。
-        """
-        if self._credentials_verified:
-            # 已经验过：后续会话（``getUpdates`` 失败后的重连）不再重复打 getMe。
-            # ⚠️ 启动**之后** token 被吊销这件事不由这里管：`getUpdates` 自己带
-            # 鉴权，被吊销时它回 401 ⇒ ``_poll_round`` 抛异常 ⇒ 传输层按既有退避
-            # 一直重连（入站不会被掐死，只是不再有消息进来）—— 那是既有行为。
-            return
-        while True:
-            self._credential_probe_attempts += 1
-            failure = self._probe_get_me_once()
-            if failure is None:
-                self._announce_credential_recovery()
-                # ⛔ 积压历史**只在这里丢一次**（见 :meth:`_flush_history_once`）。
-                self._flush_history_once()
-                self._credentials_verified = True
-                return
-            self._log_credential_failure(failure)
-            # ``attempts - 1`` = 这是第几次**等待**（线程里第一次失败是第 1 次等待
-            # ⇒ 拿初值）。⚠️ 直接传 ``attempts`` 会让**初值那一档永远用不上**
-            # （同步那次是第 1 次尝试、它不等），阶梯就变成"4s 起步" —— 而
-            # 「初值 2s → ×2」这句话会被读成一句假话。
-            if self._stop_event.wait(
-                self._credential_probe_backoff_for(self._credential_probe_attempts - 1)
-            ):
-                raise ReconnectNow("getMe 探测已中止（stop() 已请求）")
+    def _invalidate_credentials(self, code: Any, description: Any) -> None:
+        """转发（``_poll_round`` 观测到 401 的调用点不变）。"""
+        self._credential_lifecycle._invalidate_credentials(code, description)
 
     def _credential_probe_initial_backoff(self) -> float:
         """阶梯初值（秒）。夹到非负。"""
@@ -571,105 +528,9 @@ class TelegramAdapter(Adapter):
         return min(initial * (2.0 ** exponent), ceiling)
 
     # ------------------------------------------------------------------
-    # 运行期凭据失效（**401**）→ 重新探 ``getMe`` → 自愈
+    # 运行期凭据失效的**落盘记录**两留守方法（§5.1 第一刀：401 自愈与重探
+    # 已迁 ``TelegramCredentialLifecycle``，这两条以绑定可调用注入那边）
     # ------------------------------------------------------------------
-    def _invalidate_credentials(self, code: Any, description: Any) -> None:
-        """``getUpdates`` 回 401 ⇒ **凭据在运行期失效**，把闸门重新关上。
-
-        改之前这一格是空的：凭据闸门**验过一次就永不再探**（``_credentials_verified``
-        为真时 :meth:`_credential_gate` 直接返回）⇒ token 在启动之后被吊销时，
-        ``getUpdates`` 连续回 401，而每一轮都只是「抛异常 → 恒定 2.0s 退避 → 再抛」，
-        ``getMe`` **一次都不打** ⇒ 换回 token 也不会自愈。
-
-        为什么放在 ``_poll_round`` 而不是闸门里：401 是**在轮询里观测到的**，
-        只有真正发了 ``getUpdates`` 的那个线程知道 ⇒ 判据与观测必须同一个地方。
-
-        ⚠️ **只认 401**（:data:`UNAUTHORIZED_ERROR_CODE`）—— 按**语义**判，不按
-        "任何失败都算"（理由见那个常量的注释）。
-
-        ⚠️ **绝不碰** :attr:`startup_verdict`：那条是「上次**启动**那一刻」的结论，
-        由 :meth:`start` 写一次就定（理由见 :meth:`start` 的 docstring）⇒ 运行期的
-        事实走**另一个键** :attr:`_runtime_credentials_invalid` + 落盘那份
-        :mod:`opencode_bridge.credential_health`，⛔ 两件事不许混成一个值。
-        """
-        if self._runtime_credentials_invalid:
-            return          # 已经在失效态：重复的 401 不重复置位、不重复打日志
-        self._runtime_credentials_invalid = True
-        self._credentials_verified = False
-        # 这一轮重新探测的计数与起点**重置**：恢复行里的「第 N 次 / 历时 T 秒」
-        # 必须描述**这一轮运行期故障**，而不是把启动段那几个数字接着往上加
-        # （否则用户读到「第 37 次尝试 / 历时 4 小时」而故障才刚发生 3 秒）。
-        self._runtime_reverify_attempts = 0
-        self._credential_probe_started_at = time.monotonic()
-        self._record_runtime_credential_failure(code, description)
-        logger.error(
-            "telegram: 运行期凭据失效（code=%s）：%s —— 入站已停止，"
-            "将按退避重新探 getMe（初值 %.0fs、×2、封顶 %.0fs、至多 %d 次）；"
-            "请检查/更新 config.json 里的 bot_token（@BotFather 重新签发）",
-            code, description or "（平台没给描述）",
-            self._credential_probe_initial_backoff(),
-            self._credential_probe_max_backoff(),
-            RUNTIME_CREDENTIAL_REVERIFY_LIMIT,
-        )
-
-    def _reverify_runtime_credentials(self) -> None:
-        """运行期失效后重新探 ``getMe``：**至多** :data:`RUNTIME_CREDENTIAL_REVERIFY_LIMIT` 次。
-
-        ✅ 探通 ⇒ **自愈**：:attr:`_credentials_verified` 置回真、入站继续收发，
-        并把落盘那条盖上 ``recovered_at``。
-
-        ⛔ **探满仍失败 ⇒ 说清「要重启桥」并停在这里**（见
-        :data:`RUNTIME_CREDENTIAL_REVERIFY_LIMIT` 上面那段取舍）。
-
-        ⚠️ **放弃之后不许偷偷恢复**：:attr:`_runtime_credentials_invalid` 与
-        :attr:`_credentials_verified` 都**留在假** ⇒ :attr:`running` 继续为假、
-        入站继续不放行。而下一次会话进来时上面那句 ``attempts >= 上界`` 会让本方法
-        **直接返回**（连日志都不再打）⇒ ``getMe`` 的调用总数**严格有界**，
-        不会退化成"每 2 秒探一次、探一整夜"（那正是今晚反复出现的形态）。
-
-        ⚠️ 等待 park 在 ``_stop_event.wait()`` 上（``stop()`` 一置位就立刻可打断），
-        阶梯**复用** :meth:`_credential_probe_backoff_for`（初值 → ``×2`` → 封顶）
-        ⇒ **不另写一份阶梯**，也不落在这个 ``PollingTransport`` 实例上
-        （理由见 :meth:`_make_transport` 末尾那段）。
-        """
-        if self._runtime_reverify_attempts >= RUNTIME_CREDENTIAL_REVERIFY_LIMIT:
-            return      # 已经探满：那一行「需要重启桥」在超限那一刻打过，不再重复
-        while self._runtime_reverify_attempts < RUNTIME_CREDENTIAL_REVERIFY_LIMIT:
-            self._runtime_reverify_attempts += 1
-            failure = self._probe_get_me_once()
-            if failure is None:
-                self._announce_runtime_credential_recovery()
-                self._record_runtime_credential_recovery()
-                self._runtime_credentials_invalid = False
-                self._credentials_verified = True
-                return
-            self._log_credential_failure(failure)
-            if self._runtime_reverify_attempts >= RUNTIME_CREDENTIAL_REVERIFY_LIMIT:
-                break       # 超限：不再多等一档，直接说清「需要重启桥」
-            if self._stop_event.wait(
-                self._credential_probe_backoff_for(self._runtime_reverify_attempts)
-            ):
-                raise ReconnectNow("getMe 运行期重探已中止（stop() 已请求）")
-        logger.error(
-            "telegram: 已重新探 getMe %d 次仍失败 —— **停止重探，需要重启桥**。"
-            "（改完 bot_token 必须重启；本进程不会自己去读 config.json）",
-            RUNTIME_CREDENTIAL_REVERIFY_LIMIT,
-        )
-
-    def _announce_runtime_credential_recovery(self) -> None:
-        """运行期自愈的那一行：必须**响亮**（WARNING）且带「第 N 次 / 历时 T 秒」。
-
-        ⚛️ 与启动段那条（:meth:`_announce_credential_recovery`）**形状一致但分开**：
-        两者的「第 N 次」数的是**不同的两轮**（启动段那轮 vs 这一次运行期故障），
-        混成一行会让用户对不上"到底是第几次"。
-        """
-        elapsed = max(0.0, time.monotonic() - self._credential_probe_started_at)
-        logger.warning(
-            "telegram: 运行期凭据恢复：重新探 getMe 第 %d 次通过 / 历时 %.1f 秒 —— "
-            "入站轮询继续",
-            self._runtime_reverify_attempts, elapsed,
-        )
-
     def _record_runtime_credential_failure(
         self, code: Any, description: Any
     ) -> None:
@@ -704,141 +565,6 @@ class TelegramAdapter(Adapter):
                 "credential-failures: 记录凭据恢复时抛了（%s: %s）—— 不影响轮询",
                 type(exc).__name__, exc,
             )
-
-    def _probe_get_me_once(self) -> Optional[dict]:
-        """跑**一次** ``getMe``。**返回 ``None`` = 通过**；否则返回失败记录。
-
-        失败记录四个键：``code``（平台 ``error_code``；载荷不是 dict 时是 ``"?"``）、
-        ``description``、``detail``（上报口径的一行）、``raised``
-        （走没走异常路径 —— **只**用来选那行**文档引用**的日志措辞）。
-
-        ⚠️ **不要拿「异常类型」当生产里的瞬时判据**：:meth:`_post` 自己把传输
-        异常包成 ``{"ok": False, "error_code": 0, "description": "transport error: …"}``
-        再 ``return`` ⇒ 生产里**根本走不到**下面的 ``except``（它只对被替换的
-        实现 / 未预料的异常可达）。分类一律走
-        :func:`~opencode_bridge.adapters.base.classify_http`，而它对
-        ``status <= 0`` 的判法就是 :attr:`~opencode_bridge.hooks.SendError.TRANSIENT`。
-
-        ⚠️ **台账：``429`` 的 ``retry_after`` 在这条路径上仍未被处理。**
-        ``getMe`` 走 :meth:`_post` 而**不是** :meth:`_api`，所以只有 ``_api``
-        里那段"按 ``retry_after`` 睡一次再重试"在这里**没有**。
-        ⚠️ 这条**在本次改动之前就存在**，⛔ **不许顺手把它混进来**（那是另一件事、
-        该有另一条测试），写在这里是为了让它留在台账上。
-        """
-        try:
-            response = self._post("getMe", {}, timeout=8.0)
-        except Exception as exc:
-            # ``_post`` 自己会把传输失败包成 ``{"ok": False, "error_code": 0, …}``
-            # —— 所以这里的 ``code=0`` 与那条路径**同一个含义**：没拿到 HTTP 状态码
-            # （同 ``classify_http`` 对 ``status <= 0`` 的判法）。不是"没有码"。
-            return {
-                "code": 0,
-                "description": str(exc),
-                "detail": f"getMe 抛出异常 {type(exc).__name__}: {exc}",
-                "raised": True,
-            }
-        if isinstance(response, dict) and response.get("ok") is True:
-            return None
-        if isinstance(response, dict):
-            code = response.get("error_code")
-            description = response.get("description")
-        else:
-            code = "?"
-            description = repr(response)
-        return {
-            "code": code,
-            "description": description,
-            "detail": f"getMe: {description or '（平台没给描述）'}",
-            "raised": False,
-        }
-
-    def _log_credential_failure(self, failure: dict) -> None:
-        """一次失败的 ``getMe``：**按分类选日志档位与文案**。
-
-        ⛔ **绝不碰** :attr:`startup_verdict` —— 上报只有 :meth:`start` 那一处
-        （理由见 :meth:`start` 的 docstring）。
-
-        ⚠️ **分类只用来选档位与文案，绝不用来门控重试**：两类都重试。
-        ``_post`` 把传输失败包成 ``error_code: 0``（= 没拿到 HTTP 状态码），
-        于是"超时 / DNS 未就绪 / 代理刚起"这类**瞬时**失败在生产里长成
-        :attr:`~opencode_bridge.hooks.SendError.TRANSIENT`；401/404 是
-        :attr:`~opencode_bridge.hooks.SendError.FORBIDDEN` /
-        :attr:`~opencode_bridge.hooks.SendError.NOT_FOUND`。**要不要设放弃点**
-        取决于"用户会不会去改配置"，而他不会（改配置不重启桥，见
-        :meth:`_probe_until_credentials_verified`）⇒ 不设。
-        """
-        code = failure["code"]
-        description = failure["description"]
-        # ``code`` 可能是 ``"?"``（载荷不是 dict）—— 那不是数字，别让它炸掉分类。
-        try:
-            numeric_code = int(code or 0)
-        except (TypeError, ValueError):
-            numeric_code = 0
-        failure_kind = classify_http(numeric_code, str(description or ""))
-        detail = description or "（平台没给描述）"
-        if self._credential_probe_attempts > 1:
-            logger.warning(
-                "telegram: getMe 探测第 %d 次尝试仍失败（%s code=%s）：%s —— "
-                "将继续按退避重试",
-                self._credential_probe_attempts, failure_kind.value, code, detail,
-            )
-            return
-        # ⛔ 下面那两行是**文档引用**的排障入口（``docs/install.md`` /
-        # ``plugin/README.md`` 都让用户按这两行字排障），**原文保留**。
-        # ⚠️ 句尾的 "adapter not started" 现在只表示「**入站轮询还没开始跑**」，
-        # 而**不是**「这个进程再也不会收到消息」—— 凭据闸门会在传输线程里带退避
-        # 重试到通过。改成别的字会让已写的排障指引失效，所以那句话照旧留着。
-        if failure["raised"]:
-            logger.error(
-                "telegram: getMe failed (%s); adapter not started", description
-            )
-        else:
-            logger.error(
-                "telegram: getMe failed (code=%s): %s; adapter not started",
-                code,
-                description,
-            )
-        credential_problem = failure_kind in (
-            SendError.FORBIDDEN,
-            SendError.NOT_FOUND,
-        )
-        logger.error(
-            "telegram: getMe 探测未通过（第 1 次尝试；%s code=%s）：%s —— %s；"
-            "将按退避重试（初值 %.0fs、×2、封顶 %.0fs、**永不放弃**）",
-            failure_kind.value, code, detail,
-            (
-                "请检查/更新 config.json 里的 bot_token（@BotFather 重新签发）；"
-                "改完不必重启桥，本进程会自动重新探测"
-                if credential_problem else
-                "先查网络/代理/DNS；恢复后不必重启桥，本进程会自动开始收消息"
-            ),
-            self._credential_probe_initial_backoff(),
-            self._credential_probe_max_backoff(),
-        )
-
-    def _announce_credential_recovery(self) -> None:
-        """恢复必须**响亮**地落在日志里：带「第 N 次尝试 / 历时 T 秒」。
-
-        ⚛️ 只有 ``N >= 2``（**真的失败过**）才打：一次就通过不是"恢复"，
-        打出来只是把事故那一段淹没。
-
-        ⚠️ 档位取 **WARNING** 而不是 INFO：默认档位是 INFO，两档都看得见；
-        但**事故的两端（失败 / 恢复）落在同一档位上**才搜得到 —— 用户在故障那
-        段时间最常做的动作是把档位提到 WARNING 来抓现场，而恢复行若在 INFO，
-        那段日志里就只剩"还在坏"的印象。⇒ 这一行属于**这条既有排障路径**
-        （搜 ``getMe``）的一部分，⛔ 不许降成 DEBUG。
-
-        这行同时是**标定阶梯初值**的数据源（需要的数见
-        :data:`CREDENTIAL_PROBE_INITIAL_BACKOFF` 上面的注释）。
-        """
-        attempts = self._credential_probe_attempts
-        if attempts <= 1:
-            return
-        elapsed = max(0.0, time.monotonic() - self._credential_probe_started_at)
-        logger.warning(
-            "telegram: getMe 探测恢复：第 %d 次尝试 / 历时 %.1f 秒 —— 入站轮询开始",
-            attempts, elapsed,
-        )
 
     def _flush_history_once(self) -> None:
         """丢弃积压历史 —— ⛔ **每进程只跑一次**，不是每会话一次。

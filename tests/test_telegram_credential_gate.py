@@ -420,7 +420,7 @@ class TestProbeLadder(unittest.TestCase):
         # （初值、×2、封顶、封顶）—— 逐项**等值**，不是区间。
         # 第二列（请求时已经发生过几次 ``getMe``）把「交棒那一跳」也钉住了：
         # 「``start()`` 里那次同步失败」是第 1 次，**交棒**给
-        # :meth:`~opencode_bridge.adapters.telegram.TelegramAdapter._probe_until_credentials_verified`
+        # :meth:`~opencode_bridge.adapters.telegram_credential_lifecycle.TelegramCredentialLifecycle._probe_until_credentials_verified`
         # 里那次（= 它自己的第 1 次尝试，全局第 2 次）之前**一次等待都没有**
         # ⇒ 第一项的第二列必须是 2；先等一档再交棒会写成 1。
         self.assertEqual(

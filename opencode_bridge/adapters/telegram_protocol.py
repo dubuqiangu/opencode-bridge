@@ -60,7 +60,8 @@ MAX_RETRY_AFTER = 60.0        # cap for Telegram 429 retry_after sleeps
 #: **语义**收窄，而不是"任何失败都当成凭据失效"（那会让一次网络抖动去惊动凭据闸门）。
 UNAUTHORIZED_ERROR_CODE = 401
 
-#: 运行期重新探 ``getMe`` 的**重试上界**（见 :meth:`_reverify_runtime_credentials`）。
+#: 运行期重新探 ``getMe`` 的**重试上界**（§5.1 第一刀后见
+#: :meth:`TelegramCredentialLifecycle._reverify_runtime_credentials`）。
 #:
 #: ⭐ **为什么是 5 次**（2026-10-08 拍板时的取舍，写在这里是为了可复核）：
 #: 这一段重试与启动段那个**永不放弃**的阶梯是**两件事**，判据不同 ——
@@ -70,7 +71,7 @@ UNAUTHORIZED_ERROR_CODE = 401
 #:   而每一次重试都打一行 —— 无界的重试在这里等于**刷屏**，把真正的排障现场淹掉。
 #:
 #: ⇒ 所以运行段给一个**明确的次数上界**，超了之后那一行会**说清**「已停止重探、
-#: 需要重启桥」并**保留** :attr:`_runtime_credentials_invalid`（⇒ ``running``
+#: 需要重启桥」并**保留** :attr:`TelegramCredentialLifecycle._runtime_credentials_invalid`（⇒ ``running``
 #: 继续为假、入站继续不放行，**不会**因为放弃重探而偷偷恢复）。
 #: ⇒ 5 次 × 最长一档 60s ≈ **5 分钟**的自动恢复窗口：覆盖"token 被临时吊销后
 #: 几分钟内换回来"这一类，而不会让一个永久吊销的 token 被探上一整夜。
@@ -83,7 +84,7 @@ RUNTIME_CREDENTIAL_REVERIFY_LIMIT = 5
 # （:data:`BACKOFF_INTERVAL`，也正是 ``PollingTransport`` 在 ``min_backoff ==
 # max_backoff`` 下唯一会取的那个数），**没有**任何实测数据支撑。
 # ⇒ **标定它需要哪一组数**：**恢复时延的分布** —— 首次成功时打的那行
-# 「第 N 次尝试 / 历时 T 秒」（:meth:`TelegramAdapter._announce_credential_recovery`）
+# 「第 N 次尝试 / 历时 T 秒」（:meth:`TelegramCredentialLifecycle._announce_credential_recovery`）
 # 就是为了攒这组数：攒够 **≥20 个真实事件**、其中**至少 3 次**是「失败超过 5 分钟
 # 才恢复」，再看 N 与 T 的 **p50 / p90**，再回头改这两个数。
 # ⛔ 在那之前**不许**把它当成"测过了"。

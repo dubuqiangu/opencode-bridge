@@ -91,7 +91,6 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -137,6 +136,11 @@ from .a2a_protocol import (
     _rpc_result, _text_part, extract_context_id, extract_text,
 )
 
+# §5.1 类手术再进口：task 账本域已迁入 a2a_task_ledger（``_Task`` 随域走）；
+# 这里再进口保持 ``a2a._Task`` / ``a2a.A2aTaskLedger`` 可解析（留守侧注解
+# 与转发方法签名仍引用它们）。
+from .a2a_task_ledger import A2aTaskLedger, _Task
+
 
 logger = logging.getLogger("opencode_bridge.adapters.a2a")
 
@@ -152,25 +156,6 @@ __all__ = [
     "AGENT_CARD_PATH",
     "PROTOCOL_VERSION",
 ]
-
-
-@dataclass
-class _Task:
-    """内存里的一个入站 A2A task（请求 / 回答的关联体）。
-
-    **只在内存里**：见模块 docstring「消息与对端的对应关系」一节对重启后果的说明。
-    """
-
-    task_id: str
-    context_id: str
-    peer: str
-    #: 等待 agent 答复的信号。**用 :class:`threading.Event` 而不是 ``Future``**：
-    #: ``stop()`` 能立刻 ``set()`` 它唤醒所有阻塞中的 HTTP handler 线程，而
-    #: ``Future.result(timeout=...)`` 只能靠轮询才能被停机打断。
-    done: threading.Event = field(default_factory=threading.Event)
-    state: str = STATE_SUBMITTED
-    reply: str = ""
-    created_at: float = 0.0
 
 
 @register("a2a")
@@ -335,6 +320,12 @@ class A2aAdapter(Adapter):
         #: ``(task, inbound) -> None``。HTTP handler 线程投递，分发线程消费
         #: —— 见 :meth:`_dispatch_loop` 的注释（为什么要这一层间接）。
         self._queue: "queue.Queue[Optional[tuple[_Task, Inbound]]]" = queue.Queue()
+        #: task 账本域已抽出（§5.1 类手术）：账本方法在
+        #: :class:`A2aTaskLedger`；状态（``_tasks``/``_order``/``_lock``/
+        #: ``max_tasks``）留在适配器本体 —— 锁与留守侧轮次计数 / send /
+        #: stats 共享，测试也直戳 ``adapter._tasks``；新类逐调用经
+        #: read-only property 转发回来。
+        self._task_ledger = A2aTaskLedger(self)
 
     # ==================================================================
     # 配置
@@ -919,22 +910,12 @@ class A2aAdapter(Adapter):
         return str(raw).strip(), None
 
     def _lookup(self, task_id: str, peer: str) -> Optional[_Task]:
-        """按 id 取 task，且**必须属于本对端**（§13.1）。
-
-        刻意不返回"存在但不是你"的区分信息 —— §3.3.2 明说服务器 *SHOULD NOT*
-        distinguish between "does not exist" and "not authorized"。
-        """
-        key = str(task_id or "").strip()
-        if not key:
-            return None
-        with self._lock:
-            task = self._tasks.get(key)
-        if task is None or task.peer != peer:
-            return None
-        return task
+        """转发 :meth:`A2aTaskLedger._lookup`（task 账本域已抽出）。"""
+        return self._task_ledger._lookup(task_id, peer)
 
     # ==================================================================
-    # task 账本
+    # task 账本（域已抽出 → a2a_task_ledger.A2aTaskLedger；留守转发方法
+    # + 状态本体）
     # ==================================================================
     def _conversation_id(self, peer: str) -> str:
         """``conversation_id = a2a:<对端标识>``（一个对端 agent 一个会话）。
@@ -946,78 +927,20 @@ class A2aAdapter(Adapter):
         return format_id(self.name, peer or "local:unknown")
 
     def _new_task(self, context_id: str, peer: str) -> _Task:
-        return _Task(
-            task_id=_new_id("task"),
-            context_id=context_id,
-            peer=peer,
-            created_at=time.time(),
-        )
+        """转发 :meth:`A2aTaskLedger._new_task`。"""
+        return self._task_ledger._new_task(context_id, peer)
 
     def _register(self, task: _Task) -> None:
-        """把 task 记进账本（**幂等**）。
-
-        幂等是必需的：``returnImmediately`` 那条路径会先同步登记一次，好让对端
-        紧接着的 ``GetTask`` 能查到；分发线程随后再登记一次 —— 不幂等就会在
-        ``_order`` 里塞进**两个**相同的 id，FIFO 顺序和条数统计全乱。
-        """
-        with self._lock:
-            if task.task_id in self._tasks:
-                return
-            self._tasks[task.task_id] = task
-            self._order.setdefault(task.peer, collections.deque()).append(task.task_id)
-            self._trim_locked()
-
-    def _trim_locked(self) -> None:
-        """超上限时按 FIFO 丢最老的**终态**记录（调用方持锁）。
-
-        只丢终态：在飞 task 被丢会让等待中的 HTTP 请求永远醒不过来。
-        """
-        limit = max(8, int(self.max_tasks))
-        while len(self._tasks) > limit:
-            victim = next(
-                (t.task_id for t in self._tasks.values()
-                 if t.state in TERMINAL_STATES),
-                None,
-            )
-            if victim is None:
-                return                      # 全在飞：宁可不裁也不制造悬挂
-            self._drop_locked(victim)
-
-    def _drop_locked(self, task_id: str) -> None:
-        task = self._tasks.pop(task_id, None)
-        if task is None:
-            return
-        queue_ = self._order.get(task.peer)
-        if queue_ is not None:
-            try:
-                queue_.remove(task_id)
-            except ValueError:
-                pass
-            if not queue_:
-                self._order.pop(task.peer, None)
+        """转发 :meth:`A2aTaskLedger._register`。"""
+        self._task_ledger._register(task)
 
     def _finalize(self, task: _Task, state: str, reply: str = "") -> bool:
-        """把 task 推到终态并唤醒等待者。**幂等**（第一个终态说了算）。"""
-        with self._lock:
-            if task.state in TERMINAL_STATES and task.done.is_set():
-                return False
-            task.state = state
-            task.reply = reply or ""
-            task.done.set()
-        return True
+        """转发 :meth:`A2aTaskLedger._finalize`。"""
+        return self._task_ledger._finalize(task, state, reply)
 
     def _fail_pending(self, state: str, reason: str) -> int:
-        """停机 / 关服时把所有未完成 task 判终态，唤醒阻塞中的 handler 线程。"""
-        with self._lock:
-            pending = [t for t in self._tasks.values()
-                       if t.state not in TERMINAL_STATES]
-        count = 0
-        for task in pending:
-            if self._finalize(task, state, reason):
-                count += 1
-        if count:
-            logger.info("a2a: %d 个等待中的任务被判为 %s（%s）", count, state, reason)
-        return count
+        """转发 :meth:`A2aTaskLedger._fail_pending`。"""
+        return self._task_ledger._fail_pending(state, reason)
 
     # ==================================================================
     # 防回环：轮次计数

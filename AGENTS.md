@@ -167,12 +167,14 @@ SLACK_TOKEN = "xox" + "b-" + "<数字段>" + "-" + "<密钥段>"   # 示例用�
 **就在本节下方 30 行**（§5.0 里的「判据缺失」）⇒ 所以「自查段」= **本小节末尾那四项列表**；它必须包含**紧邻的实例**（⛔ 不只是「远处的已知项」），
 **且必须与 `tasks.md` 的「未完成项总表」逐行对齐** —— 两处数目不等就是漏了（判据：数一遍两边的行数）。
 ⚠️ **台账里已有的待办要用这条重新过一遍**（2026-10-11 A3 闭合 + D3 首个平台 Slack 落地 + telegram callback 文案零钉闭合后的状态：**20 项**——D3 行闭合、D3 剩余平台行新开，两抵仍 21；「callback 文案零钉」行闭合（`0e3794c`）⇒ 21 − 1 = 20；
-逐项类别与必填件见 `tasks.md` 的「未完成项总表」⇒ ⚠️ **两边数目必须相等**，判据是数一遍行数）：
+逐项类别与必填件见 `tasks.md` 的「未完成项总表」⇒ ⚠️ **两边数目必须相等**，判据是数一遍行数。**2026-10-16 更新：当前 23 项**——2026-10-15 新增「dsh-im 借鉴面落地」行时此处未补记（彼时实为 21，今补记）；本轮再新增「dsh-im-connect 借鉴面落地」「参考项目定期回看」两行 ⇒ 23）：
 ~~D3 交互按钮~~ ⇒ **已闭合** ✅（2026-10-11 · 编排者认领并落地首个平台 Slack `432720e`，范围与证据见总表 ~~D3~~ 行——「多平台」只闭合了 Slack，出站/入站/answer 镜像 telegram 契约）；
 **D3 剩余平台的交互按钮** ⇒ **第 1 类**（中 · 认领人=编排者 · 2026-10-11 起）——
 要拍的问题（一句话可复述）：「Slack 已落稳，D3 是否连带 Discord，还是止步于 Telegram+Slack？」
 （用户裁定后排期，⛔ 不编日期）；
 **dsh-im 借鉴面落地（①②③）** ⇒ **第 1 类**（中 · 认领人=编排者 · 2026-10-15 认领起）——**用户 2026-10-15 已拍板：①渠道级故障隔离与子系统降级 ②跨 HTTP/RPC 单源错误码表 ③主动投递不可变目标模型与诚实投递语义，全部进入插件工作排期**（证据与分析见 §6.1 登记行，参考锁 `b7698a6`）；下一步 = 插件工作排期启动时逐项落地（排期由用户发起，⛔ 不编日期）；
+**dsh-im-connect 借鉴面落地（A/B/C/D）** ⇒ **第 1 类**（中 · 认领人=编排者 · 2026-10-16 认领起）——**用户 2026-10-16 拍板：A 投递三态+手动补投、B 冷历史恢复答复、C 结构感知切分、D 审批超时语义，全部进入插件工作排期**（分析与适用性 = `docs/borrowing-catalog.md` §1 借鉴点清单 A~N，参考锁 `MichengAI/dsh-im-connect` commit `e271ec1`；落地跟踪见总表同名行）；下一步 = 插件工作排期启动时逐项落地——C 最自包含先行；A/B/D 各有前置核实（A 先量投递失败分类面、B 先核 opencode 会话消息 API 形状、D 先核审批等待现状；⛔ 核实不过不先拍形状）（排期由用户发起，⛔ 不编日期）；
+**参考项目定期回看** ⇒ **第 1 类**，下一步**可机械判定**（触发 = 每日首次开工时对四收录项目跑 HEAD SHA 比对 + `isArchived` 归档核验，判定方法全套见 `docs/borrowing-catalog.md`「定期回看机制」节；间隔 = **一天一次**，用户 2026-10-16 拍板；最近一次检查 = **2026-10-16**（基线建立同日）：四项均成功取到 HEAD SHA 且均未归档，基线四 SHA 见 catalog 项目一览表）；
 ~~`:882` 错误正文超长~~ ⇒ **已闭合** ✅（2026-10-09 · 核验 · 零代码）——
 用户已拍「自动拆成多条连续消息」，而待核判据（找出调用点、看有没有走 `split_text`）已核：
 调用点 = `_on_execution_failed` → `outbound.finalize(kind="error", shown_progress_text="")`，
@@ -974,8 +976,9 @@ sloc = sum(1 for l in code
 | `NousResearch/hermes-agent`（MIT） | **首选**，250806 stars |
 | `zhuiyueya/dsh-im-gateway`（MIT） | 次选，49 stars |
 | `xmanrui/dsh-im`（MIT） | 用户认可的**插件实现参考**（源码 clone 在宿主临时目录 `ref-xmanrui-dsh-im`，git 仓非快照，引用一律锁 commit `b7698a6`（2026-10-15 14:28 +0800）；2023 stars、MIT、未归档、纯 JavaScript，均 2026-10-15 `gh` 现查；DeepSeek Harness 官方 Token 赞助、TrendShift 上榜）：cordis/Koishi 双侧插件（client=设置面板 / host=连接投递，渠道目录两侧镜像），README 内置渠道表实为 **12 个 IM 渠道** + AI Office Connector（原记「9 渠道」按源码更正：入口 `index.mjs` 渠道表 14 项 = 13 IM + office，README 表 12 行 = 含实验性 Matrix、不含 office）；每渠道多机器人、扫码 / App Manifest / 凭据三种接入、本地 Harness 主动外连。**借鉴面分析已做（2026-10-15，证据=README 章节选读 + `host/index.mjs` + `delivery-service.mjs` + `PROACTIVE_DELIVERY.md` 错误码/语义节 + `credential-binding.js` + `harness-connection.mjs`）**：⭐ 可借鉴面（**用户 2026-10-15 拍板：①②③ 全部进入插件工作排期**；落地跟踪见 tasks.md 未完成项总表「dsh-im 借鉴面落地」行）——① 入口只做装配：DI 全量可注入 + 渠道 `Promise.all` 单败仅记日志继续、全败才 `AggregateError`，可选子系统逐个 try/catch 降级；② `delivery-service.mjs` 统一错误码表 + 适配器契约 `ADAPTER_METHODS` 注册校验 + `sendChecked` TOCTOU 防护（目标路由 SHA-256 摘要比对 + 账号指纹 + 能力协商 + `beforeSend` 复检 + `AbortSignal.any` 热替换在途操作）；③ `PROACTIVE_DELIVERY.md` 投递目标 `botId+targetId` 不可变寻址、`{sent:true}` 不承诺送达、不生成幂等键不自动重试（调用方自管业务幂等）、回环默认 +「`trusted-host` 是可达性边界、不是用户认证」；⛔ 结构性不适用：扫码 / App Manifest 接入流程依赖各平台专属配对端点（飞书扫码建 bot、微信 iLink、QQ 扫码）——本桥目标平台均为静态 token；client/host 设置面板镜像依赖 Koishi console UI 框架，opencode V2 无对应物（现用 `/setup` 命令 + `bridge_setup` 工具）；**交叉印证（既有拍板的旁证）**：超时补发「明确失败≤3 次重试、结果不确定保留记录停止自动重试」与 fix-299 `outcome_unknown` 只告警不重放完全同构；Telegram 占位消息编辑式进度与本桥占位消息模型同形 |
+| `MichengAI/dsh-im-connect`（Apache-2.0） | **与本桥领域高度同构的借鉴源**（2026-10-16 收录；59 stars、Apache-2.0、未归档、2026-10-15 仍在推送，均 `gh` 现查；源码 clone 在宿主临时目录 `ref-michengai-dsh-im-connect`，git 仓非快照，引用一律锁 commit `e271ec1`（v0.1.77））：把主流 IM 平台（dingtalk/discord/feishu/lark/qq/slack/telegram/wecom/weixin 共 9 家）接入本机 DeepSeek Harness 的 TypeScript / Koishi(cordis) 双侧插件，引擎域与本桥一一对应（去重 / 按会话串行 / 合并窗口 / 流式回复组装 / 长文切分 / 占位进度 / 审批与提问交互 / 会话注册表 / 原子落盘）。**借鉴点全目录 = `docs/borrowing-catalog.md` §1（A~N 逐条：来源文件 + 对本桥适用性 + ⛔ 结构性不适用清单）**；⭐ **用户 2026-10-16 拍板：A 投递三态+手动补投、B 冷历史恢复答复、C 结构感知切分、D 审批超时语义进入插件工作排期**（落地跟踪见 tasks.md 未完成项总表「dsh-im-connect 借鉴面落地」行）；**定期回看**见总表「参考项目定期回看」行与 catalog「定期回看机制」节（间隔一天一次，用户 2026-10-16 拍板） |
 
-平台清单取两者并集（≈31 家），见 `docs/platform-design-reference.md`。
+平台清单取两者并集（≈31 家），见 `docs/platform-design-reference.md`。全部收录项目的总目录与回看机制 = `docs/borrowing-catalog.md`（四项目锁 SHA + 借鉴点清单 + 定期回看机制与基线）。
 
 **本机已有两者的全量纯文本快照**（含目录树 + 全部文件内容），文件名里的
 `8a5edab282632443` 是 commit SHA，**锁定了参考版本** —— 引用结论时务必连 SHA 一起写，

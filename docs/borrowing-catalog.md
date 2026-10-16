@@ -58,6 +58,26 @@ credentials,abort}.ts` + `src/channels/connection-state.ts` +
 - 扫码 / App Manifest 配对接入（依赖各平台专属配对端点；本桥目标平台均为静态 token——与 dsh-im 侧结论相同）；
 - DSH 专有接口（冷历史读取、`connection.requestRejection` 管理面鉴权）——本桥对应面需另行核实形状，⛔ 不照抄接口名。
 
+### A/B/D 落地核实（2026-10-16 直核；证据 = 本仓库源码 + 上游 schema 锁 tag `v2.0.22`）
+
+标号对照：**用户 A = §1-A（+ §1-B 手动补投）· 用户 B = §1-C · 用户 C = §1-D · 用户 D = §1-F**。
+
+**A（投递三态 + 手动补投）**——现有分档（`inbound_gateway._dispatch_prompt`，恢复路径对应 `inbox_recovery`）：`create_session` 阶段失败 ⇒ `failed`（可重放）· `prompt()` 抛 `OpenCodeError` 且 `status == 409` ⇒ `pending`（可重放）· 抛 `OpenCodeError` 且 `status` 非 None 非 409 ⇒ `failed`（可重放）· 抛 `OpenCodeError` 且 `status is None` ⇒ `outcome_unknown`（⛔ 只告警不重放）· 抛非 `OpenCodeError` ⇒ `outcome_unknown`（⛔ 只告警）· 崩在 `prompt()` 内 ⇒ `attempting`（⛔ 只告警）。
+关键事实（`opencode_client._request`）：`HTTPError` ⇒ 带 status（服务端**已答复**）；`(URLError, OSError, HTTPException)` ⇒ status=None ⇒ **这一类混装**「连接未建立（请求没出门）」与「已发出但读响应时断（可能已提交）」⇒ 现状**无法区分**。
+⇒ 与 §1-A 的差：①「确定未提交」与「可能已提交」未分（前者可安全自动补投）；② §1-B 的**手动补投面完全缺失**（桥只有「请重新发送一次」告警）。
+⇒ 待用户拍板：手动补投的**入口形状**；「未提交」是否提升为独立可自动恢复档（会触碰 `_request` 分档 + 可能改 `_dispatch_prompt` 返回契约，而 fix-300 明写「⛔ 不许在缺陷修复里顺手改契约」）。
+
+**B（冷历史恢复答复）**——API 存在：`OpenCodeClient.messages(session_id, *, limit=100)` ⇒ `GET /api/session/{id}/message` ⇒ `list[dict]`；⚠️ **生产零调用点**（仅 2 处测试，用假桩 ⇒ 形状未被真机核过）。
+v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2.0.22`）：Base `{id: "msg_" 前缀, metadata?, time.created}`；`{type: "user", text}`；`{type: "assistant", content: [...]}`，其中 `{type: "text", text}` = 正文片段。
+⚠️ 关键缺口：失败路径上**拿不到 prompt 的 msg id**（`prompt()` 抛了 ⇒ 无 `data.id`）⇒ §1-C 的「按 requestId 精确匹配回合」**不可直接照搬**；桥只能按 `queued.text` + 时间序定位（弱于参考；同文本重发会歧义）。
+⚠️ 未核实：真机 envelope 与字段名（需一次真实 GET；本机无运行中的 opencode server）。
+⇒ 待用户拍板：无 requestId 时的对接口径（按文本 + 时间序，还是先搁置待真机）。
+
+**D（审批超时语义）**——现状：`event_stream._on_permission_asked` 只**渲染 + 记账**（`PermissionLedger.record_asked`），**无任何等待 / 超时 / 队列门控**；`PermissionLedger` 无超时（其 docstring 明写「缺超时」非 C4 根因）；档位 pending / already_replied / resolved_upstream / unseen，进程内、重启清空、容量 512。
+「审批期间其他文本不进下一轮」在桥上是**间接**由服务端 busy 实现（审批挂起 ⇒ 那轮不结束 ⇒ 新 prompt 得 409 ⇒ 落 `pending`），⛔ 不是桥显式门控。⚠️ a2a `reply_timeout=300s` 是 task 阻塞、**另一回事**。
+⇒ 与 §1-F 的差：①「等待上限、到期按**取消**结束」桥没有；②「群聊只认发起者」桥现状未核（callback 只有白名单闸）；③ `accepting` 旗桥没有。
+⇒ 待用户拍板：是否引入桥侧定时器「到期按取消」+ 超时值；范围（是否含「群聊只认发起者」）。
+
 ---
 
 ## 2. xmanrui/dsh-im（MIT，锁 `b7698a6`）

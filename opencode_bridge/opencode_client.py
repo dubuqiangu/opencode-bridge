@@ -28,6 +28,7 @@ from .opencode_wire import (
     _force_close_stream,
     _safe_read_body,
 )
+from .request_phase import request_definitely_never_sent
 
 __all__ = [
     "DEFAULT_SERVICE_URL",
@@ -109,7 +110,14 @@ class OpenCodeClient:
                 body=err_body,
             ) from None
         except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-            raise OpenCodeError(f"{method} {path} failed: {exc}") from exc
+            # ⚠️ 这一支把两种**相反**的处境压成了同一个异常：连接压根没建起来
+            # （可证明「从未提交」⇒ 可安全重放）与请求已发出但读响应中断
+            # （⇒ 结果未知、绝不能重放）。分档判据在 request_phase，而**只有这一层**
+            # 拿得到原始传输异常的**形状** ⇒ 那件事必须在这里被记下来（§8 第 3 条）。
+            raise OpenCodeError(
+                f"{method} {path} failed: {exc}",
+                request_never_sent=request_definitely_never_sent(exc),
+            ) from exc
 
         if not raw:
             return {}

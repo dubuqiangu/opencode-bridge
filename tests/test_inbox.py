@@ -1184,8 +1184,12 @@ class TestEveryFailedRowCarriesAStatusClue(unittest.TestCase):
     def test_there_is_at_least_one_call_site_so_the_criteria_is_not_vacuous(self):
         """前提守卫：判据不许在空集上恒真（§7.1 第 1 条：报 0 命中先怀疑判据）。
 
-        这一条同时把**调用点数**钉下来：把三处调用点删掉两条，上面那条照样全绿
+        这一条同时把**调用点数**钉下来：把这几个调用点删掉，上面那条照样全绿
         ⇒ 而「覆盖面」守门真正的失效方式正是调用点被挪走/被删掉。
+
+        ⚠️ 下面那个数是**手维护的常量、⛔ 不是量出来的**（§7.1：判据里的列表字面量
+        与它读的文件是两种东西，前者必须手工同步）—— 它按实测同步：投递侧三处
+        （``create_session`` 失败 / 传输层**证明没提交** / 非 409 有 status）+ 恢复层一处。
         """
         call_sites = [
             os.path.relpath(path, _REPOSITORY_ROOT)
@@ -1194,8 +1198,8 @@ class TestEveryFailedRowCarriesAStatusClue(unittest.TestCase):
         ]
 
         self.assertGreaterEqual(
-            len(call_sites), 3,
-            "生产侧 mark_failed 调用点少于 3 处 —— 三处是实际存在的（投递侧两处 + "
+            len(call_sites), 4,
+            "生产侧 mark_failed 调用点少于 4 处 —— 四处是实际存在的（投递侧三处 + "
             "恢复层一处），少一处意味着有人挪走或删了它，而上面那条守门会照样全绿",
         )
         self.assertIn(os.path.join("opencode_bridge", "inbox_recovery.py"), call_sites)

@@ -17,16 +17,31 @@ from typing import Any
 
 
 class OpenCodeError(Exception):
+    """一次 HTTP 调用失败。``status is None`` 时是**传输层**失败。
+
+    ``request_never_sent`` = 「**可证明**请求压根没离开本机」——由
+    :func:`~opencode_bridge.request_phase.request_definitely_never_sent` 从原始
+    传输异常的形状判定，缺省 ``False``（保守）。
+
+    ⚠️ 它**只**在 ``status is None`` 时有意义：有 status 就说明服务端答复过，
+    那时候这个字段不再提供任何额外信息。⛔ 也别拿它当「已提交」的证据 ——
+    「可能已经跑过」那一档由**缺省值**表达（与
+    :func:`~opencode_bridge.inbox_recovery.mark_prompt_never_sent` 同一条纪律：
+    显式标「已提交」会让缺省那个安全方向消失）。
+    """
+
     def __init__(
         self,
         message: str,
         *,
         status: int | None = None,
         body: str | None = None,
+        request_never_sent: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        self.request_never_sent = request_never_sent
 
 
 @dataclass(frozen=True)

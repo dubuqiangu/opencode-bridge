@@ -1704,6 +1704,52 @@ class DispatchPromptTests(InboundGatewayTestCase):
                          "把一次可能成功的提交变成丢会话")
         self.assertNotIn("/new", self.send_text.last.text)
 
+    def test_a_transport_failure_proven_never_sent_is_a_failure_that_will_be_replayed(self):
+        """⭐ A2：**可证明请求没离开本机** ⇒ 落 ``failed``（恢复层按退避阶梯重放它）。
+
+        与上面那条的差别**只有一个字段**（``request_never_sent``），而两档的结论正好
+        相反 ⇒ 它们必须落**不同的档**，返回值也必须是两个不同的字面量
+        （``"error"`` vs ``"outcome_unknown"``）—— 恢复路径 ``recover_inbox`` 对
+        这两个值**逐个枚举**盖「没跑过」的戳（§7.1 判据⑥：判定里不许有否定式条件）。
+        """
+        self.client.prompt_errors.append(
+            OpenCodeError("POST /session/x -> connection refused", request_never_sent=True)
+        )
+
+        self.deliver()
+
+        self.assertEqual(
+            self.inbox.writes,
+            [("d1", "attempting"), ("d1", "failed")],
+            "连接都没建立 ⇒ agent 不可能跑过 ⇒ 这正是 inbox_recovery 规则 1 说的"
+            "「投递侧盖了压根没提交的戳 ⇒ 明确失败」⛔ 不是 outcome_unknown",
+        )
+        self.assertEqual(self.states_of(), {"d1": DeliveryState.FAILED})
+        self.assertIn("没有发出去", self.send_text.last.text)
+        self.assertIn("自动重投", self.send_text.last.text)
+        self.assertNotIn(
+            "请重新发送一次",
+            self.send_text.last.text,
+            "它会自动重投 ⇒ ⛔ 不许叫用户手动重发：平台不给 message_id 时逐字节相同的"
+            "重发会被去重挡掉，用户只会以为重发没生效",
+        )
+        self.assertNotIn("结果未知", self.send_text.last.text)
+        self.assertNotIn("/new", self.send_text.last.text)
+
+    def test_a_proven_never_sent_failure_is_recorded_with_a_status_clue(self):
+        """盘上那一行仍要带 ``status`` 线索 —— ``last_error`` 是事后唯一的分辨依据。
+
+        ⛔ 这**不是**分档依据（分档依据在 ``state`` 本身），而是让两类「没有 status
+        的失败」在盘上分得开：tests/test_inbox.py 的 AST 守门钉的就是这条。
+        """
+        self.client.prompt_errors.append(
+            OpenCodeError("POST /session/x -> connection refused", request_never_sent=True)
+        )
+
+        self.deliver()
+
+        self.assertIn("status=", self.inbox.failures["d1"])
+
     def test_a_failure_that_carries_a_status_is_still_a_definite_failure(self):
         """反向对照：有 status ⇒ 服务端**明确**给了答复 ⇒ 那一档仍然可重放。
 

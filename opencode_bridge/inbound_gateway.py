@@ -92,6 +92,20 @@ UNKNOWN_OUTCOME_NOTICE = (
     "请检查该会话是否已经处理过；如果没有，请重新发送一次。"
 )
 
+#: 请求**可证明没离开本机**时告诉用户的话。
+#:
+#: ⛔ 它与 :data:`UNKNOWN_OUTCOME_NOTICE` **必须措辞不同**，因为两档的结论**正好相反**：
+#: 那一档是「可能已经跑过」（所以不许自动重发，只能请用户自己确认）；这一档是
+#: 「确定没跑过」—— 连接都没建立，请求一个字节都没发出去。两句若长得一样，
+#: 用户就无法从消息判断该不该自己再发一次。
+#:
+#: ⚠️ 这一档**会**自动重投（落 ``failed`` ⇒ 退避阶梯 + 下次启动重放）⇒ 这里
+#: ⛔ 不许写「请重新发送一次」：那会诱使用户手动重发一条**已经在队列里**的指令。
+PROMPT_NEVER_SENT_NOTICE = (
+    "这一条没有发出去：没能连上 agent，请求从未提交（因此不可能已经执行）。"
+    "已记录，重启后会自动重投。"
+)
+
 #: Values accepted in ``perm:<sessionID>:<reqID>:<decision>`` callbacks.
 _PERM_DECISIONS = ("once", "always", "reject")
 
@@ -888,12 +902,45 @@ class InboundGateway:
                     inbox.mark_pending(queued.delivery_id)
                 return "busy"
             if exc.status is None:
-                # ⚠️⚠️ **这一支就是本次分出第三态的地方**。请求**已经**交给 opencode，
-                # 而失败发生在**传输层**（超时 / 连接被拒 / 流中断，见
-                # ``OpenCodeClient._request``）⇒ 远端**是否收到从未被记录**。
-                # ⇒ ⛔ 绝不能记 ``failed``：那是把"不知道"说成"一定没送到"，而
-                # :mod:`inbox_recovery` 会按退避阶梯重放 ``failed`` ⇒ **agent 对同一条
-                # 指令跑两遍**（AGENTS.md §8 第 3 条：恢复一份没记录过的信息 = 猜）。
+                # ⚠️⚠️ **传输层失败在本次被分成两档**，而分档判据只问一件事：
+                # **请求有没有真的离开本机**（见 ``OpenCodeClient._request``）。
+                #
+                # (1) **可证明没离开**（连接被拒 / DNS 失败）⇒ agent 不可能跑过
+                # ⇒ 落 ``failed``：退避阶梯与预算照管它，下次启动重放。
+                # 这与 ``create_session`` 阶段的传输失败**同型** ——
+                # :func:`~opencode_bridge.inbox_recovery._agent_may_have_run` 的规则 1
+                # 写的就是这一档（「投递侧显式盖『压根没提交』戳 ⇒ 恰恰是**明确失败**」）
+                # ⇒ 同一认识论类别必须落同一档，⛔ 不为此新增状态。
+                if getattr(exc, "request_never_sent", False):
+                    logger.warning(
+                        "prompt never left this host for %s (connection refused /"
+                        " DNS failure before any request was sent); marking it"
+                        " failed so the backoff ladder replays it: %s",
+                        queued.delivery_id, exc,
+                    )
+                    self._send_text(
+                        conversation_id,
+                        f"{PROMPT_NEVER_SENT_NOTICE}（{exc}）",
+                        kind="error",
+                        adapter=adapter,
+                    )
+                    if inbox is not None:
+                        # ⚠️ 句子里仍要带 ``status``：盘上只靠 ``last_error`` 分辨
+                        # 两类（§8 第 3 条 + tests/test_inbox.py 的 AST 守门）。
+                        inbox.mark_failed(
+                            queued.delivery_id,
+                            f"prompt never left this host (status={exc.status}): {exc}",
+                        )
+                    # ⚠️ 返回值必须**已在** ``_DISPATCH_OUTCOMES`` 里：恢复路径
+                    # （``dispatch_recovered``）按 ``("busy", "error")`` 逐个枚举
+                    # 盖「没跑过」的戳，⛔ 新增一个返回值会落进「结果未知」那一支
+                    # （§7.1 判据⑥：判定里不许有否定式条件，缺省留给「不知道」）。
+                    return "error"
+                # (2) **已发出但读响应中断**（超时 / reset / 流中断）⇒ 远端**是否
+                # 收到从未被记录**。⚠️ 注意措辞：这一档是「**未被证明没提交**」，
+                # ⛔ 不是「一定没送到」⇒ 绝不能记 ``failed``：:mod:`inbox_recovery`
+                # 会按退避阶梯重放 ``failed`` ⇒ **agent 对同一条指令跑两遍**
+                # （AGENTS.md §8 第 3 条：恢复一份没记录过的信息 = 猜）。
                 # ⇒ 落 ``outcome_unknown``：恢复层对它**只告警、绝不重放**。
                 logger.warning(
                     "prompt outcome is UNKNOWN for %s (no HTTP status from the"

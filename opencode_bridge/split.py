@@ -37,6 +37,16 @@ from __future__ import annotations
 
 import unicodedata
 
+from .markdown_blocks import (
+    Block,
+    Segment,
+    merge_segments,
+    prefix_allowance,
+    render_chunks,
+    split_block,
+    to_blocks,
+)
+
 __all__ = ["NO_PREFIX_FMT", "SEGMENT_NUMBERING_FMT", "split_text"]
 
 # ---------------------------------------------------------------------------
@@ -263,6 +273,65 @@ def _apply_prefix(
 
 
 # ---------------------------------------------------------------------------
+# 结构感知切分（由 markdown_blocks 注入纯文字切分器）
+# ---------------------------------------------------------------------------
+def _split_prose(text: str, max_len: int) -> list[str]:
+    """纯文字切分：字素感知、不加分段前缀。
+
+    注入给 :mod:`opencode_bridge.markdown_blocks` 当中段的 ``split_prose`` ——
+    结构模块只认结构，文字怎么切由这里说了算。等价于 :func:`_cut_bodies` 在
+    **固定预算**（``prefix_fmt=""`` ⇒ 前缀长度为 0）下取出的正文段序列。
+    """
+    if max_len <= 0:
+        return [text]
+    if len(text) <= max_len:
+        return [text]
+    atoms = _grapheme_atoms(text)
+    if not atoms:
+        return []
+    return [body for body, _ in _cut_bodies(atoms, max_len, NO_PREFIX_FMT, 1)]
+
+
+def _split_markdown(
+    blocks: list[Block],
+    text: str,
+    max_len: int,
+    prefix_fmt: str,
+) -> list[str]:
+    """结构感知切分：围栏 / 表格整块不拦腰切，序号只加在纯文字片。
+
+    与 legacy 两遍法的差异：这里先按「纯文字用扣完前缀的预算、结构片用全额预算」
+    切块，再贪心装片，最后才加一次序号；legacy 是「先按全额切、再按前缀长度
+    重切最多 ``_MAX_PREFIX_PASSES`` 遍」。对**无结构**文本两者逐字节相同——那条
+    走 legacy；有结构时才分岔。段数 ``<= 1`` 时不加编号，与 legacy 同向。
+    """
+    allowance = prefix_allowance(len(text))
+    numbered = max_len > allowance + 16
+    budget = max_len - allowance if numbered else max_len
+    segments: list[Segment] = []
+    for block in blocks:
+        segments.extend(
+            split_block(
+                block,
+                budget if block.kind == "prose" else max_len,
+                _split_prose,
+            )
+        )
+    parts = render_chunks(merge_segments(segments, budget, max_len))
+    if len(parts) <= 1:
+        return [part.text for part in parts]
+    total = len(parts)
+    return [
+        (
+            _render(prefix_fmt, index, total) + part.text
+            if numbered and part.plain
+            else part.text
+        )
+        for index, part in enumerate(parts, 1)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
 def split_text(text: str, max_len: int, *, prefix_fmt: str = NO_PREFIX_FMT) -> list[str]:
@@ -300,6 +369,14 @@ def split_text(text: str, max_len: int, *, prefix_fmt: str = NO_PREFIX_FMT) -> l
         return [text]
     if len(text) <= max_len:
         return [text]
+
+    # 有结构（围栏 / 表格）⇒ 走保形路径。**纯文字单块不进这里**，继续走下面的既有
+    # 长度切分 —— 那条路径逐字节不变（连它在 ``\r\n`` 上的既有行为也一并保持），
+    # 这是本模块对全部 13 个生产调用点的兼容承诺。
+    blocks = to_blocks(text)
+    if not (len(blocks) == 1 and blocks[0].kind == "prose"):
+        return _split_markdown(blocks, text, max_len, prefix_fmt)
+
     atoms = _grapheme_atoms(text)
     if not atoms:  # 理论不可达（空串已被 len 检查拦下），纯防御
         return []

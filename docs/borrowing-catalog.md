@@ -66,17 +66,20 @@ credentials,abort}.ts` + `src/channels/connection-state.ts` +
 关键事实（`opencode_client._request`）：`HTTPError` ⇒ 带 status（服务端**已答复**）；`(URLError, OSError, HTTPException)` ⇒ status=None ⇒ **这一类混装**「连接未建立（请求没出门）」与「已发出但读响应时断（可能已提交）」⇒ 现状**无法区分**。
 ⇒ 与 §1-A 的差：①「确定未提交」与「可能已提交」未分（前者可安全自动补投）；② §1-B 的**手动补投面完全缺失**（桥只有「请重新发送一次」告警）。
 ⇒ 待用户拍板：手动补投的**入口形状**；「未提交」是否提升为独立可自动恢复档（会触碰 `_request` 分档 + 可能改 `_dispatch_prompt` 返回契约，而 fix-300 明写「⛔ 不许在缺陷修复里顺手改契约」）。
+⇒ ⭐ **2026-10-16 用户已拍板 + A2 已落地**：形状 = 手动补投走**群内命令 `/delivery retry`**（列出本会话待补投项 + 按序号补投指定一条）；「确定未提交」**不新增状态档**、**复用既有 `failed`**（可重放 ⇒ 自动重投）。**A2 已落地（`a21abfb`）** = 传输层分档：新增 `request_phase.py` 的 `request_definitely_never_sent(exc)`（链中 `ConnectionRefusedError`/`socket.gaierror` ⇒ True；`TimeoutError`/`ConnectionResetError`/`RemoteDisconnected`/`SSLError` 等一律 False ⇒ fail-safe）+ `OpenCodeError` keyword-only 字段 `request_never_sent`（默认 False）+ `_dispatch_prompt` 的 `status is None` 分支拆两档 ⇒ 上面那条「现状**无法区分**」在**传输层这一档已不成立**（服务端**已答复**的 status 档本来就能分）。⚠️ `_dispatch_prompt` **返回契约未动**（复用既有 `"error"`，不新增返回值 ⇒ `recover_inbox`/`dispatch_recovered` 零改动）；⚠️ 知情代价：从未提交的消息也走退避阶梯与预算、最终可能 abandoned。**A1（`/delivery retry`）待落地**。
 
 **B（冷历史恢复答复）**——API 存在：`OpenCodeClient.messages(session_id, *, limit=100)` ⇒ `GET /api/session/{id}/message` ⇒ `list[dict]`；⚠️ **生产零调用点**（仅 2 处测试，用假桩 ⇒ 形状未被真机核过）。
 v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2.0.22`）：Base `{id: "msg_" 前缀, metadata?, time.created}`；`{type: "user", text}`；`{type: "assistant", content: [...]}`，其中 `{type: "text", text}` = 正文片段。
 ⚠️ 关键缺口：失败路径上**拿不到 prompt 的 msg id**（`prompt()` 抛了 ⇒ 无 `data.id`）⇒ §1-C 的「按 requestId 精确匹配回合」**不可直接照搬**；桥只能按 `queued.text` + 时间序定位（弱于参考；同文本重发会歧义）。
 ⚠️ 未核实：真机 envelope 与字段名（需一次真实 GET；本机无运行中的 opencode server）。
 ⇒ 待用户拍板：无 requestId 时的对接口径（按文本 + 时间序，还是先搁置待真机）。
+⇒ ⭐ **2026-10-16 用户已拍板**：对接口径 = **先按 `queued.text` + 时间序定位 assistant 正文**（⛔ 不照搬 §1-C 的 requestId 匹配）。**B 待落地**。
 
 **D（审批超时语义）**——现状：`event_stream._on_permission_asked` 只**渲染 + 记账**（`PermissionLedger.record_asked`），**无任何等待 / 超时 / 队列门控**；`PermissionLedger` 无超时（其 docstring 明写「缺超时」非 C4 根因）；档位 pending / already_replied / resolved_upstream / unseen，进程内、重启清空、容量 512。
 「审批期间其他文本不进下一轮」在桥上是**间接**由服务端 busy 实现（审批挂起 ⇒ 那轮不结束 ⇒ 新 prompt 得 409 ⇒ 落 `pending`），⛔ 不是桥显式门控。⚠️ a2a `reply_timeout=300s` 是 task 阻塞、**另一回事**。
 ⇒ 与 §1-F 的差：①「等待上限、到期按**取消**结束」桥没有；②「群聊只认发起者」桥现状未核（callback 只有白名单闸）；③ `accepting` 旗桥没有。
 ⇒ 待用户拍板：是否引入桥侧定时器「到期按取消」+ 超时值；范围（是否含「群聊只认发起者」）。
+⇒ ⭐ **2026-10-16 用户已拍板**：**引入桥侧定时器，等待上限 5 分钟、到期按取消（非拒绝）**；本轮范围**只做超时**，⛔ 不含「群聊只认发起者」与 `accepting` 旗。⚠️ **前置未核实**：桥侧是否有「权限答复」通道、以及「取消」语义**能否在 API 层表达**（`permission_ledger` 只有 pending/already_replied/resolved_upstream/unseen 档）⇒ **核实前不动手**。**D 待落地**。
 
 ---
 

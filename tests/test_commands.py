@@ -2,7 +2,7 @@
 
 这一整个文件存在的理由是 AGENTS.md §5.1 说的"抽出去"那种拆法：新类必须能脱离
 原类单独测。所以这里没有 ``make_env``、没有适配器挂载、没有 ``BridgeCore``；
-八个协作者要么是真实的小对象（``Config`` / ``ConversationState`` / ``StateStore`` /
+九个协作者要么是真实的小对象（``Config`` / ``ConversationState`` / ``StateStore`` /
 权限账本），要么是本文件里现造的替身。
 
 因此这里能断言 core 层面**看不见**的东西：``platform`` 透传、``drop`` 与
@@ -26,6 +26,7 @@ from opencode_bridge.commands import (
 from opencode_bridge.config import Config
 from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.core import BridgeCore
+from opencode_bridge.delivery_retry import DeliveryReply
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.permission_ledger import PermissionLedger
@@ -42,7 +43,7 @@ NULL_BYTE = "\x00"
 
 
 # ----------------------------------------------------------------------
-# 替身：八个协作者里只有 client / 发信 / 建会话 / 删会话需要替身
+# 替身：九个协作者里只有 client / 发信 / 建会话 / 删会话与两条子命令需要替身
 # ----------------------------------------------------------------------
 class RecordingOpenCodeClient:
     """``CommandHandler`` 会用到的三个接口（就这三个：interrupt / get_session /
@@ -194,11 +195,27 @@ class StubModelCommand:
         return self.reply
 
 
+class StubDeliveryRetryCommand:
+    """只回放一条固定回复。
+
+    ``/delivery`` 自己的清单、序号解析与文案在 ``tests/test_delivery_retry.py``
+    里测；这里只关心本类有没有把 ``text`` / ``kind`` 原样交给 ``send_text``。
+    """
+
+    def __init__(self, reply: DeliveryReply) -> None:
+        self.reply = reply
+        self.calls: list[tuple[str, str]] = []
+
+    def reply_for(self, conversation_id: str, args: str) -> DeliveryReply:
+        self.calls.append((conversation_id, args))
+        return self.reply
+
+
 # ----------------------------------------------------------------------
 # 基类：造一套 CommandHandler（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class HandlerTestCase(unittest.TestCase):
-    """每个用例一套全新的八件协作者。"""
+    """每个用例一套全新的九件协作者。"""
 
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -215,6 +232,9 @@ class HandlerTestCase(unittest.TestCase):
             CommandReply("当前模型: prov/model-x", kind="text",
                          session_id=SESSION_ID)
         )
+        self.delivery_retry = StubDeliveryRetryCommand(
+            DeliveryReply("已补投 #1：hello", kind="text")
+        )
         #: 真对象（不是替身）：本文件要测的正是"命令侧与账本之间有没有接线"。
         self.permission_ledger = PermissionLedger()
         self.handler = CommandHandler(
@@ -222,6 +242,7 @@ class HandlerTestCase(unittest.TestCase):
             config=self.config,
             conversation_state=self.conversation_state,
             model_command=self.model_command,
+            delivery_retry=self.delivery_retry,
             ensure_session=self.ensure_session,
             drop_session=self.drop_session,
             send_text=self.send_text,
@@ -246,12 +267,13 @@ class HandlerTestCase(unittest.TestCase):
 # 1-2: 依赖面（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(HandlerTestCase):
-    def test_the_constructor_takes_exactly_the_eight_collaborators(self):
+    def test_the_constructor_takes_exactly_the_nine_collaborators(self):
         parameters = inspect.signature(CommandHandler.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "config", "conversation_state", "model_command",
-             "ensure_session", "drop_session", "send_text", "permission_ledger"],
+             "delivery_retry", "ensure_session", "drop_session", "send_text",
+             "permission_ledger"],
         )
         for name, parameter in parameters.items():
             if name == "self":

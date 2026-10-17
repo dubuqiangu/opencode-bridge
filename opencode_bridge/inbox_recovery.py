@@ -35,7 +35,7 @@ callable**，本模块对它们一无所知。
 :attr:`~opencode_bridge.inbox.DeliveryState.OUTCOME_UNKNOWN`；它与 ``attempting``
 在**恢复层**没有区别（同一批行、同一句告警、同样不重放），差别只在"谁发现的"。
 
-⚠️ 而 :func:`_replay_one` 是这一档的**第二个**产地：启动重放时投递侧抛出的异常若
+⚠️ 而 :func:`replay_one` 是这一档的**第二个**产地：启动重放时投递侧抛出的异常若
 "可能 agent 已经跑过"，那一行就落 ``outcome_unknown`` 而不是 ``failed``
 （:func:`_agent_may_have_run` 判据）⇒ 而它**当轮**就会被第 3 步读出来告警，
 因为第 3 步跑在第 1/2 步**之后**。
@@ -70,9 +70,14 @@ from .inbox import (
 __all__ = [
     "BACKOFF_LADDER_SECONDS",
     "MAX_ATTEMPTS",
+    "REPLAY_DELIVERED",
+    "REPLAY_FAILED",
+    "REPLAY_NOT_ATTEMPTED",
+    "REPLAY_OUTCOME_UNKNOWN",
     "RecoveryOutcome",
     "mark_prompt_never_sent",
     "recover_pending",
+    "replay_one",
 ]
 
 logger = logging.getLogger("opencode_bridge.inbox_recovery")
@@ -82,6 +87,20 @@ logger = logging.getLogger("opencode_bridge.inbox_recovery")
 # 写 ``not_before``，而 :class:`QueuedPrompt` 不带 ``attempts``，恢复层自己算不出
 # "还差几次预算"。放在恢复层会造成循环 import，所以这里只做转发 ——
 # 调用方 ``from opencode_bridge import inbox_recovery`` 就能拿到全部策略常量。
+
+#: :func:`replay_one` 的**四种返回值** —— 调用方（群内手动补投）按它决定说哪句话，
+#: ⛔ 不从 :class:`RecoveryOutcome` 的成员里反推：批量恢复只关心「成功」那一种，
+#: 而手动补投要**逐档**告诉用户发生了什么。
+#:
+#: ⚠️ ``REPLAY_NOT_ATTEMPTED`` 是**独立一档**，⛔ 不许并进 ``REPLAY_FAILED``：
+#: 它指 ``mark_attempting`` 写失败因而**压根没投**那条路（:func:`replay_one` 里有整段
+#: 注释讲为什么那一档必须存在）。两者对盘上的影响**不同** —— 前一档那一行**没被动过**
+#: （仍是 ``pending``/``failed``，下次恢复照样会试），后一档已经落 ``failed`` 且
+#: **消耗了一级重试预算**。并档就等于告诉用户「失败了」，而真相是「这次根本没试」。
+REPLAY_DELIVERED = "delivered"
+REPLAY_FAILED = "failed"
+REPLAY_OUTCOME_UNKNOWN = "outcome_unknown"
+REPLAY_NOT_ATTEMPTED = "not_attempted"
 
 
 @dataclass
@@ -116,7 +135,7 @@ def _safe_action(action: Callable[[], None], *, doing: str) -> bool:
     """做一次收件箱写入。**成功**返回 ``True``；失败只记日志并返回 ``False``
     （那一行会留给下次恢复再处理）。
 
-    ⚠️ 返回值不是装饰：:func:`_replay_one` 要靠它决定**敢不敢投递** ——
+    ⚠️ 返回值不是装饰：:func:`replay_one` 要靠它决定**敢不敢投递** ——
     见那里「记不下 ``attempting`` 就不投」那一段。⇒ 把它改成只打印的话，
     那一段的判据就成了恒真的（§9）。
     """
@@ -241,13 +260,28 @@ def _replay_failure_reason(exc: BaseException) -> str:
     )
 
 
-def _replay_one(
+def replay_one(
     prompt: QueuedPrompt,
     inbox: InboundInbox,
     dispatch: Callable[[QueuedPrompt], None],
     outcome: RecoveryOutcome,
-) -> None:
+) -> str:
     """重放一条：写 ``attempting`` → 投递 → 成功才写 ``delivered``。
+
+    :returns: 四种结果之一（模块级 ``REPLAY_*`` 常量）——
+
+        * :data:`REPLAY_DELIVERED` —— 投出去且那行记成了 ``delivered``；
+        * :data:`REPLAY_FAILED` —— 明确失败，已落 ``failed``（**消耗了一级重试预算**；
+          预算刚好在这里耗尽时那一行会转 ``abandoned``，由调用方查收件箱判定）；
+        * :data:`REPLAY_OUTCOME_UNKNOWN` —— 落 ``outcome_unknown``（请求可能**已经**
+          交出去）⇒ **绝不重放**，也**不碰**预算；
+        * :data:`REPLAY_NOT_ATTEMPTED` —— ``mark_attempting`` 写失败 ⇒ **压根没投**
+          （理由见下），那一行留在盘上等下次恢复。
+
+    ⚠️ 批量恢复（:func:`recover_pending`）**不看返回值** —— 它靠
+    :class:`RecoveryOutcome` 记账；这个返回值是给**群内手动补投**用的，那一侧要逐档
+    给用户一句不同的话。⇒ ⛔ 改这里时两处调用点都要看一眼（:func:`_replay_batch`
+    忽略它，:mod:`opencode_bridge.delivery_retry` 按它分话）。
 
     投递抛异常时**分两档**记（:func:`_agent_may_have_run` 判）：
 
@@ -291,7 +325,7 @@ def _replay_one(
             " the next boot replays (the prompt may already have been submitted)",
             prompt.delivery_id,
         )
-        return
+        return REPLAY_NOT_ATTEMPTED
     try:
         dispatch(prompt)
     except Exception as exc:
@@ -312,18 +346,19 @@ def _replay_one(
                 lambda: inbox.mark_outcome_unknown(prompt.delivery_id, reason),
                 doing="mark the row outcome-unknown",
             )
-            return
+            return REPLAY_OUTCOME_UNKNOWN
         logger.warning(
             "inbox recovery: replaying %s failed (%s)", prompt.delivery_id, reason
         )
         _safe_action(
             lambda: inbox.mark_failed(prompt.delivery_id, reason), doing="mark the row failed"
         )
-        return
+        return REPLAY_FAILED
     _safe_action(
         lambda: inbox.mark_delivered(prompt.delivery_id), doing="mark the row delivered"
     )
     outcome.replayed.append(prompt)
+    return REPLAY_DELIVERED
 
 
 def _replay_batch(
@@ -333,7 +368,8 @@ def _replay_batch(
     outcome: RecoveryOutcome,
 ) -> None:
     for prompt in prompts:
-        _replay_one(prompt, inbox, dispatch, outcome)
+        # 返回值只对手动补投那一侧有意义；批量恢复走的是 outcome 账本。
+        replay_one(prompt, inbox, dispatch, outcome)
 
 
 def recover_pending(

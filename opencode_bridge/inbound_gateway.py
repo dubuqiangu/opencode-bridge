@@ -1147,70 +1147,6 @@ class InboundGateway:
                 _EVENT_STREAM_CONFIRMED_TIMEOUT_SECONDS,
             )
 
-        def dispatch_recovered(queued: QueuedPrompt) -> None:
-            """Hand one recovered prompt to opencode.
-
-            Goes through the very same :meth:`_dispatch_prompt` a live message
-            takes, which is also why the inbox bookkeeping is split the way it
-            is: :func:`~.inbox_recovery.recover_pending` owns the writes here
-            (it brackets this call with ``mark_attempting`` / ``mark_delivered``),
-            so a second ``mark_failed`` from inside the dispatch would burn two
-            retry-budget steps for one failure.
-
-            Anything other than ``ok`` raises so recovery records the row and
-            the next boot decides. ``busy`` included: at startup there
-            is no in-memory queue to fall back into.
-
-            ⚠️⚠️ 抛出去的**是哪一档**决定恢复层记 ``failed`` 还是 ``outcome_unknown``
-            ⇒ 而**这一层是唯一知道「prompt 有没有真的交出去」的地方**：
-            :meth:`_dispatch_prompt` 判完了，异常本身却把两档压成同一个字符串。
-            ⇒ 所以**两档不许合成同一个异常**，判据在
-            :func:`~.inbox_recovery._agent_may_have_run`：
-
-            * ``outcome_unknown`` ⇒ 抛**不带 status** 的
-              :class:`~opencode_bridge.opencode_client.OpenCodeError`
-              ⇒ 恢复层判成「可能已经跑过」⇒ **只告警、绝不重放**；
-            * ``busy`` / ``error`` ⇒ 那两档 prompt **压根没提交**，重放**安全**，与实况
-              路径把行记成 ``failed`` 完全一致 ⇒ 用
-              :func:`~.inbox_recovery.mark_prompt_never_sent` 盖上那一档的戳。
-
-            ⛔ **不许**在这里自己编一个 status 出来（服务端到底答了什么，只有
-            :meth:`_dispatch_prompt` 看得见），⛔ 也不许把「认不出来的返回值」一律
-            当成明确失败 —— 缺省必须是**不知道**那一侧。判据：
-            :mod:`tests.test_inbound_gateway` 两条用例分别走这两档，外加一条守门
-            钉住「每个明确失败的返回值都必须在这里被点名」。
-
-            ⚠️ **知情代价**：那一抛把服务端**真正的** status 丢了 ⇒ 恢复路径落
-            ``failed`` 时 ``last_error`` 里的 ``status=`` 恒为 ``None``（而实况路径
-            会记下真实的 4xx/5xx）。分档**不受影响**（真正分开两档的是
-            ``agent_may_have_run``，它在盘上），丢的只是排查时能看到的那个数字。
-            ⛔ 想把它带回来就得让 :meth:`_dispatch_prompt` 在恢复路径上重抛原始
-            异常，而那会改掉它 ``ok``/``busy``/``error`` 的返回契约
-            （:mod:`tests.test_inbound_gateway` 有两条用例钉着那个契约）——
-            ⇒ 那是**设计改动**，不在缺陷修复里顺手做。
-            """
-            outcome = self._dispatch_prompt(queued, recording_delivery=False)
-            if outcome == "ok":
-                return
-            # ⚠️ 下面那两个字面量是 ``_dispatch_prompt`` **每一个**「明确失败」的
-            # 返回值，必须与那边的集合逐字对齐 ⇒ 判据是
-            # ``TestEveryDispatchOutcomeIsClassified`` 那几条（它查的是**形状**：
-            # 盖戳那一支的判定里不许有否定式条件）。
-            if outcome in ("busy", "error"):
-                raise mark_prompt_never_sent(
-                    OpenCodeError(f"replay of {queued.delivery_id} returned {outcome!r}")
-                )
-            # ⛔ **这一支是 fail-safe 的缺省**：任何**认不出来**的返回值都按
-            # 「可能 agent 已经跑过」处理 ⇒ 只告警、绝不重放。
-            # ⇒ 上一版的形状是反的（``!= "ok"`` 一律盖「压根没提交」的戳）⇒ 那样
-            # 一个**新增**的、含义为「结果未知」的返回值会被当成可重放 ⇒ 双跑。
-            # ⇒ 误判方向也必须是保守的那一侧：宁可丢一条消息（用户被告知重新发送），
-            # 不可让 agent 对同一条指令跑两遍。
-            raise OpenCodeError(
-                f"replay of {queued.delivery_id} ended with an UNKNOWN outcome"
-                f" ({outcome!r})"
-            )
-
         def notify_recovered(conversation_id: str, alert_text: str) -> None:
             """Send one user-visible recovery alert; never let it vanish."""
             if self._send_text(conversation_id, alert_text, kind="text") is None:
@@ -1223,7 +1159,7 @@ class InboundGateway:
         logger.info("write-ahead inbox enabled; scanning for rows left by a crash")
         outcome = recover_pending(
             inbox,
-            dispatch=dispatch_recovered,
+            dispatch=self.dispatch_recovered,
             notify=notify_recovered,
         )
         logger.info(
@@ -1232,4 +1168,68 @@ class InboundGateway:
             len(outcome.replayed),
             len(outcome.uncertain),
             len(outcome.abandoned),
+        )
+
+    def dispatch_recovered(self, queued: QueuedPrompt) -> None:
+        """Hand one recovered prompt to opencode.
+
+        Goes through the very same :meth:`_dispatch_prompt` a live message
+        takes, which is also why the inbox bookkeeping is split the way it
+        is: :func:`~.inbox_recovery.recover_pending` owns the writes here
+        (it brackets this call with ``mark_attempting`` / ``mark_delivered``),
+        so a second ``mark_failed`` from inside the dispatch would burn two
+        retry-budget steps for one failure.
+
+        Anything other than ``ok`` raises so recovery records the row and
+        the next boot decides. ``busy`` included: at startup there
+        is no in-memory queue to fall back into.
+
+        ⚠️⚠️ 抛出去的**是哪一档**决定恢复层记 ``failed`` 还是 ``outcome_unknown``
+        ⇒ 而**这一层是唯一知道「prompt 有没有真的交出去」的地方**：
+        :meth:`_dispatch_prompt` 判完了，异常本身却把两档压成同一个字符串。
+        ⇒ 所以**两档不许合成同一个异常**，判据在
+        :func:`~.inbox_recovery._agent_may_have_run`：
+
+        * ``outcome_unknown`` ⇒ 抛**不带 status** 的
+          :class:`~opencode_bridge.opencode_client.OpenCodeError`
+          ⇒ 恢复层判成「可能已经跑过」⇒ **只告警、绝不重放**；
+        * ``busy`` / ``error`` ⇒ 那两档 prompt **压根没提交**，重放**安全**，与实况
+          路径把行记成 ``failed`` 完全一致 ⇒ 用
+          :func:`~.inbox_recovery.mark_prompt_never_sent` 盖上那一档的戳。
+
+        ⛔ **不许**在这里自己编一个 status 出来（服务端到底答了什么，只有
+        :meth:`_dispatch_prompt` 看得见），⛔ 也不许把「认不出来的返回值」一律
+        当成明确失败 —— 缺省必须是**不知道**那一侧。判据：
+        :mod:`tests.test_inbound_gateway` 两条用例分别走这两档，外加一条守门
+        钉住「每个明确失败的返回值都必须在这里被点名」。
+
+        ⚠️ **知情代价**：那一抛把服务端**真正的** status 丢了 ⇒ 恢复路径落
+        ``failed`` 时 ``last_error`` 里的 ``status=`` 恒为 ``None``（而实况路径
+        会记下真实的 4xx/5xx）。分档**不受影响**（真正分开两档的是
+        ``agent_may_have_run``，它在盘上），丢的只是排查时能看到的那个数字。
+        ⛔ 想把它带回来就得让 :meth:`_dispatch_prompt` 在恢复路径上重抛原始
+        异常，而那会改掉它 ``ok``/``busy``/``error`` 的返回契约
+        （:mod:`tests.test_inbound_gateway` 有两条用例钉着那个契约）——
+        ⇒ 那是**设计改动**，不在缺陷修复里顺手做。
+        """
+        outcome = self._dispatch_prompt(queued, recording_delivery=False)
+        if outcome == "ok":
+            return
+        # ⚠️ 下面那两个字面量是 ``_dispatch_prompt`` **每一个**「明确失败」的
+        # 返回值，必须与那边的集合逐字对齐 ⇒ 判据是
+        # ``TestEveryDispatchOutcomeIsClassified`` 那几条（它查的是**形状**：
+        # 盖戳那一支的判定里不许有否定式条件）。
+        if outcome in ("busy", "error"):
+            raise mark_prompt_never_sent(
+                OpenCodeError(f"replay of {queued.delivery_id} returned {outcome!r}")
+            )
+        # ⛔ **这一支是 fail-safe 的缺省**：任何**认不出来**的返回值都按
+        # 「可能 agent 已经跑过」处理 ⇒ 只告警、绝不重放。
+        # ⇒ 上一版的形状是反的（``!= "ok"`` 一律盖「压根没提交」的戳）⇒ 那样
+        # 一个**新增**的、含义为「结果未知」的返回值会被当成可重放 ⇒ 双跑。
+        # ⇒ 误判方向也必须是保守的那一侧：宁可丢一条消息（用户被告知重新发送），
+        # 不可让 agent 对同一条指令跑两遍。
+        raise OpenCodeError(
+            f"replay of {queued.delivery_id} ended with an UNKNOWN outcome"
+            f" ({outcome!r})"
         )

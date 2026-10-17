@@ -1,14 +1,15 @@
 """IM 侧斜杠命令：``/help`` ``/setup`` ``/new`` ``/stop`` ``/status`` ``/cd``
-``/approve`` ``/deny``，以及 ``/model`` 的转发。
+``/approve`` ``/deny``，以及 ``/model`` ``/delivery`` 的转发。
 
 这一整块原先是 :class:`~opencode_bridge.core.BridgeCore` 的十几个私有方法。搬出来
 是因为那个类已经远超 AGENTS.md §5.1 的阈值（方法数 ~15+ / 类自身代码行 ~250+），
-而命令处理恰好是其中**耦合最浅**的一块：它对 core 的依赖只有八个协作者
+而命令处理恰好是其中**耦合最浅**的一块：它对 core 的依赖只有九个协作者
 （见 :class:`CommandHandler`），搬出去之后既不用碰 core 的运行期状态
 （``_turns`` / ``_sid_conv`` / ``_lock`` 那一摊），又能脱离 core 单独测试。
 
 搬法与同一次拆分的前一步一致：``/model`` 已经在
-:mod:`opencode_bridge.session_model` 里，core 侧只留一个转发；这里同理，
+:mod:`opencode_bridge.session_model` 里、``/delivery`` 在
+:mod:`opencode_bridge.delivery_retry` 里，core 侧只留一个转发；这里同理，
 :class:`~opencode_bridge.core.BridgeCore` 只留 :meth:`~opencode_bridge.core.BridgeCore._handle_command`
 一个转发点（``on_inbound`` 的调用点不变）。
 
@@ -29,6 +30,7 @@ from collections.abc import Callable
 from .adapters import Adapter
 from .config import DEFAULT_CONFIG_NAME, Config
 from .conversation_keys import ConversationState
+from .delivery_retry import DeliveryRetryCommand
 from .hooks import Button, MsgHandle, Outbound
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient, OpenCodeError
@@ -54,6 +56,7 @@ HELP_TEXT = """\
 /status                     查看当前会话状态
 /model [provider/id]         查看或切换当前会话使用的模型
 /cd <目录>                  切换工作目录并新建会话
+/delivery retry             列出待补投的消息，或按序号补投一条
 /approve <请求ID> [always]  允许权限请求（always = 总是允许）
 /deny <请求ID>              拒绝权限请求
 直接发送文本即可与 agent 对话。
@@ -245,12 +248,13 @@ DropSession = Callable[..., str | None]
 class CommandHandler:
     """斜杠命令的全部逻辑：认命令、分支、回话。
 
-    与 :class:`~opencode_bridge.core.BridgeCore` 之间只有 :meth:`__init__` 里那八个
+    与 :class:`~opencode_bridge.core.BridgeCore` 之间只有 :meth:`__init__` 里那九个
     注入的协作者 —— **没有** core 引用、也不读 core 的任何私有状态，所以这一整块
     能脱离 core 单独测（见 ``tests/test_commands.py``）。
 
     ``/model`` 的参数解析与模型目录缓存在
-    :mod:`opencode_bridge.session_model` 里，这里仍然只是转发（同一次拆分的前一步，
+    :mod:`opencode_bridge.session_model` 里、``/delivery retry`` 的补投逻辑在
+    :mod:`opencode_bridge.delivery_retry` 里，这里仍然只是转发（同一次拆分的前一步，
     边界没变）。命令**绝不**写进收件箱这件事也不在这里：落盘由
     :meth:`~opencode_bridge.core.BridgeCore.on_inbound` 决定要不要做，命令自己从不经过
     ``prompt()``。
@@ -263,12 +267,13 @@ class CommandHandler:
         config: Config,
         conversation_state: ConversationState,
         model_command: SessionModelCommand,
+        delivery_retry: DeliveryRetryCommand,
         ensure_session: EnsureSession,
         drop_session: DropSession,
         send_text: SendText,
         permission_ledger: PermissionLedger,
     ) -> None:
-        """八个协作者全部由 core 注入，本类不自己去找。
+        """九个协作者全部由 core 注入，本类不自己去找。
 
         ``client`` 只用到 ``get_session`` / ``interrupt`` / ``reply_permission``；
         ``conversation_state`` 只用到 ``get_session`` / ``set_meta``；
@@ -282,6 +287,7 @@ class CommandHandler:
         self._config = config
         self._conversation_state = conversation_state
         self._model_command = model_command
+        self._delivery_retry = delivery_retry
         self._ensure_session = ensure_session
         self._drop_session = drop_session
         self._send_text = send_text
@@ -313,6 +319,7 @@ class CommandHandler:
             "stop": self._cmd_stop,
             "status": self._cmd_status,
             "model": self._cmd_model,
+            "delivery": self._cmd_delivery,
             "cd": self._cmd_cd,
             "approve": self._cmd_approve,
             "allow": self._cmd_approve,
@@ -482,6 +489,15 @@ class CommandHandler:
             conversation_id, reply.text, kind=reply.kind, adapter=adapter,
             session_id=reply.session_id,
         )
+
+    def _cmd_delivery(self, conversation_id: str, adapter: Adapter, args: str) -> None:
+        """``/delivery`` —— 逻辑在 :mod:`opencode_bridge.delivery_retry`，这里只转发。
+
+        :class:`~opencode_bridge.delivery_retry.DeliveryReply` 不带 ``session_id``
+        （这条命令没有会话可指），所以这里比 :meth:`_cmd_model` 少一个参数。
+        """
+        reply = self._delivery_retry.reply_for(conversation_id, args)
+        self._send_text(conversation_id, reply.text, kind=reply.kind, adapter=adapter)
 
     def _cmd_approve(
         self, conversation_id: str, adapter: Adapter, args: str

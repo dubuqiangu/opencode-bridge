@@ -64,6 +64,7 @@ from .commands import (
 )
 from .config import Config
 from .conversation_keys import ConversationState
+from .delivery_retry import DeliveryRetryCommand
 from .event_stream import EventStream, Turn
 from .health import platform_key, probe_after_start
 from .held_buffer_store import HeldBufferStore
@@ -73,7 +74,7 @@ from .hooks import Inbound  # BridgeCore implements Hooks
 # ``Turn`` 也要 import：turn 表留在 core 的视野里（事件流与入站那一侧共用同一个
 # dict），但类型本身归事件流所有 —— 改一处只碰一个类。
 from .inbound_gateway import InboundGateway
-from .inbox import InboundInbox
+from .inbox import InboundInbox, QueuedPrompt
 # ``NO_OUTPUT_TEXT`` 与 ``ruleset_for`` 跟着各自的实现搬走了（出站那一侧与会话
 # 映射那一侧），但它们在 ``__all__`` 里、``tests/test_core.py`` 与 ``__main__``
 # 都按 ``core`` 的路径 import —— 所以这里**再导出**，导入路径不能因为搬动而变。
@@ -285,8 +286,21 @@ class BridgeCore:
         self.model_command = SessionModelCommand(
             client, ensure_session=self.sessions.ensure_session
         )
+        #: ``/delivery retry`` 的全部逻辑（待补投清单、序号解析、回复文案）都在这个
+        #: 对象里。``dispatch`` 是**手动补投那条投递路**：复用网关恢复路径的
+        #: :meth:`~opencode_bridge.inbound_gateway.InboundGateway.dispatch_recovered`
+        #: ⇒ 自动重投与手动补投走**同一条**路，⛔ 这里不为手动补投另写一套投递。
+        #: ⚠️ 构造点早于 ``inbound_gateway`` ⇒ 传进来的是
+        #: :meth:`_dispatch_retried_prompt` 这个**转发**（同 :meth:`_flush_queue`
+        #: 的先例），调用时才解析对方。
+        #: ⚠️ ``inbox`` 允许为 ``None``（write-ahead 收件箱没启用）——
+        #: 那时命令回「收件箱未启用」，⛔ 不是报错。
+        self.delivery_retry = DeliveryRetryCommand(
+            inbox=inbox,
+            dispatch=self._dispatch_retried_prompt,
+        )
         #: 斜杠命令那一整块（``/help`` ``/setup`` ``/new`` ``/stop`` ``/status``
-        #: ``/cd`` ``/approve`` ``/deny`` 与 ``/model`` 的转发）。八个协作者
+        #: ``/cd`` ``/approve`` ``/deny`` 与 ``/model`` ``/delivery`` 的转发）。九个协作者
         #: **显式注入**（见 :class:`~opencode_bridge.commands.CommandHandler`）。
         #: ⚠️ 构造点必须在 ``sessions`` / ``outbound`` **之后**：它们是依赖之一。
         self.commands = CommandHandler(
@@ -294,6 +308,7 @@ class BridgeCore:
             config=config,
             conversation_state=self.conversation_state,
             model_command=self.model_command,
+            delivery_retry=self.delivery_retry,
             ensure_session=self.sessions.ensure_session,
             drop_session=self.sessions.drop_session,
             send_text=self.outbound.send_text,
@@ -525,3 +540,17 @@ class BridgeCore:
         又需要事件流的 ``stream_confirmed``（见 :meth:`__init__` 里的构造顺序说明）。
         """
         self.inbound_gateway.flush_queue(conversation_id)
+
+    def _dispatch_retried_prompt(self, queued: QueuedPrompt) -> None:
+        """``/delivery retry`` 补投一条 —— 转发给入站那一侧的恢复路径。
+
+        与 :meth:`_flush_queue` 同一个理由：
+        :class:`~opencode_bridge.delivery_retry.DeliveryRetryCommand` 是在
+        ``inbound_gateway`` **之前**构造的，所以这里传的是转发，调用时才解析。
+
+        复用的就是
+        :meth:`~opencode_bridge.inbound_gateway.InboundGateway.dispatch_recovered`
+        ⇒ 手动补投与自动重投的**分档语义完全一致**（⛔ 不另写一套投递，
+        理由见那边 docstring 里「两档不许合成同一个异常」那段）。
+        """
+        self.inbound_gateway.dispatch_recovered(queued)

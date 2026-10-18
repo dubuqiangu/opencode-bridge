@@ -34,6 +34,7 @@ from opencode_bridge.hooks import Inbound, MsgHandle, Outbound
 from opencode_bridge.inbound_gateway import InboundGateway
 from opencode_bridge.inbox import QueuedPrompt
 from opencode_bridge.permission_ledger import PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 
 
 # ----------------------------------------------------------------------
@@ -478,6 +479,11 @@ class InjectionIsWiredIntoTheSinglePromptCallTests(unittest.TestCase):
                          kind=kwargs.get("kind", "text"))
             ) or MsgHandle(conversation_id, "m1", "quibblechat"),
             permission_ledger=PermissionLedger(),
+            permission_timeout=PermissionTimeoutWatcher(
+                timeout_seconds=0.05,
+                ledger=PermissionLedger(),
+                notify=lambda session_id, request_id, message: None,
+            ),
             bridge_config={},
         )
         return gateway, client, rows

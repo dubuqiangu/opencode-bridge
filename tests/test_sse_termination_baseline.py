@@ -57,6 +57,7 @@ from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import EventStream
 from opencode_bridge.opencode_client import Endpoint, OpenCodeClient, OpenCodeError
 from opencode_bridge.permission_ledger import PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 from opencode_bridge.state import StateStore
 from opencode_bridge.subscription_supervisor import (
     FIRST_RECONNECT_DELAY_SECONDS,
@@ -335,6 +336,11 @@ def build_event_stream(
         finalize=(lambda *args, **kwargs: None) if finalize is None else finalize,
         flush_queue=lambda conversation_id: None,
         permission_ledger=PermissionLedger(),
+        permission_timeout=PermissionTimeoutWatcher(
+            timeout_seconds=0.05,
+            ledger=PermissionLedger(),
+            notify=lambda session_id, request_id, message: None,
+        ),
     )
 
 

@@ -35,6 +35,7 @@ from .opencode_client import OpenCodeClient
 # ``shown_progress_text``。这不是把出站服务拖进本模块，只是共用它的答案。
 from .outbound import one_message_budget
 from .permission_ledger import PermissionLedger
+from .permission_timeout import PermissionTimeoutWatcher
 from .state import StateStore
 # ``/api/event`` 订阅的**看护者**：重连状态机与退避策略归它（见该模块的 docstring
 # 为什么这件事必须住在另一个文件里）。这里只做装配。
@@ -267,6 +268,7 @@ class EventStream:
         finalize: Finalize,
         flush_queue: FlushQueue,
         permission_ledger: PermissionLedger,
+        permission_timeout: PermissionTimeoutWatcher,
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -282,6 +284,11 @@ class EventStream:
         :mod:`opencode_bridge.permission_ledger`）。本类只在两个时刻写它：
         ``permission.asked``（这是唯一知道 request id 的时刻）与
         ``permission.replied``。
+
+        ``permission_timeout`` 也是**共用**的（命令侧 / 按钮侧要 `cancel` 真回复的
+        计时器，见 :mod:`opencode_bridge.permission_timeout`）。本类三处用它：
+        ``permission.asked`` 时 ``watch``、``permission.replied`` 时 ``cancel``、
+        到点后把超时 IM 渲染给用户（:meth:`_on_permission_timeout`）。
         """
         self._client = client
         self._state = state
@@ -296,6 +303,13 @@ class EventStream:
         self._finalize = finalize
         self._flush_queue = flush_queue
         self._permission_ledger = permission_ledger
+        #: 权限请求的本地超时看护。``permission.asked`` 时 ``watch``、一条真回复落地
+        #: （``permission.replied`` / 命令 / 按钮）时 ``cancel``；到点且仍是 pending
+        #: 就在账本里标成已取消，并**锁外**调 :meth:`_on_permission_timeout` 渲染 IM。
+        self._permission_timeout = permission_timeout
+        #: 把"渲染超时 IM"的回调接到这个看护上：等 core 把本类构造完，它才能真正
+        #: 用 ``_send_text`` 发消息（构造期 ``_send_text`` 已就位，直接接即可）。
+        self._permission_timeout.set_notify(self._on_permission_timeout)
 
         #: ``/api/event`` 订阅的**看护者**。它拥有重连状态机、退避策略与那份
         #: 「正在重连 / 线程已经死了」的状态记录（AGENTS.md §5.1：新机制进新模块，
@@ -365,8 +379,11 @@ class EventStream:
         而**正处于退避等待**中的看护者等的是它自己那个 Event ⇒ 它会睡满这一拍才去
         订阅（那时候订阅立刻返回空），``join(5.0)`` 有可能刚好等不满、平白打一行
         "did not exit within 5s"。
+
+        顺带停掉权限超时看护：关停后不该再有计时器到点发超时 IM。
         """
         self._supervisor.request_stop()
+        self._permission_timeout.stop()
 
     def subscription_status(self) -> SubscriptionStatus:
         """订阅现在处于什么状态 —— 「正在重连」与「线程已经死了」必须分得开。"""
@@ -826,6 +843,7 @@ class EventStream:
         # 之前这里把 request_id 渲染成文字就扔了，之后只能靠用户手敲的字符串
         # 去猜，见 :mod:`opencode_bridge.permission_ledger`）。
         self._permission_ledger.record_asked(session_id, request_id)
+        self._permission_timeout.watch(session_id, request_id)
         text = (
             "🔐 权限请求\n"
             f"动作: {action}\n"
@@ -865,6 +883,36 @@ class EventStream:
             )
             return
         self._permission_ledger.note_replied(session_id, request_id)
+        # 服务端说它结束了 —— 这就是"真回复落地"，把本地超时计时器撤掉，免得它
+        # 稍后到点再发一条假的"已超时"。
+        self._permission_timeout.cancel(session_id, request_id)
+
+    def _on_permission_timeout(self, session_id: str, request_id: str,
+                               message: str) -> None:
+        """一个权限请求在本地超时了（:class:`PermissionTimeoutWatcher` 的计时器到点）。
+
+        在**计时器线程**里被调用，所以必须轻量、必须 try/except 包住。只渲染一条
+        IM 告诉用户它超时了；**不发任何 API**（那是"按取消非拒绝"的边界）。
+
+        会话可能已经没了（等满 5 分钟、用户早把它关掉）—— 那时拿不到 conversation
+        就不发，镜像 :meth:`_on_permission_asked` 的守卫。
+        """
+        try:
+            conversation_id = self._conversation_for(session_id)
+            if not conversation_id:
+                logger.warning(
+                    "permission timeout for a session this bridge no longer "
+                    "serves (session=%s); nothing rendered", session_id,
+                )
+                return
+            self._send_text(
+                conversation_id, message, kind="text", session_id=session_id,
+            )
+        except Exception:
+            logger.exception(
+                "rendering permission timeout failed for %s/%s",
+                session_id, request_id,
+            )
 
     def _finalize_session(self, session_id: str) -> None:
         """Publish the turn's final message, then flush the queue.

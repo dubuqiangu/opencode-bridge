@@ -79,7 +79,7 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 「审批期间其他文本不进下一轮」在桥上是**间接**由服务端 busy 实现（审批挂起 ⇒ 那轮不结束 ⇒ 新 prompt 得 409 ⇒ 落 `pending`），⛔ 不是桥显式门控。⚠️ a2a `reply_timeout=300s` 是 task 阻塞、**另一回事**。
 ⇒ 与 §1-F 的差：①「等待上限、到期按**取消**结束」桥没有；②「群聊只认发起者」桥现状未核（callback 只有白名单闸）；③ `accepting` 旗桥没有。
 ⇒ 待用户拍板：是否引入桥侧定时器「到期按取消」+ 超时值；范围（是否含「群聊只认发起者」）。
-⇒ ⭐ **2026-10-16 用户已拍板**：**引入桥侧定时器，等待上限 5 分钟、到期按取消（非拒绝）**；本轮范围**只做超时**，⛔ 不含「群聊只认发起者」与 `accepting` 旗。⚠️ **前置未核实**：桥侧是否有「权限答复」通道、以及「取消」语义**能否在 API 层表达**（`permission_ledger` 只有 pending/already_replied/resolved_upstream/unseen 档）⇒ **核实前不动手**。**D 待落地**。
+⇒ ⭐ **2026-10-16 用户已拍板**：**引入桥侧定时器，等待上限 5 分钟、到期按取消（非拒绝）**；本轮范围**只做超时**，⛔ 不含「群聊只认发起者」与 `accepting` 旗。⚠️ **前置核实（2026-10-18 两车道定案）**：上游 v2.0.22 **无「取消」API**（`Permission.Reply` 锁死 `["once","always","reject"]`，pending 永久挂、服务关闭时才逐一 reject）⇒ `reject` = 会话级批拒绝、**违背「非拒绝」** ⇒ **唯一忠实实现 = ledger-only 取消**：每 pending 请求 5 分钟 Timer，到期**不发任何 API**、ledger 标 `ANSWER_CANCELLED` + IM 告知用户。⚠️ **知情代价（须文档化）**：服务端那条请求**永久挂到服务关闭**（本桥无法撤回）。⇒ **D 已落地**（见 tasks.md 未完成项总表「dsh-im-connect 借鉴面落地」行）：新增 `permission_timeout.py`（`PermissionTimeoutWatcher`）+ `permission_ledger` 第五态 `ANSWER_CANCELLED` + `record_cancelled`（不重开已关闭请求守卫）+ event_stream/commands/inbound_gateway 三处真回复落点 `cancel`；守门 = tests/test_permission_timeout.py 12 用例 + ledger，定向 472/472 全绿、反向证明 3/3。
 
 ---
 

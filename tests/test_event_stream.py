@@ -29,6 +29,7 @@ from opencode_bridge.permission_ledger import (
     ANSWER_UNSEEN,
     PermissionLedger,
 )
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 from opencode_bridge.state import StateStore
 from tests.test_outbound import ScriptedAdapter
 
@@ -178,6 +179,15 @@ class EventStreamTestCase(unittest.TestCase):
         #: 真对象：本文件要断言的正是"事件流有没有在 ``permission.asked`` 上记账、
         #: 在 ``permission.replied`` 上销账"，所以不能拿替身把它糊过去。
         self.permission_ledger = PermissionLedger()
+        #: 本地超时看护：事件流三处用到它（watch / cancel / 渲染超时 IM）。给一个
+        #: **很长**的超时 —— 本文件只测"watch/cancel 接线"与"账本记账"，不测超时
+        #: 本身（那是 tests/test_permission_timeout.py 的职责）；太短会让
+        #: ``permission.asked`` 之后的 PENDING 断言在计时器到点后被改成 CANCELLED。
+        self.permission_timeout = PermissionTimeoutWatcher(
+            timeout_seconds=3600.0,
+            ledger=self.permission_ledger,
+            notify=lambda session_id, request_id, message: None,
+        )
         self.stream = EventStream(
             client=self.client,
             state=self.state,
@@ -192,6 +202,7 @@ class EventStreamTestCase(unittest.TestCase):
             finalize=self._record_finalize,
             flush_queue=self._flush_queue,
             permission_ledger=self.permission_ledger,
+            permission_timeout=self.permission_timeout,
         )
 
     # --- 五个协作者的可调用替身 -----------------------------------------
@@ -242,6 +253,7 @@ class EventStreamTestCase(unittest.TestCase):
             "finalize": self._record_finalize,
             "flush_queue": self._flush_queue,
             "permission_ledger": self.permission_ledger,
+            "permission_timeout": self.permission_timeout,
         }
         kwargs.update(overrides)
         self.stream = EventStream(**kwargs)
@@ -262,13 +274,14 @@ class EventStreamTestCase(unittest.TestCase):
 # 1-2: 依赖面与共享状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(EventStreamTestCase):
-    def test_the_constructor_takes_the_thirteen_injected_dependencies(self):
+    def test_the_constructor_takes_the_fourteen_injected_dependencies(self):
         parameters = inspect.signature(EventStream.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "state", "lock", "turns", "clock", "edit_interval",
              "max_message_chars", "adapter_for", "send_text", "edit_progress",
-             "finalize", "flush_queue", "permission_ledger"],
+             "finalize", "flush_queue", "permission_ledger",
+             "permission_timeout"],
         )
         for name, parameter in parameters.items():
             if name == "self":

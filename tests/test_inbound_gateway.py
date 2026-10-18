@@ -47,6 +47,7 @@ from opencode_bridge.inbound_merge import BUFFERED_NOTICE, HELD_EXPIRED_NOTICE
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.permission_ledger import REPEATED_ANSWER_ACK, PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 
 CONVERSATION = "chat:55"
 OTHER_CONVERSATION = "chat:66"
@@ -318,6 +319,13 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.answer = RecordingAnswer()
         #: 真对象：本文件要断言的正是按钮那条路上有没有接上账本。
         self.permission_ledger = PermissionLedger()
+        #: 本地超时看护：按钮侧只用到它"真回复落地时撤掉计时器"这一面。给个极短
+        #: 超时，便于需要时测到它。
+        self.permission_timeout = PermissionTimeoutWatcher(
+            timeout_seconds=0.05,
+            ledger=self.permission_ledger,
+            notify=lambda session_id, request_id, message: None,
+        )
         self.gateway = self.build_gateway()
         #: ``_adapter_for`` 返回什么（``None`` = 没有挂适配器）。
         #: ⚠️ 默认值是**真的适配器**而不是裸 ``object()`` —— C1 让投递路径去问
@@ -353,6 +361,7 @@ class InboundGatewayTestCase(unittest.TestCase):
             "remember_platform": self._remember_platform,
             "send_text": self.send_text,
             "permission_ledger": self.permission_ledger,
+            "permission_timeout": self.permission_timeout,
             "bridge_config": self.bridge_config,
         }
         kwargs.update(overrides)
@@ -424,7 +433,7 @@ class InboundGatewayTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(InboundGatewayTestCase):
-    def test_the_constructor_takes_the_fourteen_injected_dependencies(self):
+    def test_the_constructor_takes_the_fifteen_injected_dependencies(self):
         parameters = inspect.signature(InboundGateway.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
@@ -432,7 +441,7 @@ class CollaboratorSurfaceTests(InboundGatewayTestCase):
              "stream_confirmed",
              "adapter_for", "answer_callback", "ensure_session",
              "handle_command", "remember_platform", "send_text",
-             "permission_ledger", "bridge_config"],
+             "permission_ledger", "permission_timeout", "bridge_config"],
         )
         for name, parameter in parameters.items():
             if name == "self":

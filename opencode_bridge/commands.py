@@ -35,6 +35,7 @@ from .hooks import Button, MsgHandle, Outbound
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient, OpenCodeError
 from .permission_ledger import PermissionLedger, repeated_answer_notice
+from .permission_timeout import PermissionTimeoutWatcher
 from .session_model import SessionModelCommand
 
 __all__ = [
@@ -272,14 +273,17 @@ class CommandHandler:
         drop_session: DropSession,
         send_text: SendText,
         permission_ledger: PermissionLedger,
+        permission_timeout: PermissionTimeoutWatcher,
     ) -> None:
-        """九个协作者全部由 core 注入，本类不自己去找。
+        """十个协作者全部由 core 注入，本类不自己去找。
 
         ``client`` 只用到 ``get_session`` / ``interrupt`` / ``reply_permission``；
         ``conversation_state`` 只用到 ``get_session`` / ``set_meta``；
         ``permission_ledger`` 只读到 :meth:`PermissionLedger.status_of`、写到
         :meth:`PermissionLedger.record_answered`（见
         :mod:`opencode_bridge.permission_ledger`）；
+        ``permission_timeout`` 只在一个时刻用到：一条真回复落地后 `cancel` 掉本地
+        超时计时器（见 :mod:`opencode_bridge.permission_timeout`）；
         后三个是 core 那边的函数（建会话、删会话、发信），按**可调用对象**注入，
         所以本类拿不到 core 本身。
         """
@@ -292,6 +296,7 @@ class CommandHandler:
         self._drop_session = drop_session
         self._send_text = send_text
         self._permission_ledger = permission_ledger
+        self._permission_timeout = permission_timeout
 
     # ------------------------------------------------------------------
     # 入口
@@ -604,6 +609,8 @@ class CommandHandler:
         # 只在**成功**之后记账：一次 5xx 若也记成"已答过"，这个还挂在服务端的请求
         # 就再也批准不了（用户唯一能做的事被我们自己锁掉了）。
         self._permission_ledger.record_answered(session_id, request_id, decision)
+        # 真回复落地：撤掉本地超时计时器，免得它稍后到点再发一条假的"已超时"。
+        self._permission_timeout.cancel(session_id, request_id)
         self._send_text(
             conversation_id,
             f"已回复权限请求 {request_id}: {decision}",

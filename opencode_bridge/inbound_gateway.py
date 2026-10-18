@@ -52,6 +52,7 @@ from .permission_ledger import (
     PermissionLedger,
     repeated_answer_notice,
 )
+from .permission_timeout import PermissionTimeoutWatcher
 
 __all__ = ["InboundGateway"]
 
@@ -321,6 +322,7 @@ class InboundGateway:
         remember_platform: RememberPlatform,
         send_text: SendText,
         permission_ledger: PermissionLedger,
+        permission_timeout: PermissionTimeoutWatcher,
         bridge_config: Mapping[str, Any],
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
@@ -347,6 +349,10 @@ class InboundGateway:
         同一个答案 —— 否则同一个请求从两条路各能答一次，去重就成了半拉子
         （见 :mod:`opencode_bridge.permission_ledger`）。
 
+        ``permission_timeout`` 也是**共用**的（命令侧 / 事件流侧都要 `cancel` 真回复
+        的计时器，见 :mod:`opencode_bridge.permission_timeout`）。本类只在一个时刻
+        用到它：一条真回复落地后 `cancel` 掉本地超时计时器。
+
         ``bridge_config`` 是 ``config.bridge`` 那一段（构造时读一次，运行时不会
         被改写）。C3 只从里面取两个数：长输入回执的字数门槛、续行保险丝的秒数。
         刻意**不**注入整个 :class:`~opencode_bridge.config.Config` —— 本类用不到
@@ -366,6 +372,7 @@ class InboundGateway:
         self._remember_platform = remember_platform
         self._send_text = send_text
         self._permission_ledger = permission_ledger
+        self._permission_timeout = permission_timeout
         self._long_input_ack_chars = _positive_int(
             bridge_config.get("long_input_ack_chars"), DEFAULT_LONG_INPUT_ACK_CHARS
         )
@@ -728,6 +735,8 @@ class InboundGateway:
             self._permission_ledger.record_answered(
                 session_id, request_id, decision
             )
+            # 真回复落地：撤掉本地超时计时器，免得它稍后到点再发一条假的"已超时"。
+            self._permission_timeout.cancel(session_id, request_id)
             self._answer(adapter, query_id, "已处理")
         except Exception:
             logger.exception("on_callback failed")

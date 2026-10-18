@@ -43,6 +43,7 @@ __all__ = [
     "ANSWER_PENDING",
     "ANSWER_ALREADY_REPLIED",
     "ANSWER_RESOLVED_UPSTREAM",
+    "ANSWER_CANCELLED",
     "ANSWER_UNSEEN",
     "REPEATED_ANSWER_ACK",
     "repeated_answer_notice",
@@ -52,7 +53,7 @@ logger = logging.getLogger("opencode_bridge.permission_ledger")
 
 
 # ----------------------------------------------------------------------
-# 四种状态
+# 五种状态
 # ----------------------------------------------------------------------
 #: ``permission.asked`` 已经渲染到 IM，而本桥还没为它发过决策。
 ANSWER_PENDING = "pending"
@@ -64,13 +65,27 @@ ANSWER_ALREADY_REPLIED = "already_replied"
 #: 或者 agent 自己走了另一条路）。这是"已经关闭"这件事的**权威**来源。
 ANSWER_RESOLVED_UPSTREAM = "resolved_upstream"
 
+#: **本桥**让这个请求**在本地超时取消**了：桥侧定时器等了 5 分钟没等到答复，把它在
+#: 账本里标成"已取消"。它**没有**向服务端发过任何决策（上游没有"取消"这个 API，
+#: 发 ``reject`` 会变成对整个会话的批量拒绝，违背"到期按取消（非拒绝）"）——
+#: 所以服务端那个请求**仍然挂在那里**（永远没人回答它）。这是"非拒绝"的已知代价，
+#: 写进 :mod:`opencode_bridge.permission_timeout` 的 docstring。
+ANSWER_CANCELLED = "cancelled"
+
 #: 本进程从没见过这个请求：重启之前问的、用户手敲的、或者压根不存在。
 #: ⚠️ **绝不能**据此拒绝 —— 见模块 docstring：服务端才是权威，而在这里拒绝一个
 #: 还活着的请求会把 agent 永远卡住。这个状态一律**照旧转给服务端**，由它来判。
 ANSWER_UNSEEN = "unseen"
 
-#: 这两种状态意味着"再答一次就是对同一个请求的第二次回答"，必须**本地**否掉。
-_CLOSED_STATES = frozenset({ANSWER_ALREADY_REPLIED, ANSWER_RESOLVED_UPSTREAM})
+#: 这三种状态意味着"再答一次就是对同一个请求的第二次回答"，必须**本地**否掉。
+#: 语义各不相同：:data:`ANSWER_ALREADY_REPLIED` 是本桥发过决策、
+#: :data:`ANSWER_RESOLVED_UPSTREAM` 是服务端说它结束了、
+#: :data:`ANSWER_CANCELLED` 是本桥让它在本地超时取消（服务端还挂着）。
+_CLOSED_STATES = frozenset({
+    ANSWER_ALREADY_REPLIED,
+    ANSWER_RESOLVED_UPSTREAM,
+    ANSWER_CANCELLED,
+})
 
 #: 账本最多记多少个请求。权限请求是低频事件（一个请求对应一次工具调用），
 #: 这个上限只为"有界"存在 —— 一个只增不减的账本就是慢速泄漏。
@@ -90,7 +105,8 @@ class PermissionRequestStatus:
     session_id: str
     request_id: str
     #: one of :data:`ANSWER_PENDING` / :data:`ANSWER_ALREADY_REPLIED` /
-    #: :data:`ANSWER_RESOLVED_UPSTREAM` / :data:`ANSWER_UNSEEN`.
+    #: :data:`ANSWER_RESOLVED_UPSTREAM` / :data:`ANSWER_CANCELLED` /
+    #: :data:`ANSWER_UNSEEN`.
     state: str
     #: 本桥**已经**为它发过的决策（:data:`ANSWER_ALREADY_REPLIED` 时非空）。
     #: 留着它是为了让"已回复过"那句话能说清上次答的是什么。
@@ -191,6 +207,27 @@ class PermissionLedger:
             self._remember(key, PermissionRequestStatus(
                 session_id=key[0], request_id=key[1],
                 state=ANSWER_RESOLVED_UPSTREAM,
+            ))
+
+    def record_cancelled(self, session_id: str, request_id: str) -> None:
+        """**本桥**让这个请求在本地超时取消了（等待 5 分钟没答复，见
+        :mod:`opencode_bridge.permission_timeout`）。
+
+        只应被超时定时器调用。**不会**重开一个已经关闭的请求：若计时器到期的瞬间
+        一条真回复刚好抢先落地（:data:`ANSWER_ALREADY_REPLIED` 或
+        :data:`ANSWER_RESOLVED_UPSTREAM`），本方法直接返回、不覆盖它 —— 否则晚到
+        的计时器会把一次真回答抹成"已取消"。
+        """
+        key = self._key(session_id, request_id)
+        if key is None:
+            return
+        with self._lock:
+            tracked = self._requests.get(key)
+            if tracked is not None and tracked.already_closed:
+                return
+            self._remember(key, PermissionRequestStatus(
+                session_id=key[0], request_id=key[1],
+                state=ANSWER_CANCELLED,
             ))
 
     # ------------------------------------------------------------------

@@ -81,6 +81,10 @@ from .inbox import InboundInbox, QueuedPrompt
 from .outbound import NO_OUTPUT_TEXT, OutboundSender
 from .opencode_client import OpenCodeClient
 from .permission_ledger import PermissionLedger
+from .permission_timeout import (
+    PERMISSION_TIMEOUT_SECONDS,
+    PermissionTimeoutWatcher,
+)
 from .session_model import SessionModelCommand
 from .session_registry import SessionRegistry, ruleset_for
 from .state import StateStore
@@ -230,6 +234,16 @@ class BridgeCore:
         #: 归属在本类，与 ``_lock`` / ``_turns`` 同一性质。
         self.permission_ledger = PermissionLedger()
 
+        #: 权限请求的本地超时看护（D）。**与账本同时建、跨三块共用** —— 命令侧与
+        #: 按钮侧要 `cancel` 真回复的计时器，事件流侧要 `watch`/`cancel` 并渲染超时
+        #: IM（见 :mod:`opencode_bridge.permission_timeout`）。`notify` 回调此时先给
+        #: 个占位，等 ``EventStream`` 构造好由它接成自己的 ``_on_permission_timeout``。
+        self.permission_timeout = PermissionTimeoutWatcher(
+            timeout_seconds=PERMISSION_TIMEOUT_SECONDS,
+            ledger=self.permission_ledger,
+            notify=lambda session_id, request_id, message: None,
+        )
+
         bridge_cfg = getattr(config, "bridge", None) or {}
         self.edit_interval = self._positive_float(
             bridge_cfg.get("edit_interval_seconds"), DEFAULT_EDIT_INTERVAL
@@ -313,9 +327,10 @@ class BridgeCore:
             drop_session=self.sessions.drop_session,
             send_text=self.outbound.send_text,
             permission_ledger=self.permission_ledger,
+            permission_timeout=self.permission_timeout,
         )
 
-        #: 订阅 SSE、把执行过程渲染回 IM 的那一整块。十三个依赖**显式注入**
+        #: 订阅 SSE、把执行过程渲染回 IM 的那一整块。十四个依赖**显式注入**
         #: （见 :class:`~opencode_bridge.event_stream.EventStream`）—— 其中
         #: ``lock`` / ``turns`` 是共用的状态（同上），其余是协作者。事件流不碰
         #: 收件箱、不碰入站、不碰生命周期，所以搬出去就能脱离 core 单独测
@@ -339,6 +354,7 @@ class BridgeCore:
             finalize=self.outbound.finalize,
             flush_queue=self._flush_queue,
             permission_ledger=self.permission_ledger,
+            permission_timeout=self.permission_timeout,
         )
 
         #: 适配器进来的两个 hook、每会话的 prompt 队列、写前收件箱与启动重放。
@@ -365,6 +381,7 @@ class BridgeCore:
             remember_platform=self.routing.remember_platform,
             send_text=self.outbound.send_text,
             permission_ledger=self.permission_ledger,
+            permission_timeout=self.permission_timeout,
             bridge_config=getattr(config, "bridge", None) or {},
         )
 

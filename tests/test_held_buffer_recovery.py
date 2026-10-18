@@ -36,6 +36,7 @@ from opencode_bridge.inbound_merge import (
     ConversationMerger,
 )
 from opencode_bridge.permission_ledger import PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 
 #: 仓库内的临时目录：即便 TEMP/TMP 指向机器别处，测试也不可能写到仓库之外。
 _REPOSITORY_TEMP = os.path.join(
@@ -310,6 +311,11 @@ class GatewayHeldBufferWiringTests(unittest.TestCase):
             remember_platform=lambda conversation_id, platform: None,
             send_text=self.send_text,
             permission_ledger=PermissionLedger(),
+            permission_timeout=PermissionTimeoutWatcher(
+                timeout_seconds=0.05,
+                ledger=PermissionLedger(),
+                notify=lambda session_id, request_id, message: None,
+            ),
             bridge_config={},
         )
         self.addCleanup(gateway._merger.stop)

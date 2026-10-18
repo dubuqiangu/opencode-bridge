@@ -17,6 +17,7 @@ import unittest
 
 from opencode_bridge.permission_ledger import (
     ANSWER_ALREADY_REPLIED,
+    ANSWER_CANCELLED,
     ANSWER_PENDING,
     ANSWER_RESOLVED_UPSTREAM,
     ANSWER_UNSEEN,
@@ -45,6 +46,21 @@ class LedgerStateTests(unittest.TestCase):
         status = self.ledger.status_of(SESSION, "per_1")
         self.assertEqual(status.state, ANSWER_PENDING)
         self.assertFalse(status.already_closed)
+
+    def test_a_locally_cancelled_request_is_closed_but_distinct_from_replied(self):
+        """D：本地超时取消是一个**已关闭**状态，但语义上区别于"本桥发过决策"。
+
+        :data:`ANSWER_CANCELLED` 是 :meth:`PermissionLedger.record_cancelled` 写入的；
+        它算"再答一次 = 第二次回答"，所以 ``already_closed`` 为真 —— 但服务端那个
+        请求还挂着（我们没有发过任何决策），所以状态名**不是** ``already_replied``。
+        """
+        self.ledger.record_asked(SESSION, "per_cancelled")
+        self.ledger.record_cancelled(SESSION, "per_cancelled")
+
+        status = self.ledger.status_of(SESSION, "per_cancelled")
+        self.assertEqual(status.state, ANSWER_CANCELLED)
+        self.assertTrue(status.already_closed)
+        self.assertEqual(status.decision, "")
 
     def test_one_answer_closes_the_request_and_remembers_the_decision(self):
         self.ledger.record_asked(SESSION, "per_1")

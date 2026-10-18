@@ -30,6 +30,7 @@ from opencode_bridge.delivery_retry import DeliveryReply
 from opencode_bridge.hooks import MsgHandle, Outbound
 from opencode_bridge.opencode_client import OpenCodeError
 from opencode_bridge.permission_ledger import PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 from opencode_bridge.session_model import CommandReply
 from opencode_bridge.state import StateStore
 
@@ -215,7 +216,7 @@ class StubDeliveryRetryCommand:
 # 基类：造一套 CommandHandler（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class HandlerTestCase(unittest.TestCase):
-    """每个用例一套全新的九件协作者。"""
+    """每个用例一套全新的十件协作者。"""
 
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -237,6 +238,13 @@ class HandlerTestCase(unittest.TestCase):
         )
         #: 真对象（不是替身）：本文件要测的正是"命令侧与账本之间有没有接线"。
         self.permission_ledger = PermissionLedger()
+        #: 本地超时看护：命令侧只用到它"真回复落地时撤掉计时器"这一面。给个极短
+        #: 超时，便于需要时测到它。
+        self.permission_timeout = PermissionTimeoutWatcher(
+            timeout_seconds=0.05,
+            ledger=self.permission_ledger,
+            notify=lambda session_id, request_id, message: None,
+        )
         self.handler = CommandHandler(
             client=self.client,
             config=self.config,
@@ -247,6 +255,7 @@ class HandlerTestCase(unittest.TestCase):
             drop_session=self.drop_session,
             send_text=self.send_text,
             permission_ledger=self.permission_ledger,
+            permission_timeout=self.permission_timeout,
         )
 
     # --- 驱动与断言的小帮手 ---------------------------------------------
@@ -267,13 +276,13 @@ class HandlerTestCase(unittest.TestCase):
 # 1-2: 依赖面（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(HandlerTestCase):
-    def test_the_constructor_takes_exactly_the_nine_collaborators(self):
+    def test_the_constructor_takes_exactly_the_ten_collaborators(self):
         parameters = inspect.signature(CommandHandler.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "config", "conversation_state", "model_command",
              "delivery_retry", "ensure_session", "drop_session", "send_text",
-             "permission_ledger"],
+             "permission_ledger", "permission_timeout"],
         )
         for name, parameter in parameters.items():
             if name == "self":

@@ -375,6 +375,8 @@ class BridgeCore:
             adapter_for=self.routing.adapter_for,
             answer_callback=self.outbound.answer,
             ensure_session=self.sessions.ensure_session,
+            # B 冷历史恢复要**只读**地查既有 session（绝不能触发新一轮）。
+            session_for=self.conversation_state.get_session,
             # 命令就地转发：判断"该不该写前落盘"的人在 InboundGateway.on_inbound，
             # 执行命令的人在 CommandHandler —— 两者之间只需要这条 callable。
             handle_command=self.commands.handle_command,

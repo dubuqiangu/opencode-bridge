@@ -299,7 +299,7 @@ def queued(delivery_id: str, text: str,
 # 基类：造一套 InboundGateway（**没有** BridgeCore）
 # ----------------------------------------------------------------------
 class InboundGatewayTestCase(unittest.TestCase):
-    """每个用例一套全新的十四个协作者（第 14 个 held_buffer_store 默认
+    """每个用例一套全新的十五个协作者（第 15 个 held_buffer_store 默认
     ``None``= 纯内存旧行为；接线的守门在 tests/test_held_buffer_recovery.py）。"""
 
     #: C3 的两个配置项在这里要显式给 0 / 极短，否则那些用例会去抢真实的计时器
@@ -357,6 +357,7 @@ class InboundGatewayTestCase(unittest.TestCase):
             "adapter_for": self._adapter_for,
             "answer_callback": self.answer,
             "ensure_session": self._ensure_session,
+            "session_for": self._session_for,
             "handle_command": self._handle_command,
             "remember_platform": self._remember_platform,
             "send_text": self.send_text,
@@ -395,6 +396,15 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.ensure_session_calls.append((conversation_id, platform))
         if self.ensure_session_errors:
             raise self.ensure_session_errors.pop(0)
+        return self.session_id_by_conversation.get(conversation_id, self.session_id)
+
+    def _session_for(self, conversation_id: str, *, platform: str = "") -> str | None:
+        """只读会话查找（B 冷历史恢复用的协作者，见 ``SessionFor``）。
+
+        默认按会话映射表回 ``SESSION_ID`` —— 与 :meth:`_ensure_session` 同一张
+        映射表；None = 查无会话。绝大多数用例不覆盖它，于是冷历史恢复路径
+        一律有一个可查的会话。
+        """
         return self.session_id_by_conversation.get(conversation_id, self.session_id)
 
     def _handle_command(self, conversation_id, adapter, text) -> None:
@@ -439,7 +449,7 @@ class CollaboratorSurfaceTests(InboundGatewayTestCase):
             [name for name in parameters if name != "self"],
             ["client", "lock", "turns", "inbox", "held_buffer_store",
              "stream_confirmed",
-             "adapter_for", "answer_callback", "ensure_session",
+             "adapter_for", "answer_callback", "ensure_session", "session_for",
              "handle_command", "remember_platform", "send_text",
              "permission_ledger", "permission_timeout", "bridge_config"],
         )

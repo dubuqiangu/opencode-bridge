@@ -116,6 +116,9 @@ class RecoveryOutcome:
     replayed: list[QueuedPrompt] = field(default_factory=list)
     #: 结果不可知、只告警未重放的。
     uncertain: list[QueuedPrompt] = field(default_factory=list)
+    #: 结果不可知、但**冷历史恢复**找到答复并已投给用户的（:mod:`cold_history_recovery`）。
+    #: 它们**不算重放**（没有让 agent 再跑一遍），也**不再告警**。
+    recovered: list[QueuedPrompt] = field(default_factory=list)
     #: 终态（重试预算耗尽），只告警未重放的。
     abandoned: list[QueuedPrompt] = field(default_factory=list)
 
@@ -377,6 +380,7 @@ def recover_pending(
     *,
     dispatch: Callable[[QueuedPrompt], None],
     notify: Callable[[str, str], None],
+    recover_cold: Callable[[QueuedPrompt], str | None] | None = None,
 ) -> RecoveryOutcome:
     """启动时把收件箱里的行恢复成"用户真的收到了回复"。
 
@@ -384,6 +388,10 @@ def recover_pending(
     :param dispatch: 把一条 :class:`QueuedPrompt` 真正交给 opencode。
         抛异常就算这次失败 —— 本函数负责记 ``failed``，**不**负责重试。
     :param notify: ``(conversation_id, text)``，把一条**用户可见**的告警发出去。
+    :param recover_cold: 可选 —— 结果不可知的那档，先试**冷历史恢复**（B，见
+        :mod:`opencode_bridge.cold_history_recovery`）。它接收一条 prompt，返回
+        **最终 assistant 正文**（调用方负责取历史 + 投递）；返回 ``None`` 表示
+        没找到，那一行仍按既有逻辑告警「请重新发送一次」。不传则完全维持旧行为。
     :returns: 本次恢复了什么。**永不抛异常** —— 恢复失败不该让桥起不来。
     """
     outcome = RecoveryOutcome()
@@ -403,11 +411,35 @@ def recover_pending(
     )
     _replay_batch(due_failed, inbox, dispatch, outcome)
 
-    # 3) 结果不可知 —— **只告警，绝不重放**。见模块开头的用户拍板说明。
+    # 3) 结果不可知 —— **不重放**，但先试**冷历史恢复**（B）；只有恢复不到才告警。
     #    ``uncertain_prompts()`` 一张嘴就含两档：崩在 ``prompt()`` 里的 ``attempting``，
     #    与传输层失败记下来的 ``outcome_unknown``。⛔ 这一档**绝不许**进上面第 1/2 步
-    #    的重放集合 —— 那样 agent 会对同一条指令跑两遍。
-    outcome.uncertain = _safe_call(inbox.uncertain_prompts, reading="outcome-unknown")
+    #    的重放集合 —— 那样 agent 会对同一条指令跑两遍。B 不走模型、不重放工具，
+    #    只是回查冷历史把最终正文投给用户，**不属于重放**。
+    uncertain = _safe_call(inbox.uncertain_prompts, reading="outcome-unknown")
+    if recover_cold is None:
+        outcome.uncertain = uncertain
+    else:
+        outcome.uncertain = []
+        for prompt in uncertain:
+            try:
+                recovered_text = recover_cold(prompt)
+            except Exception:
+                logger.exception(
+                    "inbox recovery: cold-history recovery for %s raised; "
+                    "keeping the re-send alert",
+                    prompt.delivery_id,
+                )
+                recovered_text = None
+            if recovered_text is None:
+                outcome.uncertain.append(prompt)
+            else:
+                # 找到并已投出最终正文 —— 该行 settle，不再每启动告警一次。
+                _safe_action(
+                    lambda: inbox.mark_delivered(prompt.delivery_id),
+                    doing="mark a cold-recovered row delivered",
+                )
+                outcome.recovered.append(prompt)
     _alert_per_conversation(outcome.uncertain, notify, _uncertain_alert_text)
 
     # 4) 终态：预算耗尽。也可能正是上面第 2 步里刚刚耗尽的 —— 那一条本轮就该告警。

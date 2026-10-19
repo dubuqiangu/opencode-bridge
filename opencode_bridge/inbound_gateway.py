@@ -44,6 +44,7 @@ from .inbound_merge import (
     ConversationMerger,
 )
 from .inbox import InboundInbox, QueuedPrompt, RecordOutcome
+from .cold_history_recovery import find_reply_for_prompt
 from .inbox_recovery import mark_prompt_never_sent, recover_pending
 from .normalize import _clean, trim_outer_whitespace
 from .opencode_client import OpenCodeClient, OpenCodeError
@@ -178,6 +179,11 @@ AnswerCallback = Callable[[Adapter | None, str, str], None]
 
 #: 取（或建）这条会话的 opencode session；平台以关键字 ``platform`` 传入。
 EnsureSession = Callable[..., str]
+
+#: **只读**地查这条会话的 opencode session；查不到返回 ``None``。
+#: 与 :data:`EnsureSession` 的区别：**绝不新建**（冷历史恢复不能触发新一轮）。
+#: 平台以关键字 ``platform`` 传入（与 :data:`EnsureSession` 同一调用形状）。
+SessionFor = Callable[..., str | None]
 
 #: 执行一条斜杠命令。
 HandleCommand = Callable[[str, Adapter, str], None]
@@ -318,6 +324,7 @@ class InboundGateway:
         adapter_for: AdapterFor,
         answer_callback: AnswerCallback,
         ensure_session: EnsureSession,
+        session_for: SessionFor,
         handle_command: HandleCommand,
         remember_platform: RememberPlatform,
         send_text: SendText,
@@ -368,6 +375,7 @@ class InboundGateway:
         self._adapter_for = adapter_for
         self._answer = answer_callback
         self._ensure_session = ensure_session
+        self._session_for = session_for
         self._handle_command = handle_command
         self._remember_platform = remember_platform
         self._send_text = send_text
@@ -1165,11 +1173,40 @@ class InboundGateway:
                     conversation_id,
                 )
 
+        def recover_cold(prompt: QueuedPrompt) -> str | None:
+            """B 冷历史恢复：从会话历史里找回那一轮的最终 assistant 正文并投出。
+
+            返回找到并**已投出**的正文（``_send_text`` 返回非 None 才算投出）；
+            找不到 / 没会话 / 取历史失败 ⇒ 返回 ``None``，让那一行保留既有告警。
+            """
+            session_id = self._session_for(
+                prompt.conversation_id, platform=prompt.platform
+            )
+            if session_id is None:
+                # 这条会话还没建（或已删）——没有历史可查，回退告警。
+                return None
+            try:
+                messages = self._client.messages(session_id)
+            except Exception:
+                logger.exception(
+                    "inbox recovery: cold-history messages() failed for %s",
+                    session_id,
+                )
+                return None
+            reply_text = find_reply_for_prompt(messages, prompt.text)
+            if reply_text is None:
+                return None
+            if self._send_text(prompt.conversation_id, reply_text, kind="text") is None:
+                # 投不出去 == 没有真的投，保留告警（fail-closed）。
+                return None
+            return reply_text
+
         logger.info("write-ahead inbox enabled; scanning for rows left by a crash")
         outcome = recover_pending(
             inbox,
             dispatch=self.dispatch_recovered,
             notify=notify_recovered,
+            recover_cold=recover_cold,
         )
         logger.info(
             "inbox recovery done: %d replayed, %d uncertain (alerted, NOT replayed),"

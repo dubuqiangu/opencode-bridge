@@ -417,8 +417,8 @@ class SubscribeTests(unittest.TestCase):
             http_error("http://x/api/event", 401, b"nope"),
         ]
         with mock.patch("urllib.request.urlopen", side_effect=responses) as m:
-            with mock.patch("opencode_bridge.opencode_client._RECONNECT_MIN", 0.01), \
-                 mock.patch("opencode_bridge.opencode_client._RECONNECT_MAX", 0.02):
+            with mock.patch("opencode_bridge.opencode_event_stream._RECONNECT_MIN", 0.01), \
+                 mock.patch("opencode_bridge.opencode_event_stream._RECONNECT_MAX", 0.02):
                 gen = client.subscribe(restart=True)
                 ev = next(gen)
                 self.assertEqual(ev["type"], "session.status")

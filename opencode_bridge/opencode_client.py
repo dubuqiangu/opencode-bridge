@@ -5,9 +5,15 @@ carry HTTP Basic auth (username ``opencode`` by default).  The event stream
 (``GET /api/event``) is consumed line-by-line — never buffered whole.
 
 Provenance: 2026-10-13 §5 第六刀（文件刀）：endpoint 发现域与 wire 契约域逐字
-移植 ``opencode_endpoint_discovery.py`` / ``opencode_wire.py``；客户端类与
-重连常量留守（测试 patch ``_RECONNECT_MIN/_MAX`` 钉在本模块）；顶部再进口
+移植 ``opencode_endpoint_discovery.py`` / ``opencode_wire.py``；顶部再进口
 块保既有 import 路径，行为零变化。
+
+2026-10-19 §5.1 第三刀（类手术）：SSE 事件订阅域（``subscribe``/``_iter_events``/
+``_register_stream``/``_unregister_stream``/``close`` 本体）连 ``_closed``/
+``_stream_lock``/``_streams`` 状态逐字迁入 ``opencode_event_stream.py`` 的
+``OpenCodeEventStream``（协作者 property 逐调用转发回 ``self._client.endpoint``）；
+``_STREAM_TIMEOUT``/``_RECONNECT_MIN``/``_RECONNECT_MAX`` 常量随迁（测试 patch
+目标已重指向新模块）；本类只留转发。
 """
 
 from __future__ import annotations
@@ -15,17 +21,16 @@ from __future__ import annotations
 import http.client
 import json
 import logging
-import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Iterator
 
 from .opencode_endpoint_discovery import DEFAULT_SERVICE_URL, discover_endpoint
+from .opencode_event_stream import OpenCodeEventStream
 from .opencode_wire import (
     Endpoint,
     OpenCodeError,
-    _force_close_stream,
     _safe_read_body,
 )
 from .request_phase import request_definitely_never_sent
@@ -40,21 +45,13 @@ __all__ = [
 
 logger = logging.getLogger("opencode_bridge.opencode_client")
 
-#: socket timeout used while streaming ``GET /api/event``
-_STREAM_TIMEOUT = 300.0
-_RECONNECT_MIN = 0.5
-_RECONNECT_MAX = 30.0
-
 _PERMISSION_DECISIONS = frozenset({"once", "always", "reject"})
-
 
 class OpenCodeClient:
     def __init__(self, endpoint: Endpoint, *, timeout: float = 30.0) -> None:
         self._endpoint = endpoint
         self._timeout = timeout
-        self._closed = threading.Event()
-        self._stream_lock = threading.Lock()
-        self._streams: list[Any] = []
+        self._event_stream = OpenCodeEventStream(self)
 
     @property
     def endpoint(self) -> Endpoint:
@@ -62,7 +59,7 @@ class OpenCodeClient:
 
     @property
     def closed(self) -> bool:
-        return self._closed.is_set()
+        return self._event_stream.closed
 
     # ------------------------------------------------------------------
     # basics
@@ -277,122 +274,9 @@ class OpenCodeClient:
     # events
     # ------------------------------------------------------------------
     def subscribe(self, *, restart: bool = True) -> Iterator[dict]:
-        """Infinite event generator backed by ``GET /api/event`` (SSE).
-
-        - parses ``data: {json}`` lines and yields the dicts
-        - ignores ``: heartbeat`` comments, blank and non-data lines
-        - connection loss with ``restart=True`` -> exponential backoff
-          (0.5s .. 30s, unlimited retries); with ``restart=False`` ->
-          ``StopIteration``
-        - HTTP non-200 -> raises :class:`OpenCodeError`
-        - :meth:`close` ends the generator within ~2 seconds
-        """
-        delay = _RECONNECT_MIN
-        while not self._closed.is_set():
-            stream_error: BaseException | None = None
-            events = self._iter_events()
-            try:
-                for event in events:
-                    delay = _RECONNECT_MIN
-                    yield event
-            except OpenCodeError:
-                raise
-            except (OSError, ValueError, http.client.HTTPException) as exc:
-                stream_error = exc
-            finally:
-                try:
-                    events.close()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-
-            if self._closed.is_set():
-                return
-            if not restart:
-                if stream_error is not None:
-                    logger.debug("event stream ended: %s", stream_error)
-                return
-            if stream_error is None:
-                logger.debug("event stream closed by server; reconnecting")
-            else:
-                logger.warning("event stream error: %s; reconnecting", stream_error)
-            if self._closed.wait(delay):
-                return
-            delay = min(delay * 2, _RECONNECT_MAX)
-
-    def _iter_events(self) -> Iterator[dict]:
-        url = self._endpoint.url + "/api/event"
-        req = urllib.request.Request(
-            url, headers=self._endpoint.auth_header(), method="GET"
-        )
-        try:
-            resp = urllib.request.urlopen(req, timeout=_STREAM_TIMEOUT)
-        except urllib.error.HTTPError as exc:
-            err_body = _safe_read_body(exc)
-            raise OpenCodeError(
-                f"GET /api/event -> HTTP {exc.code}",
-                status=exc.code,
-                body=err_body,
-            ) from None
-
-        if not self._register_stream(resp):
-            _force_close_stream(resp)
-            return
-
-        try:
-            status = getattr(resp, "status", None) or getattr(resp, "code", None)
-            if status is not None and int(status) != 200:
-                raise OpenCodeError(
-                    f"GET /api/event -> HTTP {status}",
-                    status=int(status),
-                    body="",
-                )
-            while not self._closed.is_set():
-                line = resp.readline()  # streaming: one SSE line at a time
-                if not line:
-                    return  # EOF
-                text = line.decode("utf-8", "replace").rstrip("\r\n")
-                if not text or text.startswith(":"):
-                    continue  # blank line / heartbeat comment
-                if not text.startswith("data:"):
-                    continue  # event:/id:/retry: fields are not payloads
-                payload = text[5:].lstrip()
-                if not payload:
-                    continue
-                try:
-                    event = json.loads(payload)
-                except ValueError:
-                    logger.warning("skipping malformed SSE frame: %.200s", payload)
-                    continue
-                if isinstance(event, dict):
-                    yield event
-                else:
-                    logger.warning("skipping non-object SSE frame: %.200r", event)
-        finally:
-            self._unregister_stream(resp)
-            try:
-                resp.close()
-            except Exception:  # pragma: no cover - defensive
-                pass
-
-    def _register_stream(self, resp: Any) -> bool:
-        with self._stream_lock:
-            if self._closed.is_set():
-                return False
-            self._streams.append(resp)
-            return True
-
-    def _unregister_stream(self, resp: Any) -> None:
-        with self._stream_lock:
-            try:
-                self._streams.remove(resp)
-            except ValueError:
-                pass
+        """SSE event stream; delegated to :class:`OpenCodeEventStream`."""
+        return self._event_stream.subscribe(restart=restart)
 
     def close(self) -> None:
         """Thread-safe: stop :meth:`subscribe` and abort in-flight streams."""
-        self._closed.set()
-        with self._stream_lock:
-            streams, self._streams = self._streams, []
-        for resp in streams:
-            _force_close_stream(resp)
-        logger.debug("client closed")
+        self._event_stream.close()

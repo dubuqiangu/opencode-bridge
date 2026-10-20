@@ -8,12 +8,16 @@
 
 | 项目 | license | stars | 活跃度 | 锁定版本 |
 |---|---|---|---|---|
-| `MichengAI/dsh-im-connect` | Apache-2.0 | 59 | 2026-10-15 仍在推送 | `e271ec169c7ea743c88562461b3366e62473bf14`（v0.1.77） |
-| `xmanrui/dsh-im` | MIT | 2031 | 2026-10-15 仍在推送 | `b7698a6dc8087f7d67480b972e7f45c3773243ad` |
-| `NousResearch/hermes-agent` | MIT | 254101 | 2026-10-15 仍在推送 | `f732746bb4b9ccfa4dad90bb21e823fe3e1871ab` |
-| `zhuiyueya/dsh-im-gateway` | MIT | 50 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
+| `MichengAI/dsh-im-connect` | Apache-2.0 | 72 | 2026-10-19 仍在推送 | `617b079a6c156a343d81e6e9c5fc762a8844fc8a`（v1.0.8） |
+| `xmanrui/dsh-im` | MIT | 2181 | 2026-10-20 仍在推送 | `0b9cbc24b60a9218820a10ed1f9c8fe913aa23c5`（v5.2.0） |
+| `NousResearch/hermes-agent` | MIT | 255192 | 2026-10-19 仍在推送 | `6e9b3e3b8852f12bf965f888213470574b72803e` |
+| `zhuiyueya/dsh-im-gateway` | MIT | 52 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
 
-以上四项均未归档（2026-10-16 `gh` 核验）。本地源码 clone 在宿主临时目录
+以上四项均未归档（**2026-10-20** `gh` 现查 + 本地 clone `git fetch` 复核；dsh-im-gateway HEAD 零差异）。
+⚠️ **2026-10-16 的旧基线已作废**：四行里三个 HEAD 前移（dsh-im `b7698a6`→`0b9cbc2`
+共 **23 commit**、v5.0.0→v5.2.0；dsh-im-connect `e271ec1`→`617b079` 共 **65 commit**、
+v0.1.77→v1.0.8；hermes-agent `f732746`→`6e9b3e3` 共 **2006 commit**），star 四项全部变化
+（59→72 / 2031→2181 / 254101→255192 / 50→52）。⚠️ 引旧 SHA 的结论一律按「过期」处理（§7.1）。本地源码 clone 在宿主临时目录
 （`ref-michengai-dsh-im-connect` / `ref-xmanrui-dsh-im`，git 仓非快照）；
 hermes-agent 与 dsh-im-gateway 另有全量纯文本快照（文件名含 commit `8a5edab…`，
 搜法见 AGENTS.md §6.1）。**引用结论一律连 SHA 一起写**，否则「参考版本变了」
@@ -21,7 +25,7 @@ hermes-agent 与 dsh-im-gateway 另有全量纯文本快照（文件名含 commi
 
 ---
 
-## 1. MichengAI/dsh-im-connect（2026-10-16 新收录）
+## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 2026-10-20 更新为 `617b079`，v1.0.8）
 
 **定位**：将主流 IM 平台（dingtalk/discord/feishu/lark/qq/slack/telegram/wecom/weixin）
 接入本机 DeepSeek Harness。TypeScript / Koishi(cordis) 双侧插件，与本桥领域高度同构：
@@ -51,6 +55,16 @@ credentials,abort}.ts` + `src/channels/connection-state.ts` +
 | L | **工程面**：约百个按特性分文件的单职责测试（`tests/*.test.mjs`）；双语 CHANGELOG；迭代文档目录（每个主题含验证记录）；CI workflows；`connectionState()` 把各平台状态字符串归一化为 `{connected,connecting,reconnecting,disconnected,stopped,error,unknown}` 且「仅明确就绪状态计入在线」 | `tests/`、`CHANGELOG*.md`、`docs/01-当前工作/`、`src/channels/connection-state.ts` | 归一化谓词与「明确否/未知分开」的口径与本桥 health 面同族；测试组织已是本桥现行实践 |
 | M | **发送重试阶梯**：`SEND_RETRY_DELAYS_MS = [0, 1s, 3s, 8s, 20s]` + 30s 总预算；`isDefiniteSendFailure` 判定 | `gateway.ts` | 本桥 telegram 429 单次重试（`retry_after` 夹 60s 上限）、未接入阶梯 ⇒ 若引入注意与既有「不占关停」纪律（`stop()` 必须能打断等待）对齐 |
 | N | **小原语**：`KeyedSerialQueue`（同 key 串行、异 key 并行、完成自清）；`SeenStore`（2000 条 LRU、损坏文件先备份再重置）；`writeFileAtomicSync`（同目录临时文件 + fsync + rename，`backupCorruptFileSync` 隔离不可解析文件） | `keyed-queue.ts`、`seen-store.ts`、`atomic-file.ts` | 本桥对应物：`_drain` 会话串行、sqlite 收件箱、`state.py` 备份机制——形态对齐，无需照搬 |
+
+### 1.1 本轮新机制（2026-10-20 回看，`e271ec1..617b079`，65 commit，v0.1.77→v1.0.8）
+
+⚠️ **65 个 commit 里大半是 UI 重构**（`refactor(ui): purge antd dependency` 起的一串按钮 / 模态 / Tabs / design-token 对齐），本桥无图形宿主 ⇒ ⛔ **结构性不适用**，不逐条记。真正与本桥同域的只有下面三行。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| T1 | **Telegram 论坛话题（Forum / Topics）隔离**：会话键从 `<chatId>` 扩成 `<chatId>:<threadId>`（`telegramChatId`/`parseTelegramChatId` 一对编解码），**所有出站调用**（`sendMessage`/`sendRichMessage`/`sendDocument`/`editMessageText`/`setMessageReaction`/`sendChatAction`/`beginReply`）在解析出 `threadId` 时附 `message_thread_id`；入站 `message` 与 `callback_query` 两路都读 `message_thread_id` | `src/channels/telegram.ts`（+104）、`tests/telegram-topics.test.mjs`(217) | ⭐ **本桥确认缺失**（本桥 telegram 适配器无 `message_thread_id` 任何处理）。⚠️ **但⛔ 不要照抄它的编码方式**：它把 threadId **编进 `chatId` 字符串**，于是「会话标识」与「传输寻址」被耦合成一个字段，所有消费方都得靠 `parseTelegramChatId` 反解（如 `sendChoices`/`addStatusReaction` 里各反解一次；任一处忘了反解 ⇒ 把 `"-100123:5"` 当 chat_id 发出去）。本桥若引入，**必须把 `thread_id` 作为独立字段挂在 inbound 消息与会话键上**，⛔ 不塞进 `chat_id` ⇒ 这是**产品/协议判断**（是否支持话题群、会话粒度按话题还是按群）⇒ 归**第 1 类（产品判断等用户拍板）** |
+| T2 | **按账号的发送模式设置 `queue` / `steer`** | `feat: add per-account send mode setting (queue/steer)`、`tests/send-mode.test.mjs`(68) | 与本桥「按会话串行 `_drain`」同族但**方向不同**：本桥是固定排队，「steer」是让新消息插进在途回合。本桥若做需动在途 turn 语义（与 fix-289 拍板「在途 turn 什么都不动」冲突）⇒ ⚠️ 与原有拍板冲突，**⛔ 不擅自引入**；仅登记 |
+| T3 | **富媒体 / 文件投递的失败诚实性**：`fix(qq): infer rich media file_type`（图片不再发成文件卡片）、`fix(file-delivery): 投递前已删除的文件静默跳过，失败日志补 error.code`、`fix(file-delivery): do not skip not-regular-file so directory delivery reports error` | `src/engine/file-delivery.ts`、`src/channels/qq/qq-bridge.mjs` | 与本桥「失败要可见、⛔ 不静默」同向。⚠️ **它自己改过两版、方向相反**（先「静默跳过已删文件」、随后「不跳过非普通文件、让目录投递报错」）⇒ 可借鉴的是**那条判据「跳过要有理由，非普通文件不等于已删除」**，不必抄实现 |
 
 ### ⛔ 结构性不适用
 
@@ -83,7 +97,7 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 
 ---
 
-## 2. xmanrui/dsh-im（MIT，锁 `b7698a6`）
+## 2. xmanrui/dsh-im（MIT，锁 `b7698a6`；**2026-10-20 基线更新为 `0b9cbc2`（v5.2.0）**）
 
 **定位**：DeepSeek Harness 官方 Token 赞助的双侧插件，渠道面最宽（12 个 IM 渠道）。
 完整借鉴面分析与落地跟踪见 AGENTS.md §6.1 登记行。**用户 2026-10-15 已拍板：①②③
@@ -94,12 +108,41 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 补充（2026-10-16）：dsh-im-connect 的 `split.ts` 文件头自述「长文切分规则思路参考 dsh-im」
 ⇒ 两者切分规则同源，本目录 §1-D 的精修版可作为落地时的参考实现。
 
-## 3. NousResearch/hermes-agent（MIT，HEAD `f732746`）
+### 2.1 本轮新机制（2026-10-20 回看，`b7698a6..0b9cbc2`，23 commit，v5.0.0→v5.2.0）
+
+**证据面**：`src/channels/shared/{conversation-state-store,text-harness-bridge,group-history,
+group-history-store,group-history-access,prompt-failure-tracker}.mjs`（均读自 `0b9cbc2`）
++ 各 commit 标题与其自带测试文件名。**以下三行均未拍板**，仅登记为候选。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| O | **排队消息跨重启持久化 + `submitted` 两态**：消息进内存队列**之前**先落盘（`submitted:false`）；即将进 Harness inbox（其 inbox 自身持久）**之前**先标 `submitted:true`；重启恢复时 `false` ⇒ **重放**、`true` ⇒ **只报告中断不重放**（文案明写「为避免重复执行，未自动重放」）。上限 200 条（`PENDING_MESSAGE_LIMIT`），空队列不落 `pendingMessages` 键（保持旧文件形状）；重放前 `unmarkSeen`（早前的 mark-seen 只是一次尝试、不是已投递） | `conversation-state-store.mjs`（`pendingMessages`/`putPendingMessage`/`patchPendingMessage`/`removePendingMessage`）、`text-harness-bridge.mjs`（`pendingMessageId`/`recoverPendingMessages`/`#recordPendingMessage`/`#markPendingSubmitted`/`#pendingReplayMessage`/`#notifyInterruptedPending`）、`test/queued-message-durability.test.mjs`(202 行) | ⭐ **与本桥 §7.1 六条判据②③⑤⑥高度同构**——本桥已有 `attempting`/`outcome_unknown` 的「不重放」处置与 fail-closed，但**覆盖的是「投递到 opencode 之后」那一段**；dsh-im 覆盖的是**更前一段：消息还在桥自己的内存队列里、还没轮到它**。本桥这一段（`InboundGateway._drain` 的队列）现状靠 `inbox.db` 里的 `pending` 行 + `recover_pending` 兜，⚠️ **但「入队」与「落盘」的先后顺序本桥未核**（若先落盘再入队，则 dsh 的机制本桥已隐含具备）。⇒ **待核点（可机械判定）**：`inbound_gateway._enqueue`/`_drain` 与 `inbox.record` 的调用顺序；核出来若本桥确实「先落盘后入队」⇒ 本条判「已有」并记录差异，否则是缺 |
+| P | **群消息/群文件共享存储（可配保留期）**：`sqlite`（WAL、`busy_timeout`、外键级联）+ `groups`/`messages`/`attachments` 三表；**捕获点在 AI 响应闸门之前**（不需要 @ 或已建会话，只存平台实际投递的群消息）；文件按 `<root>/group-files/<groupId>/<messageId>/<attId>` 落盘、`.part` 临时名 + rename、重启时扫掉 `.part` 并把这批 `pending` 标 `unavailable`；保留期默认 **14 天**（`DEFAULT_GROUP_HISTORY_DAYS`），`normalizeGroupHistoryDays` 要求正整数、否则拒绝；设置文件损坏 ⇒ **暂停自动清理并响亮报错**（`#settingsError`），⛔ 不写回空对象；查询分页 = `(sent_at,id)` 游标 + 单页/总字节双上限（20 KB）；`coverage` 字段明写「只含本插件实际收到的消息，不是平台完整历史」 | `group-history-store.mjs`(383)、`group-history.mjs`(56)、`group-history-access.mjs`(133)、`docs/group-history{,.en}.md`、`test/group-history.test.mjs`(245) | **新能力候选，本桥零对应物**。但 ⚠️ 它是**产品决策**不是缺陷修复：本桥定位是「IM ↔ 本机 agent 的桥」，**是否要留存群历史**（涉及隐私面扩大、磁盘占用、保留期默认值）必须先拍板 ⇒ 按 §4.1 归**第 1 类（产品判断等用户拍板）**。⚠️ 可**单独借鉴**的两小点与本桥既有纪律同向、无需产品判断：①「设置文件损坏时不写回空对象」与 §8 第 3 条同族；② 分页双上限（条数 + 字节）防单条超大正文撑爆 —— 本条本桥目前无分页面，暂不入队 |
+| Q | **early failure 处理 + `prompt-failure-tracker`**：`HarnessPeer` 抽出共享调用者身份给 slash 命令；`modern-harness-api` 恢复 channel requests；失败跟踪 65 行 | `harness-peer.mjs`(18)、`prompt-failure-tracker.mjs`(65)、`test/harness-early-failure.test.mjs`(145)、`test/host-harness-peer.test.mjs`(222) | DSH 专有接口层（本桥无 `HarnessPeer`/slash 命令等价物）⇒ ⛔ 结构性不适用；而 `host-session-binding.mjs` 的「绑定已有会话、不新建替代」与本桥 `SessionRegistry` 的 `/new` 拍板同向，**本桥已具备** |
+
+⚠️ 另两条 commit 与本桥同域但**属修补、无新机制**：`fix(wecom): surface SDK reply-ack errcode in logs (#387)`（回复回执错误码进日志）、`fix(weixin): retry a transient sendmessage failure instead of dropping the reply (#392)`（瞬时失败重试而非丢回复）—— 前者与本桥「回执失败要响亮」同向（`63d7434`），后者与本桥 telegram 429 单次重试同族。**均不单独立条**。
+
+⚠️ **O 行的本桥对照（2026-10-20 已核，读自 `d62eb48` 的 `inbound_gateway.py`）**：本桥是
+**先落盘、后入队** —— `_deliver_plain_text` 在 `:563` 调 `_record_inbound`（写 `inbox.db`），
+成功后才在 `:589` 调 `_enqueue`（进内存队列）⇒ dsh-im 的「入队前先落盘」**本桥已具备**。
+⚠️ **两态粒度不同、本桥更粗**：dsh 分 `submitted:false`（可重放）/ `submitted:true`
+（已进 Harness inbox ⇒ 只报告不重放）；本桥对应 `pending`（可重放）/ `attempting`
+（崩在 `prompt()` 内 ⇒ 只告警）。**`mark_attempting` 的落点**才是与 dsh
+`#markPendingSubmitted` 同构的那一行，而它与 `prompt()` 的先后顺序**本次未逐行核**
+⇒ ⚠️ **那是「没核」不是「缺」**；要判就照 `mark_attempting` 的调用点读一次，⛔ 别凭本条推断。
+
+## 3. NousResearch/hermes-agent（MIT，HEAD `6e9b3e3`，2026-10-20 现查）
 
 **首选 IM 平台工程范式参考**。全量纯文本快照（64 MB / 134 万行，锁 `8a5edab…`），
 搜法与引用纪律见 AGENTS.md §6.1；平台清单并集（≈31 家）见 `docs/platform-design-reference.md`。
 ⚠️ 边界：全库零 opencode 事件流消费（`/api/event` 零命中），不能当 opencode 服务端契约依据
 （那个查 §6.2）。
+⚠️ **2026-10-20 复核（对 HEAD `6e9b3e3` 跑 `gh search code '/api/event'`）**：命中 **10 条、
+全部是它自己的 dashboard `/api/events`（复数）** —— `web/src/lib/eventsFeedClient.ts`、
+`web/src/lib/events-reconnect.ts`、`hermes_cli/web_routers/chat_ws.py`、
+`tui_gateway/event_publisher.py`、`tests/hermes_cli/test_web_server_host_header.py` 等；
+**`/api/event`（单数、opencode 的那个端点）零命中** ⇒ 结论在 2006 个新 commit 之后**仍然成立**，
+且这条现在有**在新 HEAD 上重跑过的证据**，不再依赖 `8a5edab…` 那份旧快照。
 
 ## 4. zhuiyueya/dsh-im-gateway（MIT，HEAD `8e8fbca`）
 
@@ -119,6 +162,11 @@ gh repo view <owner>/<repo> --json isArchived,pushedAt          # 归档/活跃�
 **基线（2026-10-16 现查）**：即项目一览表中的锁定版本四行；hermes-agent 与
 dsh-im-gateway 的快照仍锁旧快照 SHA（`8a5edab…`），回看时若 HEAD 与快照差距显著，
 先查快照分析结论是否仍成立再引用。
+⚠️ **2026-10-20 更新**：基线改为四行里那一列的新 SHA（dsh-im `0b9cbc2` / dsh-im-connect
+`617b079` / hermes-agent `6e9b3e3` / dsh-im-gateway `8e8fbca` 未动）。hermes-agent 的
+「零 opencode 事件流消费」结论**已在新 HEAD 上重跑**（见 §3 末段，仍成立）；⚠️ 而它那份
+**全量纯文本快照仍是 `8a5edab…`、落后 2006 个 commit** ⇒ 快照里**别的内容**（平台清单、
+`docs/platform-design-reference.md` 的并集）**仍是旧版本的**，引用前要么重抓要么明说依据版本。
 
 **回看时做什么**：
 
@@ -136,3 +184,7 @@ dsh-im-gateway 的快照仍锁旧快照 SHA（`8a5edab…`），回看时若 HEA
 |---|---|---|
 | dsh-im | ①故障隔离/降级 ②单源错误码表 ③诚实投递语义 | 2026-10-15 拍板进入插件工作排期（排期由用户发起，⛔ 不编日期） |
 | dsh-im-connect | §1-A~N 借鉴项 | **2026-10-16 用户拍板：A 投递三态+手动补投、B 冷历史恢复答复、C 结构感知切分、D 审批超时语义进入插件工作排期**（排期由用户发起，⛔ 不编日期；落地跟踪 = tasks.md 未完成项总表「dsh-im-connect 借鉴面落地」行；其余 E~N 未拍板，留本目录作参考） |
+| dsh-im | §2.1-O 排队消息跨重启持久化（`submitted` 两态） | **未拍板**（2026-10-20 回看新登记）。本桥「入队前先落盘」已具备；`mark_attempting` 与 `prompt()` 的先后**未逐行核** ⇒ 判之前先读那一处调用点 |
+| dsh-im | §2.1-P 群消息/群文件共享存储（保留期 14 天） | **未拍板 · 第 1 类（产品判断等用户拍板）**。要拍的问题（一句话可复述）：「本桥是否要留存群历史与群文件（隐私面扩大、磁盘占用、保留期默认值），还是维持『只做 IM ↔ agent 的桥』不落历史？」 |
+| dsh-im-connect | §1.1-T1 Telegram 论坛话题隔离 | **未拍板 · 第 1 类（产品判断等用户拍板）**。要拍的问题：「是否支持话题群、会话粒度按话题还是按群？」⚠️ **⛔ 不照抄它把 threadId 编进 `chatId` 的形态** |
+| dsh-im-connect | §1.1-T2 发送模式 queue/steer、T3 文件投递诚实性 | **未拍板**。T2 与 fix-289「在途 turn 什么都不动」冲突，仅登记；T3 只取判据不抄实现 |

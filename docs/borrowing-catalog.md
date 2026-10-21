@@ -8,12 +8,13 @@
 
 | 项目 | license | stars | 活跃度 | 锁定版本 |
 |---|---|---|---|---|
-| `MichengAI/dsh-im-connect` | Apache-2.0 | 72 | 2026-10-19 仍在推送 | `617b079a6c156a343d81e6e9c5fc762a8844fc8a`（v1.0.8） |
-| `xmanrui/dsh-im` | MIT | 2181 | 2026-10-20 仍在推送 | `0b9cbc24b60a9218820a10ed1f9c8fe913aa23c5`（v5.2.0） |
-| `NousResearch/hermes-agent` | MIT | 255192 | 2026-10-19 仍在推送 | `6e9b3e3b8852f12bf965f888213470574b72803e` |
-| `zhuiyueya/dsh-im-gateway` | MIT | 52 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
+| `MichengAI/dsh-im-connect` | Apache-2.0 | 79 | 2026-10-21 仍在推送 | `93428ed8aaeb6d10e0b7c8dd9e875c2104c4563d`（v1.0.11） |
+| `xmanrui/dsh-im` | MIT | 2257 | 2026-10-21 仍在推送 | `8ac3e6ee10feefcb3c907ec0a893bf88a6b41382`（v5.4.0） |
+| `NousResearch/hermes-agent` | MIT | 255751 | 2026-10-21 仍在推送 | `3cbb13f718288d21cb14889fd685b92360c204e1` |
+| `zhuiyueya/dsh-im-gateway` | MIT | 54 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
 
 以上四项均未归档（**2026-10-20** `gh` 现查 + 本地 clone `git fetch` 复核；dsh-im-gateway HEAD 零差异）。
+⚠️ **2026-10-21 回看**：四行里三个 HEAD 再前移 —— dsh-im `0b9cbc2`→`8ac3e6e`（+26 commit，v5.2.0→v5.4.0）· dsh-im-connect `617b079`→`93428ed`（本地 fetch 落在 `ee12a1f`，即 `93428ed` 之上多一个测试 commit；`log` 计 15 commit，v1.0.8→v1.0.11）· hermes-agent `6e9b3e3`→`3cbb13f`（commit 数未数，只按 GitHub `commits?per_page=1` 取 HEAD）；dsh-im-gateway `8e8fbca` **零差异**。star 四项全部变化（72→79 / 2181→2257 / 255192→255751 / 52→54），四项**均未归档**（均 2026-10-21 `gh` 现查）。本轮细读结论见 §1.2 与 §2.2。
 ⚠️ **2026-10-16 的旧基线已作废**：四行里三个 HEAD 前移（dsh-im `b7698a6`→`0b9cbc2`
 共 **23 commit**、v5.0.0→v5.2.0；dsh-im-connect `e271ec1`→`617b079` 共 **65 commit**、
 v0.1.77→v1.0.8；hermes-agent `f732746`→`6e9b3e3` 共 **2006 commit**），star 四项全部变化

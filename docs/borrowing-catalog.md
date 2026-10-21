@@ -128,8 +128,14 @@ group-history-store,group-history-access,prompt-failure-tracker}.mjs`（均读�
 ⚠️ **两态粒度不同、本桥更粗**：dsh 分 `submitted:false`（可重放）/ `submitted:true`
 （已进 Harness inbox ⇒ 只报告不重放）；本桥对应 `pending`（可重放）/ `attempting`
 （崩在 `prompt()` 内 ⇒ 只告警）。**`mark_attempting` 的落点**才是与 dsh
-`#markPendingSubmitted` 同构的那一行，而它与 `prompt()` 的先后顺序**本次未逐行核**
-⇒ ⚠️ **那是「没核」不是「缺」**；要判就照 `mark_attempting` 的调用点读一次，⛔ 别凭本条推断。
+`#markPendingSubmitted` 同构的那一行。✅ **2026-10-21 已逐行核（读 `inbound_gateway._dispatch_prompt`）**：
+本桥**先标 `attempting`、后发 `prompt()`** —— `inbox.mark_attempting(queued.delivery_id)` 在
+`try:` 之前、`self._client.prompt(...)` 之前 ⇒ **与 dsh `#markPendingSubmitted` 的时序同构，
+本桥已具备**。⚠️ 且本桥比 dsh 多一道：`prompt()` 抛 409 时**退回 `pending`**
+（服务端拒收 ⇒ agent 没跑过 ⇒ 重放不会重复副作用），否则该行会永远停在 `attempting`
+被恢复层按「结果未知」只告警 ⇒ 崩溃落在 409 与重投之间就永远送不到。
+⇒ **O 条判据整体结论：本桥已具备，无需改动**；⚠️ 差异只在粒度（本桥 `pending`/`attempting`
+两档 vs dsh `submitted` 两态），维度和粒度数一致。
 
 ## 3. NousResearch/hermes-agent（MIT，HEAD `6e9b3e3`，2026-10-20 现查）
 
@@ -184,7 +190,7 @@ dsh-im-gateway 的快照仍锁旧快照 SHA（`8a5edab…`），回看时若 HEA
 |---|---|---|
 | dsh-im | ①故障隔离/降级 ②单源错误码表 ③诚实投递语义 | 2026-10-15 拍板进入插件工作排期（排期由用户发起，⛔ 不编日期） |
 | dsh-im-connect | §1-A~N 借鉴项 | **2026-10-16 用户拍板：A 投递三态+手动补投、B 冷历史恢复答复、C 结构感知切分、D 审批超时语义进入插件工作排期**（排期由用户发起，⛔ 不编日期；落地跟踪 = tasks.md 未完成项总表「dsh-im-connect 借鉴面落地」行；其余 E~N 未拍板，留本目录作参考） |
-| dsh-im | §2.1-O 排队消息跨重启持久化（`submitted` 两态） | **未拍板**（2026-10-20 回看新登记）。本桥「入队前先落盘」已具备；`mark_attempting` 与 `prompt()` 的先后**未逐行核** ⇒ 判之前先读那一处调用点 |
+| dsh-im | §2.1-O 排队消息跨重启持久化（`submitted` 两态） | **本桥已具备（2026-10-21 核实完毕），无需拍板也无需动工**：① 入队前先落盘（`_record_inbound` 先于 `_enqueue`）；② 进 inbox 前先标 `attempting`（`mark_attempting` 在 `prompt()` 之前、`try:` 之外）；③ 409 退回 `pending`（服务端拒收 = agent 没跑过 ⇒ 可安全重放）。⚠️ 本桥粒度略粗（`pending`/`attempting` 两档 vs dsh `submitted` 两态），判据维度一致 ⇒ 只留作对照参考 |
 | dsh-im | §2.1-P 群消息/群文件共享存储（保留期 14 天） | **未拍板 · 第 1 类（产品判断等用户拍板）**。要拍的问题（一句话可复述）：「本桥是否要留存群历史与群文件（隐私面扩大、磁盘占用、保留期默认值），还是维持『只做 IM ↔ agent 的桥』不落历史？」 |
 | dsh-im-connect | §1.1-T1 Telegram 论坛话题隔离 | **未拍板 · 第 1 类（产品判断等用户拍板）**。要拍的问题：「是否支持话题群、会话粒度按话题还是按群？」⚠️ **⛔ 不照抄它把 threadId 编进 `chatId` 的形态** |
 | dsh-im-connect | §1.1-T2 发送模式 queue/steer、T3 文件投递诚实性 | **未拍板**。T2 与 fix-289「在途 turn 什么都不动」冲突，仅登记；T3 只取判据不抄实现 |

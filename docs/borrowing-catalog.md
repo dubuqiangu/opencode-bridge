@@ -26,7 +26,7 @@ hermes-agent 与 dsh-im-gateway 另有全量纯文本快照（文件名含 commi
 
 ---
 
-## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 2026-10-20 更新为 `617b079`，v1.0.8）
+## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 **2026-10-21 更新为 `93428ed`，v1.0.11**；上一基线 `617b079` 已过期）
 
 **定位**：将主流 IM 平台（dingtalk/discord/feishu/lark/qq/slack/telegram/wecom/weixin）
 接入本机 DeepSeek Harness。TypeScript / Koishi(cordis) 双侧插件，与本桥领域高度同构：
@@ -98,7 +98,21 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 
 ---
 
-## 2. xmanrui/dsh-im（MIT，锁 `b7698a6`；**2026-10-20 基线更新为 `0b9cbc2`（v5.2.0）**）
+### 1.2 本轮新机制（2026-10-21 回看，`617b079..93428ed`，v1.0.8→v1.0.11）
+
+**证据面**（均读自 `93428ed` 的 `src/`）：`channels/{telegram,discord,feishu,meta,factory,diagnostics}.ts`、
+`engine/{gateway,topic-title,keyed-queue,chat-commands,types}.ts`、`manager.ts`。
+⚠️ 这 15 个 commit 里**仍有大量 client/侧边栏 UI 重构**（`client.js` 单文件 ±2400 行）⇒ ⛔ 结构性不适用，不逐条记。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| U1 | **按账号的代理配置（`inherit`/`direct`/`custom`）+ 反射式暴露**：`proxyMode` 缺省 `inherit`（走宿主 env）；`direct` ⇒ `new Agent()` 显式绕开；`custom` ⇒ `new ProxyAgent(url)`。URL 闸**只接受 http/https、必须有 hostname、且 pathname 必须是 `/` 且无 query/hash**（`manager.normalizeProxyUrl` 另拒 `username`/`password` 与 `port > 65535`）；每处出站 `fetch` 统一经 `fetchTelegram`/`fetchImpl` 注入 dispatcher，**`stop()` 里 `dispatcher.close()` 失败再 `destroy()`**；`ChannelField` 新增 `settingsOnly` ⇒ 代理地址**不进新增账号的凭据表单**，只出现在已绑定账号的设置里 | `channels/{telegram,discord,factory,meta}.ts`、`manager.ts`（`hydrateProxyUrl`/`proxyUrlCache`/`accountView`）、`tests/telegram-proxy.test.mjs`(265)、`tests/discord-proxy*` | ⭐ **本桥确认缺失**：适配器一律用默认 `urllib`/`http.client` 行为，**无逐账号代理开关**（只有进程级 `HTTPS_PROXY` 环境变量）。可直抄的三条判据：① 代理 URL **必须拒 userinfo/query/hash**（否则 `https://u:p@host` 会被当凭据泄漏进日志）；② **渲染给前端时只给 `proxyConfigured` 布尔，不回显 URL**（本桥 `/setup` 视图同样应只报「已配置」）；③ **`direct` 是显式语义**，不是「未配置」的副作用。⚠️ 引入需动 13 个适配器的出站构造 ⇒ 归**第 1 类（产品判断等用户拍板：是否需要逐账号代理）** |
+| U2 | **Feishu 卡片 HTTP 400 回落纯文本 + 脱敏诊断摘要**：仅当 `status === 400` **且不是限流**时才回落（限流必须优先保留上层退避语义，否则改成发纯文本只会再被限一次）；回落失败再抛。诊断只输出 `http=<status> code=<code>`，且两个值都过**类型 + 范围**闸（status 100~599 整数、code 0~999999999 整数或 1~9 位数字串），⛔ 响应正文、请求配置、凭据一概不出 | `channels/feishu.ts`（`httpFailureSummary`）、commit `edef015`/`29171ce` | 与本桥「失败要可见、⛔ 不静默」同向，且**多出两条本桥没有的判据**：① 「回落前先排除限流」——本桥 telegram 的部分失败路径没有这个区分；② **诊断字段必须过范围闸再落地**，与本桥 §7.0 的脱敏纪律同族（本桥 `health` 落盘的 `description` 恰恰缺这条 ⇒ 见下方 §2.1 平台 `description` 一条的第 2 类判定）。可**单独借鉴②**，无需产品判断 |
+| U3 | **Telegram 话题名回写（`renameTopic`）+ `forum_topic_edited` 服务消息必须不送进 agent**：`forum_topic_edited` 是**服务消息不是对话内容** ⇒ 上报回调后 `continue`，否则会造出**一个没有输入的空回合**。命名策略三档 `once`（默认，只写一次）/`follow`/`off`；**按码点截断 128**（`[...clean].slice(0,128)`，`slice` 会切碎 emoji 代理对）；人工改名（收到的名字与自己刚写的不一致）⇒ **锁定**，之后的自动写一律跳过；`editForumTopic` 撞 429 ⇒ **返回 false 不抛**（「只是这次没写成」，下一轮再试）；同一话题用 `KeyedSerialQueue` 串行 ⇒ 两个标题不会同时越过 `once` 判断；⭐ **请求在途时新的人工锁定优先**（迟到的成功响应不能把新锁解除） | `channels/telegram.ts`（`renameTopic`/`setTopicEditHandler`）、`engine/topic-title.ts`、`engine/keyed-queue.ts`、`tests/topic-title*.test.mjs` | 本桥**零对应物**（不写话题名）。⚠️ 但 U3 里**两条与话题无关、可独立搬**：① **服务消息不得进 agent**（否则空回合）——本桥 telegram 适配器今天把 `message` 一律当对话，⚠️ **待核**：`channel_post`/`edited_message` 已于 `63d7434` 加 INFO 但**仍不进站**，而 `forum_topic_edited` 落在 `message` 键下 ⇒ 本桥会把它当对话**投递进 agent**；② **按码点截断而不是 UTF-16 单元**——本桥 `split.py` 已按码点，但**其他截断点未普查**。⇒ ① 归**第 1 类（已确认缺陷候选，需先核）**，② 归**第 4 类（判据未标定：需先枚举本桥全部截断点）** |
+
+⚠️ **另两条本桥结构性不适用**：`session-binding-lock.mjs` 的 `SESSION_BINDING_STATE_IDENTITY` 符号（上游用它给「同一状态的多个包装对象」统一锁，本桥无该形态）；`imessage-api.mjs` 的 `attributedBody` typedstream 解码（macOS 26 平台专有，本桥无 iMessage 渠道）。
+
+## 2. xmanrui/dsh-im（MIT，锁 `0b9cbc2`；**2026-10-21 基线更新为 `8ac3e6e`（v5.4.0）**）
 
 **定位**：DeepSeek Harness 官方 Token 赞助的双侧插件，渠道面最宽（12 个 IM 渠道）。
 完整借鉴面分析与落地跟踪见 AGENTS.md §6.1 登记行。**用户 2026-10-15 已拍板：①②③
@@ -138,18 +152,39 @@ group-history-store,group-history-access,prompt-failure-tracker}.mjs`（均读�
 ⇒ **O 条判据整体结论：本桥已具备，无需改动**；⚠️ 差异只在粒度（本桥 `pending`/`attempting`
 两档 vs dsh `submitted` 两态），维度和粒度数一致。
 
-## 3. NousResearch/hermes-agent（MIT，HEAD `6e9b3e3`，2026-10-20 现查）
+### 2.2 本轮新机制（2026-10-21 回看，`0b9cbc2..8ac3e6e`，26 commit，v5.2.0→v5.4.0）
+
+**证据面**：`src/channels/telegram/{group-triggers,config-store}.mjs`、`src/channels/wecom/stream-supervisor.mjs`、
+`src/channels/shared/{diagnostic-details,connection-error,session-binding-lock}.mjs`、`CHANGELOG.md`（5.3.0/5.4.0 两节）。
+⚠️ 本轮 26 个 commit 里**大部分是侧边栏/DS Bot 头像与设置面板的客户端重构**（`lib/client.js` ±2238 行、
+`ds-bot-avatar*.js`）⇒ ⛔ 结构性不适用，不逐条记。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| R | **企业微信流式卡片「窗口轮换」监督器**：WeCom 的流式卡片**从首帧起 10 分钟**关窗（刷新不续期，上游对着真实 errcode `846608` 核过）⇒ 长回合或静默回合会活过卡片，之后每一帧和**收尾**都被拒 ⇒ **答复丢失**。做法：**8分30秒**提前轮换（旧卡以「继续见下一段」收尾，新卡带着同一份预览内容重开）；静默超过 **2 分钟**发进度探测；**连续 2 次**更新被拒 ⇒ 立刻重开卡片；**所有 provider 交互走同一条串行队列** ⇒ 轮换在飞时收尾排在它后面，最终答复**一定落到最新那张卡**；`stop()` 之后**禁止再开卡**（被打断的轮换只关旧卡，绝不留「继续中」的孤儿卡）；收尾是**终态**（之后计时器停、探测与轮换都被抑制 ⇒ 慢速后续投递碰不到已完成的卡），而收尾失败仍回落到调用方的主动消息路径；SDK 拒绝时抛的是**原始 ack 帧**（有 errcode/errmsg 但无 `.message`）⇒ 包成 `Error` 再给调用方 | `stream-supervisor.mjs`(184)、`tests/stream-supervisor.test.mjs`、CHANGELOG 5.4.0 | ⭐ **对本桥是「占位消息生命周期」的一个完整答案**，可作为出站质量参考：本桥 telegram 占位消息是编辑式进度，**没有平台侧硬窗口**（telegram `editMessageText` 无 10 分钟限制）⇒ 机制本身**不适用**；但**三条判据可独立搬**：① **「收尾是终态」**——一旦 finalize，轮换/进度必须全部被抑制，否则慢速后续投递会碰已完成的载具（本桥 `outbound.finalize` 后是否还允许编辑**待核**）；② **`stop()` 之后禁止再开新载具**（否则关停期间多出一个孤儿气泡）；③ **连续 N 次被拒 ⇒ 换载具**，而不是继续往同一张卡里写。⇒ ①② 归**第 1 类（需先核本桥 finalize 后的写入闸）**，③ 仅登记 |
+| S | **Telegram 逐群回复触发规则**：五档 `off`（静默）/`mention`（@ 或回复）/`mention-list`（同上但只认名单内成员）/`all`（每条都答）/`all-list`（每条但只认名单）；**未配置的群维持旧的「提及或回复」行为**（⛔ 不因新功能改变既有默认）；名单上限 **500** 个 id、单 id ≤ **64** 字符、**拒绝控制字符**、去重保序；群标识支持数字 id / `@handle` / 公开 `t.me` 链接 / 内部 `t.me/c/` 链接（**邀请链接解析不出群 ⇒ 明确不支持**）；设置**随账号配置走**（不是旁路文件），每次更新经控制器重启 runtime；管理面板可隐藏已发现的群（**隐藏不删除历史**） | `group-triggers.mjs`(229)、`telegram/config-store.mjs`、`tests/channels/telegram/group-triggers*.test.mjs`(4 个) | 本桥 telegram 群聊的入站闸是**固定的「@ 或回复」**（`_addressed` 只会话级白名单）⇒ **逐群规则是新能力**。⚠️ 它是**产品决策**（要不要让 bot 在每个群都答），但**其中一条判据可直接抄、无需拍板**：**「未配置 ⇒与自己无关，维持既有默认」** —— 新增配置面时⛔ 不许改变未配置者的行为（与本桥「缺省一律按可能已跑过处理」同族）。⇒ 规则本身归**第 1 类（产品判断）**；判据登记为纪律 |
+| T | **诊断字段白名单化（`DIAGNOSTIC_ERROR_TYPES` + `errorTypes`）**：把原先散在 `connection-error.mjs` 里的 `STANDARD_NAMES` 收进 `diagnostic-details.mjs` 的**单一白名单**，新增 `errorTypes`（去重、只留白名单内的类型名）与 `qrEncoder`/`qrRenderer`；依赖版本白名单扩到 `qrcode`/`pngjs`/`zlib`；`connectionStageError` 新增 `details` 参数以便在**出错那一刻**给它盖阶段戳 | `diagnostic-details.mjs`、`connection-error.mjs`、CHANGELOG 5.3.0 | 与本桥 §7.0「诊断只落白名单字段」同向 ⇒ **本桥已具备该纪律**，本条只多一个可抄的形态：**「类型名也走白名单，⛔ 不把任意 `e.name` 落盘」**（任意 name 可被构造者写成任意字符串）。⇒ 仅登记 |
+
+⚠️ **另两条与本桥同域但属修补**：`fix(imessage): read message bodies from attributedBody on macOS 26`（平台专有，不适用）；
+`fix(wecom): surface SDK reply-ack errcode in logs`（与本桥 `63d7434`「回执失败要响亮」同向，已具备）。**均不单独立条**。
+
+## 3. NousResearch/hermes-agent（MIT，HEAD `3cbb13f`，2026-10-21 现查）
 
 **首选 IM 平台工程范式参考**。全量纯文本快照（64 MB / 134 万行，锁 `8a5edab…`），
 搜法与引用纪律见 AGENTS.md §6.1；平台清单并集（≈31 家）见 `docs/platform-design-reference.md`。
 ⚠️ 边界：全库零 opencode 事件流消费（`/api/event` 零命中），不能当 opencode 服务端契约依据
 （那个查 §6.2）。
-⚠️ **2026-10-20 复核（对 HEAD `6e9b3e3` 跑 `gh search code '/api/event'`）**：命中 **10 条、
-全部是它自己的 dashboard `/api/events`（复数）** —— `web/src/lib/eventsFeedClient.ts`、
-`web/src/lib/events-reconnect.ts`、`hermes_cli/web_routers/chat_ws.py`、
-`tui_gateway/event_publisher.py`、`tests/hermes_cli/test_web_server_host_header.py` 等；
-**`/api/event`（单数、opencode 的那个端点）零命中** ⇒ 结论在 2006 个新 commit 之后**仍然成立**，
-且这条现在有**在新 HEAD 上重跑过的证据**，不再依赖 `8a5edab…` 那份旧快照。
+⚠️ **2026-10-21 复核（对 HEAD `3cbb13f` 重跑 `gh search code '/api/event' --repo NousResearch/hermes-agent`）**：命中 **约 18 行、全部是它自己的 `/api/events`（复数）** ——
+`web/src/lib/{eventsFeedClient,events-reconnect}.ts`、`hermes_cli/web_routers/chat_ws.py`、
+`hermes_cli/web_server_idle_exit.py`、`tui_gateway/event_publisher.py`、
+`web/src/components/ChatSidebar.tsx`、`web/src/lib/api.test.ts`、`tests/hermes_cli/{test_web_server_host_header,test_web_server,test_dashboard_auth_ws_auth}.py`、
+`tests/e2e/core/dashboard/test_dashboard_auth.py`；另有 `apps/bootstrap-installer/src/store.ts`
+的 `@tauri-apps/api/event`（Tauri 前端事件包，**不是 HTTP 端点**）。
+⭐ **单数 `/api/event` 零命中** ⇒ 结论**在第二个新 HEAD 上再次成立**（`6e9b3e3` → `3cbb13f`），
+证据不再依赖 `8a5edab…` 那份旧快照。
+⚠️ **口径更正（本轮自查抓出）**：`gh search code` 的「条数」按**命中行**计，同一文件多行即多条
+⇒ 2026-10-20 记的「10 条」是**行数口径**，⛔ 不要读成「10 个文件」。本轮为省时**未逐文件去重**，
+故写「约 18 行」而**不写文件数**。
 
 ## 4. zhuiyueya/dsh-im-gateway（MIT，HEAD `8e8fbca`）
 
@@ -174,6 +209,14 @@ dsh-im-gateway 的快照仍锁旧快照 SHA（`8a5edab…`），回看时若 HEA
 「零 opencode 事件流消费」结论**已在新 HEAD 上重跑**（见 §3 末段，仍成立）；⚠️ 而它那份
 **全量纯文本快照仍是 `8a5edab…`、落后 2006 个 commit** ⇒ 快照里**别的内容**（平台清单、
 `docs/platform-design-reference.md` 的并集）**仍是旧版本的**，引用前要么重抓要么明说依据版本。
+⚠️ **2026-10-21 更新**：基线再前移三项（dsh-im `8ac3e6e` / dsh-im-connect `93428ed` /
+hermes-agent `3cbb13f`；dsh-im-gateway `8e8fbca` **连续第三轮零差异**）。
+本轮的**回看动作本身**与 10-20 那次有一处不同，值得记：dsh-im-connect 的 `git fetch`
+**第一次报 `RPC failed; curl 28 Recv failure`**、重试才成功 ⇒ **「零差异」只有在 fetch 成功后才算结论**，
+⛔ 网络失败不等于上游没变（§7.1：超时 ≠ 零命中）。
+hermes-agent 的「零 opencode 事件流消费」**在第二个新 HEAD 上再核一次、仍成立**（§3 末段）；
+其快照落后量**本轮未重数** ⇒ 上面那句「落后 2006 个 commit」现在是**过期值**，
+引用时须注明它是 `6e9b3e3` 当时的数。
 
 **回看时做什么**：
 
@@ -195,3 +238,5 @@ dsh-im-gateway 的快照仍锁旧快照 SHA（`8a5edab…`），回看时若 HEA
 | dsh-im | §2.1-P 群消息/群文件共享存储（保留期 14 天） | ✅ **2026-10-21 用户拍板：不落历史，维持纯桥定位**（否掉「只留消息不留文件」与「消息+文件都做」两个候选）。理由：本桥定位是「IM ↔ 本机 agent 的转发」，留存群消息/群文件会扩大隐私面与磁盘占用，且保留期默认值是无人量过的数。⇒ 本目录 §2.1-P 行只留作对照参考，⛔ 不落地 |
 | dsh-im-connect | §1.1-T1 Telegram 论坛话题隔离 | ✅ **2026-10-21 用户拍板：暂不支持话题群**（维持按 `chatId` 的会话粒度）。⚠️ 知情代价：论坛群里同一 `chat` 下不同话题共用一条会话 —— 行为简单，但话题之间会串消息；若日后要支持，⛔ 不照抄它把 `threadId` 编进 `chatId` 字符串的形态，而应把 thread id 作为独立字段挂在入站消息与会话键上 |
 | dsh-im-connect | §1.1-T2 发送模式 queue/steer、T3 文件投递诚实性 | **未拍板**。T2 与 fix-289「在途 turn 什么都不动」冲突，仅登记；T3 只取判据不抄实现 |
+| dsh-im-connect | §1.2-U3 Telegram 服务消息（`forum_topic_edited`）被当对话送进 agent | **未拍板 · 第 1 类（已确认缺陷候选，需先核本桥）**：本桥 telegram 适配器的入站形状过滤只认 `message` 键，而 `forum_topic_edited` **就挂在 `message` 下**（见上游 `TgUpdate.message` 形状）⇒ 若本桥真的把这种 update 投进 agent，会产生**一个没有输入的空回合**。⚠️ 与 T1（暂不支持话题群）**不冲突**：T1 定的是「会话粒度按群」，本条定的是「**服务消息不许进 agent**」，后者即便不支持话题群也必须挡。⇒ **下一步**：把一条真实的 `forum_topic_edited` update（可从上游测试夹具抄形状，⛔ 不需外网）喂给本桥 telegram 适配器，量「投递条数 / 日志条数」两臂 ⇒ 若投递 **1 条**则核实缺陷，改动面 = 形状过滤加一条（与 `63d7434` 的 non-message INFO 同处） |
+| dsh-im | §2.2-R 载具生命周期三条判据（收尾终态 / stop 后禁开新载具 / 连拒换载具） | **未拍板 · 第 1 类（需先核本桥 finalize 后写入闸）**：前两条判据对本桥的对应面是 `outbound.finalize` 之后**是否仍允许编辑占位气泡** —— ⚠️ 本桥没有平台侧硬窗口（telegram `editMessageText` 无 10 分钟限制），所以**机制不适用、判据适用**。⇒ **下一步（可机械判定）**：读 `outbound.py` 的 `finalize` 与其后的写入点，量「finalize 之后再调 `edit` 会不会被拒/被忽略」；③「连拒换载具」暂只登记 |

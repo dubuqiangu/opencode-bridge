@@ -759,6 +759,7 @@ python -m opencode_bridge --setup --json          # 机器可读视图：{config
 | `adapters.telegram.bot_token` | `""` | Telegram bot token（`@BotFather`） |
 | `adapters.telegram.allowed_chat_ids` | `[]` | **白名单**：非空时只响应列表内的 chat id。空数组的含义**取决于 `config_version`**（见上）—— `< 2` 时是「全部放行」，`>= 2` 时是「谁都不放行」。⚠️ **每个平台的默认 `[]` 在 `config_version < 2` 时都是全放行**，任何能给 bot 发消息的人都能以你的权限驱动 agent —— 见「7. 安全须知」 |
 | `adapters.telegram.poll_timeout` | `25` | `getUpdates` 的**长轮询挂起秒数**（Bot API 上限 50）。⚠️ **写错不会打死桥接**：非整数（`"25s"`、`"25.5"`）或**非正数**（`0`、`-5`）都会**回落为默认值 `25` 并打一条 WARNING**（`telegram: 配置项 poll_timeout=… 已回落为 25`），适配器照常启动。留空 = 静默用默认值 |
+| `adapters.telegram.send_limit_per_minute` | `15` | 每聊天每分钟可**新建**的消息条数（Telegram 的每聊天发送预算，对齐 Bot API 的「per-chat 约 1 条/秒、突发 30 条」上限）。编辑 / typing / reaction / 回调应答**不计费**（否则一次流式改写就能耗光预算）。⚠️ **写错不会打死桥接**：非整数（`"15"`、`15.5`、`true`）会**回落默认 `15` 并打一条点名该键的 WARNING**；越界值**夹逼**到 `1..30` 并告警（配 `999` 等于关掉预算、配 `0` 会让防御分支变得可达，两者都必须在日志里点名）。默认 `15`、可配范围 `1..30` |
 | `adapters.slack.bot_token` | `""` | Slack bot token（`xoxb-`）：**出站必需**；入站还需下面的 `app_token` |
 | `adapters.slack.app_token` | `""` | Slack **app-level token**（`xapp-`）：Socket Mode 入站专用，缺它时降级为只发出站 |
 | `adapters.matrix.homeserver` | `""` | Matrix homeserver 根地址（如 `https://matrix.example.org`，尾部斜杠会自动去掉） |

@@ -92,6 +92,12 @@ from .telegram_protocol import (  # noqa: F401  再导出：消费面沿用旧�
     _button_row, _retry_after,
 )
 from .telegram_credential_lifecycle import TelegramCredentialLifecycle
+from .telegram_send_budget import (
+    DEFAULT_SEND_LIMIT_PER_MINUTE, MAX_RATE_LIMIT_WAIT_SECONDS,
+    MAX_SEND_ATTEMPTS, SEND_LIMIT_MAX_PER_MINUTE, SEND_LIMIT_MIN_PER_MINUTE,
+    clamp_send_limit, rate_limit_wait_seconds, record_send,
+    seconds_until_send_slot,
+)
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
 
@@ -136,6 +142,16 @@ class TelegramAdapter(Adapter):
     # Class-level knobs (tests may override them on the instance).
     min_interval = MIN_SEND_INTERVAL
     backoff_interval = BACKOFF_INTERVAL
+    #: 每聊天每分钟可**新建**的消息条数（Telegram 的预算）。上游默认 15，
+    #: 可配范围 1..30（:func:`clamp_send_limit` 夹逼）；编辑 / typing /
+    #: reaction / 回调应答**不计费**，见 :attr:`_BILLABLE_METHODS`。
+    send_limit_per_minute = DEFAULT_SEND_LIMIT_PER_MINUTE
+    #: 计费方法：只有「新建一条消息」消耗每聊天预算。``sendRichMessage`` /
+    #: ``sendDocument`` / ``sendPhoto`` 目前零调用点，但列进来是为了让
+    #: 「哪些方法计费」这一判断只存在一处 —— 接媒体时不必再想起预算。
+    _BILLABLE_METHODS = frozenset(
+        {"sendMessage", "sendRichMessage", "sendDocument", "sendPhoto"}
+    )
     #: 「凭据闸门没过时的重试阶梯」。⛔ **与 :attr:`backoff_interval` 是两件事**：
     #: 后者是 ``getUpdates`` 失败后的间隔（迁移前逐字保留的恒定 2s），前者是
     #: ``getMe`` 探测阶梯的**初值**。测试要缩短阶梯时覆盖这两个**实例**属性，
@@ -157,8 +173,13 @@ class TelegramAdapter(Adapter):
         self.poll_long_timeout = self._coerce_poll_timeout()
         self._offset = 0
         self._api_lock = threading.Lock()          # serializes _post calls
-        self._throttle_lock = threading.Lock()     # guards _last_send
+        self._throttle_lock = threading.Lock()     # guards _last_send / _send_history
         self._last_send: dict[str, float] = {}
+        #: 每聊天「窗口内已新建消息的时刻表」，只由 _await_send_budget 读写。
+        #: 每次记录都会裁掉窗口外的时刻 ⇒ 列表长度恒 <= send_limit_per_minute；
+        #: 键的寿命与 _last_send 同（刻意不淘汰，见 tasks.md 那一行）。
+        self._send_history: dict[str, list[float]] = {}
+        self.send_limit_per_minute = self._coerce_send_limit()
         self._transport: Optional[PollingTransport] = None
         # §5.1 第一刀（类手术）：凭据生命周期的 5 个状态属性已随 8 个方法迁入
         # TelegramCredentialLifecycle（telegram_credential_lifecycle.py）。
@@ -229,6 +250,37 @@ class TelegramAdapter(Adapter):
             return POLL_LONG_TIMEOUT
         return seconds
 
+    def _coerce_send_limit(self) -> int:
+        """``send_limit_per_minute``：1..30 夹逼，非整数回落默认并告警。
+
+        与 :meth:`_coerce_poll_timeout` 同一纪律：**配置写坏不许打死适配器**
+        （``base.build`` 会把异常包成 ``AdapterError``，用户只看到「没有可用
+        适配器」）；也**不静默采纳越界值** —— 配 ``999`` 等于关掉预算，
+        配 ``0`` 会让 ``seconds_until_send_slot`` 的防御分支（0 = 不阻塞）
+        从配置面变得可达，两者都必须在日志里点名。
+
+        ⚠️ 浮点**不算整数**（``15.0`` 回落 15、``15.5`` 也回落 15）：接受它
+        就得决定 ``15.5`` 是截断还是四舍五入，而那个决定没有任何依据。
+        """
+        raw = self.config.get("send_limit_per_minute")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return DEFAULT_SEND_LIMIT_PER_MINUTE
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            logger.warning(
+                "telegram: 配置项 send_limit_per_minute=%r 不是整数（%s），"
+                "已回落为 %d",
+                raw, type(raw).__name__, DEFAULT_SEND_LIMIT_PER_MINUTE,
+            )
+            return DEFAULT_SEND_LIMIT_PER_MINUTE
+        clamped = clamp_send_limit(raw)
+        if clamped != raw:
+            logger.warning(
+                "telegram: 配置项 send_limit_per_minute=%r 超出 %d..%d，"
+                "已夹到 %d",
+                raw, SEND_LIMIT_MIN_PER_MINUTE, SEND_LIMIT_MAX_PER_MINUTE, clamped,
+            )
+        return clamped
+
     # ------------------------------------------------------------------
     # HTTP plumbing
     # ------------------------------------------------------------------
@@ -290,32 +342,69 @@ class TelegramAdapter(Adapter):
     ) -> dict:
         """Throttled + 429-retried wrapper around ``_post``.
 
+        三道闸，作用域**故意不同**：
+
+        1. :meth:`_throttle` —— 每聊天最小间隔，**所有**方法都守（编辑也算
+           一次「对平台的请求」）；
+        2. :meth:`_await_send_budget` —— 每聊天每分钟**新建消息**预算，只对
+           :attr:`_BILLABLE_METHODS` 生效（编辑 / typing / reaction / 回调
+           应答不计费，否则一次流式改写就能把预算耗光）；
+        3. 429 重试 —— 最多 :data:`MAX_SEND_ATTEMPTS` 次尝试、累计等待不超过
+           :data:`MAX_RATE_LIMIT_WAIT_SECONDS`；**等待用 ``_stop_event.wait``**
+           而不是 ``time.sleep``，所以 ``stop()`` 能立刻打断（此前最坏被拖 60s）。
+
         Returns the final response dict; on transport failure returns
         ``{"ok": False}``. Never raises.
         """
         self._throttle(conversation_id)
-        try:
-            with self._api_lock:
-                data = self._post(method, payload, timeout=timeout)
-        except Exception:
-            logger.exception("telegram: %s request failed", method)
-            return {"ok": False, "error_code": 0, "description": "transport error"}
-        if isinstance(data, dict) and data.get("ok") is False:
+        if method in self._BILLABLE_METHODS:
+            self._await_send_budget(conversation_id)
+        attempts_done = 0
+        already_waited = 0.0
+        while True:
+            attempts_done += 1
+            try:
+                with self._api_lock:
+                    data = self._post(method, payload, timeout=timeout)
+            except Exception:
+                logger.exception("telegram: %s request failed", method)
+                return {"ok": False, "error_code": 0, "description": "transport error"}
+            if not (isinstance(data, dict) and data.get("ok") is False):
+                break
             delay = _retry_after(data)
-            if delay is not None:
+            if delay is None:
+                break
+            if method not in self._BILLABLE_METHODS:
+                # 上游机制：编辑 / 草稿撞 429 不重试、直接返回失败（下一帧
+                # 会再试，且 _mark_backoff 让下一次至少隔 2s）。套上重试会把
+                # 一次流式改写的等待拖到 60s，比丢掉这一帧更坏。
                 logger.warning(
-                    "telegram: %s rate-limited, sleeping %.1fs and retrying once",
-                    method,
-                    delay,
+                    "telegram: %s rate-limited（非计费方法，不重试）", method
                 )
                 self._mark_backoff(conversation_id)
-                time.sleep(delay)
-                try:
-                    with self._api_lock:
-                        data = self._post(method, payload, timeout=timeout)
-                except Exception:
-                    logger.exception("telegram: %s retry failed", method)
-                    return {"ok": False, "error_code": 0, "description": "transport error"}
+                break
+            wait = rate_limit_wait_seconds(
+                delay, already_waited=already_waited, attempts_done=attempts_done
+            )
+            if wait is None:
+                logger.warning(
+                    "telegram: %s 仍被限流，不再重试"
+                    "（已尝试 %d 次、累计等待 %.1fs，上限 %d 次 / %.0fs）",
+                    method, attempts_done, already_waited,
+                    MAX_SEND_ATTEMPTS, MAX_RATE_LIMIT_WAIT_SECONDS,
+                )
+                break
+            logger.warning(
+                "telegram: %s rate-limited, waiting %.1fs (attempt %d/%d)",
+                method, wait, attempts_done, MAX_SEND_ATTEMPTS,
+            )
+            self._mark_backoff(conversation_id)
+            if self._stop_event.wait(wait):
+                logger.info(
+                    "telegram: %s 的 429 等待被关停打断，不再重试", method
+                )
+                break
+            already_waited += wait
         # No generic failure logging here: callers decide which errors are
         # silent (e.g. editMessageText "message is not modified").
         return data if isinstance(data, dict) else {"ok": False}
@@ -339,6 +428,42 @@ class TelegramAdapter(Adapter):
         backoff = getattr(self, "backoff_interval", BACKOFF_INTERVAL)
         with self._throttle_lock:
             self._last_send[conversation_id] = time.monotonic() + backoff - self.min_interval
+
+    def _await_send_budget(self, conversation_id: str) -> None:
+        """等到这个聊天有「新建消息」额度，并把这一刻记进窗口。
+
+        ⚠️ **只给 :attr:`_BILLABLE_METHODS` 调用**：编辑 / typing / reaction /
+        回调应答不消耗 Telegram 的每聊天预算，套上它会白白拖慢流式改写。
+
+        等待用 ``_stop_event.wait`` ⇒ ``stop()`` 立刻打断，⛔ 不是
+        ``time.sleep``（那正是 429 那条曾被拖 60s 的同型缺陷）。
+        ⚠️ 被打断时**不记账就返回**，调用方仍会发出这条消息 —— 与
+        :meth:`_throttle` 的既有语义一致（stop = 不再等，不是「放弃发送」）。
+
+        ``limit <= 0`` 是纯函数层的防御分支（配置面到不了：``_coerce_send_limit``
+        把合法值夹到 1..30），这里直接放行。
+        """
+        limit = getattr(
+            self, "send_limit_per_minute", DEFAULT_SEND_LIMIT_PER_MINUTE
+        )
+        if limit <= 0:
+            return
+        while True:
+            now = time.monotonic()
+            with self._throttle_lock:
+                history = self._send_history.get(conversation_id, ())
+                wait = seconds_until_send_slot(history, now=now, limit=limit)
+                if wait <= 0.0:
+                    self._send_history[conversation_id] = record_send(
+                        history, now=now
+                    )
+                    return
+            logger.info(
+                "telegram: 每聊天发送预算已满（%d 条/分钟），等待 %.1fs 后再发",
+                limit, wait,
+            )
+            if self._stop_event.wait(wait):
+                return
 
     # ------------------------------------------------------------------
     # Lifecycle

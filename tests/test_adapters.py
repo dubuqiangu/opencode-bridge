@@ -966,7 +966,7 @@ class TestCapabilities(unittest.TestCase):
         hooks = RecordingHooks()
         expected = {
             "telegram": {"max_message_length": 4096, "supports_inbound": True,
-                         "supports_inline_buttons": True, "supports_media": True},
+                         "supports_inline_buttons": True, "supports_media": False},
             "slack": {"max_message_length": 40000, "supports_inbound": True,
                       "supports_inline_buttons": True, "supports_media": False},
             "discord": {"max_message_length": 2000, "supports_inbound": True,

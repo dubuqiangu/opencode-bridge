@@ -166,7 +166,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 >    - **@BotFather 的 privacy mode 默认开着** ⇒ Telegram **服务端根本不下发**非提及消息，这是**平台侧**的事，桥里**没有这个旋钮**。⇒ **去 BotFather 对该 bot 关掉 privacy mode**。
 >    - **私聊 id ≠ 群 id**：群 chat id 是**负数**（形如 `-1001234567890`），而 **@userinfobot** 给的是**正数的 user id**（只有私聊能用它）。⇒ **去 `@RawDataBot`**（或在群内用 Telegram 客户端 / 第三方工具）**拿到那个负数群 id**，把**它**填进 `allowed_chat_ids`。
 > 4. ⚠️ **群里不需要 @ bot —— 这有安全含义**。Telegram 适配器**没有任何 mention 过滤**：群里**每一条文本消息**都会被当成"有人在对 agent 说话"送进模型（对照 **IRC / Twitch 只响应提及**）。所以把群 id 加进 `allowed_chat_ids` 之前先想清楚：**那个群里所有人、所有话都会以你的权限驱动 agent**。
-> 5. **只收文本消息**。图片 / 语音 / 贴纸等**非文本** update 一律**静默丢弃**（`text` 字段不是字符串就直接 return）。⚠️ 而 `capabilities()` 报的 `supports_media: true` 指的是「**能发出站媒体**」，**不是「能收媒体」** —— README 平台能力表里 Telegram 行的媒体能力也是这个意思。
+> 5. **只有文本会进模型 —— 出站也只有文本**。图片 / 语音 / 贴纸等**非文本** update 一律**静默丢弃**（`text` 字段不是字符串就直接 return）；反方向同样没有：本桥**发不了图片或文件**，`capabilities()` 的 `supports_media` 是 `false`（整个桥的出站面 `hooks.Outbound` 就没有承载媒体的字段，Telegram Bot API 的 `sendDocument` / `sendPhoto` 本桥一个都没调用）。⚠️ 所以 `--status` 能力表里 Telegram 的「媒体」列是**否** —— 那是如实回答，不是缺陷。
 >
 > ⚠️ **上面五条都排干净、启动探测也是绿的，却仍然收不到回信** ⇒ 那是**运行期**的另一个记录，
 > 坑 1 讲的「上次启动时的探测结论」/ `last_start_probe` **帮不上忙** —— 它答的是

@@ -157,7 +157,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 | 平台 | 接收消息 | 发送消息 | 编辑消息 | 备注 |
 |---|---|---|---|---|
-| Telegram | ✅ 长轮询 `getUpdates` | ✅ | ✅ 原生 | 最成熟，按钮交互已支持；**私聊 / 群消息皆收、群里无需 @ bot** —— ⚠️ 群里每条文本消息都会驱动 agent，加群前先看 [`docs/install.md`](docs/install.md) Telegram 节「收不到消息怎么查」第 4 条 |
+| Telegram | ✅ 长轮询 `getUpdates` | ✅ | ✅ 原生 | 最成熟，按钮交互已支持；**私聊 / 群消息皆收、群里无需 @ bot** —— ⚠️ 群里每条文本消息都会驱动 agent，加群前先看 [`docs/install.md`](docs/install.md) Telegram 节「收不到消息怎么查」第 4 条。**只走文本**：非文本入站静默丢弃，本桥也发不了图片/文件（能力表「媒体」列 = 否） |
 | Slack | ✅ Socket Mode | ✅ | ✅ 原生 | 入站需另配 `app_token`（`xapp-`） |
 | Discord | ✅ Gateway v10 | ✅ | ✅ 原生 | 需在后台开 **Message Content Intent** |
 | Matrix | ✅ `/sync` 长轮询 | ✅ | ⚠️ 兼容近似 | 无标准编辑 API，见该节说明 |

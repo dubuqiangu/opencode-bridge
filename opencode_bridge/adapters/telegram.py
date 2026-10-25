@@ -116,7 +116,20 @@ class TelegramAdapter(Adapter):
     #: (c) 平台对发件人做过认证 —— 三条判据都成立。
     pairing_supported = True
     supports_inline_buttons = True              # 仓库里唯一支持 inline 按钮的平台
-    supports_media = True
+    #: ⛔ ``False``，而且这与"Telegram 能不能发媒体"**不是同一个问题**。
+    #:
+    #: 这个字段问的是"本桥**接没接**出站媒体"，而答案在整个桥的接口面上：
+    #: :class:`~opencode_bridge.hooks.Outbound` 只有 ``conversation_id`` /
+    #: ``text`` / ``kind`` / ``buttons`` / ``session_id`` —— **压根没有承载媒体的
+    #: 字段** ⇒ 任何适配器都无处拿到一个文件去发。Telegram Bot API 确实有
+    #: ``sendDocument`` / ``sendPhoto`` 等，但**本桥一个都没调用**（2026-10-25 审计：
+    #: 上述方法与 ``parse_mode`` 在 ``telegram.py`` 里命中数全为 0）。
+    #:
+    #: ⚠️ 此前这里写的是 ``True``，而那个值**唯一**的消费方是 ``--status`` 的能力表
+    #: （``platform_status.py`` 把它印成"媒体：是"）⇒ 它对用户**谎报**"能给 bot
+    #: 发图片/文件"。其余十二个平台一律 ``False``，Telegram 曾是唯一的例外，
+    #: 且没有一行注释解释为什么 —— 因为那个理由并不存在。
+    supports_media = False
     #: ``editMessageText`` 真能把占位气泡顶成最终答复，所以 ``⏳ 处理中…`` 发得。
     supports_message_edit = True
 

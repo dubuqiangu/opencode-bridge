@@ -546,7 +546,7 @@ class InboundGateway:
         inbound: Inbound,
         text: str,
     ) -> QueuedPrompt | None:
-        """Acknowledge if long, write the inbox receipt, then queue for delivery.
+        """Write the inbox receipt, then — only if it will be delivered — ack and queue.
 
         合并**已经**做完，这里只处理"怎么把它变成一次投递"。拆成独立方法是
         因为保险丝那条路要走同样的三步，而它拿到的是**并集**而不是一行 ——
@@ -558,7 +558,6 @@ class InboundGateway:
             :meth:`_deliver_expired_hold` **说真话**用的：那一帧对用户宣布
             「已把等到的内容原样发出」，而它必须先知道这件事成不成立。
         """
-        self._acknowledge_long_input(conversation_id, adapter, text)
         try:
             queued = _record_inbound(self._inbox, inbound, text)
         except Exception:
@@ -586,6 +585,11 @@ class InboundGateway:
             return None
         if queued is not None:
             # None = 去重命中（已投递过）**或**收件箱已关（没落盘，见 _record_inbound）
+            # ⚠️ 回执只发给**真的会投递**的那次：平台重投一条已投递过的消息时
+            # ``_record_inbound`` 返回 ``None``（去重命中），此时再发一条
+            # 「已收到 N 字，处理中…」就是永不兑现的假回执 —— 用户收到第二条
+            # 回执，却永远等不到答复。⇒ 回执移进这个闸内，去重命中不发。
+            self._acknowledge_long_input(conversation_id, adapter, text)
             self._enqueue(queued)
         return queued
 

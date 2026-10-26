@@ -1079,6 +1079,35 @@ class InboundMergeWiringTests(InboundGatewayTestCase):
             out.text for out in self.send_text.outgoing
         ))
 
+    def test_a_dedup_hit_sends_no_second_receipt_on_a_platform_that_cannot_edit(self):
+        """平台重投一条已投递过的长消息 ⇒ 去重命中 ⇒ **不发**第二条「处理中…」。
+
+        回执本是给「粘了一大段、却没有占位进度可看」的用户的第一句话；但若这一条
+        **已经投递过**（平台重投、去重命中），再发一条回执就是**永不兑现的假回执**：
+        用户收到「已收到 N 字，处理中…」，却永远等不到答复。判据：去重命中的那次
+        只投递正文、**不发第二条回执**。
+        """
+        long_text = "改一下 README 的安装步骤" * 20
+        self.adapter_result = StandInAdapter({}, hooks=None)
+        self.adapter_result.supports_message_edit = False
+
+        # 第一次投递：正文进队、发一条「处理中…」回执。
+        self.gateway.on_inbound(message(long_text, message_id="m1"))
+        self.assertEqual(1, self.prompt_bodies.count((SESSION_ID, long_text)))
+        self.assertIn("已收到", "".join(
+            out.text for out in self.send_text.outgoing
+        ))
+        receipts_before = len(self.send_text.outgoing)
+
+        # 平台重投同一条 ⇒ 去重命中 ⇒ 正文不入队，也**不**再发第二条回执。
+        self.inbox.duplicate_of = "fake:chat:55:m1"
+        self.gateway.on_inbound(message(long_text, message_id="m1"))
+
+        self.assertEqual(1, self.prompt_bodies.count((SESSION_ID, long_text)),
+                         "去重命中：正文必须只投递一次")
+        self.assertEqual(receipts_before, len(self.send_text.outgoing),
+                         "去重命中：不得再发第二条「处理中…」假回执")
+
 
 # ----------------------------------------------------------------------
 # 3c-续: 保险丝到点时那句「已把等到的内容原样发出」必须**说真话**

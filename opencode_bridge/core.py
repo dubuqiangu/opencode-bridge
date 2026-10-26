@@ -218,6 +218,14 @@ class BridgeCore:
         #: :class:`~opencode_bridge.session_registry.SessionRegistry` 删会话时弹掉它。
         #: 所以它留在本类、作为**同一个对象**注入三者 —— 不是复制一份，是同一个 dict。
         self._turns: dict[str, Turn] = {}
+        #: 占位消息**正在飞行中**（``progress_message_creating == True``）就被 ``/new``
+        #: 弹掉的那批会话 id。成员 = 取消动作必须由那次 send 的 ``finally`` 执行
+        #: （句柄此刻才到手）。跨三块**共有**：:class:`~opencode_bridge.session_registry.
+        #: SessionRegistry.drop_session` 登记它、事件流与入站那一侧的 ``finally``
+        #: 消费它（见各自模块的同一段注释）⇒ 留在本类、作为**同一个对象**注入三者，
+        #: 与 ``_lock`` / ``_turns`` 同一性质。解法见
+        #: :class:`~opencode_bridge.event_stream.Turn.progress_message_creating` 的说明。
+        self._pending_cancel_session_ids: set[str] = set()
         self._thread: threading.Thread | None = None
         self._started = False
         #: 「上次启动」各适配器的探测结论（``{平台键: {verdict, code, detail}}``）。
@@ -294,6 +302,7 @@ class BridgeCore:
             # 僵尸气泡，而用户零反馈）⇒ 注入**出站那一条**，它按平台能力决定改写
             # 占位消息还是补发一句。⛔ 绝不发半截正文（用户 2026-10-07 拍板）。
             cancel_turn=self.outbound.cancel_turn,
+            pending_cancel_session_ids=self._pending_cancel_session_ids,
         )
         #: ``/model`` 的全部逻辑（参数解析、模型目录缓存、回复文案）都在这个对象
         #: 里，core 侧只把它当协作者传下去。
@@ -355,6 +364,8 @@ class BridgeCore:
             flush_queue=self._flush_queue,
             permission_ledger=self.permission_ledger,
             permission_timeout=self.permission_timeout,
+            cancel_turn=self.outbound.cancel_turn,
+            pending_cancel_session_ids=self._pending_cancel_session_ids,
         )
 
         #: 适配器进来的两个 hook、每会话的 prompt 队列、写前收件箱与启动重放。
@@ -385,6 +396,8 @@ class BridgeCore:
             permission_ledger=self.permission_ledger,
             permission_timeout=self.permission_timeout,
             bridge_config=getattr(config, "bridge", None) or {},
+            cancel_turn=self.outbound.cancel_turn,
+            pending_cancel_session_ids=self._pending_cancel_session_ids,
         )
 
         # 事件名以 **anomalyco/opencode v2.0.22 源码** 为准，不是文档

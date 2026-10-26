@@ -171,8 +171,12 @@ class EventStreamTestCase(unittest.TestCase):
         self.send_text = RecordingSendText()
         self.edit_progress_calls: list[tuple] = []
         self.finalize_calls: list[tuple] = []
+        self.cancel_turn_calls: list[tuple] = []
         self.flush_queue_calls: list[str] = []
         self.adapter_for_calls: list[str] = []
+        #: 占位消息飞行中就被弹掉的那批会话 id —— 与 ``lock`` / ``turns`` 同为
+        #: 共用的状态（真实 core 里是同一个对象注入事件流/入站/会话注册表）。
+        self.pending_cancel_session_ids: set[str] = set()
         #: 替身适配器。默认上限远高于 ``max_message_chars``，所以本文件其余用例
         #: 看到的仍是"闸门只按桥的预算判"；要测平台上限更小的路就改这个属性。
         self.adapter = FakeAdapter()
@@ -203,6 +207,8 @@ class EventStreamTestCase(unittest.TestCase):
             flush_queue=self._flush_queue,
             permission_ledger=self.permission_ledger,
             permission_timeout=self.permission_timeout,
+            cancel_turn=self._record_cancelled_turn,
+            pending_cancel_session_ids=self.pending_cancel_session_ids,
         )
 
     # --- 五个协作者的可调用替身 -----------------------------------------
@@ -229,6 +235,11 @@ class EventStreamTestCase(unittest.TestCase):
             shown_progress_text,
         ))
 
+    def _record_cancelled_turn(self, conversation_id, handle, session_id) -> None:
+        self.cancel_turn_calls.append(
+            (conversation_id, handle.message_id if handle else None, session_id)
+        )
+
     def _flush_queue(self, conversation_id: str) -> None:
         self.flush_queue_calls.append(conversation_id)
 
@@ -254,6 +265,8 @@ class EventStreamTestCase(unittest.TestCase):
             "flush_queue": self._flush_queue,
             "permission_ledger": self.permission_ledger,
             "permission_timeout": self.permission_timeout,
+            "cancel_turn": self._record_cancelled_turn,
+            "pending_cancel_session_ids": self.pending_cancel_session_ids,
         }
         kwargs.update(overrides)
         self.stream = EventStream(**kwargs)
@@ -281,7 +294,7 @@ class CollaboratorSurfaceTests(EventStreamTestCase):
             ["client", "state", "lock", "turns", "clock", "edit_interval",
              "max_message_chars", "adapter_for", "send_text", "edit_progress",
              "finalize", "flush_queue", "permission_ledger",
-             "permission_timeout"],
+             "permission_timeout", "cancel_turn", "pending_cancel_session_ids"],
         )
         for name, parameter in parameters.items():
             if name == "self":

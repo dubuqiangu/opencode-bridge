@@ -66,6 +66,7 @@ class SessionRegistry:
         turns: dict[str, Turn],
         asking_platform: Callable[[str], str],
         cancel_turn: Callable[..., None],
+        pending_cancel_session_ids: set[str],
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -76,6 +77,12 @@ class SessionRegistry:
         ``cancel_turn`` 是出站那一侧的"这一轮被丢弃了，请告诉读者"（见
         :meth:`drop_session`）—— 归属归 :mod:`opencode_bridge.outbound`，本类只负责
         在**锁外**调它。
+
+        ``pending_cancel_session_ids`` 是**共用的状态**（同 ``lock`` / ``turns``）：
+        占位消息**正在飞行中**就被弹掉的那批会话 id。``/new`` 落下时若那一轮的
+        占位消息还在飞行中（:attr:`~opencode_bridge.event_stream.Turn.
+        progress_message_creating`），这里只**登记**、取消由那次 send 的 ``finally``
+        在句柄到手后执行 —— 免得此处用一个 ``None`` 句柄去补一句（那是双份）。
         """
         self._client = client
         self._config = config
@@ -84,6 +91,7 @@ class SessionRegistry:
         self._turns = turns
         self._asking_platform = asking_platform
         self._cancel_turn = cancel_turn
+        self._pending_cancel_session_ids = pending_cancel_session_ids
 
     # ------------------------------------------------------------------
     # 会话生命周期
@@ -182,6 +190,7 @@ class SessionRegistry:
             conversation_id, platform=asking
         )
         dropped_turn: Optional[Turn] = None
+        cancel_in_flight = False
         if session_id:
             try:
                 self._client.delete_session(session_id)
@@ -190,7 +199,18 @@ class SessionRegistry:
             self._conversation_state.drop_session(conversation_id, platform=asking)
             with self._lock:
                 dropped_turn = self._turns.pop(session_id, None)
-        if dropped_turn is not None:
+                if (
+                    dropped_turn is not None
+                    and dropped_turn.progress_message_creating
+                ):
+                    # ⚠️ 占位消息**正在飞行中**（一次 HTTP send）：句柄此刻还不存在，
+                    # 直接在这里 `_announce_cancelled_turn` 会拿 ``None`` 去补一句
+                    # 「已取消」—— 而那条飞行中的消息随后照样上线 ⇒ 双份。
+                    # ⇒ 只登记，取消由那次 send 的 ``finally`` 在句柄到手后执行
+                    # （见事件流/入站那一侧同一段：``pending_cancel_session_ids``）。
+                    self._pending_cancel_session_ids.add(session_id)
+                    cancel_in_flight = True
+        if dropped_turn is not None and not cancel_in_flight:
             # ⚠️ 位置有意义：**锁外**。各适配器的 ``edit()`` / ``send()`` 会 sleep，
             # 锁内发会把别的会话冻住（见 :meth:`_announce_cancelled_turn`）。
             self._announce_cancelled_turn(conversation_id, session_id, dropped_turn)

@@ -341,6 +341,8 @@ def build_event_stream(
             ledger=PermissionLedger(),
             notify=lambda session_id, request_id, message: None,
         ),
+        cancel_turn=lambda conversation_id, handle, session_id: None,
+        pending_cancel_session_ids=set(),
     )
 
 

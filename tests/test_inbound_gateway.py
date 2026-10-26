@@ -314,6 +314,11 @@ class InboundGatewayTestCase(unittest.TestCase):
         self.inbox = RecordingInbox()
         self.lock = threading.RLock()
         self.turns: dict[str, Turn] = {}
+        #: 占位消息飞行中就被弹掉的那批会话 id —— 与 ``lock`` / ``turns`` 同为
+        #: 共用的状态（真实 core 里是同一个对象注入入站/事件流/会话注册表）。
+        self.pending_cancel_session_ids: set[str] = set()
+        #: ``cancel_turn`` 被调用的记录：``(conversation_id, handle, session_id)``。
+        self.cancelled_turns: list[tuple[str, object | None, str]] = []
         self.stream_confirmed = RecordingStreamConfirmed()
         self.send_text = RecordingSendText()
         self.answer = RecordingAnswer()
@@ -364,6 +369,8 @@ class InboundGatewayTestCase(unittest.TestCase):
             "permission_ledger": self.permission_ledger,
             "permission_timeout": self.permission_timeout,
             "bridge_config": self.bridge_config,
+            "cancel_turn": self._cancel_turn,
+            "pending_cancel_session_ids": self.pending_cancel_session_ids,
         }
         kwargs.update(overrides)
         self.gateway = InboundGateway(**kwargs)
@@ -415,6 +422,13 @@ class InboundGatewayTestCase(unittest.TestCase):
             raise self.remember_platform_error
         self.remembered_platforms.append((conversation_id, platform))
 
+    def _cancel_turn(
+        self, conversation_id: str, handle: object | None, session_id: str,
+    ) -> None:
+        """``cancel_turn`` 替身：把那个被弹掉的 turn 记下来（真实现里是改占位
+        消息成「已取消」，见 outbound）。"""
+        self.cancelled_turns.append((conversation_id, handle, session_id))
+
     # --- 断言用的小帮手 -------------------------------------------------
     @property
     def prompt_bodies(self) -> list[tuple[str, str]]:
@@ -443,7 +457,7 @@ class InboundGatewayTestCase(unittest.TestCase):
 # 1: 依赖面与共有状态（AGENTS.md §5.1 的"抽出去"能不能成立）
 # ----------------------------------------------------------------------
 class CollaboratorSurfaceTests(InboundGatewayTestCase):
-    def test_the_constructor_takes_the_fifteen_injected_dependencies(self):
+    def test_the_constructor_takes_the_eighteen_injected_dependencies(self):
         parameters = inspect.signature(InboundGateway.__init__).parameters
         self.assertEqual(
             [name for name in parameters if name != "self"],
@@ -451,7 +465,8 @@ class CollaboratorSurfaceTests(InboundGatewayTestCase):
              "stream_confirmed",
              "adapter_for", "answer_callback", "ensure_session", "session_for",
              "handle_command", "remember_platform", "send_text",
-             "permission_ledger", "permission_timeout", "bridge_config"],
+             "permission_ledger", "permission_timeout", "bridge_config",
+             "cancel_turn", "pending_cancel_session_ids"],
         )
         for name, parameter in parameters.items():
             if name == "self":

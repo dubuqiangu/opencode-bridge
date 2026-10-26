@@ -307,6 +307,7 @@ class GatewayHeldBufferWiringTests(unittest.TestCase):
             adapter_for=lambda conversation_id: _StandInAdapter(),
             answer_callback=lambda adapter, query_id, text: None,
             ensure_session=lambda conversation_id, *, platform="": "ses_fake0001",
+            session_for=lambda conversation_id, *, platform="": "ses_fake0001",
             handle_command=lambda conversation_id, adapter, text: None,
             remember_platform=lambda conversation_id, platform: None,
             send_text=self.send_text,
@@ -317,6 +318,8 @@ class GatewayHeldBufferWiringTests(unittest.TestCase):
                 notify=lambda session_id, request_id, message: None,
             ),
             bridge_config={},
+            cancel_turn=lambda conversation_id, handle, session_id: None,
+            pending_cancel_session_ids=set(),
         )
         self.addCleanup(gateway._merger.stop)
         return gateway

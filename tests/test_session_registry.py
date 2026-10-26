@@ -23,7 +23,11 @@ from opencode_bridge.conversation_keys import ConversationState
 from opencode_bridge.core import BridgeCore
 from opencode_bridge.event_stream import Turn
 from opencode_bridge.hooks import MsgHandle
+from opencode_bridge.inbound_gateway import InboundGateway, PROGRESS_TEXT
+from opencode_bridge.inbox import QueuedPrompt
 from opencode_bridge.opencode_client import OpenCodeError
+from opencode_bridge.permission_ledger import PermissionLedger
+from opencode_bridge.permission_timeout import PermissionTimeoutWatcher
 from opencode_bridge.session_registry import (
     SESSION_TITLE_MAX,
     SESSION_TITLE_PREFIX,
@@ -34,6 +38,8 @@ from opencode_bridge.state import StateStore
 
 CONVERSATION = "chat:55"
 PLATFORM = "telegram"
+#: 这条测试文件里固定复用的会话 id（与 ``seed_session`` 的默认一致）。
+SESSION_ID = "ses_0001"
 
 
 class RecordingClient:
@@ -76,6 +82,9 @@ class SessionRegistryTestCase(unittest.TestCase):
             self.tempdir.name, "work"))
         self.lock = threading.RLock()
         self.turns: dict[str, Turn] = {}
+        #: 占位消息飞行中就被弹掉的那批会话 id —— 与 ``lock`` / ``turns`` 同为
+        #: 共用的状态（真实 core 里是同一个对象注入会话注册表/事件流/入站）。
+        self.pending_cancel_session_ids: set[str] = set()
         self.asked: list[str] = []
         #: 「那一轮被丢弃了」的记录：``(conversation_id, handle, session_id)``。
         self.cancellations: list[tuple[str, MsgHandle | None, str]] = []
@@ -98,6 +107,7 @@ class SessionRegistryTestCase(unittest.TestCase):
             "turns": self.turns,
             "asking_platform": self._asking_platform,
             "cancel_turn": self._record_cancelled_turn,
+            "pending_cancel_session_ids": self.pending_cancel_session_ids,
         }
         kwargs.update(overrides)
         self.registry = SessionRegistry(**kwargs)
@@ -121,7 +131,7 @@ class CollaboratorSurfaceTests(SessionRegistryTestCase):
         self.assertEqual(
             [name for name in parameters if name != "self"],
             ["client", "config", "conversation_state", "lock", "turns",
-             "asking_platform", "cancel_turn"],
+             "asking_platform", "cancel_turn", "pending_cancel_session_ids"],
         )
         for name, parameter in parameters.items():
             if name == "self":
@@ -456,6 +466,161 @@ class CancelledTurnAnnouncementTests(SessionRegistryTestCase):
 
         self.assertEqual(seen_turn_present_during_report, [False],
                          "报告时那一轮仍在共享表里")
+
+
+# ----------------------------------------------------------------------
+# 7: 占位消息【飞行中】被弹掉 ⇒ 取消由 send 的 finally 在句柄到手后执行
+#    （`ora-15` 的孤儿气泡竞态 —— 任务 ④ 的目标）
+#
+# 这里是「在飞的那一次 HTTP send」那个**窄窗**的守门：``/new`` 在占位消息还在
+# 飞行中就把那一轮弹掉了。三处协作者（会话注册表 / 入站 / 事件流）**共享**同一个
+# ``pending_cancel_session_ids`` 集合，把「该不该取消」的登记与「取消执行」拆开：
+#
+#   * ``drop_session`` 看到 ``progress_message_creating`` ⇒ 只登记、**不**当场说；
+#   * 那次 send 的 ``finally`` 句柄到手后，发现那一轮已不在表里 ⇒ 才执行取消。
+#
+# ⛔ 同步点全用 ``threading.Event``，⛔ 不用 ``time.sleep``。两条臂只差「drop 落在
+# 飞行窗口内」还是「send 已落定之后」。
+# ----------------------------------------------------------------------
+class InFlightPlaceholderCancellationTests(SessionRegistryTestCase):
+    """占位消息仍在一次 send 里飞行、turn 已被弹掉时，取消必须**不重不漏**。"""
+
+    #: ``send_text`` 替身的两条臂共用的同步点：``entered`` 表示「已进入 send」，
+    #: ``release`` 表示「允许 send 返回」。两臂只差要不要等 ``release``。
+    def _blocking_send_text(self, entered: threading.Event,
+                            release: threading.Event | None):
+        def send_text(conversation_id, text, **kwargs):
+            entered.set()
+            if release is not None:
+                release.wait(timeout=5.0)
+            return MsgHandle(conversation_id, "m_flight", PLATFORM)
+        return send_text
+
+    def _build_gateway(self, send_text) -> InboundGateway:
+        """与注册表**共享** lock / turns / pending 集合的入站网关（真实 core 里
+        就是同一个对象注入两侧）。"""
+        stream_confirmed = threading.Event()
+        stream_confirmed.set()
+        gateway = InboundGateway(
+            client=self.client_for_prompt,
+            lock=self.lock,
+            turns=self.turns,
+            inbox=None,
+            held_buffer_store=None,
+            stream_confirmed=stream_confirmed,
+            adapter_for=lambda conversation_id: None,
+            answer_callback=lambda adapter, query_id, text: None,
+            ensure_session=lambda conversation_id, *, platform="": SESSION_ID,
+            session_for=lambda conversation_id, *, platform="": SESSION_ID,
+            handle_command=lambda conversation_id, adapter, text: None,
+            remember_platform=lambda conversation_id, platform: None,
+            send_text=send_text,
+            permission_ledger=PermissionLedger(),
+            permission_timeout=PermissionTimeoutWatcher(
+                timeout_seconds=0.05,
+                ledger=PermissionLedger(),
+                notify=lambda session_id, request_id, message: None,
+            ),
+            bridge_config={},
+            cancel_turn=self._record_cancelled_turn,
+            pending_cancel_session_ids=self.pending_cancel_session_ids,
+        )
+        self.addCleanup(gateway._merger.stop)
+        return gateway
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        class _PromptClient:
+            def prompt(self, session_id: str, text: str) -> None:
+                self.last_prompt = (session_id, text)
+
+            def reply_permission(self, session_id: str, request_id: str,
+                                 *, allow: bool) -> None:
+                return None
+
+        self.client_for_prompt = _PromptClient()
+        self.conversation_state.set_session(CONVERSATION, SESSION_ID)
+
+    def test_no_cancel_while_the_placeholder_is_in_flight(self):
+        """⛔ 飞行窗口内 ``drop_session`` 只登记、不执行 —— 否则句柄还不存在，
+        ``cancel_turn`` 会拿 ``None`` 去补一句「已取消」，而那一条随后照样上线 ⇒ 双份。"""
+        session_id = SESSION_ID
+        entered = threading.Event()
+        release = threading.Event()
+        gateway = self._build_gateway(
+            self._blocking_send_text(entered, release)
+        )
+        queued = QueuedPrompt(
+            delivery_id="dlv_flight", conversation_id=CONVERSATION,
+            platform=PLATFORM, message_id="msg1", text="跑起来",
+        )
+
+        driver = threading.Thread(
+            target=gateway._dispatch_prompt, args=(queued,),
+            name="guard-flight-driver",
+        )
+        driver.start()
+        #: 等 send 真的进去（占位消息在飞）。
+        entered.wait(timeout=5.0)
+        self.assertTrue(entered.is_set(), "send 没进去 —— 同步点没被踩到")
+
+        #: 占位消息飞行中，``/new`` 弹掉这一轮。
+        self.registry.drop_session(CONVERSATION)
+
+        #: ⛔ 此刻还在飞行窗口内：取消**不许**已经发生（句柄还没到手）。
+        self.assertEqual(self.cancellations, [],
+                         "飞行中不该就报取消 —— 那会拿 None 句柄去补一句「已取消」")
+        self.assertIn(session_id, self.pending_cancel_session_ids,
+                      "drop 应当把这一轮登记为「飞行中待取消」")
+
+        #: send 返回 ⇒ finally 句柄到手 ⇒ 取消在锁外执行一次。
+        release.set()
+        driver.join(timeout=5.0)
+        self.assertFalse(driver.is_alive(), "驱动线程没在超时内退")
+
+        self.assertEqual(
+            self.cancellations,
+            [(CONVERSATION, MsgHandle(CONVERSATION, "m_flight", PLATFORM),
+              session_id)],
+            "句柄到手后应恰好取消一次，且用**那条飞行中的消息**的句柄",
+        )
+        self.assertNotIn(session_id, self.pending_cancel_session_ids,
+                         "取消执行完就该把登记清掉 —— 否则下次误判")
+
+    def test_a_send_that_finishes_before_the_drop_is_unchanged(self):
+        """对照臂：send 已落定（``progress_message_creating`` 已还、句柄已写回）
+        之后才 ``drop_session`` —— 行为与**改动前**逐字相同：当场宣布取消。"""
+        session_id = SESSION_ID
+        entered = threading.Event()
+        #: release = None ⇒ 不阻塞，send 立即返回。
+        gateway = self._build_gateway(
+            self._blocking_send_text(entered, None)
+        )
+        queued = QueuedPrompt(
+            delivery_id="dlv_settled", conversation_id=CONVERSATION,
+            platform=PLATFORM, message_id="msg2", text="已跑完",
+        )
+        gateway._dispatch_prompt(queued)
+
+        #: send 已落定 ⇒ drop 走原来的「当场宣布」路径，不登记。
+        self.registry.drop_session(CONVERSATION)
+
+        self.assertEqual(
+            self.cancellations,
+            [(CONVERSATION, MsgHandle(CONVERSATION, "m_flight", PLATFORM),
+              session_id)],
+            "send 落定后的 drop 仍按老行为当场取消",
+        )
+        self.assertEqual(self.pending_cancel_session_ids, set(),
+                         "send 已落定就不该登记进 pending")
+
+    def test_the_drop_with_no_turn_still_says_nothing(self):
+        """连 turn 都没有（没在跑）时 ``/new``：飞行登记面也不该误伤。"""
+        self.conversation_state.set_session(CONVERSATION, SESSION_ID)
+        self.registry.drop_session(CONVERSATION)
+        self.assertEqual(self.cancellations, [])
+        self.assertEqual(self.pending_cancel_session_ids, set())
 
 
 if __name__ == "__main__":

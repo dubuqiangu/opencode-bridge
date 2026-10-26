@@ -331,12 +331,20 @@ class InboundGateway:
         permission_ledger: PermissionLedger,
         permission_timeout: PermissionTimeoutWatcher,
         bridge_config: Mapping[str, Any],
+        cancel_turn: Callable[..., None],
+        pending_cancel_session_ids: set[str],
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
         ``lock`` 与 ``turns`` 是**共用的状态**而不是协作者：事件流读改同一个
         ``turns``，core 那边七个方法还在用同一把锁（见模块 docstring）。注入的是
         同一个对象，所以互斥关系与 dict 身份都没变。
+
+        ``pending_cancel_session_ids`` 也是**共用的状态**（同 ``lock`` / ``turns``）：
+        占位消息**正在飞行中**就被弹掉的那批会话 id。``/new`` 落下时那一轮已被弹出、
+        句柄此刻才到手 ⇒ 取消由本类这里的 ``finally`` 在锁外调 ``cancel_turn`` 执行
+        （见 :attr:`~opencode_bridge.event_stream.Turn.progress_message_creating`
+        的完整说明）。
 
         ``inbox`` 是 ``None`` 时写前收件箱整个关掉 —— 投递照走，只是不留收据。
 
@@ -379,6 +387,14 @@ class InboundGateway:
         self._handle_command = handle_command
         self._remember_platform = remember_platform
         self._send_text = send_text
+        #: 出站那一条的「这一轮被丢弃了」收尾（见
+        #: :meth:`~opencode_bridge.session_registry.SessionRegistry.drop_session`）。
+        #: 占位消息**飞行中被弹掉**时由本类这里的 ``finally`` 在锁外调它。
+        self._cancel_turn = cancel_turn
+        #: 占位消息飞行中就被弹掉的那批会话 id —— 与 ``lock`` / ``turns`` 同为
+        #: **共用的状态**（core 注入同一个对象），见 :attr:`~opencode_bridge.
+        #: event_stream.Turn.progress_message_creating` 的完整说明。
+        self._pending_cancel_session_ids = pending_cancel_session_ids
         self._permission_ledger = permission_ledger
         self._permission_timeout = permission_timeout
         self._long_input_ack_chars = _positive_int(
@@ -1060,12 +1076,21 @@ class InboundGateway:
                 )
             finally:
                 # 成功**和**抛异常都要把创建权还回去（见事件流那一侧的同一段注释）。
+                do_cancel = False
                 with self._lock:
                     current = self._turns.get(session_id)
                     if current is not None:
                         current.progress_message_creating = False
                         if current.progress_handle is None:
                             current.progress_handle = handle
+                    elif session_id in self._pending_cancel_session_ids:
+                        # ⚠️ ``/new`` 在占位消息**飞行中**弹掉了这一轮：句柄此刻
+                        # 才到手 ⇒ 取消由这里执行（既不多发也不漏，见事件流那一侧）。
+                        self._pending_cancel_session_ids.discard(session_id)
+                        do_cancel = True
+                if do_cancel:
+                    # ⛔ **锁外**调：适配器的 ``edit()`` / ``send()`` 会 sleep。
+                    self._cancel_turn(conversation_id, handle, session_id)
         return "ok"
 
     # ------------------------------------------------------------------

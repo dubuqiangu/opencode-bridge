@@ -133,6 +133,9 @@ Finalize = Callable[..., None]
 #: turn 收尾后把排队的消息放出去。
 FlushQueue = Callable[[str], None]
 
+#: 那一轮被丢弃时"告诉读者"（出站那一条）；同一份也由 session_registry 用。
+CancelTurn = Callable[..., None]
+
 
 # ----------------------------------------------------------------------
 # event stream
@@ -269,6 +272,8 @@ class EventStream:
         flush_queue: FlushQueue,
         permission_ledger: PermissionLedger,
         permission_timeout: PermissionTimeoutWatcher,
+        cancel_turn: CancelTurn,
+        pending_cancel_session_ids: set[str],
     ) -> None:
         """全部依赖由 core 注入，本类不自己去找。
 
@@ -302,6 +307,14 @@ class EventStream:
         self._edit_progress = edit_progress
         self._finalize = finalize
         self._flush_queue = flush_queue
+        #: 出站那一条的「这一轮被丢弃了」收尾（见
+        #: :meth:`~opencode_bridge.session_registry.SessionRegistry.drop_session`）。
+        #: 占位消息**飞行中被弹掉**时由本类的 ``finally`` 在锁外调它。
+        self._cancel_turn = cancel_turn
+        #: 占位消息飞行中就被弹掉的那批会话 id —— 与 ``lock`` / ``turns`` 同为
+        #: **共用的状态**（core 注入同一个对象），见 :attr:`Turn.progress_message_creating`
+        #: 的完整说明。
+        self._pending_cancel_session_ids = pending_cancel_session_ids
         self._permission_ledger = permission_ledger
         #: 权限请求的本地超时看护。``permission.asked`` 时 ``watch``、一条真回复落地
         #: （``permission.replied`` / 命令 / 按钮）时 ``cancel``；到点且仍是 pending
@@ -660,6 +673,7 @@ class EventStream:
             finally:
                 # 成功**和**抛异常都要把创建权还回去：留在别人身上会让这一轮**再也**
                 # 发不出进度消息（收尾仍会发完整答复，但读者一路看不到流式正文）。
+                do_cancel = False
                 with self._lock:
                     current = self._turns.get(session_id)
                     if current is not None:
@@ -669,6 +683,14 @@ class EventStream:
                             # 发成功才记：失败时那条消息并不存在（见 shown_progress_text）
                             if new_handle is not None:
                                 current.shown_progress_text = text
+                    elif session_id in self._pending_cancel_session_ids:
+                        # ⚠️ ``/new`` 在占位消息**飞行中**弹掉了这一轮：turn 已被
+                        # 弹出，而句柄此刻才到手 ⇒ 取消由这里执行（既不多发也不漏）。
+                        self._pending_cancel_session_ids.discard(session_id)
+                        do_cancel = True
+                if do_cancel:
+                    # ⛔ **锁外**调：适配器的 ``edit()`` / ``send()`` 会 sleep。
+                    self._cancel_turn(conversation_id, new_handle, session_id)
             return
         if self._edit_progress(conversation_id, handle, text, session_id):
             with self._lock:

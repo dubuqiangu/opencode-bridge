@@ -8,13 +8,14 @@
 
 | 项目 | license | stars | 活跃度 | 锁定版本 |
 |---|---|---|---|---|
-| `MichengAI/dsh-im-connect` | Apache-2.0 | 93 | 2026-10-24 仍在推送 | `551f02997c7b617d438c732a9b070e8c943693d6` |
-| `xmanrui/dsh-im` | MIT | 2497 | 2026-10-25 仍在推送 | `e686e15540e36b2c061b45a7dfc2b0e7e1e61b5b` |
-| `NousResearch/hermes-agent` | MIT | 256994 | 2026-10-25 仍在推送 | `4ea8d23cc9f527332ccb1d55359b27741b6ea51b` |
-| `zhuiyueya/dsh-im-gateway` | MIT | 54 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
+| `MichengAI/dsh-im-connect` | Apache-2.0 | 102 | 2026-10-28 仍在推送 | `6ef35e01615de5e639239182879b9186195a589a` |
+| `xmanrui/dsh-im` | MIT | 2746 | 2026-10-27 仍在推送 | `e278ac7da82384e6e21d907c606db6545fdc1d1e` |
+| `NousResearch/hermes-agent` | MIT | 258011 | 2026-10-28 仍在推送 | `190c0b7f65e26d9d57837c9946d4a01e7c645ae8` |
+| `zhuiyueya/dsh-im-gateway` | MIT | 56 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
 
-以上四项均未归档（**2026-10-25** `gh` 现查 + 本地 clone `git fetch` 复核 dsh-im/dsh-im-connect；dsh-im-gateway HEAD 零差异）。
-⚠️ **2026-10-25 回看**：四行里三个 HEAD 再前移 —— dsh-im `8ac3e6e`→`e686e15`（+60 commit，**8 个 telegram 相关**，新增可借鉴点见 §2.3）· dsh-im-connect `93428ed`→`551f029`（telegram 相关 **0**）· hermes-agent `3cbb13f`→`4ea8d23`（本轮回看基线；⚠️ live HEAD 已再前移 `d050956`，+407 commit，均 2026-10-25 `gh` 现查）；dsh-im-gateway `8e8fbca` **连续第四轮零差异**。star 四项全部变化（79→93 / 2257→**2497** / 255751→256994 / 54→54），四项**均未归档**（均 2026-10-25 `gh` 现查）。本轮细读结论见 §1.3 与 §2.3。
+以上四项均未归档（**2026-10-28** `gh` 现查：`isArchived` 四项均 false；本地 clone 已 `--unshallow` 后 `fetch` 复核 dsh-im/dsh-im-connect，`origin/main` 与 live HEAD 逐字相等；dsh-im-gateway 经 `gh api` 比对 HEAD 零差异 —— 该仓本轮**无本地 clone**，判据只有 `gh api` 这一路）。
+⚠️ **2026-10-28 回看**：四行里三个 HEAD 再前移 —— dsh-im `e686e15`→`e278ac7`（+~18 commit，**telegram 相关 0**，tag v5.2.0→v5.7.0，见 §2.3 本轮）· dsh-im-connect `551f029`→`6ef35e0`（+19 commit，**telegram 专项 0**，tag v1.0.11→v1.0.19，见 §1.3）· hermes-agent `4ea8d23`→`190c0b7`（本轮回看基线；⚠️ 本轮**仅 poll 了 HEAD/stars/archived，未逐 commit 读 diff**，故不写 commit 数 —— 见 §3 末段）；dsh-im-gateway `8e8fbca` **连续第五轮零差异**。star 变化：93→102（dsh-im-connect）· 2497→**2746**（dsh-im）· 256994→258011（hermes-agent）· 54→56（gateway）。本轮细读结论见 §1.3 与 §2.3（dsh-im-connect 本轮候选已逐条登记，dsh-im telegram 面零新增）。
+⚠️ **2026-10-25 回看（上一轮，已被上面的 10-28 取代为新基线，此段保留作历史）**：四行里三个 HEAD 再前移 —— dsh-im `8ac3e6e`→`e686e15`（+60 commit，**8 个 telegram 相关**，新增可借鉴点见 §2.3）· dsh-im-connect `93428ed`→`551f029`（telegram 相关 **0**）· hermes-agent `3cbb13f`→`4ea8d23`（本轮回看基线；⚠️ live HEAD 已再前移 `d050956`，+407 commit，均 2026-10-25 `gh` 现查）；dsh-im-gateway `8e8fbca` **连续第四轮零差异**。star 四项全部变化（79→93 / 2257→**2497** / 255751→256994 / 54→54），四项**均未归档**（均 2026-10-25 `gh` 现查）。本轮细读结论见 §1.3 与 §2.3。
 ⚠️ **2026-10-16 的旧基线已作废**：四行里三个 HEAD 前移（dsh-im `b7698a6`→`0b9cbc2`
 共 **23 commit**、v5.0.0→v5.2.0；dsh-im-connect `e271ec1`→`617b079` 共 **65 commit**、
 v0.1.77→v1.0.8；hermes-agent `f732746`→`6e9b3e3` 共 **2006 commit**），star 四项全部变化
@@ -26,7 +27,7 @@ hermes-agent 与 dsh-im-gateway 另有全量纯文本快照（文件名含 commi
 
 ---
 
-## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 **2026-10-21 更新为 `93428ed`，v1.0.11**；上一基线 `617b079` 已过期）
+## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 **2026-10-28 更新为 `6ef35e0`，v1.0.19**；上一基线 `551f029`（v1.0.11）已过期）
 
 **定位**：将主流 IM 平台（dingtalk/discord/feishu/lark/qq/slack/telegram/wecom/weixin）
 接入本机 DeepSeek Harness。TypeScript / Koishi(cordis) 双侧插件，与本桥领域高度同构：
@@ -112,7 +113,24 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 
 ⚠️ **另两条本桥结构性不适用**：`session-binding-lock.mjs` 的 `SESSION_BINDING_STATE_IDENTITY` 符号（上游用它给「同一状态的多个包装对象」统一锁，本桥无该形态）；`imessage-api.mjs` 的 `attributedBody` typedstream 解码（macOS 26 平台专有，本桥无 iMessage 渠道）。
 
-## 2. xmanrui/dsh-im（MIT，锁 `0b9cbc2`；**2026-10-21 基线更新为 `8ac3e6e`（v5.4.0）**）
+### 1.3 本轮新机制（2026-10-28 回看，`551f029..6ef35e0`，19 commit，v1.0.11→v1.0.19）
+
+**判据（可复核）**：`git rev-list --count 551f029..6ef35e0` = 19；commit subject **telegram 专项 0**
+（telegram 侧本轮只有 §1. 清单里已登记的「话题名回写」等既有面，无新增 telegram 机制）。
+下面 4 条是本轮扫过 diff 后**唯一与本桥引擎域同构**的候选，按触达本桥核心路径的相关性排序。
+⚠️ **以下四条全部未拍板**，仅登记为候选；⛔ 无任何一条表示「要做」。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| C1 | **分段回复（按自然段/空行拆成多条依次发，而不是一条长消息或纯长度切分）**：上游把「一条回复 → 多个物理消息」的切分依据从**长度**换成**语义边界**，由会话层按段落发出。⚠️ 本轮只扫了 commit subject 与 `git diff --name-only`，**未逐行读实现**（merge PR #49 的落点文件已确认在 `src/engine/`，行为细节未核） | `73f21df`（merge PR #49）+ `467b846` | ⭐ **与本桥 `split.py` 的 `split_text` 直接同域**：本桥目前是纯长度切分 + §1.2-D 的结构感知切分（已落地 `f39882d`），而 §1.2-D 解决的是「**一个超长片段**怎么切」，本条解决的是「**一条回复**是否该拆成多条」——**两个不同的轴**，§1.2-D 不覆盖它。⚠️ 但触发后果不小：本桥 telegram 出站 `send()` 的返回值契约 = `MsgHandle|None`（单句柄），而「一条回复 N 条消息」会动到占位气泡改写与 `finalize` 的 tail 补发关系，也直接冲击「短答复无通知」那条已文档化的残余（`outbound.py:388-497`）：分段后**每段都是新消息** ⇒ 通知行为会变。⇒ 归**第 1 类（产品判断：是否要按段多发、以及它与占位气泡/通知语义的取舍）**，⛔ 不代拍 |
+| C2 | **max-tokens 截断的 stop reason 从 `cancelled` 里分出**：上游让「模型到了输出上限被截断」与「被主动取消」**在 stop reason 上可区分**，不再共用 `cancelled` | `c025b76` | 与本桥出站失败「要说真话」同向。⚠️ 但**本桥对应面不在出站**：本桥拿到的终止信号是 `session.execution.*`（§6.3 铁律 1），截断与否体现在**正文本身**（是否被硬切），而本桥当前**没有**任何地方读上游的 stop reason 来区分这两者 —— 核实结论：本桥**不消费**这个字段 ⇒ 候选的落地前提是「本桥是否该开始消费 stop reason」，而不是「照抄映射」。⇒ 归**第 4 类（判据尚未标定：需先枚举本桥有没有 stop reason 读取点；既有证据是 0）** |
+| C3 | **统一 IM 会话 id 的编解码**（`e44fa3c` + 后续 `e4a8fa5` 分两步：先抽编解码，再让所有消费方走它） | `e44fa3c`、`e4a8fa5` | ⚠️ **与本桥 §1.1 的 T1 是同一个做法的干净形态，也正好是 T1 里我点名的那个反面做法的修正**：T1 把 threadId **编进 `chatId` 字符串**、靠 `parseTelegramChatId` 反解；C3 的做法是把它**收成一对编解码函数、所有消费方只走这一对**。⇒ 对本桥的意义**不是新增功能**，而是：若将来做 T1（话题群），**结构上应当照 C3 的轴走，⛔ 不是照 T1 的轴**。⚠️ 本桥当前无「话题/线程」维度 ⇒ **无可统一之物** ⇒ 归**第 3 类（代价已知且刻意不做）**：代价 = 若将来引入话题群时按 T1 的编进字符串做法，会出现「同一 chatId 两种形态、一处漏反解」的分叉；为什么可接受 = 现在没有该维度，提前抽象等于造一个无人使用的编解码层 |
+| C4 | **`taskTreeSessions` 过滤**（会话树视图只注入被选中范围的 session，而不是全量） | `0ee5b68` | ⚠️ 这是**它自己的客户端 dashboard 视图**的过滤，本桥无图形宿主 ⇒ **结构性不适用**（与 §1.1 里成片的 UI 重构同理）。⛔ 但**别顺手读成**「本桥该做会话范围过滤」：本桥的 `SessionRegistry` 是单键查找、没有「树」这个形状，也没有任何一次全量注入 ⇒ 照抄会造出一个不存在的需求。仅登记不适用 |
+
+⚠️ **登记结论（2026-10-28）**：19 个 commit 里**可借鉴候选 2 条**（C1 分段回复、C2 stop reason），**1 条仅作为做法参照**（C3 —— 它是 T1 的**正确轴**，但当前无落地对象），**1 条结构性不适用**（C4）。
+§1 的 A~N 清单**本轮不改**（无新机制足以立为新行）。⚠️ **C1 与既有 §1.1-T1 都属「产品判断等用户拍板」**，⛔ 不代拍、⛔ 不排期。
+
+## 2. xmanrui/dsh-im（MIT，锁 `0b9cbc2`；**2026-10-28 基线更新为 `e278ac7`（v5.7.0）**；上一基线 `8ac3e6e`（v5.4.0）已过期）
 
 **定位**：DeepSeek Harness 官方 Token 赞助的双侧插件，渠道面最宽（12 个 IM 渠道）。
 完整借鉴面分析与落地跟踪见 AGENTS.md §6.1 登记行。**用户 2026-10-15 已拍板：①②③
@@ -121,7 +139,7 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 （`{sent:true}` 不承诺送达、不生成幂等键不自动重试）。
 
 补充（2026-10-16）：dsh-im-connect 的 `split.ts` 文件头自述「长文切分规则思路参考 dsh-im」
-⇒ 两者切分规则同源，本目录 §1-D 的精修版可作为落地时的参考实现。
+⇒ 两者切分规则同源，本目录 §1.2-D 的精修版可作为落地时的参考实现。
 
 ### 2.1 本轮新机制（2026-10-20 回看，`b7698a6..0b9cbc2`，23 commit，v5.0.0→v5.2.0）
 
@@ -170,6 +188,10 @@ group-history-store,group-history-access,prompt-failure-tracker}.mjs`（均读�
 
 ### 2.3 本轮新机制（2026-10-25 回看，`8ac3e6e..e686e15`，+60 commit，**其中 8 个 telegram 相关**）
 
+### 2.4 本轮增量（2026-10-28 回看，`e686e15..e278ac7`，~18 commit，v5.2.0→v5.7.0）：**新增 0 条**
+
+⚠️ **2026-10-28 回看（`e686e15..e278ac7`，~18 commit，v5.2.0→v5.7.0）**：本段**新增 0 条**。
+
 **证据面**：本地 clone `ref-xmanrui-dsh-im`（`origin/main`=`e686e15`）+ `gh` 现查。
 本轮 60 个 commit 里**大部分是客户端/设置面板重构**（延续 §2.2 的侧边栏/DS Bot 头像面）⇒ 结构性不适用，
 不逐条记。**只登记 8 个 telegram 相关新增**，逐条连适用性：
@@ -185,14 +207,28 @@ group-history-store,group-history-access,prompt-failure-tracker}.mjs`（均读�
 | AA | **Telegram 消息 id 的持久化复用**（跨会话用同一条消息 id 做进度/答复） | `src/channels/telegram/*.mjs` | 与本桥 `message_id` 去重键同域；本桥已支持 ⇒ **已具备**，仅登记 |
 | AB | **Telegram 多机器人/多凭据的账号隔离** | `src/channels/telegram/*.mjs` | **⛔ 暂不做（2026-10-26 裁定）**：相对当前「把 Telegram 做完善并正常运行」目标，多 bot token 是大范围架构改动（每机器人配置/状态/会话映射），应**随插件工作排期一起处理**（与 D3 剩余平台同批），不单独实现。仅记录裁定，不动工 |
 
-⚠️ **登记结论**：8 个 telegram 相关新点里 **5 个（V/W/X/Y/Z）本桥已具备**、**2 个（U/AA）与本桥占位消息同域**、**1 个（AB 多机器人）已裁定**。⛔ **2026-10-26 裁定**：**U 已具备**（本桥 `outbound.finalize` 已有「跳过编辑的长度守卫」，仅记录确认、零动工）；**AB 暂不做**（多机器人大范围架构改动，随插件工作排期一起处理，不单独实现）。
+⚠️ **登记结论**：8 个 telegram 相关新点里 **5 个（V/W/X/Z/Y）本桥已具备**、**2 个（U/AA）与本桥占位消息同域**、**1 个（AB 多机器人）已裁定**。⛔ **2026-10-26 裁定**：**U 已具备**（本桥 `outbound.finalize` 已有「跳过编辑的长度守卫」，仅记录确认、零动工）；**AB 暂不做**（多机器人大范围架构改动，随插件工作排期一起处理，不单独实现）。
 
-## 3. NousResearch/hermes-agent（MIT，HEAD `4ea8d23`，2026-10-25 现查；live HEAD 已前移 `d050956`）
+⚠️ **2026-10-28 回看（`e686e15..e278ac7`，~18 commit，v5.2.0→v5.7.0）**：本段**新增 0 条**。
+判据（可复核）：该区间的 commit subject **`telegram` 命中 0**，且 `git diff --name-only e686e15 e278ac7`
+里**没有一条 `src/channels/telegram/` 下的路径**。改动落在 wecom / qq / slack / feishu 四个渠道、
+Windows 更新服务、客户端跑马灯（marquee）与 v5.7.0 发版。⇒ **本轮 dsh-im 侧无可借鉴点，U/AB 裁定不变**
+（仍按 2026-10-26 的状态：U 已具备、零动工；AB 随插件工作排期）。
+⚠️ 与 §2.2 的关系：§2.2 的 R（WeCom 流式卡片窗口轮换）属 `wecom` 域，本次 wecom 改动**未触及 `stream-supervisor.mjs`**
+⇒ R 的三条判据（收尾终态 / stop 后禁开载具 / 连拒换载具）引用的证据仍成立，**不因此轮回看而过期**。
+
+## 3. NousResearch/hermes-agent（MIT，HEAD `190c0b7`，2026-10-28 现查；上一基线 `4ea8d23` 已过期，它当时的 live 前移值是 `d050956`）
 
 **首选 IM 平台工程范式参考**。全量纯文本快照（64 MB / 134 万行，锁 `8a5edab…`），
 搜法与引用纪律见 AGENTS.md §6.1；平台清单并集（≈31 家）见 `docs/platform-design-reference.md`。
 ⚠️ 边界：全库零 opencode 事件流消费（`/api/event` 零命中），不能当 opencode 服务端契约依据
 （那个查 §6.2）。
+⚠️ ⚠️ **「零 opencode 事件流消费」在 `190c0b7` 上未重跑**（2026-10-28 回看只做了 HEAD/stars/archived 的 poll，没逐 commit 读 diff、
+也没重跑 `gh search code`）⇒ 该结论**最后一次被证据支持**是在 `3cbb13f` 上（2026-10-21）。
+⇒ 引用它时必须写明依据版本是 `3cbb13f`；⛔ 不要写成「在最新 HEAD 上成立」（那是未测）。
+⚠️ 快照落后量：`8a5edab…` 之后上游已走了多远**本轮未重数** ⇒ 本目录**不写具体数字**
+（旧记的「2006 个 commit」属于 `6e9b3e3` 那一刻，⛔ 不是现状；此处刻意留空而非猜一个）。
+
 ⚠️ **2026-10-21 复核（对 HEAD `3cbb13f` 重跑 `gh search code '/api/event' --repo NousResearch/hermes-agent`）**：命中 **约 18 行、全部是它自己的 `/api/events`（复数）** ——
 `web/src/lib/{eventsFeedClient,events-reconnect}.ts`、`hermes_cli/web_routers/chat_ws.py`、
 `hermes_cli/web_server_idle_exit.py`、`tui_gateway/event_publisher.py`、

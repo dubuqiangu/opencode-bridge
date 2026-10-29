@@ -487,29 +487,33 @@ class SlackAdapter(Adapter):
             # :meth:`_action_buttons`）；value 优先，兼容只在 value 里携带的写法。
             data = str(first_action.get("value") or first_action.get("action_id") or "")
         channel_container = payload.get("channel")
-        channel_id = (
+        # 与消息路径同名：这两条是同一个 principal（Slack channel ID），
+        # 只是 block_actions 把它嵌在对象里。⛔ 不要为了描述"它是 ID"
+        # 另起名 channel_id —— 闸门 principal 的源码符号面就会多出一个名字，
+        # gate-principal 守门会（且应当）因此报红。
+        channel = (
             channel_container.get("id")
             if isinstance(channel_container, dict)
             else None
         )
         user_container = payload.get("user")
         user_id = user_container.get("id") if isinstance(user_container, dict) else ""
-        if not data or not channel_id:
+        if not data or not channel:
             # 只记形状（排序顶层键名），不记载荷 —— 与 telegram 同一纪律。
             logger.info(
                 "slack: ignoring block_actions with keys=%s",
                 sorted(str(key) for key in payload.keys()),
             )
             return
-        conversation_id = self._conversation_id(channel_id)
+        conversation_id = self._conversation_id(channel)
         # 授权闸门与普通消息同一道、且在最前：未授权频道里点的按钮不许进上层
         # （否则一个按钮就能绕过白名单触发命令）。
-        if not self.admits(channel_id) and not self.answer_pairing_request(
-            channel_id, conversation_id, None
+        if not self.admits(channel) and not self.answer_pairing_request(
+            channel, conversation_id, None
         ):
             logger.info(
                 "slack: dropping callback from non-whitelisted channel %s",
-                redactable_id(self.name, channel_id),
+                redactable_id(self.name, channel),
             )
             return
         message_container = payload.get("message")
@@ -521,7 +525,7 @@ class SlackAdapter(Adapter):
         # query_id 编码 "<user_id>:<channel_id>" —— 两个字段都是 Slack id
         # （[A-Z][A-Z0-9]{5,}，不含冒号），拆分无歧义；answer() 靠它定位
         # chat.postEphemeral 的投递对象（Slack 没有 answerCallbackQuery 的对应物）。
-        query_id = f"{user_id}:{channel_id}" if user_id else ""
+        query_id = f"{user_id}:{channel}" if user_id else ""
         try:
             self.hooks.on_inbound(
                 Inbound(

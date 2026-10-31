@@ -80,6 +80,54 @@ class TestFindReplyForPrompt(unittest.TestCase):
         self.assertEqual(find_reply_for_prompt(messages, "重发这句话"),
                          "这一轮的最终答复")
 
+    def test_a_duplicate_prompt_user_no_longer_aborts_the_scan(self):
+        """B-1 守门：连续两条**同文本**匹配 user，其后确有正文 ⇒ 不该中止扫描。
+
+        原缺陷最小复现（消息序列逐字照录）：
+        ``[{type:"user",text:"hi"}, {type:"user",text:"hi"}, <assistant 正文>]``。
+        ⚠️ assistant 一律用本模块文档的形状 ``content:[{type:"text",text}]``——
+        ``_assistant_text`` 只认该形状，顶层 ``text`` 会被当成「无正文」而跳过。
+        缺陷版在第二条匹配处把 ``awaiting_reply`` 置假 ⇒ 其后的正文被跳过 ⇒
+        返回 ``None``（静默丢掉一条本可恢复的答复）；文档步骤 2 要求「同文本重发时
+        **保持现状**」⇒ 应返回 ``"reply"``。
+        """
+        messages = [user("hi"), user("hi"), assistant("reply")]
+        self.assertEqual(find_reply_for_prompt(messages, "hi"), "reply")
+
+    def test_a_duplicate_match_after_tool_calls_still_reaches_its_reply(self):
+        """B-1 辨别臂：首个匹配被纯工具调用隔开、又来一条同文本匹配 —— 后者有正文。
+
+        缺陷版：第二条匹配命中 ``else`` ⇒ 候选被清 ⇒ 其后的正文被跳过 ⇒ ``None``。
+        修正版：同文本匹配保持候选 ⇒ 返回 ``"这一轮的答复"``。两条臂结论不同。
+        """
+        messages = [
+            user("hi"),
+            tool_only_assistant(),
+            user("hi"),
+            assistant("这一轮的答复"),
+        ]
+        self.assertEqual(find_reply_for_prompt(messages, "hi"), "这一轮的答复")
+
+    def test_the_first_match_with_a_body_wins_over_a_later_duplicate(self):
+        """同文本重发取**首个**「之后确有正文」的匹配。
+
+        修正版在第一条匹配后的正文处返回 ``"第一轮答复"``；缺陷版会清候选、
+        继续扫到第二轮 ⇒ 返回 ``"第二轮答复"`` ⇒ 该断言对缺陷有辨别力。
+        """
+        messages = [
+            user("hi"),
+            user("hi"),
+            assistant("第一轮答复"),
+            user("hi"),
+            assistant("第二轮答复"),
+        ]
+        self.assertEqual(find_reply_for_prompt(messages, "hi"), "第一轮答复")
+
+    def test_a_different_user_still_clears_the_pending_candidate(self):
+        """步骤 3 未被修坏：**别的** user 消息切断候选 ⇒ 其后的正文不算这一轮答复。"""
+        messages = [user("hi"), user("别的指令"), assistant("对别人的答复")]
+        self.assertIsNone(find_reply_for_prompt(messages, "hi"))
+
     def test_a_user_followed_only_by_tool_calls_is_suppressed(self):
         """interim 抑制：匹配的 user 后面只有纯工具调用的 assistant ⇒ 返回 ``None``。"""
         messages = [user("跑一下工具"), tool_only_assistant()]

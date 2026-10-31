@@ -76,9 +76,11 @@ def find_reply_for_prompt(messages: list[dict], prompt_text: str) -> str | None:
     for message in messages:
         user_text = _user_text(message)
         if user_text is not None:
-            if user_text == prompt_text and not awaiting_reply:
+            if user_text == prompt_text:
+                # 步骤 2：同文本重发时保持现状（首个「之后确有正文」的匹配截断）。
                 awaiting_reply = True
             else:
+                # 步骤 3：别的 user 消息切断上一段对话，清掉候选。
                 awaiting_reply = False
             continue
         assistant_text = _assistant_text(message)

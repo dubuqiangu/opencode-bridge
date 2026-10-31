@@ -19,7 +19,14 @@ import unittest
 from unittest import mock
 
 import opencode_bridge.split as split_module
-from opencode_bridge.markdown_blocks import table_cells, table_end, to_blocks
+from opencode_bridge.markdown_blocks import (
+    Segment,
+    merge_segments,
+    render_chunks,
+    table_cells,
+    table_end,
+    to_blocks,
+)
 from opencode_bridge.split import split_text
 
 #: 围栏开始标记。三反引号，恰好 3 个字符。
@@ -125,11 +132,92 @@ class NumberingTests(unittest.TestCase):
         self.assertEqual(pieces[-1], fence)
         for piece in pieces:
             self.assertLessEqual(len(piece), 60, repr(piece))
-        # 纯文字片拼回去应当逐字等于原文（前缀只加在片首，正文无损）。
+        # 纯文字片拼回去应当逐字等于**该纯文字块**（前缀只加在片首，正文无损）。
+        # ⚠️ 块文本 = ``prose + "\n"``：源里 ``prose`` 与围栏之间是一个空行，其中第一个
+        # 换行被这个纯文字块吸走（``to_blocks`` 把连续纯文字行并成一个块）⇒ 无损重建必须
+        # 保留它。⛔ 断言 ``== prose`` 正是被 C-1 修掉的「丢掉那个换行」行为。
         rebuilt_prose = "".join(
             _strip_test_prefix(piece) for piece in pieces if not piece.startswith(FENCE_OPENING)
         )
-        self.assertEqual(rebuilt_prose, prose)
+        self.assertEqual(rebuilt_prose, prose + "\n")
+
+
+class StructuredPathIsLosslessTests(unittest.TestCase):
+    """C-1 守门：结构化路径的**同一片内**正文逐字无损（⛔ 不注入空行、⛔ 不丢字符）。
+
+    缺陷本体：纯文字切分器切出的片**自带分隔符**（片尾保留 ``"\\n"``）；参考实现
+    那种「一律 ``"\\n"`` 连接 + strip 首尾」会**再加一个** ``"\\n"``（两条表格数据行
+    之间多出空行 ⇒ GFM 把表格截断）并**删掉**片尾那个 ``"\\n"``（开围栏后的换行丢失）。
+    ⇒ 本类的判据是**可复核的不变量**（具体子串在 / 不在 + 重建逐字相等），
+    ⛔ 不是抄一份输出。为什么是子串而不是整体相等：跨**消息**（chunk）边界的块间
+    分隔符本就不在同一片里（消息是分开发送的），故只有单块样本能整体相等。
+    """
+
+    def test_a_split_table_keeps_its_rows_adjacent_without_a_blank_line(self):
+        # 一张超过预算的表会被切成多片；相邻两片之间**不得**多出空行，
+        # 否则 GFM 会在空行处结束表格、把后半截渲染成普通段落。
+        text = "intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\nend"
+
+        pieces = split_text(text, 20)
+        joined = "".join(pieces)
+
+        self.assertNotIn("| 1 | 2 |\n\n| 3 | 4 |", joined, pieces)
+        self.assertIn("| 1 | 2 |\n| 3 | 4 |", joined, pieces)
+        self.assertNotIn("\n\n", joined, pieces)
+        for piece in pieces:
+            self.assertLessEqual(len(piece), 20, repr(piece))
+
+    def test_a_split_fence_rebuilds_the_original_text_byte_for_byte(self):
+        # 单块围栏：整段正文必须**逐字**重建（含开围栏后那个换行，以及闭围栏前的换行）。
+        text = FENCE_OPENING + "\nabcdefghijklmnop\n" + FENCE_OPENING
+
+        pieces = split_text(text, 12)
+
+        self.assertGreater(len(pieces), 1, pieces)  # 前提自检：确实被切过
+        self.assertEqual("".join(pieces), text, pieces)
+        self.assertIn("\nabcdefghijklmnop\n", "".join(pieces), pieces)
+        self.assertNotIn("\n\n", "".join(pieces), pieces)
+        for piece in pieces:
+            self.assertLessEqual(len(piece), 12, repr(piece))
+
+    def test_a_long_prose_block_beside_a_table_rebuilds_with_its_absorbed_newline(self):
+        # 源里 ``prose`` 与表格之间是一个空行；其中第一个换行被这个纯文字块吸走
+        # （``to_blocks`` 把连续纯文字行并成一个块）⇒ 重建必须保留它，⛔ 不能丢。
+        prose = "乙" * 90
+        table = "| a | b |\n|---|---|\n| 1 | 2 |"
+        text = prose + "\n\n" + table
+
+        pieces = split_text(text, 40)
+        prose_pieces = [piece for piece in pieces if not piece.startswith("|")]
+
+        self.assertGreater(len(prose_pieces), 1, pieces)  # 前提自检：纯文字块确实被切过
+        self.assertEqual("".join(prose_pieces), prose + "\n", pieces)
+        for piece in pieces:
+            self.assertLessEqual(len(piece), 40, repr(piece))
+
+    def test_a_continuation_piece_joins_without_injecting_a_blank_line(self):
+        # 连接规则本身：续片（``needs_separator_before=False``）直连，其余片之间补一个 ``"\n"``。
+        # 第一片片尾自带 ``"\n"``（逐字划分的产物）⇒ 续片直连后恰好是一个换行，⛔ 不是两个。
+        pieces = [
+            Segment("甲\n", True, True),
+            Segment("乙", True, False),
+            Segment("丙", True, True),
+        ]
+        rendered = [
+            part.text for part in render_chunks(merge_segments(pieces, 100, 100))
+        ]
+        self.assertEqual(rendered, ["甲\n乙\n丙"])
+
+        # 对照臂：把那片标成「需要分隔符」⇒ 立刻多出一个空行 ⇒ 证明上面那条不是恒真。
+        doubled = [
+            Segment("甲\n", True, True),
+            Segment("乙", True, True),
+            Segment("丙", True, True),
+        ]
+        rendered_doubled = [
+            part.text for part in render_chunks(merge_segments(doubled, 100, 100))
+        ]
+        self.assertEqual(rendered_doubled, ["甲\n\n乙\n丙"])
 
 
 class RoutingTests(unittest.TestCase):

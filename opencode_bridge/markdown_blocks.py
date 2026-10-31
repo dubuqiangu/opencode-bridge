@@ -18,8 +18,13 @@
 - ``tableCells`` 里定位行内代码结束标记用 ``str.find``（码点）而非 JS
   ``indexOf``（UTF-16 码元）；仅当行内代码含增补平面字符（emoji）时才有差异，
   且本模块的算法更正确。
-- 段片之间一律以 ``"\\n"`` 连接（与参考实现一致）；因此 ``to_blocks`` 的重建文本
-  在 CR 归一化后与原文本逐字相同，而**未闭合围栏**是唯一例外（会补出结束标记）。
+- 段片之间的连接**刻意不照搬**参考实现的「一律 ``"\\n"`` 连接 + ``strip`` 首尾换行」：
+  参考实现的纯文字切分器 ``splitProse`` 与本模块的 ``split_prose`` 都是**逐字划分**
+  ——切出来的片自带分隔符（``splitFence`` 里那句 ``piece.endsWith('\\n')`` 就是明证）
+  ⇒ 若再补一个 ``"\\n"``，两条表格数据行之间就被注入一个空行（GFM 会就此把表格截断）、
+  闭围栏前也会多一个空行，而那正是本桥修掉的结构路径丢字缺陷。改为「续片直连、
+  其余片之间补 ``"\\n"``」且**不** strip 首尾 ⇒ 两种片各自无损。因此 ``to_blocks``
+  的重建文本在 CR 归一化后与原文本逐字相同，而**未闭合围栏**是唯一例外（会补出结束标记）。
 - 未移植 ``markdownTableOffsets``（返回表格起始偏移）：本桥无调用方（§8 不造无用件）。
 """
 from __future__ import annotations
@@ -59,6 +64,9 @@ _SEPARATOR_CELL = re.compile(r"^\s*:?-+:?\s*$")
 PREFIX_ALLOWANCE = 8
 
 #: 注入的纯文字切分器签名：``(text, max_len) -> 段列表``。
+#: ⚠️ **契约**：返回的段列表必须是 ``text`` 的**逐字划分**（``"".join(段) == text``），
+#: 且切点保留换行 ⇒ 第 2 片起是**续片**（``needs_separator_before=False``）。
+#: 本契约是 C-1 的根因所在：片自带分隔符，就不能再补 ``"\n"`` 连接。
 ProseSplitter = Callable[[str, int], list[str]]
 
 
@@ -77,6 +85,10 @@ class Segment:
     text: str
     #: 围栏 / 表格片加序号会破坏结构，故只有纯文字片是 ``True``。
     plain: bool
+    #: 与前一片之间是否需要补一个 ``"\n"``。**默认需要**（不同块之间、结构片之间
+    #: 都靠它分隔）；只有**同一切分单元的续片**才是 ``False`` —— 那一族的片是逐字
+    #: 划分，分隔符已留在前一片的结尾里，再补一个就会注入空行。
+    needs_separator_before: bool = True
 
 
 def fence_marker(line: str) -> str | None:
@@ -266,8 +278,25 @@ def split_block(block: Block, budget: int, split_prose: ProseSplitter) -> list[S
         if pieces:
             return [Segment(piece, False) for piece in pieces]
     return [
-        Segment(piece, block.kind == "prose") for piece in split_prose(block.text, budget)
+        Segment(piece, block.kind == "prose", index == 0)
+        for index, piece in enumerate(split_prose(block.text, budget))
     ]
+
+
+def _join_piece_texts(pieces: list[Segment]) -> str:
+    """把同一片里的段片拼回正文：续片直连，其余片之间补一个 ``"\n"``。
+
+    ⛔ **不是**参考实现那种「一律 ``"\\n"`` 连接」：本模块的纯文字片是**逐字划分**，
+    片尾自带分隔符（如 ``"| 1 | 2 |\\n"``、``"```\\n"``）⇒ 再补一个 ``"\\n"`` 就会
+    在两条表格数据行之间注入空行（GFM 会就此把表格截断）、在闭围栏前多出空行。
+    只有 ``needs_separator_before`` 为真的片（不同块之间、结构片之间）才补分隔符。
+    """
+    rendered = ""
+    for index, piece in enumerate(pieces):
+        if index and piece.needs_separator_before:
+            rendered += "\n"
+        rendered += piece.text
+    return rendered
 
 
 def merge_segments(
@@ -281,7 +310,7 @@ def merge_segments(
         if chunks:
             last = chunks[-1]
             limit = budget if last[0].plain else max_len
-            merged = "\n".join([item.text for item in last] + [segment.text])
+            merged = _join_piece_texts(last + [segment])
             if len(merged) <= limit:
                 last.append(segment)
                 continue
@@ -290,10 +319,17 @@ def merge_segments(
 
 
 def render_chunks(chunks: list[list[Segment]]) -> list[Segment]:
-    """把装好的片渲染成最终段片，并重判「纯文字」——首行是围栏 / 表格则不能加序号。"""
+    """把装好的片渲染成最终段片，并重判「纯文字」——首行是围栏 / 表格则不能加序号。
+
+    ⛔ **不再** ``strip("\\n")``（那是参考实现 ``renderChunks`` 的
+    ``replace(/^\\n+/,'').replace(/\\n+$/,'')``）：本模块的片是逐字划分，片尾那个
+    ``"\\n"`` 是**正文的一部分**（如开围栏 ``"```\\n"`` 后的换行），剥掉就是丢字符。
+    参考实现剥它是为了把「首行是空行」的情况认出来，本模块改由下面的
+    ``first_line == ""`` 判据承担，无需真的删字符。
+    """
     parts: list[Segment] = []
     for chunk in chunks:
-        text = "\n".join(item.text for item in chunk).strip("\n")
+        text = _join_piece_texts(chunk)
         first_line = text.split("\n", 1)[0]
         structural = (
             first_line == ""

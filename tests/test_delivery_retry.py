@@ -175,7 +175,7 @@ class _InboxThatCannotMarkAttempting:
     def __getattr__(self, name: str):
         return getattr(self._inbox, name)
 
-    def mark_attempting(self, delivery_id: str) -> None:
+    def mark_attempting(self, delivery_id: str) -> bool:
         raise sqlite3.OperationalError("database is locked")
 
 
@@ -494,6 +494,53 @@ class TestAFailureThatCouldNotBeRecordedIsReportedHonestly(DeliveryRetryTestCase
         self.assertNotIn("可能", reply.text)
         # 盘上那一行留在 attempting —— 正是「不会被自动重投」的原因。
         self.assertEqual(self.state_of("a-row"), DeliveryState.ATTEMPTING)
+
+
+class _InboxWhoseRowWasAlreadyClaimed:
+    """除 ``mark_attempting`` 外全部转发给真收件箱；``mark_attempting`` 回 ``False``。
+
+    ⚠️ 与 :class:`_InboxThatCannotMarkAttempting` 同型，区别是这里**不抛** ——
+    CAS 未命中是一条**正常的判决**（另一条路径先认领了那一行），而不是写故障。
+    """
+
+    def __init__(self, inbox: InboundInbox) -> None:
+        self._inbox = inbox
+
+    def __getattr__(self, name: str):
+        return getattr(self._inbox, name)
+
+    def mark_attempting(self, delivery_id: str) -> bool:
+        return False
+
+
+class TestARowAlreadyClaimedByAnotherPathIsNotResent(DeliveryRetryTestCase):
+    """⭐ CAS 未命中：另一条路径（启动恢复或实况投递）已认领 ⇒ 手动补投**不许**再投。
+
+    再投一次就是 agent 对同一条指令跑两遍，而那正是本模块存在的理由所反对的。
+    """
+
+    def test_an_already_claimed_row_is_reported_truthfully_without_resending(self):
+        self.record(make_prompt("a-row", text="看一下 README"))
+        inbox = _InboxWhoseRowWasAlreadyClaimed(self.inbox)
+
+        reply = self.command(inbox=inbox).reply_for(_SESSION, "retry 1")
+
+        self.assertEqual(reply.kind, "error")
+        self.assertEqual(
+            self.dispatch.dispatched, [],
+            "已被人认领还投 ⇒ agent 对同一条指令跑两遍",
+        )
+        # ⛔ 不是兜底那句「结果不明」—— 那是「我们投了、但不知道结果」，而这里确知没投。
+        self.assertNotIn("补投结果不明", reply.text)
+        # ⛔ 不是成功那句 —— 本路径一条都没投出去。
+        self.assertNotIn("已补投", reply.text)
+        # ⛔ 不是「下一次启动会自动重试」—— 本路径既没投、也没消耗重试预算。
+        self.assertNotIn("自动重试", reply.text)
+        self.assertIn("另一条路径", reply.text)
+        self.assertEqual(
+            self.state_of("a-row"), DeliveryState.PENDING,
+            "本路径没有投递，那一行必须原样留在盘上，由认领它的那条路径负责",
+        )
 
 
 class TestWhenTheInboxIsDisabled(DeliveryRetryTestCase):

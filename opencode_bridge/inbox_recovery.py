@@ -70,6 +70,7 @@ from .inbox import (
 __all__ = [
     "BACKOFF_LADDER_SECONDS",
     "MAX_ATTEMPTS",
+    "REPLAY_ALREADY_CLAIMED",
     "REPLAY_DELIVERED",
     "REPLAY_FAILED",
     "REPLAY_FAILED_UNRECORDED",
@@ -89,7 +90,7 @@ logger = logging.getLogger("opencode_bridge.inbox_recovery")
 # "还差几次预算"。放在恢复层会造成循环 import，所以这里只做转发 ——
 # 调用方 ``from opencode_bridge import inbox_recovery`` 就能拿到全部策略常量。
 
-#: :func:`replay_one` 的**五种返回值** —— 调用方（群内手动补投）按它决定说哪句话，
+#: :func:`replay_one` 的**六种返回值** —— 调用方（群内手动补投）按它决定说哪句话，
 #: ⛔ 不从 :class:`RecoveryOutcome` 的成员里反推：批量恢复只关心「成功」那一种，
 #: 而手动补投要**逐档**告诉用户发生了什么。
 #:
@@ -106,6 +107,12 @@ logger = logging.getLogger("opencode_bridge.inbox_recovery")
 #: ⇒ 它**不会**被自动重投。⛔ 并回 ``REPLAY_FAILED`` 就等于承诺「下次启动会自动重试」，
 #: 而那句话在这里**是假的**；⛔ 也**不许**并进 ``REPLAY_NOT_ATTEMPTED``（那次**投过**）
 #: 或 ``REPLAY_OUTCOME_UNKNOWN``（这里**确知**投递失败，不是「可能已经跑过」）。
+#: ⚠️ ``REPLAY_ALREADY_CLAIMED`` 是 A1-1 新增的**独立一档**：``mark_attempting`` 的
+#: CAS 未命中 ⇒ 这一行**已被另一条路径认领**（实况 :meth:`InboundGateway._dispatch_prompt`
+#: 或恢复期另一条路径）⇒ 本路径**没有投递**。⛔ 不许并进 ``REPLAY_FAILED``（那次
+#: **投过**、须按失败告知）或 ``REPLAY_NOT_ATTEMPTED``（那是**写失败**、这行仍留在可重放
+#: 状态；而这里没有写失败，是**别人已经赢了**）。
+REPLAY_ALREADY_CLAIMED = "already_claimed"
 REPLAY_DELIVERED = "delivered"
 REPLAY_FAILED = "failed"
 REPLAY_FAILED_UNRECORDED = "failed_unrecorded"
@@ -281,7 +288,7 @@ def replay_one(
 ) -> str:
     """重放一条：写 ``attempting`` → 投递 → 成功才写 ``delivered``。
 
-    :returns: 五种结果之一（模块级 ``REPLAY_*`` 常量）——
+    :returns: 六种结果之一（模块级 ``REPLAY_*`` 常量）——
 
         * :data:`REPLAY_DELIVERED` —— 投出去且那行记成了 ``delivered``；
         * :data:`REPLAY_FAILED` —— 明确失败，已落 ``failed``（**消耗了一级重试预算**；
@@ -294,6 +301,9 @@ def replay_one(
           交出去）⇒ **绝不重放**，也**不碰**预算；
         * :data:`REPLAY_NOT_ATTEMPTED` —— ``mark_attempting`` 写失败 ⇒ **压根没投**
           （理由见下），那一行留在盘上等下次恢复。
+        * :data:`REPLAY_ALREADY_CLAIMED` —— ``mark_attempting`` 的 CAS **未命中** ⇒
+          这一行**已被另一条路径认领**，本路径**没有投递**（理由见本函数里那段
+          CAS 注释）。⛔ 既不是失败、也不是写失败。
 
     ⚠️ 批量恢复（:func:`recover_pending`）**不看返回值** —— 它靠
     :class:`RecoveryOutcome` 记账；这个返回值是给**群内手动补投**用的，那一侧要逐档
@@ -317,9 +327,9 @@ def replay_one(
     发送一次」**的告警（:func:`_uncertain_alert_text`）。⛔ 这里若自己再发一遍就是
     每条发两次；⛔ 若只记一条日志不告诉用户怎么办，那是把负担转给用户。
     """
-    if not _safe_action(
-        lambda: inbox.mark_attempting(prompt.delivery_id), doing="mark the row attempting"
-    ):
+    try:
+        claimed = inbox.mark_attempting(prompt.delivery_id)
+    except Exception:
         # ⚠️⚠️ **记不下 ``attempting`` 就不投**。``attempting`` 是"结果不可知"的**唯一**
         # 来源（理由见 :meth:`InboundInbox.mark_attempting` 的 docstring：写在它之前，
         # 崩溃就落在"还没试"，而那一档会被重放）。⇒ 写失败还照样投的话，这一行在盘上
@@ -338,6 +348,10 @@ def replay_one(
         # try **之外** ⇒ 失败一路冒到 ``_drain`` 的 except，那条队列就此中止
         # （``tests/test_inbound_gateway`` 有一条用例钉着 ``prompt`` 一次都没被调用）。
         # ⇒ 恢复路径此前与它**不一致**，而那一侧正是会重放的地方。
+        logger.exception(
+            "inbox recovery: cannot mark the row attempting;"
+            " the row stays for the next boot"
+        )
         logger.warning(
             "inbox recovery: NOT replaying %s — its row could not be marked"
             " attempting, so a crash right now would leave a never-tried row that"
@@ -345,6 +359,16 @@ def replay_one(
             prompt.delivery_id,
         )
         return REPLAY_NOT_ATTEMPTED
+    if not claimed:
+        # ⚠️ CAS 未命中：这一行**已被另一条路径认领**（实况投递或另一轮恢复），
+        # 本路径没有投递，⛔ 绝不重投 —— 那正是 agent 对同一条指令跑两遍。
+        logger.info(
+            "inbox recovery: NOT replaying %s — its row was already claimed by"
+            " another path (mark_attempting's CAS missed); it is being delivered"
+            " elsewhere",
+            prompt.delivery_id,
+        )
+        return REPLAY_ALREADY_CLAIMED
     try:
         dispatch(prompt)
     except Exception as exc:

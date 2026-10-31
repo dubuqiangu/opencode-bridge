@@ -444,8 +444,9 @@ class RecordingRows:
         self.states[queued.delivery_id] = "pending"
         return True
 
-    def mark_attempting(self, delivery_id: str) -> None:
+    def mark_attempting(self, delivery_id: str) -> bool:
         self.states[delivery_id] = "attempting"
+        return True
 
     def mark_delivered(self, delivery_id: str) -> None:
         self.states[delivery_id] = "delivered"

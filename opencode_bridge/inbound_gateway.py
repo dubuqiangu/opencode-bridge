@@ -863,7 +863,10 @@ class InboundGateway:
         self, queued: QueuedPrompt, *, recording_delivery: bool = True,
     ) -> str:
         """Send one queued prompt. Returns ``ok`` / ``busy`` / ``error`` /
-        ``outcome_unknown``.
+        ``outcome_unknown`` / ``already_claimed``.
+
+        ⚠️ ``already_claimed`` 表示 ``mark_attempting`` 的 CAS **未命中**：这一行已被
+        另一条路径认领，本方法**没有投递**（⛔ 既不是失败、也不是结果未知）。
 
         ⭐ 第四个返回值是本方法的**分档契约**：恢复层只会拿到一个字符串，所以
         「prompt 有没有真的交出去」必须由**这里**说出来 ——
@@ -914,8 +917,16 @@ class InboundGateway:
                 )
             return "error"
 
-        if inbox is not None:
-            inbox.mark_attempting(queued.delivery_id)
+        if inbox is not None and not inbox.mark_attempting(queued.delivery_id):
+            # ⚠️ CAS 未命中：这一行已被**另一条路径**认领（恢复层
+            # :func:`~.inbox_recovery.replay_one`），此刻已经有人在投递同一条
+            # prompt。再投一次就是 agent 对同一条指令跑两遍 —— 正是本行要防的
+            # 那件事。⛔ 绝不在此重投；那一行留由认领它的那条路径负责。
+            logger.info(
+                "prompt %s already claimed by another path; not dispatching",
+                queued.delivery_id,
+            )
+            return "already_claimed"
         try:
             # ⚠️ 渠道说明（C1）只在**发给 opencode 的这一刻**拼上去，而且是
             # 由 ``adapter`` 自己的能力算出来的（见 :mod:`opencode_bridge.channel_profile`

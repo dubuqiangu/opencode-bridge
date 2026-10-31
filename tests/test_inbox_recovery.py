@@ -32,6 +32,7 @@ import unittest
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.inbox_recovery import (
     MAX_ATTEMPTS,
+    REPLAY_ALREADY_CLAIMED,
     REPLAY_FAILED,
     REPLAY_FAILED_UNRECORDED,
     RecoveryOutcome,
@@ -161,8 +162,9 @@ class FakeInbox:
         self.add(prompt, DeliveryState.PENDING)
         return True
 
-    def mark_attempting(self, delivery_id: str) -> None:
+    def mark_attempting(self, delivery_id: str) -> bool:
         self._move(delivery_id, DeliveryState.ATTEMPTING)
+        return True
 
     def mark_pending(self, delivery_id: str) -> None:
         self._move(delivery_id, DeliveryState.PENDING)
@@ -635,6 +637,76 @@ class TestARowThatCannotBeMarkedAttemptingIsNeverReplayed(unittest.TestCase):
         self.assertEqual([prompt.delivery_id for prompt in dispatch.dispatched],
                          [self._DELIVERY_ID])
         self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
+
+
+class _AlreadyClaimedInbox:
+    """把一个收件箱包起来，让 ``mark_attempting`` 的 CAS **未命中**（回 ``False``）。
+
+    ⚠️ 与 :class:`WritesThatFail` / :class:`InboxWhoseMarkFailedRaises` 同型，区别是
+    这里**不抛** —— CAS 未命中是一条**正常的判决**（另一条路径先认领了那一行），
+    而不是写故障。
+    """
+
+    def __init__(self, inbox) -> None:
+        self._inbox = inbox
+        #: 实际走到 ``mark_attempting`` 那一次调用的记录（确认注入真的生效）。
+        self.mark_attempting_calls: list[str] = []
+
+    def __getattr__(self, name: str):
+        return getattr(self._inbox, name)
+
+    def mark_attempting(self, delivery_id: str) -> bool:
+        self.mark_attempting_calls.append(delivery_id)
+        return False
+
+
+class TestARowAlreadyClaimedByAnotherPathIsNotReplayed(unittest.TestCase):
+    """⭐ CAS 未命中：另一条路径已认领 ⇒ 本路径**绝不重投**（不能跑两遍）。
+
+    ``mark_attempting`` 现在带守卫，所以恢复路径可能**输给**实况投递 —— 那一刻这一行
+    已经在被投递，再投一次就是 agent 对同一条指令跑两遍。返回值
+    :data:`~opencode_bridge.inbox_recovery.REPLAY_ALREADY_CLAIMED` 把这一档和"写失败"
+    分开，让上游（:mod:`opencode_bridge.delivery_retry`）能说清"没投、但也不失败"。
+    """
+
+    _DELIVERY_ID = "telegram:100200:23"
+
+    def setUp(self) -> None:
+        self.database_path = _temporary_database_path(self)
+        self.inbox = InboundInbox(self.database_path)
+        self.addCleanup(self.inbox.close)
+        self.inbox.record(make_prompt(self._DELIVERY_ID))
+
+    def test_replay_one_reports_already_claimed_without_dispatching(self):
+        claimed_elsewhere = _AlreadyClaimedInbox(self.inbox)
+        dispatch = RecordingDispatcher()
+
+        result = replay_one(
+            make_prompt(self._DELIVERY_ID),
+            claimed_elsewhere,
+            dispatch,
+            RecoveryOutcome(),
+        )
+
+        self.assertEqual(claimed_elsewhere.mark_attempting_calls, [self._DELIVERY_ID],
+                         "前提：注入真的走到了 mark_attempting 那一次 CAS")
+        self.assertEqual(result, REPLAY_ALREADY_CLAIMED)
+        self.assertEqual(dispatch.dispatched, [],
+                         "CAS 未命中还投 ⇒ 与另一条认领路径重复 ⇒ 跑两遍")
+        self.assertEqual(_read_state(self.database_path), DeliveryState.PENDING,
+                         "本路径没有投递，那一行必须原样留在盘上，由赢家那条路径负责")
+
+    def test_the_batch_recovery_also_skips_an_already_claimed_row(self):
+        dispatch = RecordingDispatcher()
+
+        recover_pending(
+            _AlreadyClaimedInbox(self.inbox),
+            dispatch=dispatch, notify=RecordingNotifier(),
+        )
+
+        self.assertEqual(dispatch.dispatched, [],
+                         "批量恢复同样不许重投已被别人认领的行")
+        self.assertEqual(_read_state(self.database_path), DeliveryState.PENDING)
 
 
 class InboxWhoseMarkFailedRaises:

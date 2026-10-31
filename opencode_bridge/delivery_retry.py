@@ -50,6 +50,7 @@ from typing import Optional
 
 from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import (
+    REPLAY_ALREADY_CLAIMED,
     REPLAY_DELIVERED,
     REPLAY_FAILED,
     REPLAY_FAILED_UNRECORDED,
@@ -224,7 +225,7 @@ class DeliveryRetryCommand:
     def _reply_for_result(
         self, ordinal: int, prompt: QueuedPrompt, result: str
     ) -> DeliveryReply:
-        """把 :func:`replay_one` 的**五档**返回值翻成一句给用户的话。
+        """把 :func:`replay_one` 的**六档**返回值翻成一句给用户的话。
 
         ⚠️ 逐档**显式枚举**，末尾留一条 fail-safe 兜底 —— ⛔ 不要写成
         ``if result == REPLAY_FAILED: … else: 成功``：那样新增一档返回值时会落进
@@ -254,6 +255,16 @@ class DeliveryRetryCommand:
         if result == REPLAY_NOT_ATTEMPTED:
             return DeliveryReply(
                 f"#{ordinal} 没能记下投递状态，因此这次没有投递；请稍后再试。",
+                kind="error",
+            )
+        if result == REPLAY_ALREADY_CLAIMED:
+            # ⚠️ 这一档既不声称成功也不声称失败：另一条路径（启动恢复或网关的
+            # 实况投递）已经认领并在投递同一条 prompt，本命令**没有投出任何东西**。
+            # ⛔ 不许落进兜底那句「结果不明」——那是「我们投了、但不知道结果」，
+            # 而这里我们**确知没投**，且那条消息**正在被另一条路径处理**。
+            return DeliveryReply(
+                f"#{ordinal} 已由另一条路径接手（启动恢复或实况投递正在处理它），"
+                "这里没有重复投递；通常不需要再手动补投。",
                 kind="error",
             )
         logger.warning(

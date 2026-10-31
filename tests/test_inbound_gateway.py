@@ -208,10 +208,11 @@ class RecordingInbox:
         self.writes.append((queued.delivery_id, "recorded"))
         return True
 
-    def mark_attempting(self, delivery_id: str) -> None:
+    def mark_attempting(self, delivery_id: str) -> bool:
         self.rows[delivery_id] = DeliveryState.ATTEMPTING
         self.attempts[delivery_id] = self.attempts.get(delivery_id, 0) + 1
         self.writes.append((delivery_id, "attempting"))
+        return True
 
     def mark_pending(self, delivery_id: str) -> None:
         """409：服务端拒收 —— 退回可重放，**不**算一次尝试（``attempts`` 不动）。"""
@@ -1862,6 +1863,30 @@ class DispatchPromptTests(InboundGatewayTestCase):
         self.assertEqual(self.inbox.rows, {})
         self.assertEqual(self.inbox.failures, {})
 
+    def test_a_row_already_claimed_elsewhere_is_not_dispatched_by_the_live_path(self):
+        """⭐ ``mark_attempting`` 的 CAS 未命中时，实况路径**绝不**再投一次。
+
+        恢复路径（``inbox_recovery.replay_one``）与实况路径会来认领同一行；若两者
+        都投，agent 就会对同一条指令跑两遍（重复改文件、重复 git 操作）。CAS 保证
+        恰好一个赢，输的那个**不投**。
+        """
+        self.inbox.mark_attempting = mock.Mock(return_value=False)
+
+        outcome = self.gateway._dispatch_prompt(queued("d1", "重放"))
+
+        self.assertEqual(outcome, "already_claimed")
+        self.assertEqual(
+            self.client.prompts, [],
+            "已被人认领还投 ⇒ agent 对同一条指令跑两遍",
+        )
+
+    def test_a_successful_claim_still_dispatches_the_live_path(self):
+        """反向对照：CAS 命中时实况路径照常投 —— 否则上一条只是「压根没投」。"""
+        outcome = self.gateway._dispatch_prompt(queued("d1", "看一下 README"))
+
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(len(self.client.prompts), 1)
+
 
 # ----------------------------------------------------------------------
 # 6: recover_inbox —— 等事件流确认、只重放该重放的
@@ -2174,7 +2199,9 @@ _GATEWAY_MODULE_PATH = os.path.join(
 
 #: ``_dispatch_prompt`` 允许返回的**全集**。新增一档必须先在这里登记 ——
 #: 登记的动作本身就是提醒「去把 ``dispatch_recovered`` 也改了」。
-_DISPATCH_OUTCOMES = frozenset({"ok", "busy", "error", "outcome_unknown"})
+_DISPATCH_OUTCOMES = frozenset(
+    {"ok", "busy", "error", "outcome_unknown", "already_claimed"}
+)
 
 
 def _returned_literals_in_source(source: str, function_name: str) -> set:

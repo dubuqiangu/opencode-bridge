@@ -134,6 +134,7 @@ from .inbox_sqlite import open_inbox_connection
 
 __all__ = [
     "BACKOFF_LADDER_SECONDS",
+    "CLAIMABLE_STATES",
     "DEFAULT_DELIVERED_RETENTION_SECONDS",
     "DEFAULT_MAX_ROWS",
     "DeliveryState",
@@ -144,6 +145,17 @@ __all__ = [
 ]
 
 logger = logging.getLogger("opencode_bridge.inbox")
+
+#: CAS 认领守卫（:meth:`InboundInbox.mark_attempting`）**接受**的那些状态 —— 只有从这些
+#: 状态出发，一行才允许被改写成 ``attempting``。
+#:
+#: ⚠️ 它**恰好**等于恢复层的重放集合（``pending_prompts()`` + ``due_failed_prompts()``）：
+#: 守卫接受的状态，正是恢复层会去重放的状态。两者一旦分叉，就有一侧会「以为自己认领
+#: 成功、其实没有」或反过来 —— 前者让实况路径与恢复路径**同时**投同一条（双跑），
+#: 后者让一条本可重放的行永远认领不到（静默搁浅）。所以它是**契约**，不是实现细节。
+#: 也正因如此 ``attempting`` / ``outcome_unknown`` / ``delivered`` / ``abandoned`` 都不在
+#: 其中 —— 那些行各有归属，谁都别想再从它们出发认领一次。
+CLAIMABLE_STATES = frozenset({DeliveryState.PENDING, DeliveryState.FAILED})
 
 
 @dataclass(frozen=True)
@@ -303,19 +315,53 @@ class InboundInbox:
             self._enforce_row_cap()
             return RecordOutcome.RECORDED
 
-    def mark_attempting(self, delivery_id: str) -> None:
-        """标记"投递已经开始"，紧贴 ``prompt()`` 调用之前。
+    def mark_attempting(self, delivery_id: str) -> bool:
+        """**认领**这一行去投递（带守卫的 CAS），紧贴 ``prompt()`` 调用之前。
+        返回「这次认领成功了吗」。
 
         这一行是**结果不可知**的唯一来源，所以它必须尽可能贴近真正发出去的那一刻：
         写在它之前，崩溃就落在"还没试"（可以放心重放）；写在它之后，崩溃就落在
         "可能已经跑过 agent"（只能告警）。
+
+        ⚠️ **这是一个比较并交换（CAS），⛔ 不是裸 UPDATE**：只有当前状态落在
+        :data:`CLAIMABLE_STATES`（``pending`` / ``failed``）里的行才允许被改写成
+        ``attempting``（守卫就是 UPDATE 的 ``WHERE ... AND state IN (...)``）。守卫是必需的，
+        因为**两条独立的路径**会来认领同一行 —— 实况路径
+        （:meth:`~opencode_bridge.inbound_gateway.InboundGateway._dispatch_prompt`）与
+        恢复路径（:func:`~opencode_bridge.inbox_recovery.replay_one`）—— 若它们都
+        "认领成功"，就会各自把同一条提示词交给 agent，**跑两遍**（重复改文件、重复
+        ``git`` 操作、重复长时间构建）。CAS 保证**恰好一个**认领者赢，输的那个必须
+        **不投递**。
+
+        :returns: ``True`` = **我**认领到了，可以投递；``False`` = 别人先认领走了、或这一行
+            本就不在可认领状态（``attempting`` / ``outcome_unknown`` / ``delivered`` /
+            ``abandoned``）、或压根没有这个 ``delivery_id``、或收件箱已关。**一律不抛**。
+
+        ⚠️ **收件箱已关 ⇒ ``False``、不抛、不执行**（``close()`` 的契约：「关掉之后所有
+        公开方法都是空操作」）。这**不能**靠 :meth:`_write` 那个静默 return —— 它在关闭时
+        悄悄什么都不做，而本方法要**返回**一个判决 ⇒ 所以这里像 :meth:`record` 一样**显式**
+        看 ``self._connection is None``。
+
+        ⚠️ 而**打开连接上真实的 sqlite3 写错误照旧原样抛出**（那条契约一个字没改）：
+        :func:`~opencode_bridge.inbox_recovery.replay_one` 靠它区分「写失败」与「被别人
+        认领」，⛔ 不让它落进这里的 ``False`` —— 两者是完全不同的处置（前者那一行留在盘上
+        等下次，后者由**赢家**去投）。
         """
         with self._lock:
-            self._write(
+            if self._connection is None:
+                return False
+            placeholders = ", ".join("?" for _state in CLAIMABLE_STATES)
+            cursor = self._connection.execute(
                 "UPDATE inbox SET state = ?, not_before = 0, updated_at = ?"
-                " WHERE delivery_id = ?",
-                (DeliveryState.ATTEMPTING, time.time(), delivery_id),
+                " WHERE delivery_id = ? AND state IN (%s)" % placeholders,
+                (
+                    DeliveryState.ATTEMPTING,
+                    time.time(),
+                    delivery_id,
+                    *sorted(CLAIMABLE_STATES),
+                ),
             )
+            return cursor.rowcount == 1
 
     def mark_pending(self, delivery_id: str) -> None:
         """退回 ``pending``：**服务端明确拒收**，agent 没跑过，可以放心重放。

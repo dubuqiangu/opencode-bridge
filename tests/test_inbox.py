@@ -35,6 +35,7 @@ from unittest import mock
 
 from opencode_bridge.inbox import (
     BACKOFF_LADDER_SECONDS,
+    CLAIMABLE_STATES,
     DEFAULT_DELIVERED_RETENTION_SECONDS,
     DeliveryState,
     InboundInbox,
@@ -378,6 +379,88 @@ class TestStateTransitions(InboxTestCase):
         inbox.mark_delivered("never-existed")
         inbox.mark_failed("never-existed", "boom")
         inbox.mark_abandoned("never-existed", "boom")
+
+
+class TestClaimAttemptingIsAGuardedCompareAndSwap(InboxTestCase):
+    """⭐ ``mark_attempting`` 是一个**带守卫的 CAS**：两条认领路径里恰好一个赢。
+
+    守卫是必需的，因为**两条独立的路径**会来认领同一行 —— 实况路径
+    （:meth:`~opencode_bridge.inbound_gateway.InboundGateway._dispatch_prompt`）与
+    恢复路径（:func:`~opencode_bridge.inbox_recovery.replay_one`）。若两者都"认领
+    成功"，同一条 prompt 会被交给 agent 两遍（重复改文件、重复 ``git`` 操作、重复
+    长时间构建）。守卫就是 UPDATE 的 ``WHERE ... AND state IN (...)``。
+    """
+
+    def _pending_prompt(self) -> tuple[InboundInbox, str, QueuedPrompt]:
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("telegram:100200:40")
+        inbox.record(prompt)
+        return inbox, database_path, prompt
+
+    def test_the_claimable_states_are_exactly_pending_and_failed(self):
+        """守卫的集合本身必须被钉住 —— 否则"哪些行可认领"会随实现悄悄变。"""
+        self.assertEqual(
+            CLAIMABLE_STATES,
+            frozenset({DeliveryState.PENDING, DeliveryState.FAILED}),
+        )
+
+    def test_only_the_first_claim_of_a_pending_row_wins(self):
+        inbox, database_path, prompt = self._pending_prompt()
+
+        self.assertTrue(inbox.mark_attempting(prompt.delivery_id),
+                        "第一个认领者必须赢")
+        self.assertFalse(
+            inbox.mark_attempting(prompt.delivery_id),
+            "已在 attempting 的行不许被第二个认领者再赢一次 —— 那会双跑",
+        )
+        self.assertEqual(_only_row(database_path)["state"], DeliveryState.ATTEMPTING)
+
+    def test_a_failed_row_is_still_claimable(self):
+        """``failed`` 行可被认领 —— 退避到期后的重放走的正是这一档。"""
+        inbox, database_path, prompt = self._pending_prompt()
+        inbox.mark_failed(prompt.delivery_id, "TimeoutError: no answer")
+
+        self.assertTrue(inbox.mark_attempting(prompt.delivery_id))
+        self.assertEqual(_only_row(database_path)["state"], DeliveryState.ATTEMPTING)
+
+    def test_settled_rows_cannot_be_claimed_and_are_left_untouched(self):
+        """已定局的行（``delivered`` / ``outcome_unknown``）绝不许被认领。"""
+        for settled_state in (DeliveryState.DELIVERED, DeliveryState.OUTCOME_UNKNOWN):
+            with self.subTest(settled_state=settled_state):
+                inbox, database_path = self.open_inbox(
+                    name=f"inbox-{settled_state}.sqlite3")
+                prompt = make_prompt("slack:C0ABCDEF:41",
+                                     conversation_id="slack:C0ABCDEF",
+                                     platform="slack", message_id="41")
+                inbox.record(prompt)
+                inbox.mark_attempting(prompt.delivery_id)
+                if settled_state == DeliveryState.DELIVERED:
+                    inbox.mark_delivered(prompt.delivery_id)
+                else:
+                    inbox.mark_outcome_unknown(prompt.delivery_id, "URLError: 连接被拒")
+
+                self.assertFalse(inbox.mark_attempting(prompt.delivery_id),
+                                 "已定局的行绝不许被认领")
+                self.assertEqual(_only_row(database_path)["state"], settled_state,
+                                 "CAS 未命中时那一行必须原封不动")
+
+    def test_a_closed_inbox_refuses_the_claim_without_touching_the_row(self):
+        """``close()`` 的契约：关掉之后是空操作 —— 而且这里必须**返回** ``False``。"""
+        inbox, database_path = self.open_inbox()
+        prompt = make_prompt("matrix:!room:9:42", conversation_id="matrix:!room:9",
+                             platform="matrix", message_id="42")
+        inbox.record(prompt)
+        inbox.close()
+
+        self.assertFalse(inbox.mark_attempting(prompt.delivery_id),
+                         "关掉的收件箱不能认领，⛔ 不许抛")
+        self.assertEqual(_only_row(database_path)["state"], DeliveryState.PENDING,
+                         "关闭时不许动盘上那一行")
+
+    def test_an_unknown_delivery_id_is_not_claimable(self):
+        inbox, _database_path, _prompt = self._pending_prompt()
+
+        self.assertFalse(inbox.mark_attempting("never-existed"))
 
 
 class TestBackoffAndRetryBudget(InboxTestCase):

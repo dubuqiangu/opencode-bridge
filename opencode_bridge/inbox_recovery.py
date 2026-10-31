@@ -72,6 +72,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "REPLAY_DELIVERED",
     "REPLAY_FAILED",
+    "REPLAY_FAILED_UNRECORDED",
     "REPLAY_NOT_ATTEMPTED",
     "REPLAY_OUTCOME_UNKNOWN",
     "RecoveryOutcome",
@@ -88,7 +89,7 @@ logger = logging.getLogger("opencode_bridge.inbox_recovery")
 # "还差几次预算"。放在恢复层会造成循环 import，所以这里只做转发 ——
 # 调用方 ``from opencode_bridge import inbox_recovery`` 就能拿到全部策略常量。
 
-#: :func:`replay_one` 的**四种返回值** —— 调用方（群内手动补投）按它决定说哪句话，
+#: :func:`replay_one` 的**五种返回值** —— 调用方（群内手动补投）按它决定说哪句话，
 #: ⛔ 不从 :class:`RecoveryOutcome` 的成员里反推：批量恢复只关心「成功」那一种，
 #: 而手动补投要**逐档**告诉用户发生了什么。
 #:
@@ -97,8 +98,17 @@ logger = logging.getLogger("opencode_bridge.inbox_recovery")
 #: 注释讲为什么那一档必须存在）。两者对盘上的影响**不同** —— 前一档那一行**没被动过**
 #: （仍是 ``pending``/``failed``，下次恢复照样会试），后一档已经落 ``failed`` 且
 #: **消耗了一级重试预算**。并档就等于告诉用户「失败了」，而真相是「这次根本没试」。
+#:
+#: ⚠️ ``REPLAY_FAILED_UNRECORDED`` **同样是独立一档**（A1-2）：投递**确实**失败了
+#: （与 ``REPLAY_FAILED`` 同因），但 :meth:`~opencode_bridge.inbox.InboundInbox.mark_failed`
+#: 那一次写**也**失败了 ⇒ 那一行**留在 ``attempting``**（``mark_failed`` 是裸 UPDATE、
+#: 没有状态守卫，写不进去就原地不动）。而 ``attempting`` 在恢复层**只告警、绝不重放**
+#: ⇒ 它**不会**被自动重投。⛔ 并回 ``REPLAY_FAILED`` 就等于承诺「下次启动会自动重试」，
+#: 而那句话在这里**是假的**；⛔ 也**不许**并进 ``REPLAY_NOT_ATTEMPTED``（那次**投过**）
+#: 或 ``REPLAY_OUTCOME_UNKNOWN``（这里**确知**投递失败，不是「可能已经跑过」）。
 REPLAY_DELIVERED = "delivered"
 REPLAY_FAILED = "failed"
+REPLAY_FAILED_UNRECORDED = "failed_unrecorded"
 REPLAY_OUTCOME_UNKNOWN = "outcome_unknown"
 REPLAY_NOT_ATTEMPTED = "not_attempted"
 
@@ -271,11 +281,15 @@ def replay_one(
 ) -> str:
     """重放一条：写 ``attempting`` → 投递 → 成功才写 ``delivered``。
 
-    :returns: 四种结果之一（模块级 ``REPLAY_*`` 常量）——
+    :returns: 五种结果之一（模块级 ``REPLAY_*`` 常量）——
 
         * :data:`REPLAY_DELIVERED` —— 投出去且那行记成了 ``delivered``；
         * :data:`REPLAY_FAILED` —— 明确失败，已落 ``failed``（**消耗了一级重试预算**；
           预算刚好在这里耗尽时那一行会转 ``abandoned``，由调用方查收件箱判定）；
+        * :data:`REPLAY_FAILED_UNRECORDED` —— 明确失败，但**连 ``failed`` 都没记下**
+          （``mark_failed`` 那次写失败了）⇒ 那一行**留在 ``attempting``**、**不会**被
+          自动重投（``attempting`` 只告警）；⛔ 与 ``REPLAY_FAILED`` 不是一回事 ——
+          把它说成后者就是承诺「下次启动会自动重试」，而那句话**是假的**。
         * :data:`REPLAY_OUTCOME_UNKNOWN` —— 落 ``outcome_unknown``（请求可能**已经**
           交出去）⇒ **绝不重放**，也**不碰**预算；
         * :data:`REPLAY_NOT_ATTEMPTED` —— ``mark_attempting`` 写失败 ⇒ **压根没投**
@@ -291,7 +305,9 @@ def replay_one(
     * 可能**已经跑过**（拿不到 status）⇒ 落 ``outcome_unknown``：**不碰**
       ``attempts``（本档没有「下次」），恢复层对它**只告警、绝不重放**；
     * 明确失败（有 status，或投递侧确知 prompt 压根没提交）⇒ 落 ``failed``，
-      预算可能刚好在那里耗尽、于是转 ``abandoned``。
+      预算可能刚好在那里耗尽、于是转 ``abandoned``。⚠️ 而这次 ``mark_failed`` 若
+      **自己写失败**，那一行留在 ``attempting`` ⇒ 返回
+      :data:`REPLAY_FAILED_UNRECORDED`（不是 ``REPLAY_FAILED`` —— 见那里的注释）。
 
     两档都**不**把这条算进 :attr:`RecoveryOutcome.replayed`。
 
@@ -353,9 +369,22 @@ def replay_one(
         logger.warning(
             "inbox recovery: replaying %s failed (%s)", prompt.delivery_id, reason
         )
-        _safe_action(
-            lambda: inbox.mark_failed(prompt.delivery_id, reason), doing="mark the row failed"
-        )
+        if not _safe_action(
+            lambda: inbox.mark_failed(prompt.delivery_id, reason),
+            doing="mark the row failed",
+        ):
+            # ⚠️⚠️ 投递**确实**失败了（有 status / 投递侧确知没提交），但连 ``failed``
+            # 都没记下（盘满 / 库被锁）⇒ 那一行**留在 ``attempting``**：
+            # ``mark_failed`` 是裸 UPDATE、**没有状态守卫**，写不进去就原地不动。
+            # 而 ``attempting`` 在恢复层**只告警、绝不重放** ⇒ 它**不会**被自动重投。
+            # ⛔ 这里若照样返回 ``REPLAY_FAILED``，调用方就会说「下次启动会自动重试」，
+            # 而盘上那一行根本不会再被重放 —— 那是一句**假话**（AGENTS.md §9）。
+            logger.warning(
+                "inbox recovery: replaying %s failed AND its row could not be marked"
+                " failed; it stays attempting and will NOT be auto-retried",
+                prompt.delivery_id,
+            )
+            return REPLAY_FAILED_UNRECORDED
         return REPLAY_FAILED
     _safe_action(
         lambda: inbox.mark_delivered(prompt.delivery_id), doing="mark the row delivered"

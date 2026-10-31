@@ -9,8 +9,9 @@
    :data:`~opencode_bridge.delivery_retry.PREVIEW_LIMIT` / 跨会话隔离。
 3. **用法错误** —— 未知动词、token 过多、``0`` / 负数 / 非 ASCII 数字一律
    ``kind="error"`` 且逐字回用法。
-4. **单条补投的四档回复** —— ``delivered`` / 明确失败 / ``outcome_unknown`` /
-   ``not_attempted``，外加**预算耗尽**那一支（同属明确失败，但文案不同）。
+4. **单条补投的五档回复** —— ``delivered`` / 明确失败 / 失败但**没记下** /
+   ``outcome_unknown`` / ``not_attempted``，外加**预算耗尽**那一支（同属明确失败，
+   但文案不同）。
 5. **收件箱未启用** —— 列表与补投都回「收件箱未启用」，⛔ 不是报错、零投递。
 6. **形状守门 + 对照臂** —— ``delivery_retry.py`` 里一条收件箱状态都不许自己写，
    补投必须经 :func:`~opencode_bridge.inbox_recovery.replay_one` 走；且同一匹配器
@@ -175,6 +176,23 @@ class _InboxThatCannotMarkAttempting:
         return getattr(self._inbox, name)
 
     def mark_attempting(self, delivery_id: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+
+class _InboxThatCannotMarkFailed:
+    """除 ``mark_failed`` 外全部转发给真收件箱（模拟盘满 / 库被锁）。
+
+    ⚠️ 与 :class:`_InboxThatCannotMarkAttempting` 同型，量的是另一条路：投递**确实**
+    失败了，但 ``mark_failed`` 那次写也失败 ⇒ 那一行留在 ``attempting``。
+    """
+
+    def __init__(self, inbox: InboundInbox) -> None:
+        self._inbox = inbox
+
+    def __getattr__(self, name: str):
+        return getattr(self._inbox, name)
+
+    def mark_failed(self, delivery_id: str, error: str) -> None:
         raise sqlite3.OperationalError("database is locked")
 
 
@@ -443,6 +461,39 @@ class TestResendingOneRow(DeliveryRetryTestCase):
         after = self.command().reply_for(_SESSION, "").text.splitlines()
         self.assertEqual(after[0], "本会话有待补投的消息 1 条：")
         self.assertEqual(after[1], "1. 第二条")
+
+
+class TestAFailureThatCouldNotBeRecordedIsReportedHonestly(DeliveryRetryTestCase):
+    """⭐ A1-2：``mark_failed`` 写失败时，回复**不许**承诺「下次启动自动重试」。
+
+    那一行留在 ``attempting``（恢复层只告警、绝不重放）⇒ 它**不会**被自动重投。
+    本组同时挡住两条近路：fail-safe 兜底那句，与 :meth:`~DeliveryRetryCommand._failed_reply`
+    那句「下一次启动会自动重试」—— 在这里两句**都是假话**。
+    """
+
+    #: 逐字钉住新档那一句 —— ``_failed_reply`` 与兜底都产出别的字，所以它会红。
+    _HONEST_TEXT = (
+        "#1 投递失败，而且没能记下失败状态；它不会被自动重投，需要的话请重新发送。"
+    )
+
+    def test_an_unrecorded_failure_gets_its_own_truthful_message(self):
+        self.record(make_prompt("a-row", text="看一下 README"))
+        self.dispatch.error = _ServerRefusal("服务端明确拒收")
+        inbox = _InboxThatCannotMarkFailed(self.inbox)
+
+        with self.assertLogs("opencode_bridge.inbox_recovery", level="ERROR"):
+            reply = self.command(inbox=inbox).reply_for(_SESSION, "retry 1")
+
+        self.assertEqual(reply.kind, "error")
+        self.assertEqual(reply.text, self._HONEST_TEXT)
+        # ⛔ 不是 _failed_reply（那句承诺自动重试，而这一档不会）
+        self.assertNotIn("下一次启动会自动重试", reply.text)
+        # ⛔ 不是 fail-safe 兜底（那句既不说失败也不说重投）
+        self.assertNotIn("补投结果不明", reply.text)
+        # ⛔ 不是 outcome-unknown（「可能已经在跑」在这里也是假话：我们确知投递失败）
+        self.assertNotIn("可能", reply.text)
+        # 盘上那一行留在 attempting —— 正是「不会被自动重投」的原因。
+        self.assertEqual(self.state_of("a-row"), DeliveryState.ATTEMPTING)
 
 
 class TestWhenTheInboxIsDisabled(DeliveryRetryTestCase):

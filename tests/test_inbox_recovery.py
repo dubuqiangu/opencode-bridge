@@ -32,9 +32,12 @@ import unittest
 from opencode_bridge.inbox import DeliveryState, InboundInbox, QueuedPrompt
 from opencode_bridge.inbox_recovery import (
     MAX_ATTEMPTS,
+    REPLAY_FAILED,
+    REPLAY_FAILED_UNRECORDED,
     RecoveryOutcome,
     mark_prompt_never_sent,
     recover_pending,
+    replay_one,
 )
 
 _REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -632,6 +635,88 @@ class TestARowThatCannotBeMarkedAttemptingIsNeverReplayed(unittest.TestCase):
         self.assertEqual([prompt.delivery_id for prompt in dispatch.dispatched],
                          [self._DELIVERY_ID])
         self.assertEqual(_read_state(self.database_path), DeliveryState.DELIVERED)
+
+
+class InboxWhoseMarkFailedRaises:
+    """把一个 :class:`FakeInbox` 包起来，只让 ``mark_failed`` 抛（模拟盘满 / 库被锁）。
+
+    ⚠️ 与 :class:`WritesThatFail` 同型，区别是它包的是**假**收件箱 —— 这一条要量的是
+    :func:`replay_one` 的**返回值**，而 ``FakeInbox`` 的 ``settled_changes`` 恰好能证明
+    那一行**没有**被挪出 ``attempting``。
+    """
+
+    def __init__(self, inbox: FakeInbox) -> None:
+        self._inbox = inbox
+        #: 实际走到 ``mark_failed`` 那一次写的记录（用来确认注入真的生效）。
+        self.mark_failed_calls: list[tuple[str, str]] = []
+
+    def __getattr__(self, name: str):
+        return getattr(self._inbox, name)
+
+    def mark_failed(self, delivery_id: str, error: str) -> None:
+        self.mark_failed_calls.append((delivery_id, error))
+        raise sqlite3.OperationalError("database is locked")
+
+
+class TestReplayOneReportsWhetherTheFailureWasRecorded(unittest.TestCase):
+    """⭐ A1-2：``replay_one`` 的返回值必须反映那一行**真的**被记成了 ``failed``。
+
+    ``_safe_action`` 返回 ``bool``（写成功 ``True`` / 写失败 ``False``）。失败那一支
+    原先**丢掉**这个返回值、无条件 ``return REPLAY_FAILED`` ⇒ 消费方
+    （:mod:`~opencode_bridge.delivery_retry`）会对用户说「下一次启动会自动重试」，
+    而那一行其实留在 ``attempting``（恢复层**只告警、绝不重放**）—— 一句假话。
+    """
+
+    _DELIVERY_ID = "telegram:100200:30"
+
+    def _replay(self, inbox) -> str:
+        return replay_one(
+            make_prompt(self._DELIVERY_ID),
+            inbox,
+            RecordingDispatcher(error=_ServerRefusal(_SERVER_REFUSED)),
+            RecoveryOutcome(),
+        )
+
+    def _seeded_inbox(self) -> FakeInbox:
+        inbox = FakeInbox()
+        inbox.add(make_prompt(self._DELIVERY_ID), DeliveryState.PENDING)
+        return inbox
+
+    def test_a_failure_that_cannot_be_recorded_is_not_reported_as_recorded(self):
+        """承重的那条：``mark_failed`` 抛 ⇒ **必须**返回新常量，⛔ 不是 ``REPLAY_FAILED``。"""
+        inner = self._seeded_inbox()
+        inbox = InboxWhoseMarkFailedRaises(inner)
+
+        with self.assertLogs("opencode_bridge.inbox_recovery", level="ERROR"):
+            result = self._replay(inbox)
+
+        self.assertEqual(
+            [delivery_id for delivery_id, _reason in inbox.mark_failed_calls],
+            [self._DELIVERY_ID],
+            "前提：注入真的走到了 mark_failed 那一次写",
+        )
+        self.assertEqual(result, REPLAY_FAILED_UNRECORDED)
+        self.assertNotEqual(
+            result, REPLAY_FAILED,
+            "写失败却报 failed ⇒ 消费方会承诺「下次启动自动重试」，而那一行不会",
+        )
+        self.assertEqual(
+            states_of(inner, self._DELIVERY_ID),
+            [DeliveryState.ATTEMPTING],
+            "mark_failed 写失败 ⇒ 那一行留在 attempting（恢复层只告警、绝不重放）",
+        )
+
+    def test_a_failure_that_is_recorded_still_reports_a_recorded_failure(self):
+        """正向对照：写成功 ⇒ 仍是 ``REPLAY_FAILED``（既有行为被钉住）。"""
+        inbox = self._seeded_inbox()
+
+        result = self._replay(inbox)
+
+        self.assertEqual(result, REPLAY_FAILED)
+        self.assertEqual(
+            states_of(inbox, self._DELIVERY_ID),
+            [DeliveryState.ATTEMPTING, DeliveryState.FAILED],
+        )
 
 
 class TestEveryStateHasExactlyOneTreatment(unittest.TestCase):

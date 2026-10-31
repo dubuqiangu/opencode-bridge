@@ -52,6 +52,7 @@ from .inbox import InboundInbox, QueuedPrompt
 from .inbox_recovery import (
     REPLAY_DELIVERED,
     REPLAY_FAILED,
+    REPLAY_FAILED_UNRECORDED,
     REPLAY_NOT_ATTEMPTED,
     REPLAY_OUTCOME_UNKNOWN,
     RecoveryOutcome,
@@ -223,17 +224,27 @@ class DeliveryRetryCommand:
     def _reply_for_result(
         self, ordinal: int, prompt: QueuedPrompt, result: str
     ) -> DeliveryReply:
-        """把 :func:`replay_one` 的四档返回值翻成一句给用户的话。
+        """把 :func:`replay_one` 的**五档**返回值翻成一句给用户的话。
 
         ⚠️ 逐档**显式枚举**，末尾留一条 fail-safe 兜底 —— ⛔ 不要写成
         ``if result == REPLAY_FAILED: … else: 成功``：那样新增一档返回值时会落进
         "声称成功"那一支，而**没有任何既有用例会红**（§7.1 判据⑥：判定里不许有
         否定式条件，缺省要留给"不知道"那一侧）。兜底既不声称成功也不声称失败。
+
+        ⚠️ ``REPLAY_FAILED_UNRECORDED`` **必须有自己的分支**（⛔ 不许靠兜底）：
+        它与 ``REPLAY_FAILED`` 一样是「投递失败」，但盘上那一行**留在 ``attempting``**
+        ⇒ 它**不会被自动重投** ⇒ ``_failed_reply`` 那句「下一次启动会自动重试」是假话。
         """
         if result == REPLAY_DELIVERED:
             return DeliveryReply(f"已补投 #{ordinal}：{_preview(prompt.text)}")
         if result == REPLAY_FAILED:
             return self._failed_reply(ordinal, prompt)
+        if result == REPLAY_FAILED_UNRECORDED:
+            return DeliveryReply(
+                f"#{ordinal} 投递失败，而且没能记下失败状态；"
+                "它不会被自动重投，需要的话请重新发送。",
+                kind="error",
+            )
         if result == REPLAY_OUTCOME_UNKNOWN:
             return DeliveryReply(
                 f"#{ordinal} 已提交，但没能确认结果（很可能 agent 已经在跑了）。"

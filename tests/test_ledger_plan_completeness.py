@@ -49,7 +49,10 @@ def normalize(text):
 
 
 PAIRS = [
-    # ⚠️ 21 条 = 2026-10-28 定期回看（dsh-im / dsh-im-connect / hermes-agent / dsh-im-gateway
+    # ⚠️ 25 条 = 2026-11-01 定期回看把可借鉴候选按「归桶折叠」纳入需求后：新增 4 个开放行
+    #   （dsh-im B1/B10/B5 + dsh-im-connect V1，catalog §2.5/§1.4）⇒ 21 → 25。
+    #   其余候选 B2/B3/B4/B6/B7/B8/B9 并入既有行正文（⛔ 不新增开放行、因而不另立条目）。
+    #   ⚠️ 前史：21 条 = 2026-10-28 定期回看（dsh-im / dsh-im-connect / hermes-agent / dsh-im-gateway
     #   四基线重钉）把「参考项目定期回看」那行的回看增量并回第 4 格之后的行数。
     #   ⚠️ 前史：23 条 = 2026-10-16 补录（`2a940b1` 收录 dsh-im-connect + `cc4b9d6` 台账同步）后；
     #   其中「长输入回执」`3588a6c`、「占位消息飞行中的窄窗」`68d74df` 两条已闭合 ⇒ 条目移出。
@@ -122,6 +125,14 @@ PAIRS = [
     ("dsh-im 借鉴面落地（①②③）", "dsh-im 借鉴面落地（"),
     ("dsh-im-connect 借鉴面落地（A/B/C/D）", "dsh-im-connect 借鉴面落地（"),
     ("参考项目定期回看", "参考项目定期回看"),
+    # 2026-11-01 定期回看新增四条（dsh-im catalog §2.5 B1/B10/B5 + dsh-im-connect catalog §1.4 V1）：
+    #   台账新增 4 行 ⇒ 开放项 21 → 25。其余候选按「归桶折叠」并进既有行的正文（⛔ 不新增开放行、
+    #   因而【不】另立 PAIRS 条目）：B2 → 「平台 description」行 · B3/B8/B6/B7/B9 → 「dsh-im 借鉴面落地」行 ·
+    #   B4 → 「D3 剩余平台」行；V2/V3 是 V1 的依赖件，随 V1 一并处理。
+    ("dsh-im B1：提交超时后按 RPC ID 回查持久账本", "dsh-im B1：提交超时后按 RPC ID 回查持久账本"),
+    ("dsh-im B10：预指定 sessionId", "dsh-im B10：预指定 sessionId"),
+    ("dsh-im B5：按会话隔离工作目录", "dsh-im B5：按会话隔离工作目录"),
+    ("dsh-im-connect V1：长空闲后自动开新会话", "dsh-im-connect V1：长空闲后自动开新会话"),
 ]
 
 

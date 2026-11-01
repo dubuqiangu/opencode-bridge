@@ -1,40 +1,43 @@
-"""IM 侧斜杠命令：``/help`` ``/setup`` ``/new`` ``/stop`` ``/status`` ``/cd``
-``/approve`` ``/deny``，以及 ``/model`` ``/delivery`` 的转发。
+"""IM 侧斜杠命令：``/help`` ``/setup`` ``/new`` ``/stop`` ``/status`` ``/cd``，
+以及 ``/model`` ``/delivery`` ``/approve`` ``/deny`` 的转发。
 
 这一整块原先是 :class:`~opencode_bridge.core.BridgeCore` 的十几个私有方法。搬出来
-是因为那个类已经远超 AGENTS.md §5.1 的阈值（方法数 ~15+ / 类自身代码行 ~250+），
-而命令处理恰好是其中**耦合最浅**的一块：它对 core 的依赖只有九个协作者
-（见 :class:`CommandHandler`），搬出去之后既不用碰 core 的运行期状态
-（``_turns`` / ``_sid_conv`` / ``_lock`` 那一摊），又能脱离 core 单独测试。
+是因为那个类已经远超 AGENTS.md §5.1 的阈值，而命令处理恰好是其中**耦合最浅**的一块
+（见 :class:`CommandHandler`：与 core 之间只有注入的协作者，没有 core 引用）。
 
-搬法与同一次拆分的前一步一致：``/model`` 已经在
-:mod:`opencode_bridge.session_model` 里、``/delivery`` 在
-:mod:`opencode_bridge.delivery_retry` 里，core 侧只留一个转发；这里同理，
-:class:`~opencode_bridge.core.BridgeCore` 只留 :meth:`~opencode_bridge.core.BridgeCore._handle_command`
-一个转发点（``on_inbound`` 的调用点不变）。
-
-冻结文案（``/help``、``/setup`` 引导）**跟着逻辑一起搬**，因为它们的真源就是这条命令
-路径；:mod:`opencode_bridge.core` 从这里**继续再导出**这些名字
-（``opencode_bridge.__main__`` 的 ``--setup`` 与测试都按
-``from opencode_bridge.core import ...`` 取它们，导入路径不能变）。
-:meth:`~opencode_bridge.core.BridgeCore.on_callback` 处理 ``setup:<platform>``
-按钮回调时读的是同一份冻结文案，因此它也 import 这里，而不是复制一份。
+AGENTS.md §5 的进一步拆分（纯结构调整，行为零变化）：**用户可见的冻结文案**
+（``/help``、``/setup`` 引导）搬进 :mod:`opencode_bridge.command_text`，
+**权限决策语义**（``/approve`` / ``/deny``）搬进
+:mod:`opencode_bridge.command_permission`。本模块继续把文案名**再导出** ——
+``opencode_bridge.core`` / ``__main__`` 与测试都按
+``from opencode_bridge.commands import ...`` 取它们，导入路径不能变。
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 
 from .adapters import Adapter
-from .config import DEFAULT_CONFIG_NAME, Config
+from .command_permission import PermissionCommand
+from .command_text import (
+    HELP_TEXT,
+    SETUP_INVALID_TEXT,
+    SETUP_MENU_TEXT,
+    _SETUP_ALIASES,
+    _SETUP_BUTTON_LABELS,
+    _SETUP_GUIDES,
+    _setup_guide,
+    setup_platforms,
+    setup_reply,
+)
+from .config import Config
 from .conversation_keys import ConversationState
 from .delivery_retry import DeliveryRetryCommand
 from .hooks import Button, MsgHandle, Outbound
 from .normalize import _as_dict, _clean
 from .opencode_client import OpenCodeClient, OpenCodeError
-from .permission_ledger import PermissionLedger, repeated_answer_notice
+from .permission_ledger import PermissionLedger
 from .permission_timeout import PermissionTimeoutWatcher
 from .session_model import SessionModelCommand
 
@@ -48,185 +51,7 @@ __all__ = [
 
 logger = logging.getLogger("opencode_bridge.commands")
 
-HELP_TEXT = """\
-可用命令：
-/help                       显示本帮助
-/setup [平台]               三个平台接入引导（Telegram / Slack / Discord）
-/new  /reset                新建会话（丢弃当前上下文）
-/stop                       中断当前正在执行的任务
-/status                     查看当前会话状态
-/model [provider/id]         查看或切换当前会话使用的模型
-/cd <目录>                  切换工作目录并新建会话
-/delivery retry             列出待补投的消息，或按序号补投一条
-/approve <请求ID> [always]  允许权限请求（always = 总是允许）
-/deny <请求ID>              拒绝权限请求
-直接发送文本即可与 agent 对话。
-安全提示：桥接进程拥有与你相同的本地权限，请仅在可信环境运行，
-并务必为适配器配置 allowed_chat_ids 白名单。"""
 
-#: ``/setup`` with no argument: the platform chooser (frozen copy).
-SETUP_MENU_TEXT = """\
-选择要接入的平台：
-1) Telegram —— 支持双向对话
-2) Slack —— 支持双向对话
-3) Discord —— 支持双向对话
-
-回复 /setup 1、/setup 2 或 /setup 3 也可直接查看。"""
-
-#: ``/setup <bad>``: same list, framed as a usage hint (frozen copy).
-SETUP_INVALID_TEXT = """\
-无法识别的平台。可接入的平台有：
-1) Telegram —— 支持双向对话
-2) Slack —— 支持双向对话
-3) Discord —— 支持双向对话
-
-用法: /setup 1|2|3 或 /setup telegram|slack|discord"""
-
-#: Accepted ``/setup`` arguments -> canonical platform key (lower-cased first).
-_SETUP_ALIASES = {
-    "1": "telegram",
-    "telegram": "telegram",
-    "2": "slack",
-    "slack": "slack",
-    "3": "discord",
-    "discord": "discord",
-}
-
-#: Inline buttons offered on the menu (adapter may ignore them).
-_SETUP_BUTTON_LABELS = (("telegram", "Telegram"), ("slack", "Slack"),
-                         ("discord", "Discord"))
-
-
-def _config_path_hint() -> str:
-    """Absolute config-file path for the ``/setup`` guides (runtime only).
-
-    Mirrors :meth:`Config.load`'s search chain: honour ``OPENCODE_BRIDGE_CONFIG``
-    when it points at a real file, else ``<cwd>/config.json`` when present,
-    else fall back to ``<package root>/config.json`` with an explanatory note.
-    Never raises and never hardcodes a machine-specific path.
-    """
-    def bridge_root() -> str:
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    env_path = (os.environ.get("OPENCODE_BRIDGE_CONFIG") or "").strip()
-    if env_path and os.path.isfile(env_path):
-        return os.path.abspath(env_path)
-    cwd_path = os.path.join(os.getcwd(), DEFAULT_CONFIG_NAME)
-    if os.path.isfile(cwd_path):
-        return os.path.abspath(cwd_path)
-    return (
-        os.path.join(bridge_root(), DEFAULT_CONFIG_NAME)
-        + "（未找到已生效的配置文件，以上为桥接目录默认位置）"
-    )
-
-
-#: Frozen per-platform onboarding guides (factual copy; do not reword).
-#:
-#: ⚠️ **2026-10-05 例外：授权那一行是"承重"的，不是措辞。**
-#: Slack / Discord 的引导原先**只写 token、不写白名单**，于是照着它配完的用户得到一个
-#: **完全开放**的桥接 —— 而 ``config.example.json`` 抄的就是 ``[]``，安装脚本又把它
-#: 原样落盘，所以"什么都不改"就是全开。三个平台现在都给出**非空**
-#: ``allowed_chat_ids``，并各带一句「留空 = 全开」。
-#:
-#: 这条之所以守得住：``tests/test_allowlist_visibility.py`` **把每份引导里的配置片段
-#: 真的 ``json.loads`` 一遍**再断言白名单非空 —— 只对字符串常量做子串匹配的话，
-#: 引导写错了测试照样绿（JSON 片段能解析这件事本身就被守住了）。
-_SETUP_GUIDES = {
-    "telegram": """\
-1. 打开 Telegram，找 @BotFather → 发送 /newbot
-2. 依次设置显示名、用户名（必须以 bot 结尾），复制返回的 token（形如 123456789:AA...)
-3. 找 @userinfobot → 发送任意一句话 → 复制返回的纯数字 chat id
-4. 编辑配置文件：
-     "adapters": {
-       "telegram": { "bot_token": "123456789:AA...", "allowed_chat_ids": [123456789] }
-     }
-   注意 allowed_chat_ids 是数组，数字不要加引号
-   ⚠️ 留空数组 = **全开**：任何能私聊 bot 的人都能驱动它
-5. 执行 opencode service restart
-6. 在 Telegram 给你的 bot 发一句 hi，收到回复即成功""",
-    "slack": """\
-1. 打开 https://api.slack.com/apps → Create New App → From scratch → 选 workspace
-2. 左侧 Socket Mode → 打开 Enable Socket Mode
-3. 左侧 Basic Information → App-Level Tokens → Generate Token and Scopes
-   → 命名 → 勾选 connections:write → 复制（xapp- 开头，入站必需）
-4. 左侧 OAuth & Permissions → Scopes → Bot Token Scopes → Add an OAuth Scope，添加
-   chat:write、channels:history、im:history
-   （要 @ 才响应加 app_mentions:read；用私有频道加 groups:history）
-5. 同页顶部 Install to Workspace → Allow → 复制 Bot User OAuth Token（xoxb- 开头）
-   注意：之后每改一次 scope，都要回来点一次 Reinstall to Workspace
-6. 左侧 Event Subscriptions → 打开 Enable Events
-   → Subscribe to bot events → Add Bot User Event → 添加 message.channels、message.im
-7. 编辑配置文件（把 C0123456789 换成你频道的真实 ID：频道名右侧「…」→ 复制频道 ID）：
-     "adapters": {
-       "slack": { "bot_token": "xoxb-...", "app_token": "xapp-...", "allowed_chat_ids": ["C0123456789"] }
-     }
-   ⚠️ allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它
-8. 在目标频道输入 /invite @你的bot（私有频道同样用 /invite；私聊可直接发消息）
-9. 执行 opencode service restart
-10. 在频道里发一句普通文字，收到回复即成功
-
-两个常见坑：
-· Event Subscriptions 没打开、或事件没加在 bot events 下，会「静默收不到」且不报错
-· 只填 bot_token 也能启动，但那只发不收（入站必须有 app_token）
-· allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它""",
-    "discord": """\
-1. 打开 https://discord.com/developers/applications → New Application → 左侧 Bot
-2. Reset Token → 复制 token
-3. 同一页把 Privileged Gateway Intents 下的 Message Content Intent 打开（必需）
-4. 左侧 OAuth2 → URL Generator → 勾选 scope: bot → Permissions: Send Messages
-5. 用生成的 URL 把 bot 邀请进你的服务器
-6. 编辑配置文件（把 123456789012345678 换成你频道的真实 ID：右键频道 → 复制频道 ID）：
-     "adapters": {
-       "discord": { "bot_token": "...", "allowed_chat_ids": ["123456789012345678"] }
-     }
-   ⚠️ allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它
-7. 执行 opencode service restart
-8. 在频道里发一句普通文字，收到回复即成功
-
-两个常见坑：
-· 第 3 步的开关不开，网关会直接拒绝连接（close 4014），日志里会写明原因
-· bot 必须已被邀请进频道，否则发消息报 not_in_channel
-· allowed_chat_ids 留空数组 = **全开**：任何能私聊或 @ 到 bot 的人都能驱动它""",
-}
-
-
-def _setup_guide(platform: str) -> str:
-    """Compose the ``/setup <platform>`` reply: path hint + frozen guide."""
-    return (
-        f"配置文件： {_config_path_hint()}\n"
-        "改完后执行： opencode service restart\n\n"
-        + _SETUP_GUIDES[platform]
-    )
-
-
-def setup_reply(platform: str | None = None) -> str:
-    """Public entry for the ``/setup`` onboarding copy.
-
-    Reused by :mod:`opencode_bridge.__main__` (``--setup``) so the CLI and the
-    in-bot command share **one** source of truth. ``platform`` may be ``None``
-    (menu), a canonical key or any alias in :data:`_SETUP_ALIASES`.
-    """
-    token = (platform or "").strip()
-    if not token:
-        return SETUP_MENU_TEXT
-    key = _SETUP_ALIASES.get(token.lower())
-    return _setup_guide(key) if key is not None else SETUP_INVALID_TEXT
-
-
-def setup_platforms() -> tuple[tuple[str, str], ...]:
-    """``(key, label)`` pairs for the platform chooser, in menu order."""
-    return _SETUP_BUTTON_LABELS
-
-
-# ----------------------------------------------------------------------
-# 权限回信：决策词与用法文案（两条命令共用，所以放在模块级）
-# ----------------------------------------------------------------------
-#: ``/approve`` 第二个 token 的取值。**只有** ``/approve`` 有这个位置；
-#: ``/deny`` 的决策恒为 ``reject``，多一个 token 就是用错命令了。
-_APPROVE_CHOICES = ("once", "always")
-
-#: 参数写错时回的那一句（``/approve`` 与 ``/deny`` 共用同一份，省得两边说法不一）。
-_PERMISSION_USAGE = "用法: /approve <请求ID> [always]  或  /deny <请求ID>"
 
 
 # ----------------------------------------------------------------------
@@ -241,6 +66,7 @@ EnsureSession = Callable[..., str]
 
 #: 删掉这条会话当前用的 opencode session，返回被删掉的 id（本来没有则 ``None``）。
 DropSession = Callable[..., str | None]
+
 
 
 # ----------------------------------------------------------------------
@@ -297,6 +123,16 @@ class CommandHandler:
         self._send_text = send_text
         self._permission_ledger = permission_ledger
         self._permission_timeout = permission_timeout
+        #: ``/approve`` / ``/deny`` 的决策语义（见
+        #: :mod:`opencode_bridge.command_permission`），用本类已注入的协作者
+        #: 构造；对外的命令表仍指向本类的两条转发。
+        self._permission = PermissionCommand(
+            client=client,
+            conversation_state=conversation_state,
+            permission_ledger=permission_ledger,
+            permission_timeout=permission_timeout,
+            send_text=send_text,
+        )
 
     # ------------------------------------------------------------------
     # 入口
@@ -504,116 +340,15 @@ class CommandHandler:
         reply = self._delivery_retry.reply_for(conversation_id, args)
         self._send_text(conversation_id, reply.text, kind=reply.kind, adapter=adapter)
 
+
     def _cmd_approve(
         self, conversation_id: str, adapter: Adapter, args: str
     ) -> None:
-        """``/approve <请求ID> [once|always]`` —— **只有**这条命令能选 ``always``。
-
-        决策在这里定完，再连同请求 id 一起交给共享的回信函数；那个函数只负责把
-        **已经定好的**决策送出去。``/deny`` 因此结构上够不着 ``always`` 这条路 ——
-        之前共用一个带 ``default_decision`` 的函数，而"默认"意味着任何调用方都能
-        悄悄覆盖它，``/deny per_5 always`` 于是发出了永久放行（AGENTS.md §8：
-        权限路径上的 ``default_*`` 参数本身就是缺陷）。
-        """
-        tokens = args.split()
-        if not tokens or len(tokens) > 2:
-            self._send_text(
-                conversation_id, _PERMISSION_USAGE, kind="error",
-                adapter=adapter,
-            )
-            return
-        request_id = tokens[0]
-        decision = "once"
-        if len(tokens) == 2:
-            choice = tokens[1].lower()
-            if choice not in _APPROVE_CHOICES:
-                self._send_text(
-                    conversation_id, _PERMISSION_USAGE, kind="error",
-                    adapter=adapter,
-                )
-                return
-            decision = choice
-        self._apply_permission_decision(
-            conversation_id, adapter, request_id, decision
-        )
+        """``/approve`` —— 决策语义在 :mod:`opencode_bridge.command_permission`。"""
+        self._permission._cmd_approve(conversation_id, adapter, args)
 
     def _cmd_deny(
         self, conversation_id: str, adapter: Adapter, args: str
     ) -> None:
-        """``/deny <请求ID>`` —— 决策**只有** ``reject``，而且只接一个 token。
-
-        多写一个 token 一律当用错命令处理（回用法、**不发任何决策**）：
-        默默忽略那个多余的 token 会把用户的笔误藏起来，而"看起来拒绝了、其实没
-        拒绝"比报错糟糕得多。
-        """
-        tokens = args.split()
-        if len(tokens) != 1:
-            self._send_text(
-                conversation_id, _PERMISSION_USAGE, kind="error",
-                adapter=adapter,
-            )
-            return
-        self._apply_permission_decision(
-            conversation_id, adapter, tokens[0], "reject"
-        )
-
-    def _apply_permission_decision(
-        self,
-        conversation_id: str,
-        adapter: Adapter,
-        request_id: str,
-        decision: str,
-    ) -> None:
-        """把**终值**决策送到 opencode，并回一句确认。
-
-        ``decision`` 是调用方已经选定的最终结果：这里不做选择、不读第二个 token，
-        收到的每一个决策都原样发给服务端。这样"谁能发 ``always``"就只由
-        :meth:`_cmd_approve` 一处决定 —— 共享层没有可以被覆盖的入口。
-
-        ⚠️ **迟到的第二次回答在这里被否掉**（C4）：本桥已经为这个请求发过决策，
-        或者服务端广播过 ``permission.replied``，那就**一个字节都不发**，
-        并且明确告诉用户这条被忽略了。少了这一步，
-        ``/approve per_7 once`` 之后再敲 ``/approve per_7 always`` 会发出两次
-        ``reply_permission``，第二次把一个已经答过的请求**放宽成永久放行** ——
-        与 ``d45440f`` 修掉的 ``/deny <id> always`` 同一类危害。
-
-        ⚠️ 反过来，**"本桥没见过这个 id"不作为拒绝理由**（状态
-        :data:`~opencode_bridge.permission_ledger.ANSWER_UNSEEN`）：
-        内存账本活不过重启，而服务端才是"这个 id 存不存在"的权威。在这里拒绝一个
-        还活着的请求会把 agent 永远卡住 —— 那个错方向是静默的，而这一边不是。
-        """
-        session_id = self._conversation_state.get_session(
-            conversation_id, platform=adapter.name
-        )
-        if not session_id:
-            self._send_text(
-                conversation_id, "当前没有会话，无法回复权限请求。",
-                kind="error", adapter=adapter,
-            )
-            return
-        status = self._permission_ledger.status_of(session_id, request_id)
-        if status.already_closed:
-            logger.info(
-                "ignoring a second answer to permission request %s of session %s "
-                "(already %s); nothing is sent to the server",
-                request_id, session_id, status.state,
-            )
-            self._send_text(
-                conversation_id,
-                repeated_answer_notice(status),
-                kind="error",
-                adapter=adapter,
-            )
-            return
-        self._client.reply_permission(session_id, request_id, decision)
-        # 只在**成功**之后记账：一次 5xx 若也记成"已答过"，这个还挂在服务端的请求
-        # 就再也批准不了（用户唯一能做的事被我们自己锁掉了）。
-        self._permission_ledger.record_answered(session_id, request_id, decision)
-        # 真回复落地：撤掉本地超时计时器，免得它稍后到点再发一条假的"已超时"。
-        self._permission_timeout.cancel(session_id, request_id)
-        self._send_text(
-            conversation_id,
-            f"已回复权限请求 {request_id}: {decision}",
-            adapter=adapter,
-            session_id=session_id,
-        )
+        """``/deny`` —— 决策语义在 :mod:`opencode_bridge.command_permission`。"""
+        self._permission._cmd_deny(conversation_id, adapter, args)

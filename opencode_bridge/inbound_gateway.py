@@ -759,7 +759,8 @@ class InboundGateway:
                     adapter=adapter,
                 )
                 return
-            # 只在**成功**之后记账（理由见 commands._apply_permission_decision）。
+            # 只在**成功**之后记账（理由见 command_permission.PermissionCommand.
+            # _apply_permission_decision）。
             self._permission_ledger.record_answered(
                 session_id, request_id, decision
             )

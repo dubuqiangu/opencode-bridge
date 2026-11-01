@@ -18,6 +18,7 @@ import unittest
 from dataclasses import dataclass
 
 from opencode_bridge.adapters.base import Adapter
+from opencode_bridge.command_permission import PermissionCommand
 from opencode_bridge.commands import (
     SETUP_MENU_TEXT,
     CommandHandler,
@@ -637,7 +638,7 @@ class PermissionCommandTests(HandlerTestCase):
         """
         parameters = list(
             inspect.signature(
-                CommandHandler._apply_permission_decision
+                PermissionCommand._apply_permission_decision
             ).parameters
         )
 

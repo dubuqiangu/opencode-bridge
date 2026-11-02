@@ -338,7 +338,9 @@ class NothingInternalLeaksTests(unittest.TestCase):
         adapter = DeclaredLimitAdapter(
             label=WINDOWS_USER_DIR_SHAPED, max_message_length=400
         )
-        adapter.name = r"workSpace\python\aicode"
+        #: 名字用**通用占位符路径**（§2.2），⛔ 不是本机真路径 —— 带反斜杠的
+        #: 「路径形状」即可触发整体丢弃，值本身不必（也不该）指向任何真实目录。
+        adapter.name = r"C:\bridge\state.json"
 
         hint = self.stated(adapter)
 

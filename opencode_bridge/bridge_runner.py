@@ -69,6 +69,11 @@ def _bridge_dir() -> str:
 #: ``usable == 0`` 的那条在它**之后**、``core.start()`` **之前**。
 REFUSAL_STAGE_PREFLIGHT = "preflight_no_configured_adapter"
 REFUSAL_STAGE_NO_USABLE_ADAPTER = "no_usable_adapter"
+#: 装配必需构件在**构造期**崩掉的两条路径（预检已过、可用适配器也构造出来了）。
+#: ⚠️ 它们与上面两条**同样是「桥拒绝启动」** —— 若不落一条 ``not_started``，
+#: 盘上留下的就是上一次成功启动的 ``ok``（见 :func:`_record_bridge_refusal`）。
+REFUSAL_STAGE_CORE_CONSTRUCTION_FAILED = "core_construction_failed"
+REFUSAL_STAGE_EVENT_STREAM_START_FAILED = "event_stream_start_failed"
 
 #: 每条拒绝路径的**一句话原因**（全局的）。⚠️ 只说"是什么"；具体"哪些平台缺什么"
 #: 由 :func:`_record_bridge_refusal` 逐平台算出来交给
@@ -76,6 +81,9 @@ REFUSAL_STAGE_NO_USABLE_ADAPTER = "no_usable_adapter"
 _REFUSAL_REASON_BY_STAGE = {
     REFUSAL_STAGE_PREFLIGHT: "预检未通过：配置里没有任何适配器此刻够跑",
     REFUSAL_STAGE_NO_USABLE_ADAPTER: "没有任何适配器构造成功，桥因此没起来",
+    REFUSAL_STAGE_CORE_CONSTRUCTION_FAILED: "桥核心构造失败，桥因此没起来",
+    REFUSAL_STAGE_EVENT_STREAM_START_FAILED:
+        "事件流线程启动失败，桥无法收到 agent 回复，因此没起来",
 }
 
 
@@ -249,7 +257,15 @@ def _run_bridge_locked(cfg: Config) -> int:
         "续行缓冲快照：已启用（%s）—— 崩溃后重启会把半行重灌回缓冲并告知",
         held_buffer_path,
     )
-    core = BridgeCore(cfg, client, state, inbox, held_buffer_store=held_buffer_store)
+    # ⚠️ 构造失败必须**落一条「桥未启动」**再抛：不落的话盘上留下的是上一次成功
+    # 启动的 ``ok``（见 :func:`_record_bridge_refusal` 的 docstring）—— 而用户刚把
+    # 配置改坏时，那正是他最需要线索、视图却显示上一轮好消息的时刻。
+    # ⛔ 保持 abort 语义：记完照抛 ⇒ 退出码 1。
+    try:
+        core = BridgeCore(cfg, client, state, inbox, held_buffer_store=held_buffer_store)
+    except Exception:
+        _record_bridge_refusal(cfg, REFUSAL_STAGE_CORE_CONSTRUCTION_FAILED)
+        raise
 
     usable = 0
     # ⚠️ **装在 `core.start()` 之前**：适配器一启动就可能发信（探针回复、启动时
@@ -330,7 +346,14 @@ def _run_bridge_locked(cfg: Config) -> int:
             inbox.close()
         return 1
 
-    core.start()
+    # ⚠️ 同一条纪律：``core.start()`` 里**唯一**没被兜住的逃逸是事件流线程的
+    # ``thread.start()``（适配器逐个隔离、``recover_inbox`` 已在 core 内兜住）——
+    # 它抛了同样必须落一条「桥未启动」再抛，⛔ 不许留上一轮的 ``ok``。
+    try:
+        core.start()
+    except Exception:
+        _record_bridge_refusal(cfg, REFUSAL_STAGE_EVENT_STREAM_START_FAILED)
+        raise
     # ⚠️ **整份写一次，且只在这一处写**：``core.start()`` 刚把每个适配器的启动探测
     # 结论收进 ``core.startup_probes``（见 :meth:`BridgeCore.start`），而
     # ``_bridge_dir()`` 只有这里知道 —— 适配器不知道、本类也不该自己推一遍。
@@ -375,7 +398,18 @@ def _run_bridge_locked(cfg: Config) -> int:
     # （死因未知时加自愈机制等于用一层自愈掩盖真正的问题）。
     # 详见 opencode_bridge/diagnostics.py 的模块说明。
     diagnostics = ProcessDiagnostics(_bridge_dir())
-    diagnostics.install()
+    # ⚠️ **取证通道绝不该决定桥的生死**：install() 抛错时退化行为是
+    # 「记一条 warning + 本轮不取崩溃栈」，⛔ 不是让桥起不来 —— 而它此前会让
+    # finally 里的 exit_reason 变成未赋值（UnboundLocalError）。
+    # record()/dump_stacks()/close() 在 install() 被跳过时都安全（见 diagnostics.py：
+    # 三者各自容忍 _stack_file 为 None、_registered 为空）。
+    try:
+        diagnostics.install()
+    except Exception as exc:  # noqa: BLE001 - 取证绝不该决定桥的生死
+        logger.warning(
+            "diagnostics: 崩溃栈取证未装配（%s: %s）—— 不影响桥的运行",
+            type(exc).__name__, exc,
+        )
     exit_reason = "stopped"
     try:
         while not stop_event.wait(1.0):  # periodic -> Ctrl+C always lands

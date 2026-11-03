@@ -457,7 +457,17 @@ class BridgeCore:
         logger.info("event stream thread started")
         # ⚠️ 位置有意义：SSE 线程**之后**、适配器**之前**（理由见
         # InboundGateway.recover_inbox）。
-        self.inbound_gateway.recover_inbox()
+        # ⚠️ **重放上一轮崩溃留下的收件箱绝不能杀掉一个正在启动的桥**：
+        # recover_inbox 内部已按行 fail-closed（逐行记日志、绝不整批上抛），
+        # 而这里是它**唯一**的调用点 —— 外层再兜一道，退化行为是
+        # 「记一条日志 + 桥继续服务新消息」，⛔ 不是让桥起不来。
+        try:
+            self.inbound_gateway.recover_inbox()
+        except Exception:
+            logger.exception(
+                "收件箱重放失败 —— 桥继续服务新消息"
+                "（本轮不重放上一轮遗留的投递）"
+            )
         # A3 共享 webhook server：**先于适配器**起 —— webhook 适配器可能要在
         # 自己的 ``start()`` 里把回调地址（含实际端口；``webhook_port: 0``
         # 时由 OS 分配、只有这里能拿到）告诉平台。hub 不抛异常（零路由不绑、

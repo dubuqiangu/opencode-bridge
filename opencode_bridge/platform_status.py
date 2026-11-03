@@ -154,6 +154,25 @@ def _print_event_subscription(subscription_status: SubscriptionStatus | None) ->
         print(line)
 
 
+def _print_allowlist_conflicts(conflicts: list[tuple[str, str]]) -> None:
+    """打印表下的「授权键冲突」那一段（§3）。
+
+    独立成函数的**唯一**理由： :func:`run_status` 要给这一段套**它自己的** guard
+    （见那里的 §3 ``try/except``），而那段 guard 需要一个可点名、可打桩的符号 ——
+    否则「本段渲染失败」只能靠给整段 ``print`` 打桩才能触发，那会误伤别的段。
+
+    键冲突那句说明有一百多字，塞进上面那张表会把整张表撑烂，所以单列在表下
+    （用户扫表时已经看到「⚠键冲突」的标记了）。
+
+    :param conflicts: ``(平台 label, 冲突说明)`` 的列表，**只由**
+        :func:`_channel_config_rows` 组装出的行派生（平台清单只有那一份）。
+    """
+    print("")
+    print("== ⚠ 授权键冲突（实际生效的是哪一个键已在此说明） ==")
+    for label, detail in conflicts:
+        print(f"  {label}: {detail}")
+
+
 def run_status(
     cfg: Config,
     *,
@@ -242,29 +261,52 @@ def run_status(
 
     # 键冲突不塞进表格列里：那句说明有一百多字，塞进去会把整张表撑烂。
     # 单独列在表下 —— 用户扫表时已经看到「⚠键冲突」的标记了。
+    #
+    # ⚠️ 这一段**独自**套一层 guard：它自己渲染失败时只印一行失败说明并继续，
+    # ⛔ 不许把下面所有段一起带走（与 §1「== opencode 服务 ==」同形）。
     if conflicts:
+        try:
+            _print_allowlist_conflicts(conflicts)
+        except Exception as exc:
+            print(f"  （本段渲染失败：{exc}）")
+
+    # ⚠️ §4~§8 各段**互相独立**：一段渲染失败只印一行失败说明并继续，⛔ 不让一个
+    # 坏段把整张 --status 视图变空。§1/§2 保持原样（本任务不动它们）。
+    try:
+        _print_last_start_probes(rows, bridge_dir)
+    except Exception as exc:
+        print(f"  （本段渲染失败：{exc}）")
+
+    try:
+        _print_last_outbound_failures(rows, bridge_dir)
+    except Exception as exc:
+        print(f"  （本段渲染失败：{exc}）")
+
+    try:
+        _print_last_runtime_credential_failures(rows, bridge_dir)
+    except Exception as exc:
+        print(f"  （本段渲染失败：{exc}）")
+
+    try:
+        _print_event_subscription(subscription_status)
+    except Exception as exc:
+        print(f"  （本段渲染失败：{exc}）")
+
+    try:
         print("")
-        print("== ⚠ 授权键冲突（实际生效的是哪一个键已在此说明） ==")
-        for label, detail in conflicts:
-            print(f"  {label}: {detail}")
-
-    _print_last_start_probes(rows, bridge_dir)
-    _print_last_outbound_failures(rows, bridge_dir)
-    _print_last_runtime_credential_failures(rows, bridge_dir)
-    _print_event_subscription(subscription_status)
-
-    print("")
-    print("== bridge 运行态 ==")
-    print(f"  bridge 目录 : {bridge_dir}")
-    state, detail = _runtime_state(bridge_dir)
-    print(f"  状态        : {state} —— {detail}")
-    for name in ("bridge-plugin.log", "bridge-output.log", "config.json", "state.json"):
-        p = os.path.join(bridge_dir, name)
-        if os.path.isfile(p):
-            size = os.path.getsize(p)
-            mtime = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
-            print(f"  {name:<20} {size:>8} 字节  最后修改 {mtime}")
-    print("  注：--status 是独立进程，看不到 bridge 进程内状态；进程内健康请看 bridge-plugin.log")
+        print("== bridge 运行态 ==")
+        print(f"  bridge 目录 : {bridge_dir}")
+        state, detail = _runtime_state(bridge_dir)
+        print(f"  状态        : {state} —— {detail}")
+        for name in ("bridge-plugin.log", "bridge-output.log", "config.json", "state.json"):
+            p = os.path.join(bridge_dir, name)
+            if os.path.isfile(p):
+                size = os.path.getsize(p)
+                mtime = time.strftime("%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+                print(f"  {name:<20} {size:>8} 字节  最后修改 {mtime}")
+        print("  注：--status 是独立进程，看不到 bridge 进程内状态；进程内健康请看 bridge-plugin.log")
+    except Exception as exc:
+        print(f"  （本段渲染失败：{exc}）")
     return 0
 
 

@@ -19,6 +19,7 @@ import logging
 from collections.abc import Callable
 
 from .adapters import Adapter
+from .command_menu import COMMAND_HANDLERS
 from .command_permission import PermissionCommand
 from .command_text import (
     HELP_TEXT,
@@ -152,21 +153,8 @@ class CommandHandler:
         name = raw_name.split("@", 1)[0].lower()
         args = _clean(args)
 
-        handler = {
-            "help": self._cmd_help,
-            "setup": self._cmd_setup,
-            "new": self._cmd_new,
-            "reset": self._cmd_new,
-            "stop": self._cmd_stop,
-            "status": self._cmd_status,
-            "model": self._cmd_model,
-            "delivery": self._cmd_delivery,
-            "cd": self._cmd_cd,
-            "approve": self._cmd_approve,
-            "allow": self._cmd_approve,
-            "deny": self._cmd_deny,
-        }.get(name)
-        if handler is None:
+        method_name = COMMAND_HANDLERS.get(name)
+        if method_name is None:
             self._send_text(
                 conversation_id,
                 f"未知命令 {raw_name}，发送 /help 查看用法。",
@@ -174,6 +162,7 @@ class CommandHandler:
                 adapter=adapter,
             )
             return
+        handler = getattr(self, method_name)
         try:
             handler(conversation_id, adapter, args)
         except OpenCodeError as exc:

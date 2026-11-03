@@ -74,6 +74,7 @@ import time
 from typing import Any, List, Optional
 
 from .. import credential_health, health
+from ..command_menu import command_menu_entries
 from ..hooks import Button, Hooks, Inbound, MsgHandle, Outbound, SendError
 from ..identity import format_id
 from ..split import split_text  # 统一分片实现（T1.4b），此处再导出保持向后兼容
@@ -429,6 +430,11 @@ class TelegramAdapter(Adapter):
                 health.VERDICT_FAILED, code=failure["code"], detail=failure["detail"]
             )
             self._log_credential_failure(failure)
+        # 命令菜单（`/help` 之外的第二条发现路径）来自命令表的**单一真源**
+        # （``opencode_bridge.command_menu``）。注册是**尽力而为**：失败只记一条
+        # WARNING，绝不影响 ``start()`` 的既有控制流、也绝不新增
+        # ``report_startup_probe`` 调用点（那条"恰好一次"的契约见本方法 docstring）。
+        self._register_command_menu()
         # ⚠️ **无论上面成没成都起传输层**：探测的重试循环就跑在它那条线程里
         # （见 ``_make_transport`` 的 on_open 注释）⇒ 失败时入站仍能自愈。
         self._stop_event.clear()
@@ -436,6 +442,22 @@ class TelegramAdapter(Adapter):
         self._transport = transport
         transport.start(self._on_update)
         logger.info("telegram: polling started (offset=%s)", self._offset)
+
+    def _register_command_menu(self) -> None:
+        """把命令菜单注册到 Telegram（``setMyCommands``），失败**只告警、绝不抛**。
+
+        菜单的命令清单与说明文案全部来自 :mod:`opencode_bridge.command_menu` 的
+        单一真源；这里只负责发一次全局调用。用 :meth:`_post` 而**不是**
+        :meth:`_api` —— 后者按 ``conversation_id`` 计节流且属于逐会话通道，而
+        ``setMyCommands`` 是**全局**设置、没有会话可指。
+        """
+        try:
+            self._post("setMyCommands", {"commands": command_menu_entries()})
+        except Exception as exc:
+            logger.warning(
+                "telegram: setMyCommands 注册失败（%s: %s）—— 命令仍可用 /help 查看",
+                type(exc).__name__, exc,
+            )
 
     # ------------------------------------------------------------------
     # 凭据闸门的**转发面**（§5.1 第一刀：探测/自愈逻辑已随 8 个方法迁入

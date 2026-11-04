@@ -182,7 +182,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_standard_streams() -> None:
+    """把标准输出 / 错误流固定成 UTF-8，并以 ``backslashreplace`` 兜底。
+
+    **为什么需要**：直接连控制台时，Windows 的 ``sys.stdout`` 是 UTF-8 控制台 IO，
+    什么字符都写得出去；可一旦**重定向或接管道**（``python -m opencode_bridge
+    --status > out.txt``，或插件 spawn 后按 UTF-8 读 stdout），Python 会改用
+    **ANSI 代码页**（本机是 cp936/GBK）编码，而 ``--status`` / ``--setup`` 的文案里
+    有 ``⇒``（U+21D2）、``⚠``（U+26A0）这类代码页装不下的字符 ⇒ ``print`` 当场抛
+    ``UnicodeEncodeError``，整条命令退化成 ``main`` 的兜底 ``except``、以退出码 1
+    收场，而视图可能一段都没打出来（2026-11-05 实测）。
+
+    **为什么是 UTF-8，而不是只给现有代码页加 ``errors``**：插件的
+    ``--setup`` 通路读 stdout 时**本来就按 UTF-8 解码**
+    （``plugin/index.ts`` 的 ``chunk.toString("utf8")``）⇒ 让 CLI 也输出 UTF-8，
+    既根治崩溃，又让那条管道两侧编码一致（此前是 GBK 字节被按 UTF-8 读，中文会乱码）。
+    若只加 ``errors="replace"``，代码页仍是 GBK，中文能过、但 ``⚠`` 会静默变成 ``?``，
+    而插件那侧照样乱码 —— 那是把症状涂掉，不是根治。
+
+    ``errors="backslashreplace"`` 是第二道保险：编码换成 UTF-8 后，普通文本已不会
+    触发它；但合法 ``str`` 仍可能含**孤立代理项**（``surrogateescape`` 解码出的
+    文件系统名），UTF-8 严格模式对它一样会抛 ⇒ 用转义而不是崩溃。
+
+    **为什么不换掉 ``sys.stdout`` 对象**：直接 ``reconfigure`` 既有流，可保住
+    ``print`` 之外所有对它的引用（logging 的 handler 就握着 ``sys.stderr``），
+    也避免制造第二份缓冲。``contextlib.redirect_stdout(io.StringIO())`` 用的替身没有
+    ``reconfigure`` ⇒ 跳过即可，绝不让这段防御代码自己把 CLI 弄崩。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError, LookupError):
+            # 已经写过数据的流不允许再改编码，替身对象也可能拒绝 —— 保持原样。
+            continue
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # 必须**最先**做：argparse 的帮助文本与随后所有视图都走 stdout/stderr，
+    # 而重定向到 ANSI 代码页时，第一句含 ``⇒``/``⚠`` 的输出就会崩。
+    _configure_standard_streams()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 

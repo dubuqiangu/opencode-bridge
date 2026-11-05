@@ -43,6 +43,7 @@ import logging
 import time
 from typing import Any, Optional
 
+from ..proxy_config import proxy_endpoint_for
 from .telegram_protocol import (
     API_HOST, API_PORT, BACKOFF_INTERVAL, DEFAULT_SOCKET_TIMEOUT,
     MIN_SEND_INTERVAL, _retry_after,
@@ -84,7 +85,17 @@ class TelegramHttp:
         sock_timeout = timeout if timeout is not None else DEFAULT_SOCKET_TIMEOUT
         status = 0
         raw = b""
-        conn = http.client.HTTPSConnection(API_HOST, API_PORT, timeout=sock_timeout)
+        # 有代理（HTTPS_PROXY / ALL_PROXY）时经代理 CONNECT 隧道；否则逐字节保持
+        # 原有的直连行为。set_tunnel 的目标是**被隧穿的 API_HOST**，不是代理本身。
+        proxy_endpoint = proxy_endpoint_for(API_HOST, scheme="https")
+        if proxy_endpoint is None:
+            conn = http.client.HTTPSConnection(API_HOST, API_PORT, timeout=sock_timeout)
+        else:
+            proxy_host, proxy_port = proxy_endpoint
+            conn = http.client.HTTPSConnection(
+                proxy_host, proxy_port, timeout=sock_timeout
+            )
+            conn.set_tunnel(API_HOST, API_PORT)
         try:
             conn.request(
                 "POST",

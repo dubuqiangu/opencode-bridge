@@ -33,6 +33,8 @@ import threading
 from typing import Any, Callable
 
 from .base import NOTHING, Transport
+from ..proxy_config import proxy_endpoint_for
+from ..proxy_tunnel import establish_proxy_tunnel
 
 __all__ = ["TcpLineTransport"]
 
@@ -88,10 +90,23 @@ class TcpLineTransport(Transport):
     # --- 连接 ----------------------------------------------------------
     def _open(self) -> Any:
         """建连（+ 可选 TLS）。异常一律抛给基类退避重试。"""
-        sock = socket.create_connection(
-            (self.host, self.port), timeout=self._connect_timeout
+        # 有代理（``<scheme>_PROXY`` / ``ALL_PROXY``）时先连代理再 CONNECT 到目标；
+        # 无代理时逐字节保持原有的直连一行。TLS 与否决定用 https 还是 http 代理键。
+        proxy_endpoint = proxy_endpoint_for(
+            self.host, scheme="https" if self._tls else "http"
         )
+        if proxy_endpoint is None:
+            sock = socket.create_connection(
+                (self.host, self.port), timeout=self._connect_timeout
+            )
+        else:
+            sock = socket.create_connection(
+                proxy_endpoint, timeout=self._connect_timeout
+            )
         try:
+            if proxy_endpoint is not None:
+                # 先经代理 CONNECT 到真实目标；随后 TLS 仍以 self.host 校验证书。
+                establish_proxy_tunnel(sock, self.host, self.port)
             if self._tls:
                 sock = self._wrap_tls(sock)
             sock.settimeout(self._io_timeout)

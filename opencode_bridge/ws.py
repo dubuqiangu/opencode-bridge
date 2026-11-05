@@ -42,6 +42,8 @@ from .ws_protocol import WebSocketError, _Target, _parse_ws_url, _accept_for, _t
 from .ws_protocol import _mask, _recv_exact, _read_http_response, _parse_response_head, _hard_close
 from .ws_protocol import _decode_text, _OP_CONT, _OP_TEXT, _OP_BINARY, _OP_CLOSE
 from .ws_protocol import _OP_PING, _OP_PONG, _MAX_CONTROL_PAYLOAD
+from .proxy_config import proxy_endpoint_for
+from .proxy_tunnel import ProxyTunnelError, establish_proxy_tunnel
 
 __all__ = ["WebSocketClient", "WebSocketError", "connect"]
 
@@ -123,8 +125,17 @@ class WebSocketClient:
         prefetched: bytes = b""
         try:
             try:
-                raw = socket.create_connection((target.host, target.port), timeout=self._timeout)
+                proxy_endpoint = proxy_endpoint_for(
+                    target.host, scheme="https" if target.secure else "http"
+                )
+                if proxy_endpoint is None:
+                    raw = socket.create_connection((target.host, target.port), timeout=self._timeout)
+                else:
+                    raw = socket.create_connection(proxy_endpoint, timeout=self._timeout)
                 raw.settimeout(self._timeout)
+                if proxy_endpoint is not None:
+                    # 经代理 CONNECT 到真实目标；随后 TLS 仍以 target.host 校验证书。
+                    establish_proxy_tunnel(raw, target.host, target.port)
                 sock = raw
                 if target.secure:
                     # wss：默认校验证书链与主机名，不给关校验的开关
@@ -142,6 +153,10 @@ class WebSocketClient:
                 prefetched = body
             except WebSocketError:
                 raise
+            except ProxyTunnelError as exc:
+                raise WebSocketError(
+                    f"经代理连接 {target.host}:{target.port} 失败: {exc}"
+                ) from exc
             except OSError as exc:
                 raise WebSocketError(f"连接 {target.host}:{target.port} 失败: {exc}") from exc
         except BaseException:

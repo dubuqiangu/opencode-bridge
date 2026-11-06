@@ -21,6 +21,7 @@ import os
 import socket
 import threading
 import unittest
+import urllib.request
 from unittest import mock
 
 from .proxy_env_isolation import (
@@ -33,6 +34,11 @@ from .test_ws import accept_with_handshake, read_request_head
 from opencode_bridge.adapters.telegram_http import TelegramHttp
 from opencode_bridge.adapters.telegram_protocol import API_HOST, API_PORT
 from opencode_bridge.proxy_config import proxy_endpoint_for
+from opencode_bridge.proxy_tunnel import (
+    ProxyTunnelError,
+    _connect_authority,
+    establish_proxy_tunnel,
+)
 from opencode_bridge.transport.tcp_lines import TcpLineTransport
 from opencode_bridge.ws import WebSocketClient, WebSocketError
 
@@ -461,6 +467,235 @@ class TestTelegramHttpProxyArms(ProxyEnvTestCase):
         conn = self._post_once()
         self.assertEqual((conn.host, conn.port), (PROXY_HOST, 8888))
         self.assertEqual(conn.tunnel, (API_HOST, API_PORT))
+
+
+# ----------------------------------------------------------------------
+# 5) establish_proxy_tunnel：逐分支守门（真 socket）+ CONNECT authority 格式
+# ----------------------------------------------------------------------
+class ScriptedConnectProxy(threading.Thread):
+    """回一份**脚本化** CONNECT 应答的假代理，逼出各失败分支。
+
+    与 :class:`RecordingConnectProxy` 的区别：这里逐字节控制回给客户端的应答，
+    所以「读到一半对端关闭」「应答头非法」「状态非 200」都是真事件。``hold_open``
+    为真时发完应答先不关连接（供超时分支），由 :attr:`release` 事件决定何时关闭。
+    """
+
+    def __init__(self, response_bytes: bytes, *, hold_open: bool = False) -> None:
+        super().__init__(daemon=True)
+        self._response_bytes = response_bytes
+        self._hold_open = hold_open
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((PROXY_HOST, 0))
+        self._listener.listen(1)
+        self.port: int = self._listener.getsockname()[1]
+        self.connections: list[str] = []
+        self.release = threading.Event()
+        self._conn: socket.socket | None = None
+
+    def run(self) -> None:
+        try:
+            conn, _ = self._listener.accept()
+            conn.settimeout(_ACCEPT_TIMEOUT)
+            self._conn = conn
+            request_head = read_request_head(conn)
+            request_line = request_head.split(b"\r\n", 1)[0].decode("latin-1")
+            self.connections.append(request_line.split(" ", 2)[1])
+            conn.sendall(self._response_bytes)
+            if self._hold_open:
+                self.release.wait(_ACCEPT_TIMEOUT)
+            conn.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.release.set()
+        for sock in (self._conn, self._listener):
+            if sock is None:
+                continue
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+class TestEstablishProxyTunnelBranches(unittest.TestCase):
+    """``establish_proxy_tunnel`` 的四个失败分支与成功路径。
+
+    每个分支都经**真实 socket** 逼出：脚本化代理逐字节控制应答，于是「读到一半
+    对端关闭」「应答头非法」「状态非 200」都是真事件，不是 mock。
+    """
+
+    def _proxy(self, response_bytes: bytes, *, hold_open: bool = False) -> ScriptedConnectProxy:
+        proxy = ScriptedConnectProxy(response_bytes, hold_open=hold_open)
+        proxy.start()
+        self.addCleanup(proxy.close)
+        return proxy
+
+    def _connected_to(
+        self, proxy: ScriptedConnectProxy, *, timeout: float | None = None
+    ) -> socket.socket:
+        sock = socket.create_connection((PROXY_HOST, proxy.port), timeout=_ACCEPT_TIMEOUT)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        self.addCleanup(sock.close)
+        return sock
+
+    def test_success_returns_bytes_after_response_head(self):
+        proxy = self._proxy(b"HTTP/1.1 200 Connection established\r\n\r\nAFTER-HEAD-BYTES")
+        sock = self._connected_to(proxy)
+        leftover = establish_proxy_tunnel(sock, "example.com", 443)
+        self.assertEqual(proxy.connections, ["example.com:443"])
+        self.assertEqual(leftover, b"AFTER-HEAD-BYTES")
+
+    def test_sendall_oserror_becomes_proxy_tunnel_error(self):
+        # 真实 socket，写侧已被 shutdown —— 再发 CONNECT 必然 OSError（BrokenPipeError）。
+        client_side, peer_side = socket.socketpair()
+        self.addCleanup(client_side.close)
+        self.addCleanup(peer_side.close)
+        client_side.shutdown(socket.SHUT_WR)
+        with self.assertRaises(ProxyTunnelError) as caught:
+            establish_proxy_tunnel(client_side, "example.com", 443)
+        self.assertIn("发送 CONNECT 到代理失败", str(caught.exception))
+
+    def test_partial_response_then_close_becomes_proxy_tunnel_error(self):
+        proxy = self._proxy(b"HTTP/1.1 200 Connection established\r\n")  # 无结尾空行
+        sock = self._connected_to(proxy)
+        with self.assertRaises(ProxyTunnelError) as caught:
+            establish_proxy_tunnel(sock, "example.com", 443)
+        self.assertIn("读取代理 CONNECT 应答失败", str(caught.exception))
+
+    def test_response_read_timeout_becomes_proxy_tunnel_error(self):
+        proxy = self._proxy(b"HTTP/1.1 200 Connection established\r\n", hold_open=True)
+        sock = self._connected_to(proxy, timeout=0.2)
+        with self.assertRaises(ProxyTunnelError) as caught:
+            establish_proxy_tunnel(sock, "example.com", 443)
+        self.assertIn("读取代理 CONNECT 应答失败", str(caught.exception))
+        self.assertIn("超时", str(caught.exception))
+
+    def test_malformed_status_line_becomes_proxy_tunnel_error(self):
+        proxy = self._proxy(b"NOT-HTTP nonsense\r\n\r\n")
+        sock = self._connected_to(proxy)
+        with self.assertRaises(ProxyTunnelError) as caught:
+            establish_proxy_tunnel(sock, "example.com", 443)
+        self.assertIn("解析代理 CONNECT 应答失败", str(caught.exception))
+
+    def test_non_200_status_becomes_proxy_tunnel_error(self):
+        proxy = self._proxy(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+        sock = self._connected_to(proxy)
+        with self.assertRaises(ProxyTunnelError) as caught:
+            establish_proxy_tunnel(sock, "example.com", 443)
+        message = str(caught.exception)
+        self.assertIn("代理拒绝 CONNECT example.com:443", message)
+        self.assertIn("HTTP 407", message)
+
+
+class TestConnectAuthorityFormatting(unittest.TestCase):
+    """``_connect_authority`` 的 ``host:port`` 拼装（IPv6 字面量要加方括号）。"""
+
+    def test_ipv6_literal_is_bracketed_with_port(self):
+        self.assertEqual(_connect_authority("::1", 443), "[::1]:443")
+
+    def test_ipv4_literal_is_not_bracketed(self):
+        self.assertEqual(_connect_authority("127.0.0.1", 443), "127.0.0.1:443")
+
+    def test_hostname_is_not_bracketed(self):
+        self.assertEqual(_connect_authority("example.com", 8443), "example.com:8443")
+
+
+# ----------------------------------------------------------------------
+# 6) 环境隔离：清掉 Windows 系统代理（WinINET）
+# ----------------------------------------------------------------------
+_WININET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_WININET_VALUE_NAMES = ("ProxyEnable", "ProxyServer", "ProxyOverride")
+
+
+def _read_wininet_values_directly() -> dict[str, tuple[object, int]]:
+    """用例侧的独立读数（直接用 ``winreg``，不经被测模块，避免自证）。
+
+    返回值名 → ``(数据, 类型)``，与 ``winreg.QueryValueEx`` 的返回顺序一致。
+    """
+    import winreg
+
+    values: dict[str, tuple[object, int]] = {}
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _WININET_SETTINGS_KEY, 0, winreg.KEY_QUERY_VALUE
+        ) as key:
+            for name in _WININET_VALUE_NAMES:
+                try:
+                    values[name] = winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    continue
+    except OSError:
+        return {}
+    return values
+
+
+def _write_wininet_proxy_directly(proxy_server: str) -> None:
+    """注入一个假系统代理：``ProxyEnable=1`` 且 ``ProxyServer=proxy_server``。"""
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _WININET_SETTINGS_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_server)
+
+
+def _restore_wininet_values_directly(saved_values: dict[str, tuple[object, int]]) -> None:
+    """把用例开始前读到的三个值原样写回（含「本来就没有」= 删掉）。"""
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _WININET_SETTINGS_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            for name in _WININET_VALUE_NAMES:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    continue
+            for name, (value_data, value_type) in saved_values.items():
+                winreg.SetValueEx(key, name, 0, value_type, value_data)
+    except OSError:
+        pass
+
+
+class TestWinInetProxyIsolation(ProxyEnvTestCase):
+    """``clear_proxy_environment`` 必须同时清掉 Windows 系统代理（WinINET）。
+
+    只清 ``*_proxy`` 环境变量不够：``urllib.request.getproxies()`` 在环境为空时回落读
+    注册表（``getproxies_environment() or getproxies_registry()``），这台机器的系统代理
+    因此会漏进「无代理」用例。本例**注入**一个假系统代理、先证明它对 ``getproxies()``
+    可见（对照臂），再调 ``clear_proxy_environment`` 并断言它消失。
+
+    注册表不可用（非 Windows / 无 ``winreg`` / 无权限）时跳过；注入前后都留底并还原。
+    """
+
+    _INJECTED_PROXY_SERVER = "wininet-proxy.isolation.invalid:9999"
+
+    def setUp(self) -> None:
+        super().setUp()
+        if os.name != "nt":
+            self.skipTest("WinINET 系统代理只在 Windows 上存在")
+        try:
+            import winreg  # noqa: F401
+        except ImportError:
+            self.skipTest("winreg 不可用")
+        self._original_wininet = _read_wininet_values_directly()
+        self.addCleanup(_restore_wininet_values_directly, self._original_wininet)
+
+    def test_clear_removes_wininet_proxy_visible_to_getproxies(self):
+        _write_wininet_proxy_directly(self._INJECTED_PROXY_SERVER)
+        injected = urllib.request.getproxies()
+        self.assertTrue(
+            any(self._INJECTED_PROXY_SERVER in value for value in injected.values()),
+            f"注入的系统代理应对 getproxies() 可见（对照臂），实际 {injected!r}",
+        )
+        clear_proxy_environment()
+        self.assertEqual(urllib.request.getproxies(), {})
+        self.assertEqual(_read_wininet_values_directly(), {})
 
 
 if __name__ == "__main__":

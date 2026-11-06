@@ -4296,7 +4296,7 @@ nick-as-principal 本身**单独立项**，不在这次改。**下面是那个�
       用例锁在"连续 4 次全是2.0"。
     - **长轮询超时的两层关系**：socket 超时必须 **>** 服务端 `timeout`（25 → 40），
       否则会在服务端返回前先本地超时；并验证它**跟着 `poll_timeout` 走**（不是常数 40）。
-    - **按钮能力不许丢**（Telegram 是仓库里唯一 `supports_inline_buttons=True`）：
+    - **按钮能力不许丢**（Telegram 与 Slack 两家支持 `supports_inline_buttons=True`）：
       5 条用例，含"回调 hook 崩了**仍**在 `finally` 里应答 callback query"。
     - **`allowed_updates`（服务端侧订阅范围）与客户端入站过滤是两处不同机制**，
       刻意分开断言 —— 迁移极易把两者搞混。

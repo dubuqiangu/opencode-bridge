@@ -41,7 +41,7 @@ Telegram 特有的四点
    （"收到了也要丢"）。两者是**不同机制**，迁移不许混为一谈 ——
    服务端不推 ≠ 客户端不需要过滤（白名单与"非文本"必须在客户端拦）。
 
-3. **按钮是本平台独有的能力**（``supports_inline_buttons = True``，仓库里唯一）：
+3. **按钮能力不是本平台独有的**（``supports_inline_buttons = True``，Telegram 与 Slack 两家）：
    callback query 的接收 → :meth:`TelegramAdapter.answer` 应答是一整套顺序敏感的
    动作（见 :meth:`TelegramAdapter._handle_callback`：投递 inbound → ``on_callback``
    → ``answerCallbackQuery``，且后两步在 ``finally`` 里，**投递崩了也要应答**）。
@@ -125,7 +125,7 @@ class TelegramAdapter(Adapter):
     #: principal = chat id：(a) 会话唯一且稳定，(b) 用户在 Telegram 里能直接看到它，
     #: (c) 平台对发件人做过认证 —— 三条判据都成立。
     pairing_supported = True
-    supports_inline_buttons = True              # 仓库里唯一支持 inline 按钮的平台
+    supports_inline_buttons = True              # Telegram 与 Slack 两家支持 inline 按钮的平台
     #: ⛔ ``False``，而且这与"Telegram 能不能发媒体"**不是同一个问题**。
     #:
     #: 这个字段问的是"本桥**接没接**出站媒体"，而答案在整个桥的接口面上：
@@ -137,7 +137,7 @@ class TelegramAdapter(Adapter):
     #:
     #: ⚠️ 此前这里写的是 ``True``，而那个值**唯一**的消费方是 ``--status`` 的能力表
     #: （``platform_status.py`` 把它印成"媒体：是"）⇒ 它对用户**谎报**"能给 bot
-    #: 发图片/文件"。其余十二个平台一律 ``False``，Telegram 曾是唯一的例外，
+    #: 发图片/文件"。其余十三个平台一律 ``False``，Telegram 曾是唯一的例外，
     #: 且没有一行注释解释为什么 —— 因为那个理由并不存在。
     supports_media = False
     #: ``editMessageText`` 真能把占位气泡顶成最终答复，所以 ``⏳ 处理中…`` 发得。

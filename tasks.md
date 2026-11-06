@@ -4645,6 +4645,19 @@ nick-as-principal 本身**单独立项**，不在这次改。**下面是那个�
   验证：**transport + discord 131 OK**、七个走传输层的平台 **399 OK**、
   **全量 1404 tests OK (skipped=1)**、compileall 0、13 个平台。
 
+- **2026-11-05** **支持经 HTTP 代理的出站连接（三条裸 socket / http.client 缝）**（`ee983ee`，8 files +721/-4）——
+  新增 `proxy_config.proxy_endpoint_for`（读 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` + `urllib` `proxy_bypass` 判 `no_proxy`）
+  与 `proxy_tunnel.establish_proxy_tunnel`（复用 `ws_protocol` 的 HTTP 应答解析）；接入三条缝
+  `ws.WebSocketClient.connect` · `transport.tcp_lines.TcpLineTransport._open` · `adapters.telegram_http.TelegramHttp._post`。
+  ⚠️ **无代理时三条缝逐字节保持原有直连行为**；经代理时先 CONNECT 到真实目标、TLS 仍以真实主机名校验证书。
+  守门 = `tests/__init__.py` 导入即清空代理环境（整套测试与开发机代理解耦）+ `tests/test_proxy_support.py` 用真代理服务器 13 用例。
+
+- **2026-11-05** **修复 `--status`/`--setup` 在非 UTF-8 重定向下因字符编码崩溃**（`b8c7320`，2 files +207）——
+  `main()` 入口把 `sys.stdout`/`sys.stderr` 重配为 UTF-8 + `backslashreplace`；重定向或接管道时 Windows 会改用
+  ANSI 代码页（cp936），而 `--status`/`--setup` 文案含 U+21D2 与 U+26A0，编码不进去即抛 `UnicodeEncodeError`
+  并以退出码 1 收场；改为 UTF-8 同时让插件按 UTF-8 读 stdout 的那一侧两端编码一致，⛔ 直接控制台行为不变。
+  守门 = `tests/test_cli_stream_encoding.py`：真 cp936 流复现 + 单元测试 + 端到端 `--status` 守门（反向证明有辨别力）。
+
 ---
 
 ## ⚠️ 编排事故：我删掉了自己禁止别人删的目录（2026-10-05）

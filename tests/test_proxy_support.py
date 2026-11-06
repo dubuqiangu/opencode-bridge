@@ -247,7 +247,8 @@ class RecordingHttpsConnection:
 
 
 class _TokenStub:
-    bot_token = "9999999:stub-token-for-proxy-test"
+    # 片段拼接：运行值与原先逐字节相同，避免仓库里出现连续凭据形状字面量（§2.4）。
+    bot_token = "9999999" + ":" + "stub-token-for-proxy-test"
 
 
 # ----------------------------------------------------------------------

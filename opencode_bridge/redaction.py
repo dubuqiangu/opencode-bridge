@@ -488,16 +488,29 @@ class Redactor:
         ``email:email#...`` 更有用（一个标签就能说明它是哪一类会话）。
 
         非字符串**原样返回**：脱敏层不是强制转换器，接过什么类型都不该改。
+
+        **失败关闭（fail-closed），逐条规则**：四条规则各自包在 try 里，某一条抛
+        异常时**绝不**回退到当前文本或原文 —— 那会把正要遮蔽的秘密（或半脱敏、
+        仍含秘密的文本）原样放回日志。此时返回按 :data:`_MASK_TEMPLATE` 构造的
+        不可用标记，标签取 :data:`_UNAVAILABLE_FINGERPRINT`，与 :meth:`fingerprint`
+        同一条纪律：**宁可给出「值不可用」，也不许泄漏**。没有规则抛异常时输出
+        与逐条直接调用**逐字节相同**。
         """
         if not isinstance(text, str):
             return text
-        try:
-            scrubbed = self.scrub_credentials(text)
-            scrubbed = self.scrub_conversation_ids(scrubbed)
-            scrubbed = self.scrub_phones(scrubbed)
-            return self.scrub_emails(scrubbed)
-        except Exception:  # noqa: BLE001 - 见 fingerprint()：宁可漏，不可泄
-            return text
+        scrubbed = text
+        scrub_rules = (
+            self.scrub_credentials,
+            self.scrub_conversation_ids,
+            self.scrub_phones,
+            self.scrub_emails,
+        )
+        for scrub_rule in scrub_rules:
+            try:
+                scrubbed = scrub_rule(scrubbed)
+            except Exception:  # noqa: BLE001 - 脱敏层绝不许把明文泄给调用方
+                return _MASK_TEMPLATE % _UNAVAILABLE_FINGERPRINT
+        return scrubbed
 
     # ------------------------------------------------------------------
     # 落盘侧（``state.json``）

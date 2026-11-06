@@ -177,8 +177,11 @@ function Invoke-Installer {
         return 1
     }
     if (-not (Test-HasCommand "python")) {
-        Write-Warn "[警告] 未检测到 python。bridge 运行需要 Python 3.10+："
-        Write-Warn "       https://www.python.org/downloads/ （安装时勾选 Add python.exe to PATH）"
+        Write-Bad "[错误] 未检测到 python，bridge 运行需要 Python 3.10+。"
+        Write-Bad "       请先安装 Python for Windows: https://www.python.org/downloads/"
+        Write-Bad "       （安装时勾选 Add python.exe to PATH）"
+        Write-Bad "       安装完成后（或重开一个终端）重新运行本脚本。"
+        return 1
     }
 
     Write-Info "== opencode-bridge 安装器 =="

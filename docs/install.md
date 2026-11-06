@@ -30,7 +30,7 @@ Install opencode-bridge: https://raw.githubusercontent.com/dubuqiangu/opencode-b
 
 ### Goal
 
-装好 opencode-bridge：Telegram/Slack/Discord ↔ 本机 opencode 的消息桥。
+装好 opencode-bridge：Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS 等 IM 平台 ↔ 本机 opencode 的消息桥。
 Python 3.10+ **仅标准库**，安装过程**不得 pip install 任何东西**。
 
 ### ⚠️ Boundaries
@@ -114,7 +114,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 ### Step 2: 选择平台并配置 token
 
-**先问用户要接哪个平台**（Telegram / Slack / Discord），然后按用户选择给对应引导。内容与仓库 README「接入平台引导」一致：
+**先问用户要接哪个平台**（Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS），然后按用户选择给对应引导。内容与仓库 README「接入平台引导」一致：
 
 #### 配置文件位置
 
@@ -142,7 +142,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 
 > ⚠️ **`allowed_chat_ids` 是安全边界**：留空 = 任何人都能驱动你的 agent（任意能给 bot 发消息的人可以以用户权限执行操作）。务必填入用户自己的纯数字 chat id。
 >
-> 这不是"配错了才出事"：安装脚本从 `config.example.json` 生成的 `config.json` 里，`allowed_chat_ids` **就是空数组**，而且 **`config_version` 是 `0`（< 2）** ⇒ 现在仍是「空 = 全部放行」。只填 `bot_token` 就重启的话，你得到的是一个**完全开放**的桥接。三个平台（Telegram / Slack / Discord）都是如此。
+> 这不是"配错了才出事"：安装脚本从 `config.example.json` 生成的 `config.json` 里，`allowed_chat_ids` **就是空数组**，而且 **`config_version` 是 `0`（< 2）** ⇒ 现在仍是「空 = 全部放行」。只填 `bot_token` 就重启的话，你得到的是一个**完全开放**的桥接。所有平台都是如此。
 >
 > ⚠️ **下一版起这里会变成「空 = 谁都不放行」**（由 `config_version` 兜底：`< 2` = 旧语义，`>= 2` = 新语义；启动时会有醒目预告）。届时**不必手改配置文件**：填顶层键 `pairing_secret` → 重启 → 在 bot 里发 `/pair` 拿码 → 本机 `python -m opencode_bridge --pair <码> --conversation platform:local_id` → **再重启一次**。三条边界见 README「7. 安全须知」，其中一条必须先知道：**irc / twitch 的私聊在翻转后对所有人都不可用**（这两个平台也不提供 `/pair`）。
 
@@ -561,7 +561,7 @@ Matrix 没有"建 App 再邀请进频道"的模型 —— 直接用**你的账�
 向用户汇报：
 
 - 装到了哪两个目录（bridge 目录、插件目录的绝对路径）
-- 填了哪个平台（Telegram / Slack / Discord）
+- 填了哪个平台（Telegram / Slack / Discord / Matrix / Mattermost / Nextcloud Talk / ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS）
 - 是否重启了 opencode（或用户选择暂不重启）
 - 验证结果（--check / unittest / 可选 harness）
 - 还需要用户做的事（列清楚，如：自行填 token、下次重启、给 bot 发 hi 等）

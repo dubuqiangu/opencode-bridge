@@ -36,7 +36,7 @@ opencode plugin remove github:dubuqiangu/opencode-bridge
 
 - `opencode plugin add <package>` 的 package 参数是 **npm registry or Git package specifier**；`update` / `remove` 都用**同一条完整 specifier**（上面这条，不是短 id）。安装 = 把本仓库作为插件包装进全局配置。
 - **装完只剩两步**：填 bot token → `opencode service restart`（重启会打断当前会话，**需你点头同意**才执行）。
-- 插件**首次启动自动自举**：把包内 Python 源码与 `config.example.json` 铺到稳定 bridge 目录（Windows `%USERPROFILE%\.config\opencode-bridge`，Unix `${XDG_CONFIG_HOME:-$HOME}/.config/opencode-bridge`），已有 `config.json` **绝不覆盖**——无需任何安装脚本。
+- 插件**首次启动自动自举**：把包内 Python 源码与 `config.example.json` 铺到稳定 bridge 目录（Windows `%USERPROFILE%\.config\opencode-bridge`，Unix `${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge`），已有 `config.json` **绝不覆盖**——无需任何安装脚本。
 - **更新**用 `opencode plugin update github:dubuqiangu/opencode-bridge`（**建议在用户主目录 `~` 下执行**；工作区目录偶发 `Plugin is not configured`，换到 `~` 重试即可）；`plugin list` 显示的 commit 可能落后 update 一拍，再执行一次 update / list 对齐。
   ⚠️ **它刷的是插件目录，不是「正在跑的那份代码」。** bridge 目录（上面第 38 条那个）若是脚本安装留下的 **git clone**，自举按设计不碰它 ⇒ 跑着的仍是旧代码，还要 `git -C <bridge目录> pull --ff-only`。确认桥跑的是哪一份：`cd <bridge目录>` 后 `python -c "import opencode_bridge, os; print(os.path.abspath(opencode_bridge.__file__))"`。改完还要重启才生效。详见 [`docs/update.md`](docs/update.md)。
 - Python **3.10+ 仍需本机自带**（插件不安装 Python）。
@@ -172,7 +172,7 @@ git clone https://github.com/dubuqiangu/opencode-bridge "$env:USERPROFILE\.confi
 | Home Assistant | ✅ WebSocket 事件总线 | ✅ `call_service` | ❌ 无 | ⚠️ **默认一个事件都不收**，必须配 `entities`/`domains`/`accept_all`；上限 4096（官方未公布） |
 | SMS（Twilio） | ✅ webhook（**平台调我们**） | ✅ REST API | ❌ 无 | 单条上限 1600 字符（更长自动分片）；**验签 fail-closed**（`auth_token`/`webhook_url` 缺一即不挂路由）；**需公网可达的回调地址**（默认只绑回环）；⚠️ **号码可伪造 ⇒ 不走 `/pair` 配对**，`allowed_chat_ids`（E.164）是唯一闸门 |
 
-> 「编辑消息」能力不一致会影响流式进度更新：IRC / Twitch 没有它，长任务的进度会**退化成连续发多条消息**。
+> 「编辑消息」能力不一致会影响流式进度更新：ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS 没有它，长任务的进度会**退化成连续发多条消息**。
 >
 > 填好 token 后，可在 bot 里发送 **`/setup`** 查看 / 重温 Telegram / Slack / Discord 三个平台的引导；
 > `/setup telegram`、`/setup slack`、`/setup discord` 可直达对应平台的分步引导。
@@ -907,11 +907,11 @@ python -m opencode_bridge --setup --json          # 机器可读视图：{config
 ## 8. 已知限制
 
 - 流式显示依赖服务端事件 `session.text.delta`；若服务端不推送该事件，只能在任务结束时（`session.execution.succeeded` / `session.idle`）一次性收到结果。
-- **各平台的「编辑消息」能力不一致**（流式进度更新依赖它）：Telegram / Discord / Slack / Mattermost 原生支持；**Matrix** 用 MSC2676 兼容近似（多发一条带 `* ` 前缀与 `m.replace` 关系的事件，不支持该写法的客户端会当成新消息 —— 内容不丢但会多一条）；**IRC / Twitch 完全没有编辑**，`edit()` 恒返回 `False`，此时进度更新会退化成连续发多条消息。
+- **各平台的「编辑消息」能力不一致**（流式进度更新依赖它）：Telegram / Discord / Slack / Mattermost / Nextcloud Talk 原生支持；**Matrix** 用 MSC2676 兼容近似（多发一条带 `* ` 前缀与 `m.replace` 关系的事件，不支持该写法的客户端会当成新消息 —— 内容不丢但会多一条）；**ntfy / email / IRC / Twitch / a2a / QQ Bot / Home Assistant / SMS 完全没有编辑**，`edit()` 恒返回 `False`，此时进度更新会退化成连续发多条消息。
 - **IRC 的正文换行会被折成空格**：IRC 是单行协议，无法承载换行；原样发出会截断整行甚至被注入命令。这是协议约束，不是静默丢内容。
 - **Twitch 的消息长度上限（默认 400 字符）与限流阈值是社区经验值**，非官方文档公开常量，可能随平台调整。
 - 长任务在 IM 侧只有"一条进度消息 + 节流编辑"，**没有**中间逐步流式；工具调用只记录进内部 `tool_trace`，不会逐条推送（避免刷屏）。
-- 权限请求 v1 只发文字提示，不使用 inline buttons（跨平台行为不一致）。
+- 权限请求 v1 默认只发文字提示；**telegram / slack 已支持 inline buttons**（`supports_inline_buttons=True`），其余平台仍是纯文字（跨平台行为不一致）。
 - 一条进度消息编辑失败时不会降级为重复发送（避免刷屏），定稿消息才具备 `send` 兜底。
 - **同一种安装方式只能选一种**（原生 `plugin add` 与脚本安装并存会重复加载），切换方式需先清理旧的那份，见「11. 卸载」。
 - 若稳定 bridge 目录是**脚本安装留下的 git clone**，第 4 级自举按设计完全不碰它 —— 此时 `opencode plugin update` 只更新插件壳，Python 侧需自行 `git -C <稳定目录> pull`。

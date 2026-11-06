@@ -57,7 +57,7 @@ opencode service restart
 ## 装完之后
 
 插件装好只代表 bridge 能随 opencode 启动，**还要按平台填好 token** 才有消息进出。
-完整的分步引导见仓库根 [`README.md`](../README.md) 的「接入平台引导」一节（三个平台各一份，含配置文件路径），这里只给一句话概述：
+完整的分步引导见仓库根 [`README.md`](../README.md) 的「接入平台引导」一节（14 个平台各一份，含配置文件路径），这里只给一句话概述：
 
 - **Telegram**：`@BotFather` 建 bot 拿 token、`@userinfobot` 查 chat id，填进 `adapters.telegram`；
 - **Slack**：建 App 后开 Socket Mode 拿 `xapp-` app-level token、再取 `xoxb-` bot token，两枚都填进 `adapters.slack`（只填 `xoxb-` 只能发不能收）；
@@ -94,7 +94,7 @@ opencode service restart
    | 平台 | 路径 |
    | --- | --- |
    | Windows | `%USERPROFILE%\.config\opencode-bridge` |
-   | macOS / Linux | `${XDG_CONFIG_HOME:-$HOME}/.config/opencode-bridge` |
+   | macOS / Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/opencode-bridge` |
 
    自举时已有 `config.json` **绝不覆盖**；稳定目录本身是 git clone（脚本装法）时**完全不碰它**；`enabled: false` 时**零副作用**（不自举、不 spawn）。
 

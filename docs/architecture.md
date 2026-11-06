@@ -12,8 +12,8 @@
 | 约束 | 直接后果 |
 |---|---|
 | **Python 3.10+，仅标准库** | WebSocket 必须自研（`ws.py`）；没有 `httpx`/`websockets` 可用 |
-| **纯本机运行** | 7 个 webhook-only 平台（WhatsApp官方/LINE/Teams/SMS/Synology/Zalo/Google Chat）接不进来 —— 它们需要一个可达的公网回调地址 |
-| **不要求公网回调地址** | 12 个平台走"我们主动连出去"（长轮询 / WebSocket 客户端 / IMAP 轮询），外加 a2a 这个反方向的例外（**我们是被调方**） |
+| **纯本机运行** | 6 个 webhook-only 平台（WhatsApp官方/LINE/Teams/Synology/Zalo/Google Chat）接不进来 —— 它们需要一个可达的公网回调地址 |
+| **不要求公网回调地址** | 12 个平台走"我们主动连出去"（长轮询 / WebSocket 客户端 / IMAP 轮询），外加 a2a 这个反方向的例外（**我们是被调方**）。⚠️ **SMS（Twilio）是这一条本身的例外**：入站需要公网可达的回调地址，且方向相反（**Twilio 把短信 POST 给我们**，出站仍是我们主动调 Twilio REST）—— 见 [`../README.md`](../README.md) 的 SMS 一节 |
 
 **这三条不是技术偏好，是筛选平台时的第一道闸门。** 违反其中任何一条的平台，
 即使协议再简单也不进B 组 —— 理由见 [`../tasks.md`](../tasks.md) 的阶段 E。
@@ -50,8 +50,8 @@
 是十份重复逻辑。于是 `stop()` 的正确顺序（先关连接再 join）要在每个文件里各写对一次——
 而它恰恰是最容易写错的那一处（关一个卡在 `read()` 上的 socket 不保证唤醒那次读）。
 
-搬进传输层之后，**这类错误从"十处机会"变成"零处机会"**。迁移已完成：13 个平台里
-除 a2a 外**全部**走 `transport/`（a2a 是本机 HTTP server，用共用模块 `httpsrv.py`），
+搬进传输层之后，**这类错误从"十处机会"变成"零处机会"**。迁移已完成：14 个平台里
+除 a2a 与 SMS 外**全部**走 `transport/`（这两个是本机 HTTP server，共用模块 `httpsrv.py`），
 `tasks.md` 的阶段 A 记录了进度。
 
 **这不是"抽象洁癖"。** 迁移的实测收益是**概念性**的，不是行数：IRC 那家真实代码净减，
@@ -86,8 +86,8 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
 ```
 
 `edit()` 返回 `False` 表示**该平台没有编辑能力**，core 会退化成"再发一条新消息"。
-这是诚实降级，不是失败 —— 13 个平台里有 7 个没有：`a2a` / `email` /
-`homeassistant` / `irc` / `ntfy` / `qqbot` / `twitch`。
+这是诚实降级，不是失败 —— 14 个平台里有 8 个没有：`a2a` / `email` /
+`homeassistant` / `irc` / `ntfy` / `qqbot` / `twitch` / `sms`。
 
 ## 模块职责
 
@@ -149,7 +149,7 @@ opencode 回复 → core.py 按 conversation_id 找到适配器
    安全"，**那句前提已不成立** —— a2a 的空 `bind_port` 会被判为未配置、`start()`
    **拒绝绑定**。
 
-   ⛔ **`config_runnable` 的默认答案是「否」，而这个默认是承重的**：其余十二个平台的
+   ⛔ **`config_runnable` 的默认答案是「否」，而这个默认是承重的**：其余十三个平台的
    「够不够跑」走 `required_tokens` 那条通用规则（逐键看值非空），默认 `False` 让它们
    **一个字都不用改**地继续走那条路。⇒ **不覆写它的新平台，配好之前预检一律说
    「未配置」**（缺哪些键会被如实报出来）—— 这是**失败关闭**，不是 bug。

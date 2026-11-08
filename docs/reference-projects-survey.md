@@ -183,6 +183,23 @@ gh api "repos/<owner>/<repo>/compare/<基线>...<HEAD>" --jq '"\(.status) \(.tot
 - 未完成项总表**本轮前 = 22 开放行**（与 `tests/test_ledger_plan_completeness.py` 的 PAIRS 22 条逐行对齐）。
 - 本批（本调查落地）**新增 1 行**（参考项目借鉴面落地的 P1/P2/P3 轴）⇒ **22 → 23**，PAIRS 同步 23。
 
+### 3.5 落地追记（P0 两项均已落地）
+
+> ⚠️ §3.1 / §3.2 记的是**调查当时（已提交 HEAD）的缺陷态**，作为该次调查的历史快照保留。
+> 下记两项的**落地事实**（判据见各自提交与守门）：
+
+- **P0-1 已落地** = `78b01a6`（`feat(event_stream): 占位进度消息渲染 tool_trace`）——
+  新增 `Turn.progress_display_text()`（trace 行 + 正文；trace 为空时**逐字节等于** `assemble()`）
+  + `EventStream._refresh_progress_with_trace()`（**仅句柄已存在时**编辑，⛔ 不因工具事件新建占位）；
+  不变式：`assemble()`（=最终答复）逐字节未变、`shown_progress_text` 三处一律记 body、
+  两道长度闸按 display 判（更严 ⇒ body ≤ `one_message_budget` 保持）。
+  守门 = `tests/test_event_stream.py::ToolTraceRenderingTests` 8 用例。
+- **P0-2 已落地** = `5b37676`（`fix: Telegram 编辑撞 429 改为重试（解耦重试资格与计费）`）——
+  `TelegramHttp._api` 的 429 重试门**移除对 `_BILLABLE_METHODS` 的依赖**（计费仍只 gate `_await_send_budget`，未动）。
+  守门 = `tests/test_telegram_edit_retry.py` 5 用例 + 既有 `test_telegram_edit_send_budget_wiring.py` 反向锁定。
+- ⚠️ **§3.2 那段「起草期观察（不作结论）」现已兑现**：当时在飞的那条 lane 即本条 P0-2，已按 §9
+  等它落地并核对（⛔ 未在其在飞时裁决）。
+
 ---
 
 ## 4. 三视角
@@ -220,8 +237,8 @@ gh api "repos/<owner>/<repo>/compare/<基线>...<HEAD>" --jq '"\(.status) \(.tot
 
 | 级别 | 项 | 依据 / 出处 | 状态与下一步 |
 |---|---|---|---|
-| **P0-1** | **`Turn.tool_trace` 渲染进占位进度** | 本桥 `Turn.tool_trace`（§3.1：三处收集、零渲染） | **待落地**：把 trace 并入占位进度文本，**受同一长度闸与节流约束**（`_on_text_delta` 的长度/节流两道闸不要绕过）；守门 + 反向证明照本桥纪律办 |
-| **P0-2** | **Telegram 编辑瞬时重试**（`editMessageText` 撞 429 零重试） | HEAD `TelegramHttp._api`（§3.2：重试门在 `_BILLABLE_METHODS` 上） | **待落地**：把「计费资格」与「重试资格」**解耦**；等待用 `_stop_event.wait`（⛔ 不用 `time.sleep`），保留 `MAX_SEND_ATTEMPTS` / `MAX_RATE_LIMIT_WAIT_SECONDS` 双上限。⚠️ 疑似另一 lane 在飞（§3.2 观察） |
+| **P0-1** | **`Turn.tool_trace` 渲染进占位进度** | 本桥 `Turn.tool_trace`（§3.1：三处收集、零渲染） | ✅ **已落地** `78b01a6`（判据见 §3.5） |
+| **P0-2** | **Telegram 编辑瞬时重试**（`editMessageText` 撞 429 零重试） | HEAD `TelegramHttp._api`（§3.2：重试门在 `_BILLABLE_METHODS` 上） | ✅ **已落地** `5b37676`（判据见 §3.5） |
 | **P1** | 会话环 / 导航 · `/reset` 语义 · `/new` 只增不删 · 会话列表 / 归档 · 群聊 @闸门 · 多模态 | 本桥现状 vs 参考项目能力面（§4.1） | **登记候选**；本轮未核源码。落地前提见 §7（尤其 `session.list`/`.archive`） |
 | **P2** | 占位清理 / 429 冷却 · 投递幂等 · overtaken · deferred turn · transcript 分页 · 命令目录按渠道过滤 · 适配器能力协商 | 参考项目同名机制 + 本桥既有面 | **登记候选**；本轮未核源码 |
 | **P3** | i18n · 按钮文案净化 · logging 组件路由 | 参考项目同名机制 + 本桥既有面 | **登记候选**；本轮未核源码 |
@@ -255,7 +272,7 @@ gh api "repos/<owner>/<repo>/compare/<基线>...<HEAD>" --jq '"\(.status) \(.tot
 
 ## 8. 下一步
 
-1. **落地 P0-1 / P0-2**（§5）：各自独立提交 + 独立守门 + 反向证明；⚠️ P0-2 先确认另一 lane 的在飞状态，⛔ 不与之并发改同一文件（`AGENTS.md` §9）。
+1. ~~**落地 P0-1 / P0-2**（§5）~~ ⇒ ✅ **已落地**（P0-1 `78b01a6` · P0-2 `5b37676`，各自独立提交 + 独立守门 + 反向证明，判据见 §3.5）；⚠️ P0-2 落地前已按 §9 等另一 lane 终态、⛔ 未与之并发改同一文件。
 2. **P1 各条先核 §7 第 1 项**（`session.list`/`.archive`/`.fork`）；核出形状后再由用户拍板产品边界。
 3. **P2 / P3 维持登记**：⛔ 未核源码前不动工。
 4. **catalog 基线就地更新为 §1 四新 SHA**（含 2026-11-08 回看段），并记 FACTS 分歧（§1.1）。

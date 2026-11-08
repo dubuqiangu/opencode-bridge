@@ -218,8 +218,12 @@ class TelegramHttp:
     def _mark_backoff(self, conversation_id: str) -> None:
         """After a 429, push the next allowed send further out (2s)."""
         backoff = getattr(self._adapter, "backoff_interval", BACKOFF_INTERVAL)
+        # ``min_interval`` 与 ``backoff_interval`` 一样按 getattr 取默认：本方法由
+        # ``_api`` 在自己的 ``try`` **之外**调用，而 ``_api`` 契约是「Never raises」
+        # ⇒ 裸读一个没有该属性的适配器会抛 ``AttributeError``、把那次 429 变成异常。
+        interval = getattr(self._adapter, "min_interval", MIN_SEND_INTERVAL)
         with self._adapter._throttle_lock:
-            self._adapter._last_send[conversation_id] = time.monotonic() + backoff - self._adapter.min_interval
+            self._adapter._last_send[conversation_id] = time.monotonic() + backoff - interval
 
     def _await_send_budget(self, conversation_id: str) -> None:
         """等到这个聊天有「新建消息」额度，并把这一刻记进窗口。

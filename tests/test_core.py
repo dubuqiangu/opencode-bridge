@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -19,6 +20,7 @@ from unittest import mock
 from opencode_bridge.adapters.base import Adapter
 from opencode_bridge import __main__ as cli
 from opencode_bridge import bridge_runner
+from opencode_bridge import logging_setup
 from opencode_bridge import platform_status
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
@@ -55,6 +57,12 @@ DEFAULT_BRIDGE = {
     "webhook_port": 0,
     # A3：共享 webhook server 绑定地址（默认仅本机回环；换地址 = 显式放宽）
     "webhook_host": "127.0.0.1",
+    # Fix 4：Python 进程自己的滚动日志文件（相对路径按 bridge 目录解析）
+    "log_file": "bridge.log",
+    # Fix 4：单个日志文件的字节上限（20 MiB）
+    "log_max_bytes": 20 * 1024 * 1024,
+    # Fix 4：保留几份旧文件
+    "log_backup_count": 5,
 }
 
 
@@ -2130,9 +2138,52 @@ class CliTests(unittest.TestCase):
         """
         self.addCleanup(redaction.remove_redaction_filter)
 
-    @staticmethod
-    def _run_main_pinned_to(bridge_dir: str, argv: list[str]) -> int:
-        """跑**真的** :func:`cli.main`，但把 :func:`cli._bridge_dir` 钉在 ``bridge_dir`` 上。
+    #: 每次真跑 ``cli.main`` 后的泄漏账本（``(argv, [handler repr])``）。
+    #: 逐调用断言会漏 —— 见 :meth:`_run_main_pinned_to` 的 docstring。
+    _leak_ledger: list = []
+
+    @classmethod
+    def _leaked_rotating_file_handlers(cls) -> list:
+        """此刻 root logger 上**本仓自己的**滚动文件 handler。
+
+        判据只看 :data:`logging_setup.LOG_FILE_MARKER`（本仓唯一会打这个标记的地方），
+        ⛔ 不看「列表非空」—— 测试框架自己常驻一个 ``RotatingFileHandler``，
+        用「非空」判会永久假红；同理不按类型判「是不是我们装的」。
+        """
+        return [
+            handler
+            for handler in logging.getLogger().handlers
+            if isinstance(handler, logging.handlers.RotatingFileHandler)
+            and getattr(handler, logging_setup.LOG_FILE_MARKER, False)
+        ]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """整类跑完后收一次尾：断言 root 上**一个**本仓的滚动文件 handler 都没剩。
+
+        这一条补的是逐调用断言抓不到的那一档 —— **最后一个**用例漏下的 handler
+        之后没有任何 ``main()`` 调用去「吸收」它，逐调用扫描永远不会看见它。
+        两者合起来才覆盖「树的状态」，而不是「两次调用之间的差」。
+        """
+        try:
+            leaked = cls._leaked_rotating_file_handlers()
+            ledger = list(getattr(cls, "_leak_ledger", ()))
+        finally:
+            # 账本与 root 是本进程共享的，下一次整类跑不该看到上一次的残留。
+            cls._leak_ledger = []
+            logging_setup.detach_rotating_file_handler()
+        assert leaked == [], (
+            "CliTests left rotating file handler(s) on the root logger after the "
+            "whole class: " + repr([repr(handler) for handler in leaked])
+        )
+        assert all(record[1] == [] for record in ledger), (
+            "at least one cli.main() call leaked the rotating file handler; "
+            "ledger = " + repr(ledger)
+        )
+
+    @classmethod
+    def _run_main_pinned_to(cls, pinned_workspace_directory: str, argv: list[str]) -> int:
+        """跑**真的** :func:`cli.main`，但把 :func:`cli._bridge_dir` 钉在 ``pinned_workspace_directory`` 上。
 
         ⚠️ 为什么必须钉：``main`` 在"配置里没有可用适配器"那条路上会走
         :func:`cli._record_bridge_refusal` → :func:`opencode_bridge.health.record_startup_probes`，
@@ -2142,9 +2193,51 @@ class CliTests(unittest.TestCase):
 
         手法抄 :mod:`tests.test_bridge_refusal_probe` 的 ``_RefusalHarness``；⛔ **不许**
         用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
+
+        ⭐ 返回值之外还做一件事：**把「这次调用有没有把滚动文件 handler 漏在 root
+        logger 上」记进类级账本**，由 :meth:`tearDownClass` 在**整个类跑完**后统一断言。
+        ``main()`` 的 ``finally: detach_rotating_file_handler()`` 就是为了这一条，
+        而它原先**一条能红的用例都没有**（反向证明 13/13 全绿 ⇒ 删掉照过）
+        —— 只断言 ``rc == 0`` 抓不到「句柄还开着」，因为进程没退出、临时目录
+        也不是立刻删。
+
+        ⚠️ 为什么账本放在**类级**、而不是这里就地 ``assert``（这是修过的缺陷）：
+        ``main()`` 自己会在 ``finally`` 里卸一次，所以「调用前后 root 上多出来的
+        id」这个**逐调用差集**在 ``main()`` 还正常时恒为空；可一旦 ``main()`` 那个
+        ``finally`` 坏了，**上一个用例漏下的 handler 会留在 root 上、成为下一个用例的
+        ‵before‵ 快照成员** ⇒ 差集照样为空、断言照样绿。它有辨别力**仅当**没有任何
+        用例自己直接装过 handler —— 而 ``test_no_adapters_configured_exits_0_gracefully``
+        正是在 ``main()`` 之前**自己** ``install_rotating_file_handler(...)`` 装一个。
+        于是漏下的 handler 被它「吸收」进下一次 ``before``，缺陷贯穿全部用例而零红。
+
+        正确判据必须量**树的状态**、不是**两次调用之间的差**：
+        ① 每次 ``main()`` 返回后，root 上**此刻**还有没有带本仓标记的
+           ``RotatingFileHandler`` —— 有就是漏了，**不管它是哪一次装上来的**；
+        ② ``tearDownClass`` 再对**整个类**收一次尾，抓「最后一个用例漏了、
+           且没人再调用 ``main()`` 去吸收」这一档。
+        测试框架自己在 root 上可能常驻 RotatingFileHandler，所以判据只看
+        ``LOG_FILE_MARKER``（本仓自己打的标记），不看「列表非空」。
         """
-        with mock.patch.object(bridge_runner, "_bridge_dir", lambda: bridge_dir):
-            return cli.main(argv)
+        # ⚠️ 钉的是 ``cli._bridge_dir``，不是 ``bridge_runner._bridge_dir``：
+        # ``from .bridge_runner import _bridge_dir`` 是**按值**绑定的，``main()`` 解析的是
+        # ``__global__``（= 本模块字典），改 ``bridge_runner`` 上的同名属性**对它零影响**
+        # （实测：两臂只差钉哪一处，钉 bridge_runner 那臂 ``cli._bridge_dir()`` 仍回真实目录）
+        # ⇒ 钉错对象时 ``main()`` 从没读过这个替身，临时目录里也就从没建过 handler
+        # ⇒ ⇒ 漏 handle 的用例**恒绿**，而它还看着在测这一条。
+        with mock.patch.object(cli, "_bridge_dir", lambda: pinned_workspace_directory):
+            rc = cli.main(argv)
+        # ⚠️ 扫描必须在 ``with`` **之后**：``main()`` 的 ``finally`` 里已经卸过一次，
+        # 而块内扫只能看见「还在不在」—— 两处都扫才区分得开「从没装上」与「装了没卸」。
+        # ⚠️ 而判据**不是** id & ``before`` 的差集（见 docstring：那会被上一个用例的
+        # 泄漏吸收成恒空）；它就是「现在 root 上有没有带本仓标记的滚动文件 handler」。
+        leaked = cls._leaked_rotating_file_handlers()
+        cls._leak_ledger.append((argv, [repr(handler) for handler in leaked]))
+        assert leaked == [], (
+            "main() left the rotating file handler on the root logger; "
+            "on Windows that is WinError 32 when the caller removes the dir: "
+            + repr([repr(handler) for handler in leaked])
+        )
+        return rc
 
     def test_empty_adapter_tokens_exit_0_without_traceback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2160,6 +2253,11 @@ class CliTests(unittest.TestCase):
                 },
             )
             stderr = io.StringIO()
+            logging_setup.install_rotating_file_handler(
+                os.path.join(td, "bridge.log"),
+                max_bytes=1024 * 1024,
+                backup_count=1,
+            )
             with mock.patch.dict(
                 os.environ,
                 {
@@ -2181,6 +2279,11 @@ class CliTests(unittest.TestCase):
                 td, {"state_path": os.path.join(td, "state.json")}
             )
             stderr = io.StringIO()
+            logging_setup.install_rotating_file_handler(
+                os.path.join(td, "bridge.log"),
+                max_bytes=1024 * 1024,
+                backup_count=1,
+            )
             with mock.patch.dict(
                 os.environ,
                 {

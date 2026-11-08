@@ -255,6 +255,12 @@ class EventStream:
     #: 保证噪音有硬上限。
     _UNHANDLED_LOG_INTERVAL_SECONDS = 60.0
 
+    #: 未知事件名账本的**容量上限**。节流只约束"多久打一行"，⛔ 不约束"记多少行"
+    #: —— 一个每次带新名字的事件源（上游加了带 id 后缀的事件名、或某段重放逻辑）
+    #: 会让 :attr:`_unhandled_event_names` 无限增长，而 docstring 许诺的是有界。
+    #: 溢出时淘汰最早记入的名字（字典保序），"最近出现过哪些"这条信息不受影响。
+    _UNHANDLED_EVENT_NAME_LIMIT = 256
+
     def __init__(
         self,
         *,
@@ -482,6 +488,14 @@ class EventStream:
         """
         previous_count = self._unhandled_event_names.get(event_name, 0)
         self._unhandled_event_names[event_name] = previous_count + 1
+        # 溢出了才淘汰，且淘汰的是**最早记入**的那个（dict 保持插入序）。
+        # ⚠️ 代价：一个只来一次的名字会在 256 个更晚的新名字之后被挤掉，那时它
+        # 的「首次见到」那行早就打过了 —— 所以被挤掉的只是"再次汇总里还算数"，
+        # 不是"从没被看见"。不淘汰的话这一份就是无界的（见上方 :attr: 的许诺）。
+        if len(self._unhandled_event_names) > self._UNHANDLED_EVENT_NAME_LIMIT:
+            self._unhandled_event_names.pop(
+                next(iter(self._unhandled_event_names)), None
+            )
 
         # 注入的时钟，与本类其它时间读法一致（流式节流用的就是它）。此前这里直接
         # 调模块级 ``time.monotonic()``，于是这个节流**没法用注入的时钟测** ——

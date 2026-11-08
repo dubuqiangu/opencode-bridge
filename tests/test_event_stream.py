@@ -508,6 +508,112 @@ class UnhandledEventAccountingTests(EventStreamTestCase):
 
 
 # ----------------------------------------------------------------------
+# 4b: 未知**会话**的记账边界（与上面"未知事件名"是两件事，别混）
+# ----------------------------------------------------------------------
+class UnknownSessionAccountingTests(EventStreamTestCase):
+    """``dispatch`` 里"没有 handler"与"属于别的会话"是两条路。
+
+    上面那一组测的是前者（名字不认识 -> 记账）；这一组测后者（名字认识、会话
+    不是本桥的 -> 不上 IM、不进账本）。
+    """
+
+    def test_the_ignored_events_are_not_routed_through_the_ownership_filter(self):
+        """第三条路：名字**故意忽略**。它既不该记账，也不该去问归属。
+
+        ``session.reasoning.delta`` 既是"故意忽略"又在高频白名单里 —— 对它
+        问归属要拿锁、要拷一份 ``state.all_sessions()``，而答案不影响结果
+        （两条路都是静默丢）。纯广播的高频量下这次多余加锁是白付的 CPU。
+        """
+        self.feed(text_delta(SESSION_ID, "noise"))
+        self.start_turn()
+        reads_before = self.state.reads
+
+        with self.assertNoLogs("opencode_bridge.event_stream", level="INFO"):
+            self.feed(ev("session.reasoning.delta", sessionID=SESSION_ID,
+                         delta="思考中"))
+
+        self.assertEqual(self.state.reads, reads_before,
+                         "故意忽略的事件不该触发一次 state 全量拷贝")
+        self.assertEqual(self.stream._unhandled_event_names, {})
+
+    def test_a_high_volume_event_inside_a_live_turn_for_an_unknown_session_is_still_dropped(
+            self):
+        """高频事件的归属判定**含** turn 表，不只是 ``state.json``。
+
+        重启续跑时 turn 是内存里的（``_turns``），而 ``state.json`` 可能还没写回 ——
+        这时只看反向表会把**自己**的续跑帧当别人的丢掉（turn 丢，用户看不到这一轮）。
+        """
+        self.turns["ses_resumed_in_memory"] = Turn(conversation_id=CONVERSATION)
+
+        self.feed(text_delta("ses_resumed_in_memory", "续跑"))
+
+        self.assertIn("ses_resumed_in_memory", self.turns)
+        self.assertEqual(self.last_text(), "续跑")
+
+    def test_a_low_frequency_event_for_an_unknown_session_reaches_its_handler(self):
+        """``permission.asked`` 不在高频白名单里 ⇒ 归属闸门放行。
+
+        放行是**有意**的（见 ``_HIGH_VOLUME_SESSION_EVENTS`` 上方注释）：留一条路
+        让"未知会话"在 handler 里被说出来，而不是被归属闸门无声吞掉。
+        """
+        with self.assertLogs("opencode_bridge.event_stream", level="WARNING"):
+            self.feed(ev("permission.asked", sessionID="ses_ghost", id="per_1"))
+
+        self.assertEqual(self.send_text.outgoing, [])
+
+    def test_a_high_volume_event_for_an_unknown_session_is_dropped_before_accounting(self):
+        """高频事件走归属闸门、被丢掉 —— ⚠️ 它是**认识**的名字，不记账。
+
+        这条容易被"顺带加一行记账"改坏：``_note_unhandled_event`` 的职责是
+        "我们不认识这个名字"，而不是"这一帧我们没处理"。把不属于本桥的会话记进
+        去，等于让同机别的 agent 的流量去挤本桥的未知事件账本 —— 而那个账本的
+        唯一读者是排障人，他看到的东西会与 opencode 的版本格格不入。
+        """
+        self.assertNotIn("ses_ghost", self.sessions)
+
+        with self.assertNoLogs("opencode_bridge.event_stream", level="INFO"):
+            self.feed(ev("session.reasoning.delta", sessionID="ses_ghost",
+                         delta="noise"))
+            self.feed(text_delta("ses_ghost", "noise"))
+
+        self.assertEqual(self.stream._unhandled_event_names, {})
+        self.assertNotIn("ses_ghost", self.turns)
+        self.assertEqual(self.send_text.outgoing, [])
+
+    def test_a_low_frequency_event_for_an_unknown_session_is_not_accounted(self):
+        """放行 ≠ 记账：handled 的名字永远不进未知事件账本（哪怕会话不认识）。"""
+        with self.assertLogs("opencode_bridge.event_stream", level="WARNING"):
+            self.feed(ev("session.execution.failed",
+                         sessionID="ses_ghost_in_failure",
+                         error={"type": "boom", "message": "炸了"}))
+
+        self.assertEqual(self.stream._unhandled_event_names, {})
+        self.assertEqual(self.finalize_calls, [])
+
+    def test_the_unhandled_ledger_stays_bounded_on_a_flood_of_distinct_names(self):
+        """账本必须**有界** —— ``:attr:`` 的注释明写"有界，不无限增长"。
+
+        ⚠️ 节流约束的是"多久打一行日志"，⛔ 不约束"记多少个名字"。一个每次带新
+        名字的事件源（上游给事件名加 id 后缀、某段重放）能让它无限增长，而这里
+        记的正是"今晚涨没涨"这种长跑关注点。上界取容器自己的常量，⛔ 不在用例里
+        再抄一个魔数 —— 抄了就变成两处常量谁改谁过期。
+        """
+        capacity = EventStream._UNHANDLED_EVENT_NAME_LIMIT
+        total = capacity * 3
+
+        for index in range(total):
+            self.ticks[0] += 1.0  # 每个名字都是首见；汇总行只会打 1 次
+            self.feed(ev("session.flood.event.%05d" % index))
+
+        self.assertEqual(len(self.stream._unhandled_event_names), capacity)
+        latest = "session.flood.event.%05d" % (total - 1)
+        self.assertIn(latest, self.stream._unhandled_event_names,
+                      "溢出淘汰的必须是**最早**记入的，最新的不许被挤掉")
+        self.assertNotIn("session.flood.event.00000",
+                         self.stream._unhandled_event_names)
+
+
+# ----------------------------------------------------------------------
 # 6-8: turn 生命周期
 # ----------------------------------------------------------------------
 class TurnLifecycleTests(EventStreamTestCase):

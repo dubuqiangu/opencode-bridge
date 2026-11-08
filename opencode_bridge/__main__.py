@@ -34,6 +34,7 @@ from .diagnostics import ProcessDiagnostics, describe_environment
 from . import credential_health
 from . import health
 from .held_buffer_store import HELD_BUFFER_FILE_NAME, HeldBufferStore
+from .logging_setup import detach_rotating_file_handler
 from .instance_lock import InstanceLock, pid_is_alive
 from .inbox import InboundInbox
 from .opencode_client import OpenCodeClient, discover_endpoint
@@ -105,12 +106,42 @@ __all__ = ["main"]
 logger = logging.getLogger("opencode_bridge")
 
 
-def _setup_logging(level: str) -> None:
+def _install_rotating_file_sink(numeric: int, bridge: dict) -> None:
+    """Attach the size-bounded log file (Fix 4) BEFORE the redaction filter runs.
+
+    Order matters: ``install_redaction_filter()`` only walks handlers that already
+    exist, so a handler attached after it would receive unscrubbed records. The
+    filter is installed by the caller, right after this returns.
+
+    Never raises. A log file is an aid, not a startup precondition -- an unwritable
+    directory must degrade to "stderr only", not stop the bridge.
+    """
+    log_file = bridge.get("log_file", "")
+    max_bytes = bridge.get("log_max_bytes", 0)
+    backup_count = bridge.get("log_backup_count", 0)
+    if not isinstance(log_file, str) or not log_file:
+        return
+    try:
+        from .logging_setup import install_rotating_file_handler, resolve_log_path
+        from .bridge_runner import _bridge_dir
+
+        install_rotating_file_handler(
+            resolve_log_path(log_file, _bridge_dir()),
+            max_bytes=int(max_bytes),
+            backup_count=max(0, int(backup_count)),
+            level=numeric,
+        )
+    except Exception:  # noqa: BLE001 - degrade to stderr, never stop startup
+        logger.warning("无法打开日志文件 %r，仅保留 stderr 输出", log_file)
+
+
+def _setup_logging(level: str, bridge: dict | None = None) -> None:
     numeric = getattr(logging, str(level or "INFO").upper(), logging.INFO)
     logging.basicConfig(
         level=numeric,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    _install_rotating_file_sink(numeric, bridge or {})
     # 脱敏过滤器必须挂在 **basicConfig 之后**：它装在 handler 上，而 handler 是
     # basicConfig 建的。全仓库 34 个 logger 都是 ``opencode_bridge.*`` 的后代、
     # 记录一律 propagate 到 root，所以这一行就覆盖了全部 13 个适配器以及将来
@@ -232,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         logger.exception("加载配置失败")
         return 1
-    _setup_logging("DEBUG" if args.verbose else cfg.log_level)
+    _setup_logging("DEBUG" if args.verbose else cfg.log_level, cfg.bridge)
 
     try:
         if args.check:
@@ -252,6 +283,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         logger.exception("opencode-bridge 异常退出")
         return 1
+    finally:
+        # Fix 4：滚动文件句柄是**进程级**资源，必须在这里交还。
+        # ``--status`` / ``--check`` / ``--setup`` 全都是「读完盘就退出」的短命令，
+        # 但日志文件与它们**无关** —— 不在这里关，进程退出时句柄才被回收，
+        # 而 Windows 上「句柄还在」就等于「那个目录删不掉」（实测：同进程里连续跑
+        # 两条会抛 WinError 32）。⛔ 不放到各分支里各关一次：那会漏掉将来新增的分支。
+        detach_rotating_file_handler()
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -107,18 +107,38 @@ _BRIDGE_DEFAULTS: dict[str, Any] = {
     # 绑非回环是部署者的显式决定；hub 侧会另发 WARNING（hub 层无统一鉴权，
     # 各 handler 必须自验平台签名）。
     "webhook_host": DEFAULT_BIND_HOST,
+    # Fix 4：Python 进程自己的**滚动**日志文件（相对路径按 bridge 目录解析，
+    # 空串 = 不写文件，只留 stderr）。2026-11-07 之前 Python 只往 stderr 写，
+    # 而插件把 stderr 重定向进 ``bridge-output.log`` 且**从不轮转** ——
+    # 那个文件长到 227 MB，让「看日志排障」本身变成了不可做的一件事。
+    # ⚠️ ``plugin/index.ts`` 必须**同时**停掉那条重定向，否则这里的滚动只是
+    # 让同一份内容多写一份，227 MB 那个文件照样长。
+    "log_file": "bridge.log",
+    # 单个日志文件的字节上限。20 MB × 5 份 ⇒ 最坏 120 MB，比那个 227 MB 小一个量级。
+    "log_max_bytes": 20 * 1024 * 1024,
+    # 保留几份旧文件（含正在写的那一份，总计 ≤ log_max_bytes × (log_backup_count + 1)）。
+    "log_backup_count": 5,
 }
 
 #: ``bridge`` 段里要取整的键。``0`` 对这几个键都是**合法值**
 #: （``webhook_port`` 的 ``0`` = 操作系统分配；另两个 = 关掉该功能），
 #: 所以取整后只挡负数，不像 ``max_message_chars`` 那样要求至少 1。
 _BRIDGE_INTEGER_KEYS = frozenset(
-    {"max_message_chars", "long_input_ack_chars", "webhook_port"}
+    {
+        "max_message_chars",
+        "long_input_ack_chars",
+        "webhook_port",
+        "log_max_bytes",
+        "log_backup_count",
+    }
 )
 
 #: ``bridge`` 段里**字符串**值的键。``_merge_bridge`` 默认把一切值过
 #: ``float()`` 并拒收字符串 —— 这组键是例外（A3 为 ``webhook_host`` 加：
 #: 绑定地址本来就不是数）。非法值（非字符串 / 空串）回落默认并点名告警。
+#: ⚠️ ``log_file`` 的**空串是合法值**（= 不写文件、只留 stderr），
+#: 所以它不走这里那条 ``value.strip()`` 判空，见 ``_merge_bridge`` 里
+#: ``key == "log_file"`` 的专属分支。
 _BRIDGE_STRING_KEYS = frozenset({"webhook_host"})
 
 _ENV_OVERRIDES: dict[str, str] = {
@@ -258,6 +278,19 @@ class Config:
         for key, value in raw.items():
             if key not in merged:
                 logger.warning("ignoring unknown bridge config key: %r", key)
+                continue
+            if key == "log_file":
+                # Fix 4：**空串是合法值**（= 不写文件），所以它不能走
+                # ``_BRIDGE_STRING_KEYS`` 那条 ``value.strip()`` 判空的分支
+                # —— 那条会把「刻意关掉」当成「配错了」再反驳回去。
+                if isinstance(value, str):
+                    merged[key] = value
+                else:
+                    logger.warning(
+                        "ignoring bridge config key %r with invalid value %r",
+                        key,
+                        value,
+                    )
                 continue
             if key in _BRIDGE_STRING_KEYS:
                 # 字符串键（A3 的 ``webhook_host``）：非空字符串合法、

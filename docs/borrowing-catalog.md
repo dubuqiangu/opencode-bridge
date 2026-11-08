@@ -8,12 +8,13 @@
 
 | 项目 | license | stars | 活跃度 | 锁定版本 |
 |---|---|---|---|---|
-| `MichengAI/dsh-im-connect` | Apache-2.0 | 113 | 2026-10-30 仍在推送 | `0e66d949fab51ebfac8948a11f086dee5ac7cff7` |
-| `xmanrui/dsh-im` | MIT | 3017 | 2026-10-31 仍在推送 | `14f8648e49502bad6b5caf54fea7b7c77dcdfb0c` |
-| `NousResearch/hermes-agent` | MIT | 259200 | 2026-11-01 仍在推送 | `016b76da3a8a88e28775e08b6ca2846f471b8eda` |
-| `zhuiyueya/dsh-im-gateway` | MIT | 58 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
+| `MichengAI/dsh-im-connect` | Apache-2.0 | 127 | 2026-11-06 仍在推送 | `d869823dac938cc5fc1dbfee3dce23907d3dd8e9` |
+| `xmanrui/dsh-im` | MIT | 3339 | 2026-11-07 仍在推送 | `fc2ceab217309f8973afa03c58cdd8ff3e900130` |
+| `NousResearch/hermes-agent` | MIT | 261525 | 2026-11-08 仍在推送 | `93a2ae2eac31ccd4d9811411e54338e6a9cfe5ee` |
+| `zhuiyueya/dsh-im-gateway` | MIT | 59 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
 
 以上四项均未归档（**2026-11-01** `gh` 现查：`isArchived` 四项均 false；本地 clone 已 `--unshallow` 后 `fetch` 复核 dsh-im/dsh-im-connect，`origin/main` 与 live HEAD 逐字相等；dsh-im-gateway 经 `gh api` 比对 HEAD 零差异 —— 该仓本轮**无本地 clone**，判据只有 `gh api` 这一路。⚠️ 本轮 `gh repo view --json licenseInfo` 四项 `spdxId` 均为 `null` ⇒ **license 本轮未独立复核**，上表 license 列沿用既往已知值）。
+⚠️ **2026-11-08 回看**：四行里三个 HEAD 再前移 —— dsh-im `14f8648`→`fc2ceab`（+49 commit / 141 files）· dsh-im-connect `0e66d94`→`d869823`（+25 commit / 70 files）· hermes-agent `016b76da`→`93a2ae2e`（本轮回看基线；compare **2677 commit / 300 files** 触 `gh` compare 300-file 上限截断，⚠️ 本轮**未逐 commit 读 diff** ⇒ 「全库零 opencode 事件流消费」结论**最后被证据支持仍在 `3cbb13f`**）；dsh-im-gateway `8e8fbca` **连续第七轮零差异**（本仓无本地 clone ⇒ 判据只有 `gh api` 一路）。star 变化：113→127（dsh-im-connect）· 3017→**3339**（dsh-im）· 259200→261525（hermes-agent）· 58→59（gateway）。**四项均未归档**（2026-11-08 `gh` 现查 `isArchived` 四项均 false）；⚠️ **license 本轮未独立复核**（四项 `gh repo view --json licenseInfo --jq .licenseInfo.spdxId` **均返回空**）⇒ 上表 license 列沿用既往已知值。⚠️ **本轮未逐 commit 读任何参考项目 diff** ⇒ catalog 各节借鉴点结论**不更新**；本轮细读结论（含本桥侧 P0 两项的源码依据）见 **`docs/reference-projects-survey.md`**。
 ⚠️ **2026-11-01 回看**：四行里三个 HEAD 再前移 —— dsh-im `e278ac7`→`14f8648`（+59 commit / 78 files，v5.8.0→v5.9.1，见 §2.5 本轮）· dsh-im-connect `6ef35e0`→`0e66d94`（+11 commit / 7 files，⚠️ 本轮 version tag **未核**，见 §1.4）· hermes-agent `190c0b7`→`016b76da`（本轮回看基线；compare 711 commit / 300 files 触 `gh` compare 300-file 上限截断 `gateway/*`，未见 telegram/slack/discord 文件被触及，见 §3 末段）；dsh-im-gateway `8e8fbca` **连续第六轮零差异**。star 变化：102→113（dsh-im-connect）· 2746→**3017**（dsh-im）· 258011→259200（hermes-agent）· 56→58（gateway）。本轮细读结论见 §1.4 与 §2.5；hermes 本轮**无新增候选**。
 ⚠️ **2026-10-28 回看（上一轮，已被上面的 11-01 取代为新基线，此段保留作历史）**：四行里三个 HEAD 再前移 —— dsh-im `e686e15`→`e278ac7`（+~18 commit，**telegram 相关 0**，tag v5.2.0→v5.7.0，见 §2.3）· dsh-im-connect `551f029`→`6ef35e0`（+19 commit，**telegram 专项 0**，tag v1.0.11→v1.0.19，见 §1.3）· hermes-agent `4ea8d23`→`190c0b7`（本轮回看基线；⚠️ 该轮**仅 poll 了 HEAD/stars/archived，未逐 commit 读 diff**，故不写 commit 数 —— 见 §3 末段）；dsh-im-gateway `8e8fbca` **连续第五轮零差异**。star 变化：93→102（dsh-im-connect）· 2497→**2746**（dsh-im）· 256994→258011（hermes-agent）· 54→56（gateway）。该轮细读结论见 §1.3 与 §2.3。
 ⚠️ **2026-10-25 回看（上一轮，已被上面的 10-28 取代为新基线，此段保留作历史）**：四行里三个 HEAD 再前移 —— dsh-im `8ac3e6e`→`e686e15`（+60 commit，**8 个 telegram 相关**，新增可借鉴点见 §2.3）· dsh-im-connect `93428ed`→`551f029`（telegram 相关 **0**）· hermes-agent `3cbb13f`→`4ea8d23`（本轮回看基线；⚠️ live HEAD 已再前移 `d050956`，+407 commit，均 2026-10-25 `gh` 现查）；dsh-im-gateway `8e8fbca` **连续第四轮零差异**。star 四项全部变化（79→93 / 2257→**2497** / 255751→256994 / 54→54），四项**均未归档**（均 2026-10-25 `gh` 现查）。本轮细读结论见 §1.3 与 §2.3。

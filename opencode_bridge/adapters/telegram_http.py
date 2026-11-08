@@ -146,9 +146,13 @@ class TelegramHttp:
         2. :meth:`_await_send_budget` —— 每聊天每分钟**新建消息**预算，只对
            :attr:`_BILLABLE_METHODS` 生效（编辑 / typing / reaction / 回调
            应答不计费，否则一次流式改写就能把预算耗光）；
-        3. 429 重试 —— 最多 :data:`MAX_SEND_ATTEMPTS` 次尝试、累计等待不超过
-           :data:`MAX_RATE_LIMIT_WAIT_SECONDS`；**等待用 ``_stop_event.wait``**
-           而不是 ``time.sleep``，所以 ``stop()`` 能立刻打断（此前最坏被拖 60s）。
+        3. 429 重试 —— **所有**方法都重试（编辑 / 草稿也算）：429 意味着请求被
+           平台**拒绝**、没有副作用 ⇒ 重试安全。⛔ **计费（第 2 道闸）与重试资格
+           是两件事** —— 曾经拿 :attr:`_BILLABLE_METHODS` 兼当「值得重试」的代理，
+           于是 :meth:`edit` 撞 429 时**零重试**（当帧白丢，等下一帧再改）。重试仍受
+           :data:`MAX_SEND_ATTEMPTS` 次尝试与累计等待 :data:`MAX_RATE_LIMIT_WAIT_SECONDS`
+           的双上限约束；**等待用 ``_stop_event.wait``**而不是 ``time.sleep``，
+           所以 ``stop()`` 能立刻打断（此前最坏被拖 60s）。
 
         Returns the final response dict; on transport failure returns
         ``{"ok": False}``. Never raises.
@@ -170,15 +174,6 @@ class TelegramHttp:
                 break
             delay = _retry_after(data)
             if delay is None:
-                break
-            if method not in self._adapter._BILLABLE_METHODS:
-                # 上游机制：编辑 / 草稿撞 429 不重试、直接返回失败（下一帧
-                # 会再试，且 _mark_backoff 让下一次至少隔 2s）。套上重试会把
-                # 一次流式改写的等待拖到 60s，比丢掉这一帧更坏。
-                logger.warning(
-                    "telegram: %s rate-limited（非计费方法，不重试）", method
-                )
-                self._adapter._mark_backoff(conversation_id)
                 break
             wait = rate_limit_wait_seconds(
                 delay, already_waited=already_waited, attempts_done=attempts_done

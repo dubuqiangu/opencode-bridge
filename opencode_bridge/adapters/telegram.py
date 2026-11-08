@@ -153,6 +153,9 @@ class TelegramAdapter(Adapter):
     #: 计费方法：只有「新建一条消息」消耗每聊天预算。``sendRichMessage`` /
     #: ``sendDocument`` / ``sendPhoto`` 目前零调用点，但列进来是为了让
     #: 「哪些方法计费」这一判断只存在一处 —— 接媒体时不必再想起预算。
+    #: ⛔ **这个集合【只】管计费**（:meth:`_await_send_budget` 的闸门）；
+    #: 429 重试资格与计费**无关**（见 :meth:`TelegramHttp._api` 第 3 道闸）——
+    #: 曾把它兼当「值得重试」的代理 ⇒ 编辑撞 429 零重试。
     _BILLABLE_METHODS = frozenset(
         {"sendMessage", "sendRichMessage", "sendDocument", "sendPhoto"}
     )

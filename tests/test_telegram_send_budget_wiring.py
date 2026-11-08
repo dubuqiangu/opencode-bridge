@@ -200,11 +200,12 @@ class The429RetryTests(unittest.TestCase):
         self.assertEqual(len(posts), 2)
         self.assertEqual(waits, [40.0])
 
-    def test_a_rate_limited_edit_is_not_retried(self):
-        """编辑撞 429 ⇒ 只发 1 次、零等待（返回失败，让下一帧再试）。
+    def test_a_rate_limited_edit_is_retried_too(self):
+        """编辑撞 429 ⇒ 与 ``sendMessage`` 同等地重试（4 次尝试、3 次等待）。
 
-        红的情形：把编辑也套进 4 次重试 ⇒ 一次流式改写最坏被拖 60s，
-        而这期间后续帧与最终答复都排在它后面。
+        红的情形：退回「按 ``_BILLABLE_METHODS`` 门控重试」⇒ 编辑只发 1 次、
+        零等待（这正是被修的缺陷：编辑当帧 429 白丢，等下一帧再改）。
+        ⚠️ 重试资格与计费**无关** —— 429 意味着请求被拒、没有副作用。
         """
         adapter = make_adapter()
         posts = []
@@ -218,8 +219,8 @@ class The429RetryTests(unittest.TestCase):
         waits = []
         adapter._stop_event.wait = lambda seconds: waits.append(seconds) or False
         data = adapter._api("telegram:1", "editMessageText", {})
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(waits, [])
+        self.assertEqual(len(posts), 4)
+        self.assertEqual(waits, [5.0, 5.0, 5.0])
         self.assertIs(data["ok"], False)
 
     def test_stop_interrupts_the_429_wait_immediately(self):

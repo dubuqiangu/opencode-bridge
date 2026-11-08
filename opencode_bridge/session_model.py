@@ -201,6 +201,11 @@ class SessionModelCommand:
         self.ttl_seconds = ttl_seconds
         self.clock = clock
         self._lock = threading.Lock()
+        # 用条件变量包住同一把锁：TTL 过期后并发进来的调用者在这里排队，只放一个
+        # 去拉目录（单飞），其余等它拉完再复读缓存。网络调用仍在锁外（见
+        # :meth:`_catalog_entries`）。
+        self._catalog_ready = threading.Condition(self._lock)
+        self._catalog_loading = False
         self._catalog: tuple[CatalogEntry, ...] | None = None
         self._catalog_fresh_at = 0.0
 
@@ -325,19 +330,40 @@ class SessionModelCommand:
         return current_model_label(session)
 
     def _catalog_entries(self) -> tuple[CatalogEntry, ...]:
-        """模型目录，带 TTL 缓存（见 :data:`CATALOG_TTL_SECONDS` 的理由）。"""
-        with self._lock:
-            if (
-                self._catalog is not None
-                and self.clock() - self._catalog_fresh_at < self.ttl_seconds
-            ):
-                return self._catalog
-        # 网络调用放在锁外面：一次慢请求不该把并发着的另一个 /model 也堵住。
-        fresh = self._load_catalog()
-        with self._lock:
-            self._catalog = fresh
-            self._catalog_fresh_at = self.clock()
-            return fresh
+        """模型目录，带 TTL 缓存（见 :data:`CATALOG_TTL_SECONDS` 的理由）。
+
+        TTL 过期后并发进来的多个 ``/model`` 只允许触发**一次** ``list_models()``：
+        第一个抢到加载权的调用者去拉目录，其余的在 ``_catalog_ready`` 上等它拉完，
+        醒来自动复读到同一份新鲜目录（单飞）。网络调用始终在锁外发生——等待者
+        ``wait()`` 时会释放锁，所以命中缓存的调用者不会被一次慢请求堵住。
+        """
+        with self._catalog_ready:
+            while True:
+                if (
+                    self._catalog is not None
+                    and self.clock() - self._catalog_fresh_at < self.ttl_seconds
+                ):
+                    return self._catalog
+                if not self._catalog_loading:
+                    # 抢到加载权：由本线程去拉目录，其余调用者在下面 wait()。
+                    self._catalog_loading = True
+                    break
+                self._catalog_ready.wait()
+        # 网络调用放在锁外面：wait() 会释放锁，命中缓存的调用者不会被慢请求堵住。
+        loaded_catalog: tuple[CatalogEntry, ...] | None = None
+        try:
+            loaded_catalog = self._load_catalog()
+        finally:
+            # 无论成功还是抛异常，都要放掉加载权并唤醒等待者，否则它们会永远挂住。
+            with self._catalog_ready:
+                if loaded_catalog is not None:
+                    # 先把结果落进缓存再唤醒：否则被唤醒的调用者会看到仍旧过期的
+                    # 缓存，又去抢一次加载权 ⇒ 又一次 list_models()。
+                    self._catalog = loaded_catalog
+                    self._catalog_fresh_at = self.clock()
+                self._catalog_loading = False
+                self._catalog_ready.notify_all()
+        return loaded_catalog
 
     def _load_catalog(self) -> tuple[CatalogEntry, ...]:
         entries: list[CatalogEntry] = []

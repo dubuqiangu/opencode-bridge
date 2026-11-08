@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 
 from opencode_bridge.core import HELP_TEXT
@@ -245,6 +246,86 @@ class CatalogCacheTests(ModelCommandTestCase):
 
         self.assertEqual(len(self.client.model_switches), 1)
         self.assertEqual(len(self.client.list_models_calls), 2)
+
+
+class CatalogSingleFlightTests(ModelCommandTestCase):
+    """TTL 过期窗口内并发进来的 ``/model`` 只许拉一次目录（单飞）。"""
+
+    def test_concurrent_callers_in_the_expired_window_load_the_catalog_once(self):
+        catalog_command = self.core.model_command
+        now = [1000.0]
+        catalog_command.clock = lambda: now[0]
+        catalog_command.ttl_seconds = 60.0
+
+        # 先用一次单线程调用把缓存填上，再让时钟跳过 TTL —— 这样两个并发调用者
+        # 都会走到"缓存已过期"那一步（缓存为 None 时时钟求都求不到）。
+        catalog_command._catalog_entries()
+        now[0] = 1000.0 + 61.0
+        calls_before_concurrency = len(self.client.list_models_calls)
+        self.assertEqual(calls_before_concurrency, 1)
+
+        load_started = threading.Event()
+        release_load = threading.Event()
+        waiter_checked = threading.Event()
+        real_list_models = self.client.list_models
+
+        def blocking_list_models() -> list[dict]:
+            load_started.set()
+            # 死锁守卫：测试逻辑写错时在这里响亮失败，而不是永远挂住。
+            if not release_load.wait(timeout=5.0):
+                raise AssertionError("list_models 一直没有被放行")
+            return real_list_models()
+
+        self.client.list_models = blocking_list_models  # type: ignore[method-assign]
+
+        def instrumented_clock() -> float:
+            # 等待线程"检查缓存是否新鲜"时会读时钟；读到即说明它已进临界区，
+            # 即将决定是拉目录还是排队——这就是我们要的同步点。
+            if threading.current_thread().name == "catalog-waiter":
+                waiter_checked.set()
+            return now[0]
+
+        catalog_command.clock = instrumented_clock
+
+        loaded: list = []
+        errors: list = []
+
+        def call_catalog_entries() -> None:
+            try:
+                loaded.append(catalog_command._catalog_entries())
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        loader = threading.Thread(
+            target=call_catalog_entries, name="catalog-loader", daemon=True
+        )
+        waiter = threading.Thread(
+            target=call_catalog_entries, name="catalog-waiter", daemon=True
+        )
+        loader.start()
+        self.assertTrue(load_started.wait(timeout=5.0), "loader 没进到 list_models")
+
+        waiter.start()
+        self.assertTrue(
+            waiter_checked.wait(timeout=5.0), "第二个调用者没进到临界区"
+        )
+
+        release_load.set()
+        loader.join(timeout=5.0)
+        waiter.join(timeout=5.0)
+        self.assertFalse(loader.is_alive(), "loader 未结束")
+        self.assertFalse(waiter.is_alive(), "waiter 未结束")
+
+        self.assertEqual(errors, [])
+        # 单飞的判据：并发窗口里整份目录只许再拉一次。没有单飞时两个线程各拉
+        # 一次 = 并发增 2（预热 1 + 2 = 3）。
+        self.assertEqual(
+            len(self.client.list_models_calls) - calls_before_concurrency,
+            1,
+            "TTL 过期窗口内的并发调用必须只触发一次 list_models()",
+        )
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0], loaded[1])
 
 
 class MalformedArgumentTests(ModelCommandTestCase):

@@ -1013,18 +1013,18 @@ class TelegramAdapter(Adapter):
                     code if code is not None else "?",
                     desc or data,
                 )
-                params = data.get("parameters") if isinstance(data, dict) else None
-                retry_after = None
-                if isinstance(params, dict):
-                    retry_after = params.get("retry_after")
+                # ``retry_after`` 只作诊断值（不驱动重试）：统一走 :func:`_retry_after`
+                # —— 它只认 ``error_code == 429``（门控）并夹到
+                # :data:`MAX_RETRY_AFTER`，且**从不抛**（畸形输入返回 ``None``）。
+                # ⛔ 分类永远用 ``classify_http`` 的结果：畸形 ``retry_after``
+                # 之前会顺手把分类降成 ``SendError.UNKNOWN``、丢掉正确的限流分类。
                 try:
-                    self._note_send_failure(
-                        classify_http(int(code or 0), str(desc)),
-                        str(desc),
-                        retry_after=float(retry_after) if retry_after else None,
-                    )
+                    failure_kind = classify_http(int(code or 0), str(desc))
                 except (TypeError, ValueError):
-                    self._note_send_failure(SendError.UNKNOWN, str(desc))
+                    failure_kind = SendError.UNKNOWN
+                self._note_send_failure(
+                    failure_kind, str(desc), retry_after=_retry_after(data)
+                )
                 if handle is None:
                     return None
                 # 部分失败（用户拍板 2026-10-09「加缺口标记」）：前段已上线、

@@ -1110,6 +1110,142 @@ class ToolTraceTests(EventStreamTestCase):
 
 
 # ----------------------------------------------------------------------
+# 12b: 工具轨迹渲染进**占位进度消息**（不进最终答复）
+# ----------------------------------------------------------------------
+class ToolTraceRenderingTests(EventStreamTestCase):
+    """``tool_trace`` 只进**显示文本**（占位进度消息），⛔ 不进 ``assemble()``。
+
+    判据链：显示文本 = ``trace + body``，而 ``shown_progress_text``（收尾当"读者
+    已见过的下界"用的那个量）记录的**始终是 body**。这两条一起保证
+    ``outbound.finalize`` 不会拿含 trace 的串去挖正文。
+    """
+
+    def _give_a_progress_handle(self) -> MsgHandle:
+        """起一轮，并给这一轮塞一个**已存在**的占位消息句柄（不经过发信路径）。
+
+        句柄直接用 ``MsgHandle`` 构造，于是 ``send_text.outgoing`` 保持为空 ——
+        用例想断言"发了几条"时不会被造句柄这一步污染。
+        ``start_turn`` 把 ``last_edit_ts`` 重置为 0，所以紧随其后的第一帧不被节流。
+        """
+        self.start_turn()
+        handle = MsgHandle(
+            conversation_id=CONVERSATION, message_id="m_progress", platform=PLATFORM,
+        )
+        self.turns[SESSION_ID].progress_handle = handle
+        return handle
+
+    def test_progress_display_text_prefixes_the_trace_before_the_body(self):
+        """trace 非空 ⇒ ``trace + "\\n\\n" + assemble()``；trace 为空 ⇒ 逐字节等于 assemble。"""
+        turn = Turn(conversation_id=CONVERSATION)
+        turn.parts["msg_1"] = {0: "hello"}
+
+        self.assertEqual(turn.progress_display_text(), turn.assemble(),
+                         "空 trace 时必须与 assemble() 逐字节相同")
+        self.assertEqual(turn.progress_display_text(), "hello")
+
+        turn.tool_trace.append("▶ bash")
+        self.assertEqual(turn.progress_display_text(), "▶ bash\n\nhello")
+        self.assertEqual(turn.assemble(), "hello",
+                         "assemble() 仍然只有正文，⛔ 不带 trace")
+
+    def test_a_text_delta_after_a_tool_event_sends_the_trace_in_the_placeholder(self):
+        self.start_turn()
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+
+        self.feed(text_delta(SESSION_ID, "hello"))
+
+        sent = self.send_text.last
+        self.assertEqual(sent.kind, "progress")
+        self.assertEqual(sent.text, "▶ bash\n\nhello")
+        self.assertIn("▶ bash", sent.text)
+        self.assertIn("hello", sent.text)
+
+    def test_the_recorded_shown_text_is_the_body_not_the_rendered_trace(self):
+        self._give_a_progress_handle()
+        self.feed(text_delta(SESSION_ID, "answer"))
+        self.ticks[0] += 10.0
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+
+        turn = self.turns[SESSION_ID]
+        # 显示出去的那条**确实**带 trace
+        self.assertEqual(self.edit_progress_calls[-1][2], "▶ bash\n\nanswer")
+        # 而记进 shown_progress_text 的只有 body
+        self.assertEqual(turn.shown_progress_text, "answer")
+        self.assertNotIn("▶", turn.shown_progress_text)
+
+    def test_a_tool_event_without_a_progress_handle_creates_nothing(self):
+        self.start_turn()
+
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+
+        self.assertEqual(self.send_text.outgoing, [], "tool 事件不得新建占位消息")
+        self.assertEqual(self.edit_progress_calls, [])
+        self.assertIsNone(self.turns[SESSION_ID].progress_handle)
+        self.assertEqual(self.turns[SESSION_ID].tool_trace, ["▶ bash"],
+                         "trace 本身仍要记下（正文来时一并呈现）")
+
+    def test_a_tool_event_refreshes_an_existing_progress_message_with_the_trace(self):
+        self._give_a_progress_handle()
+        self.feed(text_delta(SESSION_ID, "answer"))
+        self.ticks[0] += 10.0
+
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+
+        self.assertEqual(len(self.edit_progress_calls), 2)
+        conversation, handle_id, text, session_id = self.edit_progress_calls[-1]
+        self.assertEqual(conversation, CONVERSATION)
+        self.assertEqual(handle_id, "m_progress")
+        self.assertEqual(text, "▶ bash\n\nanswer")
+        self.assertEqual(session_id, SESSION_ID)
+
+    def test_a_trace_that_pushes_the_display_over_budget_blocks_the_edit(self):
+        """**按 display 判长度**：trace 顶过预算而 body 没超 ⇒ 不发生编辑。"""
+        self.adapter.max_message_length = 20
+        self.rebuild(max_message_chars=100)
+        self._give_a_progress_handle()
+        self.feed(text_delta(SESSION_ID, "hello"))
+        self.ticks[0] += 10.0
+
+        # name 30 字符：display = "▶ " + 30 + "\n\nhello" = 39 > budget(20)，body 仍 5
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="x" * 30))
+
+        turn = self.turns[SESSION_ID]
+        self.assertEqual(len(turn.tool_trace), 1, "trace 仍被记下")
+        self.assertEqual(len(self.edit_progress_calls), 1,
+                         "被预算闸挡下 —— 不该有第二次编辑")
+        self.assertEqual(turn.shown_progress_text, "hello",
+                         "被挡下时已记录的 shown_progress_text 不变")
+
+    def test_finalizing_after_a_trace_publishes_the_clean_body(self):
+        self._give_a_progress_handle()
+        self.feed(text_delta(SESSION_ID, "answer"))
+        self.ticks[0] += 10.0
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+
+        self.feed(ev("session.execution.succeeded", sessionID=SESSION_ID))
+
+        _conversation, _handle, text, _session_id, kind, shown = self.finalize_calls[-1]
+        self.assertEqual(kind, "final")
+        self.assertEqual(text, "answer", "最终答复里不许出现 trace")
+        self.assertNotIn("▶", text)
+        self.assertEqual(shown, "answer",
+                         "收尾拿到的下界仍是 body（否则它会按含 trace 的串去挖正文）")
+        self.assertNotIn("▶", shown)
+
+    def test_two_tool_events_without_the_clock_advancing_edit_only_once(self):
+        """两处闸门（``_on_text_delta`` 与 ``_refresh_progress_with_trace``）一致。"""
+        self._give_a_progress_handle()
+
+        self.feed(ev("session.tool.called", sessionID=SESSION_ID, name="bash"))
+        self.feed(ev("session.tool.failed", sessionID=SESSION_ID, name="read"))
+
+        self.assertEqual(len(self.turns[SESSION_ID].tool_trace), 2,
+                         "两条 trace 都记下了")
+        self.assertEqual(len(self.edit_progress_calls), 1,
+                         "第二帧落在节流窗口内 ⇒ 只编辑一次")
+
+
+# ----------------------------------------------------------------------
 # 14-15: 重试提示与 shutdown 续跑
 # ----------------------------------------------------------------------
 class RetryAndInterruptTests(EventStreamTestCase):

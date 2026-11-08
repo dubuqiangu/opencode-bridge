@@ -114,6 +114,25 @@ class Turn:
                 chunks.append(by_ordinal[ordinal])
         return "".join(chunks)
 
+    def progress_display_text(self) -> str:
+        """占位进度消息的**显示文本** —— 与最终答复（:meth:`assemble`）刻意分离。
+
+        占位消息是流式进展气泡：读者盯着它时，除了正文还想看到"agent 正在做什么"
+        —— 所以把 ``tool_trace`` 渲染在正文**之前**（trace 先、正文后）。
+
+        ⚠️ **最终答复永远只有正文**。这里返回的显示文本**不进** :meth:`assemble`：
+        收尾那一步（:meth:`~opencode_bridge.outbound.OutboundSender.finalize`）拿
+        :attr:`shown_progress_text` 当"读者已见过的下界"，而那个下界记录的必须是
+        body —— 一旦把含 trace 的显示串记进去，收尾会按它去**挖正文**，而 trace
+        与正文毫无关系（读者读到的会是一段被挖掉一块的答复）。
+
+        含义：``tool_trace`` 为空时**逐字节等于** :meth:`assemble`（空栈无痕）。
+        """
+        body = self.assemble()
+        if not self.tool_trace:
+            return body
+        return "\n".join(self.tool_trace) + "\n\n" + body
+
 
 # ----------------------------------------------------------------------
 # 注入的协作者：签名写在这里，core 那边的实现是什么它们不关心
@@ -624,9 +643,12 @@ class EventStream:
             bucket = turn.parts.setdefault(assistant_id, {})
             bucket[ordinal] = bucket.get(ordinal, "") + delta
             text = turn.assemble()
+            # 显示文本 = trace + body（见 :meth:`Turn.progress_display_text`）。
+            # ⚠️ ``shown_progress_text`` 记的仍是 ``text``（body），⛔ 不是 ``display``。
+            display = turn.progress_display_text()
             handle = turn.progress_handle
             conversation_id = turn.conversation_id
-            if len(text) > self._max_message_chars:
+            if len(display) > self._max_message_chars:
                 # 超过上限就**不发也不改**这一轮，留给收尾时整段发出去（适配器
                 # 自己会切分）。这就是"已经有句柄时"一直在用的那条策略 ——
                 # 进度消息本来就只发得下上限那么多，再长它也会被后续片段取代。
@@ -666,7 +688,7 @@ class EventStream:
             # 一旦落到发信那条路上，``adapter_for`` 就会被调 —— 放在这里等于
             # "每发一次才问一次平台"，与原来那条路上的调用频次一样。
             adapter = self._adapter_for(conversation_id)
-            if len(text) > one_message_budget(self._max_message_chars, adapter):
+            if len(display) > one_message_budget(self._max_message_chars, adapter):
                 return
             turn.last_edit_ts = now
             if handle is None:
@@ -679,7 +701,7 @@ class EventStream:
             try:
                 new_handle = self._send_text(
                     conversation_id,
-                    text,
+                    display,
                     kind="progress",
                     adapter=adapter,
                     session_id=session_id,
@@ -706,7 +728,7 @@ class EventStream:
                     # ⛔ **锁外**调：适配器的 ``edit()`` / ``send()`` 会 sleep。
                     self._cancel_turn(conversation_id, new_handle, session_id)
             return
-        if self._edit_progress(conversation_id, handle, text, session_id):
+        if self._edit_progress(conversation_id, handle, display, session_id):
             with self._lock:
                 current = self._turns.get(session_id)
                 if current is not None:
@@ -740,6 +762,52 @@ class EventStream:
             if turn is None:
                 return
             turn.tool_trace.append(f"▶ {name}")
+        # 追加完 trace 后**锁外**刷新一次**已存在**的占位消息，把新工具行显示出去。
+        # ⛔ 不因 tool 事件新建占位消息（读者还没见过任何东西时，trace 会由下一片
+        # 正文或收尾呈现 —— 见 :meth:`_refresh_progress_with_trace`）。
+        self._refresh_progress_with_trace(session_id)
+
+    def _refresh_progress_with_trace(self, session_id: str) -> None:
+        """用当前 trace 刷新**已经存在**的进度消息（tool 事件到达时调用）。
+
+        ⚠️ **无句柄时不创建**：``progress_handle is None`` 意味着读者还没见过任何
+        东西（占位消息可能还没发、或这个平台根本不发）。tool 事件本身**不构成**
+        "该有一条进度消息"的理由 —— 所以这里只是把已发出去的那条改写成
+        ``trace + body``。若还没有那条消息，trace 会由下一片正文（``_on_text_delta``
+        的首发路径）或收尾（整段答复）一并呈现，一个字都不丢。
+
+        闸门与 :meth:`_on_text_delta` **完全一致**（两道长度闸 + 同一节流闸），
+        否则两处会漂：一处按 body 判、一处按 display 判，会让记进
+        ``shown_progress_text`` 的量超出收尾的预算（见
+        :func:`~opencode_bridge.outbound.one_message_budget`）。
+        被任一道闸挡下时**不烧节流窗口**（``last_edit_ts`` 在闸门之后才落盘）。
+        """
+        with self._lock:
+            turn = self._turns.get(session_id)
+            if turn is None:
+                return
+            handle = turn.progress_handle
+            if handle is None:
+                return  # ⛔ 不创建：无句柄 = 读者还没见过任何东西
+            conversation_id = turn.conversation_id
+            display = turn.progress_display_text()
+            if len(display) > self._max_message_chars:
+                return
+            now = self.clock()
+            if (now - turn.last_edit_ts) < self._edit_interval:
+                return  # throttled
+            adapter = self._adapter_for(conversation_id)
+            if len(display) > one_message_budget(self._max_message_chars, adapter):
+                return
+            turn.last_edit_ts = now
+            # 记下的**永远是 body**（``assemble()``），⛔ 不是 ``display`` —— 见
+            # :meth:`Turn.progress_display_text` 与 ``outbound.finalize`` 的下界。
+            body = turn.assemble()
+        if self._edit_progress(conversation_id, handle, display, session_id):
+            with self._lock:
+                current = self._turns.get(session_id)
+                if current is not None:
+                    current.shown_progress_text = body
 
     def _session_for_assistant(self, assistant_id: str) -> str | None:
         """按 ``assistantMessageID`` 反查它属于哪个会话。

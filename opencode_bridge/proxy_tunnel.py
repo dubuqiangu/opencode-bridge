@@ -29,18 +29,30 @@ class ProxyTunnelError(Exception):
     """
 
 
-def establish_proxy_tunnel(sock: socket.socket, host: str, port: int) -> bytes:
+def establish_proxy_tunnel(
+    sock: socket.socket,
+    host: str,
+    port: int,
+    *,
+    proxy_authorization: str | None = None,
+) -> bytes:
     """在已连到代理的 ``sock`` 上对 ``host:port`` 发 CONNECT，校验 200。
+
+    ``proxy_authorization`` 非 ``None`` 时，把它作为 ``Proxy-Authorization`` 头写进
+    CONNECT 请求（值由 :func:`opencode_bridge.proxy_config.proxy_endpoint_for` 预计算
+    好，本模块不碰编码）。需鉴权的代理没有这个头会回 407。
 
     成功返回**代理应答头之后多读到的字节**（正常情况下为空；调用方自行决定是否
     保留）。失败一律抛 :class:`ProxyTunnelError`。
     """
     authority = _connect_authority(host, port)
-    request = (
-        f"CONNECT {authority} HTTP/1.1\r\n"
-        f"Host: {authority}\r\n"
-        "\r\n"
-    ).encode("ascii")
+    request_lines = [
+        f"CONNECT {authority} HTTP/1.1",
+        f"Host: {authority}",
+    ]
+    if proxy_authorization is not None:
+        request_lines.append(f"Proxy-Authorization: {proxy_authorization}")
+    request = ("\r\n".join(request_lines) + "\r\n\r\n").encode("ascii")
     try:
         sock.sendall(request)
     except OSError as exc:

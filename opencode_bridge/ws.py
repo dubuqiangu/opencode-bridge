@@ -130,12 +130,25 @@ class WebSocketClient:
                 )
                 if proxy_endpoint is None:
                     raw = socket.create_connection((target.host, target.port), timeout=self._timeout)
+                    raw.settimeout(self._timeout)
                 else:
-                    raw = socket.create_connection(proxy_endpoint, timeout=self._timeout)
-                raw.settimeout(self._timeout)
-                if proxy_endpoint is not None:
+                    raw = socket.create_connection(
+                        (proxy_endpoint.host, proxy_endpoint.port), timeout=self._timeout
+                    )
+                    raw.settimeout(self._timeout)
+                    if proxy_endpoint.scheme == "https":
+                        # https:// 代理：CONNECT **之前**先对"到代理的"socket 做 TLS
+                        # （server_hostname = 代理主机），随后才在它上面发 CONNECT。
+                        raw = ssl.create_default_context().wrap_socket(
+                            raw, server_hostname=proxy_endpoint.host
+                        )
                     # 经代理 CONNECT 到真实目标；随后 TLS 仍以 target.host 校验证书。
-                    establish_proxy_tunnel(raw, target.host, target.port)
+                    establish_proxy_tunnel(
+                        raw,
+                        target.host,
+                        target.port,
+                        proxy_authorization=proxy_endpoint.proxy_authorization,
+                    )
                 sock = raw
                 if target.secure:
                     # wss：默认校验证书链与主机名，不给关校验的开关

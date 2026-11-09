@@ -101,12 +101,23 @@ class TcpLineTransport(Transport):
             )
         else:
             sock = socket.create_connection(
-                proxy_endpoint, timeout=self._connect_timeout
+                (proxy_endpoint.host, proxy_endpoint.port), timeout=self._connect_timeout
             )
         try:
             if proxy_endpoint is not None:
+                if proxy_endpoint.scheme == "https":
+                    # https:// 代理：CONNECT **之前**先对"到代理的"socket 做 TLS
+                    # （server_hostname = 代理主机），随后才在它上面发 CONNECT。
+                    sock = ssl.create_default_context().wrap_socket(
+                        sock, server_hostname=proxy_endpoint.host
+                    )
                 # 先经代理 CONNECT 到真实目标；随后 TLS 仍以 self.host 校验证书。
-                establish_proxy_tunnel(sock, self.host, self.port)
+                establish_proxy_tunnel(
+                    sock,
+                    self.host,
+                    self.port,
+                    proxy_authorization=proxy_endpoint.proxy_authorization,
+                )
             if self._tls:
                 sock = self._wrap_tls(sock)
             sock.settimeout(self._io_timeout)

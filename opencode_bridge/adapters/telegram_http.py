@@ -91,11 +91,25 @@ class TelegramHttp:
         if proxy_endpoint is None:
             conn = http.client.HTTPSConnection(API_HOST, API_PORT, timeout=sock_timeout)
         else:
-            proxy_host, proxy_port = proxy_endpoint
-            conn = http.client.HTTPSConnection(
-                proxy_host, proxy_port, timeout=sock_timeout
+            # 代理自身的 scheme 决定连代理用明文还是 TLS：``HTTPSConnection`` 会对
+            # **它连的那个主机**做 TLS，所以 http:// 代理要走 ``HTTPConnection``
+            # （此前恒用 HTTPSConnection，对 http:// 恰好对、对 https:// 错）。
+            connection_class = (
+                http.client.HTTPSConnection
+                if proxy_endpoint.scheme == "https"
+                else http.client.HTTPConnection
             )
-            conn.set_tunnel(API_HOST, API_PORT)
+            conn = connection_class(
+                proxy_endpoint.host, proxy_endpoint.port, timeout=sock_timeout
+            )
+            if proxy_endpoint.proxy_authorization is not None:
+                conn.set_tunnel(
+                    API_HOST,
+                    API_PORT,
+                    headers={"Proxy-Authorization": proxy_endpoint.proxy_authorization},
+                )
+            else:
+                conn.set_tunnel(API_HOST, API_PORT)
         try:
             conn.request(
                 "POST",

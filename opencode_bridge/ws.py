@@ -123,6 +123,9 @@ class WebSocketClient:
         raw: socket.socket | None = None
         #: 握手时多读到的字节（可能是第一帧），握手成功后交给 _read_bytes 消费
         prefetched: bytes = b""
+        #: 经代理 CONNECT 时，代理 200 应答头之后**已到达**的字节（对目标的透明流
+        #: 前缀）。无代理时恒为 b""，前插后行为逐字节不变。
+        tunnel_prefetch: bytes = b""
         try:
             try:
                 proxy_endpoint = proxy_endpoint_for(
@@ -143,7 +146,8 @@ class WebSocketClient:
                             raw, server_hostname=proxy_endpoint.host
                         )
                     # 经代理 CONNECT 到真实目标；随后 TLS 仍以 target.host 校验证书。
-                    establish_proxy_tunnel(
+                    # 返回值是代理 200 应答头之后多读到的字节，必须接回预读缓冲。
+                    tunnel_prefetch = establish_proxy_tunnel(
                         raw,
                         target.host,
                         target.port,
@@ -163,7 +167,8 @@ class WebSocketClient:
                 # 那它就是第一帧。此前这里把它丢掉了，于是客户端会一直干等到
                 # 读超时——症状是"连上了但收不到任何消息"，且**不报错**。
                 # Discord 网关确实会这么干，Slack / Mattermost 同理。
-                prefetched = body
+                # 次序：先 CONNECT leftover（本次隧道前缀），再 WS 握手响应之后的 body。
+                prefetched = tunnel_prefetch + body
             except WebSocketError:
                 raise
             except ProxyTunnelError as exc:

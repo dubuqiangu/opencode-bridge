@@ -95,6 +95,9 @@ class TcpLineTransport(Transport):
         proxy_endpoint = proxy_endpoint_for(
             self.host, scheme="https" if self._tls else "http"
         )
+        #: 经代理 CONNECT 时，代理 200 应答头之后已到达的字节（本次连接的透明流
+        #: 前缀）。无代理时恒为 b""，进缓冲后行为逐字节不变。
+        tunnel_prefetch: bytes = b""
         if proxy_endpoint is None:
             sock = socket.create_connection(
                 (self.host, self.port), timeout=self._connect_timeout
@@ -112,7 +115,8 @@ class TcpLineTransport(Transport):
                         sock, server_hostname=proxy_endpoint.host
                     )
                 # 先经代理 CONNECT 到真实目标；随后 TLS 仍以 self.host 校验证书。
-                establish_proxy_tunnel(
+                # 返回值是代理 200 应答头之后多读到的字节，必须接回行缓冲。
+                tunnel_prefetch = establish_proxy_tunnel(
                     sock,
                     self.host,
                     self.port,
@@ -129,6 +133,8 @@ class TcpLineTransport(Transport):
             raise
         # 重连后残留的半行必须丢弃：它属于**上一条**连接，拼接会错位。
         self._rbuf.clear()
+        # 次序不能反：先丢弃上一条连接的残留，再把**本次** CONNECT leftover 放进缓冲。
+        self._rbuf.extend(tunnel_prefetch)
         return sock
 
     def _wrap_tls(self, sock: socket.socket) -> Any:

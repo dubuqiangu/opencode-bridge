@@ -64,6 +64,11 @@ ORIGIN_HOST = "127.0.0.1"
 
 _ACCEPT_TIMEOUT = 5.0
 
+#: F6 哨兵：模拟「代理把 200 应答头与**到目标的**首批字节放进同一段」时的 leftover。
+#: 一段 ASCII 文本 —— 首个字节 'F'（0x46）若被误当 WS 帧会因 opcode 非法而响亮报错，
+#: 且不可能与 WS 握手响应的 body / 别的合法帧内容自然重合，便于区分「在」与「不在」。
+_TUNNEL_LEFTOVER_SENTINEL = b"F6-CONNECT-LEFTOVER-SENTINEL"
+
 
 # ----------------------------------------------------------------------
 # 真 TLS 支撑：临时目录里用 openssl 现签自签名证书（⛔ 不把 PEM 提交进仓库）
@@ -144,6 +149,10 @@ class RecordingConnectProxy(threading.Thread):
     ``tls_context`` 非 ``None`` 时，代理先作为 **TLS 服务端**接管连接（真握手），
     之后才在解密后的流上读 ``CONNECT`` —— 这正是 ``https://`` 代理那条臂的判据：
     客户端若在发 CONNECT 前没跟代理完成 TLS，服务端握手会失败、读不到 CONNECT。
+
+    ``tunnel_leftover`` 非空时，紧接在 ``200`` 应答头之后、**同一次 ``sendall``**
+    里追加这段字节 —— 模拟「到目标的首批字节在客户端开口前就已到达」的 leftover，
+    供 F6 断言消费者是否把它接回了缓冲。
     """
 
     def __init__(
@@ -152,11 +161,13 @@ class RecordingConnectProxy(threading.Thread):
         response_status: bytes = b"200 Connection established",
         relay: bool = True,
         tls_context: ssl.SSLContext | None = None,
+        tunnel_leftover: bytes = b"",
     ) -> None:
         super().__init__(daemon=True)
         self._response_status = response_status
         self._relay_enabled = relay
         self._tls_context = tls_context
+        self._tunnel_leftover = tunnel_leftover
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind((PROXY_HOST, 0))
@@ -186,7 +197,9 @@ class RecordingConnectProxy(threading.Thread):
         with self._lock:
             self.connections.append(authority)
             self.request_heads.append(request_head)
-        conn.sendall(b"HTTP/1.1 " + self._response_status + b"\r\n\r\n")
+        conn.sendall(
+            b"HTTP/1.1 " + self._response_status + b"\r\n\r\n" + self._tunnel_leftover
+        )
         if not self._response_status.startswith(b"200"):
             conn.close()
             return
@@ -576,6 +589,41 @@ class TestWebSocketProxyArms(ProxyEnvTestCase):
         self.assertEqual(proxy.connections, [f"{ORIGIN_HOST}:{origin.port}"])
         self.assertNotIn(b"proxy-authorization", proxy.request_heads[0].lower())
 
+    def test_connect_leftover_is_prepended_to_prefetch(self):
+        origin = self._origin()
+        proxy = self._proxy(tunnel_leftover=_TUNNEL_LEFTOVER_SENTINEL)
+        self.set_proxy()
+        tls_context = RecordingTlsContext()
+        with mock.patch("ssl.create_default_context", return_value=tls_context):
+            client = WebSocketClient(
+                f"wss://{ORIGIN_HOST}:{origin.port}/ws", timeout=_ACCEPT_TIMEOUT
+            )
+            self.addCleanup(client.close)
+            client.connect()
+        self._await_origin(origin)
+        self.assertEqual(proxy.connections, [f"{ORIGIN_HOST}:{origin.port}"])
+        # CONNECT leftover 必须**接回**预读缓冲、且在 WS 握手 body 之前。
+        self.assertTrue(
+            client._prefetch.startswith(_TUNNEL_LEFTOVER_SENTINEL),
+            f"握手完成后的预读缓冲应以 CONNECT leftover 开头，实际 {client._prefetch!r}",
+        )
+
+    def test_connect_without_leftover_leaves_prefetch_without_sentinel(self):
+        origin = self._origin()
+        proxy = self._proxy()  # 代理只回 200，无 leftover（对照臂）
+        self.set_proxy()
+        tls_context = RecordingTlsContext()
+        with mock.patch("ssl.create_default_context", return_value=tls_context):
+            client = WebSocketClient(
+                f"wss://{ORIGIN_HOST}:{origin.port}/ws", timeout=_ACCEPT_TIMEOUT
+            )
+            self.addCleanup(client.close)
+            client.connect()
+        self._await_origin(origin)
+        self.assertEqual(proxy.connections, [f"{ORIGIN_HOST}:{origin.port}"])
+        # 无 leftover ⇒ 预读缓冲不得以哨兵开头（对照臂：证明上一条的判据有咬合）。
+        self.assertFalse(client._prefetch.startswith(_TUNNEL_LEFTOVER_SENTINEL))
+
 
 # ----------------------------------------------------------------------
 # 3) TCP 行传输
@@ -675,6 +723,36 @@ class TestTcpLineTransportProxyArms(ProxyEnvTestCase):
         expected = "Basic " + base64.b64encode(b"user:pass").decode("ascii")
         self.assertEqual(
             header_of(proxy.request_heads[0], "Proxy-Authorization"), expected
+        )
+
+    def test_open_leftover_is_prepended_to_read_buffer(self):
+        origin = self._origin()
+        proxy = self._proxy(tunnel_leftover=_TUNNEL_LEFTOVER_SENTINEL)
+        # 明文 TCP（tls=False）走 scheme="http" 那条键 ⇒ 用 HTTP_PROXY 选代理。
+        self.set_proxy(var="HTTP_PROXY")
+        transport = self._transport(origin, tls=False)
+        sock = transport._open()
+        self.addCleanup(sock.close)
+        self.assertTrue(origin.accepted.wait(_ACCEPT_TIMEOUT))
+        self.assertEqual(proxy.connections, [f"{ORIGIN_HOST}:{origin.port}"])
+        # CONNECT leftover 必须**接回**行缓冲（_open() 之后、未被消费前）。
+        self.assertTrue(
+            bytes(transport._rbuf).startswith(_TUNNEL_LEFTOVER_SENTINEL),
+            f"建连后的行缓冲应以 CONNECT leftover 开头，实际 {bytes(transport._rbuf)!r}",
+        )
+
+    def test_open_without_leftover_leaves_read_buffer_without_sentinel(self):
+        origin = self._origin()
+        proxy = self._proxy()  # 代理只回 200，无 leftover（对照臂）
+        self.set_proxy(var="HTTP_PROXY")
+        transport = self._transport(origin, tls=False)
+        sock = transport._open()
+        self.addCleanup(sock.close)
+        self.assertTrue(origin.accepted.wait(_ACCEPT_TIMEOUT))
+        self.assertEqual(proxy.connections, [f"{ORIGIN_HOST}:{origin.port}"])
+        # 无 leftover ⇒ 行缓冲不得以哨兵开头（对照臂：证明上一条的判据有咬合）。
+        self.assertFalse(
+            bytes(transport._rbuf).startswith(_TUNNEL_LEFTOVER_SENTINEL)
         )
 
 

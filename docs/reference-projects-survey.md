@@ -277,3 +277,21 @@ gh api "repos/<owner>/<repo>/compare/<基线>...<HEAD>" --jq '"\(.status) \(.tot
 3. **P2 / P3 维持登记**：⛔ 未核源码前不动工。
 4. **catalog 基线就地更新为 §1 四新 SHA**（含 2026-11-08 回看段），并记 FACTS 分歧（§1.1）。
 5. **继续每日回看**（间隔一天一次，用户 2026-10-16 拍板）；下一次回看仍按 `docs/borrowing-catalog.md`「定期回看机制」节的四步动作。
+
+---
+
+## 9. 追记（2026-11-15 回看）
+
+> ⚠️ 本节只**追记**，⛔ **不改变** §0~§8 的「一次性调查快照」定位。
+> 事实的**权威出处仍是 `docs/borrowing-catalog.md`**（其项目一览表 + 「定期回看机制」节）；本节与其不一致时以 catalog 为准。
+
+| 项目 | 回看基线 SHA | star（2026-11-16 `gh` 现查） | 与 2026-11-08 快照的差异 |
+|---|---|---|---|
+| `MichengAI/dsh-im-connect` | `4fe786e751018080c63e3c8286ea486a7953e4f2` | 137 | `d869823`→`4fe786e7`（**+53 commit / 118 files**，`gh api compare` 坐实；逐 commit 细读结论 = catalog §1.5 W1~W8，⛔ 全部未拍板） |
+| `xmanrui/dsh-im` | `fc2ceab217309f8973afa03c58cdd8ff3e900130` | 3621 | **零差异** |
+| `NousResearch/hermes-agent` | `a3479306bb7ba183841d95e06b7e79288d5f3a54`（2026-11-15T16:50Z，Merge PR #155225） | 263578（live 263585） | `93a2ae2e`→`f66b6cdd` ⇒ `gh api compare` 报 **9407 commit / 300 files**（触 `gh` 300-file 上限截断）⇒ **未逐 commit 读 diff**；表列回看基线取 live 现查的 `a3479306` |
+| `zhuiyueya/dsh-im-gateway` | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` | 60 | **零差异（连续第八轮）** |
+
+- 四项 `isArchived` 均 false；`spdxId` 均空 ⇒ **license 未独立复核**（承 §1.2 的边界）。
+- 本轮新增可借鉴候选 = catalog §1.5（dsh-im-connect W1~W8）；dsh-im 与 hermes-agent 本轮**无新增候选**（未逐 commit 读 diff）。
+- ⛔ 与 10-20 / 10-25 / 11-01 同纪律：hermes-agent 的全量纯文本快照仍锁旧 `8a5edab…`，⛔ 不代表本轮基线。

@@ -8,12 +8,13 @@
 
 | 项目 | license | stars | 活跃度 | 锁定版本 |
 |---|---|---|---|---|
-| `MichengAI/dsh-im-connect` | Apache-2.0 | 127 | 2026-11-06 仍在推送 | `d869823dac938cc5fc1dbfee3dce23907d3dd8e9` |
-| `xmanrui/dsh-im` | MIT | 3339 | 2026-11-07 仍在推送 | `fc2ceab217309f8973afa03c58cdd8ff3e900130` |
-| `NousResearch/hermes-agent` | MIT | 261525 | 2026-11-08 仍在推送 | `93a2ae2eac31ccd4d9811411e54338e6a9cfe5ee` |
-| `zhuiyueya/dsh-im-gateway` | MIT | 59 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
+| `MichengAI/dsh-im-connect` | Apache-2.0 | 137 | 2026-11-15 仍在推送 | `4fe786e751018080c63e3c8286ea486a7953e4f2` |
+| `xmanrui/dsh-im` | MIT | 3621 | 2026-11-07 仍在推送 | `fc2ceab217309f8973afa03c58cdd8ff3e900130` |
+| `NousResearch/hermes-agent` | MIT | 263578 | 2026-11-15 仍在推送 | `a3479306bb7ba183841d95e06b7e79288d5f3a54` |
+| `zhuiyueya/dsh-im-gateway` | MIT | 60 | 2026-09-27 推送 | `8e8fbca125dda15b5cdd2ae79ac63a91e21f7c37` |
 
 以上四项均未归档（**2026-11-01** `gh` 现查：`isArchived` 四项均 false；本地 clone 已 `--unshallow` 后 `fetch` 复核 dsh-im/dsh-im-connect，`origin/main` 与 live HEAD 逐字相等；dsh-im-gateway 经 `gh api` 比对 HEAD 零差异 —— 该仓本轮**无本地 clone**，判据只有 `gh api` 这一路。⚠️ 本轮 `gh repo view --json licenseInfo` 四项 `spdxId` 均为 `null` ⇒ **license 本轮未独立复核**，上表 license 列沿用既往已知值）。
+⚠️ **2026-11-15 回看**：四行里两个 HEAD 前移 —— dsh-im-connect `d869823`→`4fe786e7`（+53 commit / 118 files，**本轮逐 commit 细读**见 §1.5）· hermes-agent `93a2ae2e`→`f66b6cdd`（compare **9407 commit / 300 files** 触 `gh` compare 300-file 上限截断 ⇒ ⚠️ **未逐 commit 读 diff**；⚠️ 且 live HEAD 已再前移 `a3479306`（2026-11-15T16:50Z，PR #155225）⇒ 表列回看基线取 `a3479306`）；dsh-im `fc2ceab` **零差异**（本轮回看基线）· dsh-im-gateway `8e8fbca` **连续第八轮零差异**（本仓无本地 clone ⇒ 判据只有 `gh api` 一路）。star 变化：127→**137**（dsh-im-connect）· 3339→**3621**（dsh-im）· 261525→263578（hermes-agent）· 59→60（gateway）。**四项均未归档**（2026-11-16 `gh` 现查 `isArchived` 四项均 false）；⚠️ **license 本轮未独立复核**（四项 `gh repo view --json licenseInfo` 的 `spdxId` 均返回空）⇒ 上表 license 列沿用既往已知值。⚠️ **本轮仅 dsh-im-connect 有逐 commit 细读**（§1.5），hermes / dsh-im / gateway 未读 diff ⇒ 其余各节借鉴点结论**不更新**。
 ⚠️ **2026-11-08 回看**：四行里三个 HEAD 再前移 —— dsh-im `14f8648`→`fc2ceab`（+49 commit / 141 files）· dsh-im-connect `0e66d94`→`d869823`（+25 commit / 70 files）· hermes-agent `016b76da`→`93a2ae2e`（本轮回看基线；compare **2677 commit / 300 files** 触 `gh` compare 300-file 上限截断，⚠️ 本轮**未逐 commit 读 diff** ⇒ 「全库零 opencode 事件流消费」结论**最后被证据支持仍在 `3cbb13f`**）；dsh-im-gateway `8e8fbca` **连续第七轮零差异**（本仓无本地 clone ⇒ 判据只有 `gh api` 一路）。star 变化：113→127（dsh-im-connect）· 3017→**3339**（dsh-im）· 259200→261525（hermes-agent）· 58→59（gateway）。**四项均未归档**（2026-11-08 `gh` 现查 `isArchived` 四项均 false）；⚠️ **license 本轮未独立复核**（四项 `gh repo view --json licenseInfo --jq .licenseInfo.spdxId` **均返回空**）⇒ 上表 license 列沿用既往已知值。⚠️ **本轮未逐 commit 读任何参考项目 diff** ⇒ catalog 各节借鉴点结论**不更新**；本轮细读结论（含本桥侧 P0 两项的源码依据）见 **`docs/reference-projects-survey.md`**。
 ⚠️ **2026-11-01 回看**：四行里三个 HEAD 再前移 —— dsh-im `e278ac7`→`14f8648`（+59 commit / 78 files，v5.8.0→v5.9.1，见 §2.5 本轮）· dsh-im-connect `6ef35e0`→`0e66d94`（+11 commit / 7 files，⚠️ 本轮 version tag **未核**，见 §1.4）· hermes-agent `190c0b7`→`016b76da`（本轮回看基线；compare 711 commit / 300 files 触 `gh` compare 300-file 上限截断 `gateway/*`，未见 telegram/slack/discord 文件被触及，见 §3 末段）；dsh-im-gateway `8e8fbca` **连续第六轮零差异**。star 变化：102→113（dsh-im-connect）· 2746→**3017**（dsh-im）· 258011→259200（hermes-agent）· 56→58（gateway）。本轮细读结论见 §1.4 与 §2.5；hermes 本轮**无新增候选**。
 ⚠️ **2026-10-28 回看（上一轮，已被上面的 11-01 取代为新基线，此段保留作历史）**：四行里三个 HEAD 再前移 —— dsh-im `e686e15`→`e278ac7`（+~18 commit，**telegram 相关 0**，tag v5.2.0→v5.7.0，见 §2.3）· dsh-im-connect `551f029`→`6ef35e0`（+19 commit，**telegram 专项 0**，tag v1.0.11→v1.0.19，见 §1.3）· hermes-agent `4ea8d23`→`190c0b7`（本轮回看基线；⚠️ 该轮**仅 poll 了 HEAD/stars/archived，未逐 commit 读 diff**，故不写 commit 数 —— 见 §3 末段）；dsh-im-gateway `8e8fbca` **连续第五轮零差异**。star 变化：93→102（dsh-im-connect）· 2497→**2746**（dsh-im）· 256994→258011（hermes-agent）· 54→56（gateway）。该轮细读结论见 §1.3 与 §2.3。
@@ -29,7 +30,7 @@ hermes-agent 与 dsh-im-gateway 另有全量纯文本快照（文件名含 commi
 
 ---
 
-## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 **2026-11-01 更新为 `0e66d949`**（自上一轮 v1.0.19 的 `6ef35e0` 起 +11 commit；⛔ 本轮 **version tag 未核**）；上一基线 `6ef35e0`（v1.0.19）已过期）
+## 1. MichengAI/dsh-im-connect（2026-10-16 收录；基线 **2026-11-15 更新为 `4fe786e7`**（自上一基线 `0e66d949` 起 **+53 commit / 118 files**，`gh api compare` 坐实，本轮逐 commit 细读见 §1.5；⛔ 本轮 **version tag 未核**）；上一基线 `0e66d949`（2026-11-01）已过期）
 
 **定位**：将主流 IM 平台（dingtalk/discord/feishu/lark/qq/slack/telegram/wecom/weixin）
 接入本机 DeepSeek Harness。TypeScript / Koishi(cordis) 双侧插件，与本桥领域高度同构：
@@ -143,6 +144,23 @@ v2.0.22 消息形状（上游 `packages/schema/src/session-message.ts` @ tag `v2
 | V3 | **斜杠命令计入会话活动**：命令本身也刷新「最近活动」，避免纯命令会话被误判为空闲 | `ef78324` 同族 | ✅ **可借鉴**：本桥 `commands.py` 处理命令时若将来引入「活动时间戳」，命令必须计入。⚠️ 本桥当前**无活动时间戳** ⇒ 属「V1 若落地则 V3 是其必要件」。⛔ 未拍板 |
 
 ⚠️ **登记结论（2026-11-01）**：11 个 commit 里**可借鉴候选 3 条**（V1 产品判断；V2/V3 可借鉴但**依赖 V1**），**9 个结构性不适用**（UI/发版噪声）。§1 的 A~N 清单**本轮不改**（无新机制足以立为新行）。⚠️ **V1 与既有 §1.1-T1 都属「产品判断等用户拍板」**，⛔ 不代拍、⛔ 不排期。
+
+### 1.5 本轮新机制（2026-11-15 回看，`d869823..4fe786e7`，53 commit）
+
+53 个 commit 里**绝大多数是 Koishi / DSH-Web UI 与发版噪声**（结构性不适用，同 §1.1 成片 UI 重构）；引擎域共读到 **8 组**实质改动（W1~W8，短 SHA 均已由 `gh api compare d869823…4fe786e7` 坐实存在于该区间）。以下 **W1~W8 全部未拍板**，仅登记为候选；§1.3 的 C1~C4 与 §1.4 的 V1~V3 逐条裁定**本轮不变**。
+
+| # | 机制 | 证据 | 对本桥适用性 |
+|---|---|---|---|
+| W1 | **群聊 mention 策略（per-group @闸门）**：群聊里只有被 @ 才响应，且策略按群配置 | `9857838cea` / `60a9f4e482` | ⚠️ **产品判断**：与 §1.1-T1（话题群隔离）同族——「群里谁的发言进 agent」是产品边界。本桥当前 telegram 群聊语义需先核。归**第 1 类（产品判断等用户拍板）**，⛔ 不代拍、⛔ 不排期（P1 候选，亦登记于 `reference-projects-survey` §5） |
+| W2 | **底层 getUpdates 等待在传输忽略 abort 时也被限界**（关停不被拖住） | `22d6db710b` | ✅ **可借鉴，高**：正对本桥已知面 —— telegram 长轮询的「一次关停最长等 `poll_timeout + 15`」（`poll_timeout` 上界 `POLL_TIMEOUT_UPPER_LIMIT`）与 discord 429 的「最坏被拖住 60 秒」（`MAX_RETRY_AFTER`）同族。落地对象 = `adapters/telegram.py` 的长轮询等待 / `transport` 层 abort 语义。⛔ 未拍板 |
+| W3 | **限制 thinking 体量 + 隔离可取消的 turn 投递**（思考与投递解耦，投递可独立取消） | `400c3ecf47` | ✅ **可借鉴**：与本桥「占位消息在飞行中被 `/new` 弹掉留下孤儿气泡」线（`68d74df`）同向 —— 投递需可取消。⚠️ 本桥已落「锁外 `cancel_turn` 用真句柄」，W3 是同类问题的另一面（限制 thinking 体量）。⛔ 未拍板 |
+| W4 | **思考过程可折叠 + 前端开关** | `570ccabe33` / `e5af1c6ddb` / `843a378554` | ❌ **结构性不适用**（折叠/开关依赖 Koishi console UI，opencode V2 无对应物，同 §1.1 成片 UI）；⛔ 本桥占位消息是编辑式纯文本，无折叠面。P2 候选（survey §5），⛔ 不落地 |
+| W5 | **status reactions（用表情回执表示处理状态）** | `c97d77f7e9` | ⚠️ **产品判断**：用 reaction 表达「收到 / 处理中 / 完成」，依赖平台 reaction API；本桥 telegram 是否支持 `setMessageReaction` 需先核。P2 候选（survey §5），归**第 1 类**，⛔ 不代拍 |
+| W6 | **unclaimed turn 守卫 + 结算串行化**（防无人认领的 turn 与并发结算） | `b3f8f265da` | ✅ **可借鉴**：与本桥 `session_registry` / `inbound_gateway` 的「锁内复检」同向（§1.4-V2 同族）；「unclaimed turn」对应本桥 `progress_message_creating` 的创建权 claim 面（`fix-288`）。P2 候选（survey §5），⛔ 未拍板 |
+| W7 | **8 语言 i18n** | `c7790d4364` + `da4043bb91` | ⚠️ **产品判断**：本桥全中文文案；引入 i18n 是产品范围决定。P3 候选（survey §5），归**第 1 类**，⛔ 不代拍 |
+| W8 | **删除废弃 updater** | `f42f2f4a6a` | ⚠️ **减法参考（非新增）**：参考上游清理废弃组件，本桥若有同类死代码可对照；⛔ 不足以立为新行 |
+
+⚠️ **登记结论（2026-11-15）**：53 个 commit 里**可借鉴候选 8 组**（W2/W3/W6 可借鉴；W1/W5/W7 产品判断；W4 结构性不适用；W8 减法参考），⛔ **全部未拍板**。§1 的 A~N 清单**本轮不改**（无新机制足以立为新行）。W1/W5/W7 归**第 1 类（产品判断等用户拍板）**，⛔ 不代拍、⛔ 不排期。
 
 ## 2. xmanrui/dsh-im（MIT，锁 `0b9cbc2`；**2026-11-01 基线更新为 `14f8648e`（v5.9.1）**；上一基线 `e278ac7`（v5.7.0）已过期）
 
@@ -310,6 +328,7 @@ hermes-agent `4ea8d23`；dsh-im-gateway `8e8fbca` **连续第四轮零差异**�
 新可借鉴点**）。hermes-agent 的 live HEAD 已再前移 `d050956`（+407 commit，均 2026-10-25
 `gh` 现查），本目录基线锁 `4ea8d23` 为回看快照值，引用时以「`4ea8d23`（live 已前移 `d050956`）」注明。
 ⚠️ **2026-11-01 更新**：基线再前移三项（dsh-im `14f8648` / dsh-im-connect `0e66d94` / hermes-agent `016b76da`；dsh-im-gateway `8e8fbca` **连续第六轮零差异**）。本轮回看结论见 §1.4（dsh-im-connect V1~V3）与 §2.5（dsh-im B1~B10）；hermes-agent 本轮**无新增候选**（telegram/slack/discord 文件零触及）。⛔ 与 10-20 / 10-25 同纪律：hermes-agent 那份全量纯文本快照仍锁旧 `8a5edab…`，快照里别的内容（平台清单等）仍是旧版本，引用前须注明依据版本。
+⚠️ **2026-11-15 更新**：基线前移两项 —— dsh-im-connect `0e66d94`→`4fe786e7`（**+53 commit / 118 files**，本轮逐 commit 细读见 §1.5）· hermes-agent `016b76da`→`a3479306`（⚠️ 中途值 `f66b6cdd` 的 compare 触 `gh` **300-file 上限截断**，「9407 commit / 300 files」⇒ **未逐 commit 读 diff**；表列回看基线取 live 现查的 `a3479306`（2026-11-15T16:50Z，PR #155225））；dsh-im `fc2ceab` **零差异** · dsh-im-gateway `8e8fbca` **连续第八轮零差异**。star 现查：dsh-im-connect **137** · dsh-im **3621** · hermes-agent **263578**（live 263585）· gateway **60**（均 2026-11-16 `gh` 现查；四项 `isArchived` 均 false、`spdxId` 均空 ⇒ **license 未独立复核**）。本轮回看结论见 §1.5（dsh-im-connect W1~W8）；dsh-im / hermes-agent 本轮**无新增候选**（未逐 commit 读 diff）。
 
 **回看时做什么**：
 

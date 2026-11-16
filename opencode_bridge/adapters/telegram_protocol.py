@@ -24,6 +24,7 @@ import 形态、零 ``mock.patch`` 钉点 ⇒ 缝干净，照 ``ws_protocol.py``
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from ..hooks import Button
@@ -94,6 +95,117 @@ CREDENTIAL_PROBE_INITIAL_BACKOFF = 2.0
 #: 封顶 60s = 传输层的默认值（``Transport.__init__`` 的 ``max_backoff``），
 #: 也是 5 个适配器的既有取值 ⇒ 「永不放弃」的代价有界：最坏每分钟一次 ``getMe``。
 CREDENTIAL_PROBE_MAX_BACKOFF = 60.0
+
+# ---------------------------------------------------------------------------
+# 连续失败到阈值之后：一个固定的永久失败冷却
+# ---------------------------------------------------------------------------
+# ⭐ 为什么这条线画在「连续 5 次」上（2026-11-09 拍板，写在这里为了可复核）：
+#
+# 上面那条阶梯只负责「添一点抖动」—— 它不回答**什么时候该停止把它当成抖动**。
+# 一次超时、一次代理刚起、一次 DNS 没就绪，是**同一种**失败；而 token 打错、
+# 被吊销、被墙，也都长得像「一次超时」。日志层却把两者拼成一个味道：
+# 每一档一条 WARNING、永远「将继续按退避重试」⇒ 用户翻故障期的日志，分不出
+# 「它下一条大概率会过」和「它接下来一小时都在打同一面墙」。
+#
+# 判据是可复核的：看这张凭据**连续**失败了几次、中间有没有一次成功。
+# 有成功 ⇒ 归零（那是抖动）；没有 ⇒ 计数往上走 ⇒ 走到阈值 = 这张凭据现在不行。
+#
+# ⚠️ 阈值 5 的取舍（不是「五这个数吉利」）：
+#   * 太小（2/3）⇒ 一次代理重启里的两三次连续超时就被标成"永久的"，而那种故障
+#     确实会在十几秒里自己好；标得越早，这个标记越不可信。
+#   * 太大（20/30）⇒ 到那时短阶梯早已封顶 60s 好几轮 ⇒ 标记本身没有新信息
+#     （"封顶 60s"已经发生了），它只是把"已经晚了很久"再说一遍。
+#   * 5 次 × 初值 2s 起翻倍 ⇒ 累计约 2+4+8+16 =
+#     30 秒量级的等待之后落点，落得下"用户改了配置还没生效"那段观察期，
+#     又短到用户还没开始怀疑"它是不是根本没在重试"。
+CREDENTIAL_PROBE_PERMANENT_FAILURE_THRESHOLD = 5
+
+#: 到了阈值之后的冷却（秒）：**固定**，⛔ 不再翻倍、⛔ 也**没有放弃点**。
+#:
+#: ⚠️ 为什么固定而不是继续翻倍：继续翻倍的终点还是某个封顶，而它唯一的效果是
+#: 让「改完配置之后下一次探测」来得更晚 —— 那正是要修的那件事。固定冷却让
+#: 「改配置 → 生效」之间的最坏时延有界（≤ 这一档），且这个界不随故障时长漂移。
+#: ⚠️ 为什么是 ~60s 而不是更长：一次 ``getMe`` 的代价可忽略（见
+#: :data:`CREDENTIAL_PROBE_MAX_BACKOFF` 的注释），而它是**唯一**能观测到
+#: 「token 被换回来了」的信号 ⇒ 拉长冷却换来的只是「更晚发现好了」。
+#: ⚠️ 它与 :data:`CREDENTIAL_PROBE_MAX_BACKOFF` 恰好同值（60s），但**不是同一个旋钮**：
+#: 那个是短阶梯的**封顶**（还在翻倍），这个是到阈值之后的**恒值**（已经不再翻倍）
+#: ⇒ 两者要能分开调、分开测。⛔ 不许互相引用（引用了就是「改一个顺带改另一个」）。
+CREDENTIAL_PERMANENT_FAILURE_COOLDOWN = 60.0
+
+#: 永久失败那一行日志的**标记**（转折点）。只在「连续失败达到阈值」那一档出现。
+#:
+#: ⚠️ 它不是「文案好看」：``tests/test_telegram_startup_probe.py`` 有一条守门按字面
+#: 钉住**首条失败**的两行 ``getMe failed ... adapter not started``，而首条文案是
+#: **文档引用**的排障入口（``docs/install.md`` / ``plugin/README.md``）⇒ ⛔ 一条
+#: "计数注记"若混进那两行，等于让既有的排障指引变成假话。所以转折点**必须**有
+#: 自己的字面，且只在阈值那一档、每个连续失败链出现一次。
+PERMANENT_FAILURE_LOG_MARKER = "已连续失败达到阈值"
+
+
+def _clamp_permanent_failure_cooldown(
+    configured_seconds: Any,
+    initial_backoff_seconds: Any = CREDENTIAL_PROBE_INITIAL_BACKOFF,
+) -> float:
+    """把冷却常量夹到 ``[初值, 一天]``，⛔ **绝不抛 ValueError**。
+
+    ⚠️ 为什么不抛：构造期抛的异常会被 ``build()`` 包成 ``AdapterError`` ⇒
+    适配器被跳过 ⇒ 整条 telegram 通道消失，而 **bot_token 明明配好了** ——
+    那比「冷却用了次优值」坏得多（AGENTS.md §病史：一个旋钮写错打死整条
+    关键路径，代价是零条日志）。
+
+    ⚠️ 下界取**生效中的**初值（``initial_backoff_seconds``，缺省
+    :data:`CREDENTIAL_PROBE_INITIAL_BACKOFF`）是**有意**的：比初值还短的冷却
+    = 「永久失败比一次抖动还值得多试」⇒ 这句话自相矛盾。
+
+    ⚠️ 为什么下界是**参数**而不是直接读模块常量：初值本身是**实例旋钮**
+    （测试用 ``adapter.credential_probe_initial_backoff`` 把整条阶梯缩短）。
+    若这里写死模块常量，旋钮一缩，冷却就**永远**被抬回 2.0 秒 ⇒ 上面那条
+    「冷却不短于初值」的不变量在**同一时间点上**变成假话（冷却 2.0 > 初值
+    0.01，而判据是「短于初值才算自相矛盾」的那一侧）。
+    ⇒ 不变量的两侧必须落在**同一个有效值**上：调用方把它正在用的初值传进来，
+    这里就跟它比。⛔ 不是「以后再说」的折中。
+
+    ⚠️ 上界（一天）只防手滑的大数：冷却 **不是** 放弃点（到了还是要重试），
+    所以一个天文数字不会让桥自己死，只会让「换回 token 到生效」拖成天荒地老。
+    """
+    try:
+        seconds = float(configured_seconds)
+    except (TypeError, ValueError):
+        seconds = CREDENTIAL_PERMANENT_FAILURE_COOLDOWN
+    if seconds != seconds:            # NaN：任何比较都假 ⇒ 单列判掉
+        seconds = CREDENTIAL_PERMANENT_FAILURE_COOLDOWN
+    try:
+        floor_seconds = float(initial_backoff_seconds)
+    except (TypeError, ValueError):
+        floor_seconds = CREDENTIAL_PROBE_INITIAL_BACKOFF
+    if not (floor_seconds == floor_seconds) or floor_seconds <= 0.0:
+        # 初值本身不可用（NaN / 非正 / 不可转）⇒ 退回模块常量：
+        # ⛔ 不能拿它当下界，否则 `max(seconds, nan)` 恒回 nan、冷却变成 NaN。
+        floor_seconds = CREDENTIAL_PROBE_INITIAL_BACKOFF
+    ceiling_seconds = 24.0 * 60.0 * 60.0
+    clamped = min(max(seconds, floor_seconds), ceiling_seconds)
+    if clamped != seconds:
+        logger.warning(
+            "telegram: CREDENTIAL_PERMANENT_FAILURE_COOLDOWN 配成了 %r 秒 —— "
+            "超出可用范围 [%s, %s]，已夹到 %s 秒。"
+            "（旋钮：:data:`CREDENTIAL_PERMANENT_FAILURE_COOLDOWN`；"
+            "这是连续失败到阈值之后**固定**的复查间隔，"
+            "夹它只改「多久复查一次」，改不了「永不放弃」）",
+            configured_seconds, floor_seconds, ceiling_seconds, clamped,
+        )
+    return clamped
+
+
+# ---------------------------------------------------------------------------
+# 凭据闸门模块的 logger（与 ``telegram_protocol`` 模块层同名；见下方说明）
+# ---------------------------------------------------------------------------
+# ⚠️ 这个 logger **不是**给本模块自己用的 —— 本模块没有一行运行期日志。
+# 它存在是因为上面那个夹逼告警必须落在「日志逐字节不变」的那个通道上：
+# 生产侧 ``telegram.py`` 与 ``telegram_credential_lifecycle.py`` 共用
+# ``opencode_bridge.adapters.telegram`` 这个通道名，测试与用户排障都搜它。
+# ⛔ 别为这条告警另开一个通道：那会让「搜 telegram 就能看到凭据问题」变成假话。
+logger = logging.getLogger("opencode_bridge.adapters.telegram")
 
 
 def _retry_after(data: Any) -> Optional[float]:

@@ -90,6 +90,7 @@ from .telegram_protocol import (  # noqa: F401  再导出：消费面沿用旧�
     EMPTY_ROUND_INTERVAL, DEFAULT_SOCKET_TIMEOUT, MAX_RETRY_AFTER,
     UNAUTHORIZED_ERROR_CODE, RUNTIME_CREDENTIAL_REVERIFY_LIMIT,
     CREDENTIAL_PROBE_INITIAL_BACKOFF, CREDENTIAL_PROBE_MAX_BACKOFF,
+    CREDENTIAL_PERMANENT_FAILURE_COOLDOWN,
     _button_row, _retry_after,
 )
 from .telegram_credential_lifecycle import TelegramCredentialLifecycle
@@ -165,6 +166,11 @@ class TelegramAdapter(Adapter):
     #: 绝不能靠改另一个来"顺带"生效 —— 那是让两个语义不同的旋钮共用一个名字。
     credential_probe_initial_backoff = CREDENTIAL_PROBE_INITIAL_BACKOFF
     credential_probe_max_backoff = CREDENTIAL_PROBE_MAX_BACKOFF
+    #: 同一张凭据连续失败越过阈值后的**固定冷却**（秒）。
+    #: ⚠️ 与 :attr:`credential_probe_max_backoff` **不是同一个旋钮** —— 理由见
+    #: :data:`~opencode_bridge.adapters.telegram_protocol.CREDENTIAL_PERMANENT_FAILURE_COOLDOWN`
+    #: 上方那段「不是同一个旋钮」。测试要把它缩短就覆盖这个**实例**属性。
+    credential_permanent_failure_cooldown = CREDENTIAL_PERMANENT_FAILURE_COOLDOWN
 
     #: ``conversation_id`` 的合法前缀：当前格式 + 切换前的旧别名（``chat:``）。
     #: :meth:`_chat_id` 按这个列表剥前缀，所以**旧前缀必须继续认** ——

@@ -32,6 +32,7 @@ logger 通道名保持 ``opencode_bridge.adapters.telegram``（日志逐字节�
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Any, Optional
@@ -39,7 +40,13 @@ from typing import Any, Optional
 from ..hooks import SendError
 from ..transport import ReconnectNow
 from .base import classify_http
-from .telegram_protocol import RUNTIME_CREDENTIAL_REVERIFY_LIMIT
+from .telegram_protocol import (
+    CREDENTIAL_PERMANENT_FAILURE_COOLDOWN,
+    CREDENTIAL_PROBE_PERMANENT_FAILURE_THRESHOLD,
+    PERMANENT_FAILURE_LOG_MARKER,
+    RUNTIME_CREDENTIAL_REVERIFY_LIMIT,
+    _clamp_permanent_failure_cooldown,
+)
 
 logger = logging.getLogger("opencode_bridge.adapters.telegram")
 
@@ -64,6 +71,25 @@ class TelegramCredentialLifecycle:
         self._credentials_verified = False
         #: 这一轮探测已尝试了几次（``start()`` 里那次同步探测**算第 1 次**）。
         self._credential_probe_attempts = 0
+        #: ⭐「**同一张凭据**」连续失败了几次（见 ``telegram_protocol`` 里
+        #: :data:`~opencode_bridge.adapters.telegram_protocol.CREDENTIAL_PROBE_PERMANENT_FAILURE_THRESHOLD`
+        #: 的注释）。与 :attr:`_credential_probe_attempts` **不是同一个计数器**，⛔ 不许合并：
+        #: 前者是"这一轮会话里打过几次 getMe"（启动段与运行段**各自**用它说"第 N 次"），
+        #: 后者是"这张凭据自己已经连挂了几次、中间有没有活过来一次"。
+        #: ⚠️ 前者在运行期每一轮重新探测时**归零**，而后者必须**跨会话、跨轮次**活着 ——
+        #: 否则 60s 一次的重连会把同一条墙重新数成第 1 次，阈值永远到不了（永久的墙
+        #: 会被永远当成"刚开始抖"）。两条分支（启动段 / 运行段）**共用**这一个计数。
+        self._consecutive_failures_for_same_credential = 0
+        #: ⭐ 上面那个计数**是在哪张凭据上**数出来的。凭据变了 ⇒ 换了一条连续的
+        #: 失败链 ⇒ 计数从 0 起、而且新一条**有权再报一次**永久失败（见
+        #: :meth:`_is_same_credential_as_last_failure`）。
+        self._credential_fingerprint_of_failure_streak = ""
+        #: ⭐ **永久失败的那一行**这一条失败链里已经报过没有。
+        #: ⛔ 不拿「计数 >= 阈值」当判据：那样一旦计数不归零，每一轮等待都会再报一行
+        #: ⇒ 故障一小时 = 60 行同样的 ERROR，而那正是这条要修的"刷屏"。
+        #: ⇒ 报完置真，唯一的复位点是**探通**（:meth:`_announce_credential_recovery`
+        #: 那条路径）与**换了凭据**（另起一条链）。
+        self._permanent_failure_announced_for_credential = False
         #: 这一轮探测的**起点**（monotonic）—— 恢复行里的「历时 T 秒」用它算。
         self._credential_probe_started_at = 0.0
         #: ⭐ **运行期**凭据失效（启动之后 ``getUpdates`` 回过 401）。与
@@ -79,6 +105,21 @@ class TelegramCredentialLifecycle:
         #: 放弃之后那一行必须**说清**"需要重启桥"，而 :attr:`_runtime_credentials_invalid`
         #: 会**继续为真** ⇒ 入站继续不放行（理由见 :meth:`_reverify_runtime_credentials`）。
         self._runtime_reverify_attempts = 0
+        #: ⭐ 越过阈值之后的**固定复查间隔**（见
+        #: :data:`~opencode_bridge.adapters.telegram_protocol.CREDENTIAL_PERMANENT_FAILURE_COOLDOWN`）。
+        #: 与 :attr:`_credential_probe_initial_backoff` / ``_max_backoff`` 同一个纪律：
+        #: **旋钮在适配器实例上、调度器经 ``getattr`` 逐调用读** ⇒ 测试在构造后直接
+        #: ```adapter.credential_permanent_failure_cooldown = 0.01``` 就能让它生效，
+        #: ⛔ 不必去改模块常量（改了模块常量就波及同一进程里所有别的用例）。
+        #: ⚠️ 而它**不是** :data:`CREDENTIAL_PROBE_MAX_BACKOFF` 的别名（理由见
+        #: ``telegram_protocol`` 里那段「不是同一个旋钮」）。
+        #: ⚠️ 旋钮**不在本类实例上**：本类是协作者，测试拿到的是适配器
+        #: ⇒ 名字与另外三个阶梯旋钮同住 ``TelegramAdapter``（``telegram.py``），
+        #: 这里只在构造时**种一次**类属性默认值（模型来自本模块 import 的常量）。
+        if not hasattr(adapter, "credential_permanent_failure_cooldown"):
+            adapter.credential_permanent_failure_cooldown = (
+                CREDENTIAL_PERMANENT_FAILURE_COOLDOWN
+            )
 
     # ------------------------------------------------------------------
     # 协作者转发面：8 个 read-only property，**逐调用**经适配器本体解析 ——
@@ -184,13 +225,35 @@ class TelegramCredentialLifecycle:
                 self._credentials_verified = True
                 return
             self._log_credential_failure(failure)
-            # ``attempts - 1`` = 这是第几次**等待**（线程里第一次失败是第 1 次等待
-            # ⇒ 拿初值）。⚠️ 直接传 ``attempts`` 会让**初值那一档永远用不上**
-            # （同步那次是第 1 次尝试、它不等），阶梯就变成"4s 起步" —— 而
-            # 「初值 2s → ×2」这句话会被读成一句假话。
-            if self._stop_event.wait(
-                self._credential_probe_backoff_for(self._credential_probe_attempts - 1)
-            ):
+            self._note_permanent_failure_streak_advanced()
+            # ⚠️ 过了阈值之后换**固定冷却**，不再走那条翻倍阶梯 ——
+            # 两条阶梯的判据不同（见 :data:`CREDENTIAL_PERMANENT_FAILURE_COOLDOWN`），
+            # 而这条必须是 ``_stop_event.wait``：``stop()`` 一置位就立刻醒。
+            # ⛔ 注释必须夹在两个分支**之间**也照样成立 —— 而它们属于 ``else``，
+            # 所以整段搬进 ``else`` 里，⛔ 不留「替不属于 ``if`` 的话打掩护」的余地。
+            if self._permanent_failure_escalation_due():
+                self._announce_permanent_failure_once()
+                delay_seconds = _clamp_permanent_failure_cooldown(
+                    # 旋钮读**适配器实例**（⛔ 不是本协作者）—— 名字与另外三个
+                    # 阶梯旋钮同住 ``TelegramAdapter``，测试在构造后给它赋值。
+                    getattr(
+                        self._adapter,
+                        "credential_permanent_failure_cooldown",
+                        CREDENTIAL_PERMANENT_FAILURE_COOLDOWN,
+                    ),
+                    # 下界跟**生效中的**初值走（同一个实例旋钮，见
+                    # :func:`~opencode_bridge.adapters.telegram_protocol._clamp_permanent_failure_cooldown`）。
+                    self._credential_probe_initial_backoff,
+                )
+            else:
+                # ``attempts - 1`` = 这是第几次**等待**（线程里第一次失败是第 1 次等待
+                # ⇒ 拿初值）。⚠️ 直接传 ``attempts`` 会让**初值那一档永远用不上**
+                # （同步那次是第 1 次尝试、它不等），阶梯就变成"4s 起步" —— 而
+                # 「初值 2s → ×2」这句话会被读成一句假话。
+                delay_seconds = self._credential_probe_backoff_for(
+                    self._credential_probe_attempts - 1
+                )
+            if self._stop_event.wait(delay_seconds):
                 raise ReconnectNow("getMe 探测已中止（stop() 已请求）")
 
     def _invalidate_credentials(self, code: Any, description: Any) -> None:
@@ -337,6 +400,82 @@ class TelegramCredentialLifecycle:
             "raised": False,
         }
 
+    def _note_permanent_failure_streak_advanced(self) -> None:
+        """这一次探测失败了 ⇒ 「同一张凭据连续失败」+1。
+
+        ⚠️ 与 :attr:`_credential_probe_attempts` **不是同一个计数器**：
+        后者数"这一轮会话里打过几次 ``getMe``"，而这里数"这张凭据自己连挂了几次"。
+        差别在跨轮次：``_credential_probe_attempts`` 会在运行期每一轮重新探测时归零，
+        而本计数器必须活着 —— 否则 60s 一次的重连会把同一条墙重新数成第 1 次，
+        阈值永远到不了（见 ``telegram_protocol`` 里那个常量的注释）。
+
+        凭据换了（指纹不同）⇒ 另起一条失败链：计数归零、并允许新链再报一次永久失败。
+        """
+        fingerprint = self._credential_fingerprint()
+        if fingerprint != self._credential_fingerprint_of_failure_streak:
+            self._credential_fingerprint_of_failure_streak = fingerprint
+            self._consecutive_failures_for_same_credential = 0
+            self._permanent_failure_announced_for_credential = False
+        self._consecutive_failures_for_same_credential += 1
+
+    def _announce_permanent_failure_once(self) -> None:
+        """连续失败越过阈值 ⇒ 这条失败链**恰好**打一行 ERROR，然后闭嘴。
+
+        ⚠️ 判据是 :attr:`_permanent_failure_announced_for_credential`，⛔ 不是
+        ``count >= threshold`` —— 后者在计数不归零时会让每一轮等待都再打一行，
+        故障一小时就是 60 行同样的 ERROR，而那正是这条要修的刷屏。
+        唯一的复位点是**探通**（:meth:`_announce_credential_recovery` 那条路径）
+        与**换了凭据**（:meth:`_note_permanent_failure_streak_advanced` 另起一条链）。
+
+        文案落在 ``PERMANENT_FAILURE_LOG_MARKER`` 上，与首条失败那两行
+        （``getMe failed ... adapter not started``）**不同字面** —— 那两行是
+        ``docs/install.md`` / ``plugin/README.md`` 引用的排障入口，
+        ⛔ 不许把计数注记混进去。
+        """
+        if self._permanent_failure_announced_for_credential:
+            return
+        self._permanent_failure_announced_for_credential = True
+        logger.error(
+            "telegram: %s（同一张凭据连续 %d 次 getMe 失败）—— 仍会每隔 %.0f 秒"
+            "重试一次，不放弃；若这是配置错误，改完 ``bot_token`` 无需重启桥",
+            PERMANENT_FAILURE_LOG_MARKER,
+            self._consecutive_failures_for_same_credential,
+            getattr(
+                self._adapter,
+                "credential_permanent_failure_cooldown",
+                CREDENTIAL_PERMANENT_FAILURE_COOLDOWN,
+            ),
+        )
+
+    def _permanent_failure_escalation_due(self) -> bool:
+        """这次失败是否已经越过阈值 —— 越过了就**再也不要短阶梯**。
+
+        判据是 :attr:`_consecutive_failures_for_same_credential`（同一张凭据的
+        连续失败数），⛔ 不是 ``_credential_probe_attempts``：后者在长时间故障里
+        会因为每一轮重新探测而反复归零，把它当判据等于"墙还在，但每次都重新开始数"。
+
+        ⚠️ 越过阈值后**不回落**：即使计数继续增长，这一支也恒真 ⇒ 冷却保持固定
+        ``CREDENTIAL_PERMANENT_FAILURE_COOLDOWN``，⛔ 不再翻倍。翻倍的终点还是某个
+        封顶，而它唯一的效果是让"改完配置之后下一次探测"来得更晚 —— 那正是要修的。
+
+        永久失败那**一行日志**由 :meth:`_note_permanent_failure_streak_advanced`
+        的调用方判断是否首次越过；这里只回答"用哪条延迟"。
+        """
+        return (
+            self._consecutive_failures_for_same_credential
+            >= CREDENTIAL_PROBE_PERMANENT_FAILURE_THRESHOLD
+        )
+
+    def _credential_fingerprint(self) -> str:
+        """这张凭据的指纹 —— **只为"换没换"服务**，⛔ 不记录、不落盘、不打日志。
+
+        ⚠️ 刻意用 ``hashlib`` 的摘要，而不是把 token 本身存进这个属性：
+        本属性会跟着实例活很久，而 token 是凭据（AGENTS.md §2.2）。
+        摘要不足以还原出 token，且这里只需要"两次是不是同一张"这一个比特。
+        """
+        token_value = str(getattr(self._adapter, "bot_token", "") or "")
+        return hashlib.sha256(token_value.encode("utf-8")).hexdigest()
+
     def _log_credential_failure(self, failure: dict) -> None:
         """一次失败的 ``getMe``：**按分类选日志档位与文案**。
 
@@ -416,6 +555,12 @@ class TelegramCredentialLifecycle:
         这行同时是**标定阶梯初值**的数据源（需要的数见
         :data:`CREDENTIAL_PROBE_INITIAL_BACKOFF` 上面的注释）。
         """
+        # ⛔ 归零必须**在** ``attempts <= 1`` 那道早退**之前** —— 否则
+        # 「第一次就探通」（``attempts == 1``，最常走的那条）会从下面出去，
+        # 而它恰恰是最该把上一条失败链抹掉的那种恢复。
+        self._consecutive_failures_for_same_credential = 0
+        self._permanent_failure_announced_for_credential = False
+        self._credential_fingerprint_of_failure_streak = ""
         attempts = self._credential_probe_attempts
         if attempts <= 1:
             return

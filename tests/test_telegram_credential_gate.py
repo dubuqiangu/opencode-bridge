@@ -179,10 +179,23 @@ def record_requested_waits(
     return ledger
 
 
-def fast_ladder(adapter: TelegramAdapter, initial: float, ceiling: float) -> None:
-    """把凭据阶梯缩到测试能等得起的尺度（**只**缩这一个旋钮）。"""
+def fast_ladder(
+    adapter: TelegramAdapter,
+    initial: float,
+    ceiling: float,
+    cooldown: float | None = None,
+) -> None:
+    """把凭据阶梯缩到测试能等得起的尺度（**只**缩这一个旋钮）。
+
+    cooldown=None ⇒ only the two ladder knobs, prior meaning unchanged.
+    Passing it additionally shrinks the fixed cooldown crossed after the
+    failure threshold, which is a different knob: without it the 6th onward
+    attempt waits the full module default before the next probe.
+    """
     adapter.credential_probe_initial_backoff = initial
     adapter.credential_probe_max_backoff = ceiling
+    if cooldown is not None:
+        adapter.credential_permanent_failure_cooldown = cooldown
 
 
 def message_update(update_id: int, text: str = "hi") -> dict:
@@ -443,7 +456,7 @@ class TestProbeLadder(unittest.TestCase):
         用户唯一的自助修法（改完 token 等它生效）变成"必须重启进程"。
         """
         adapter = make_adapter()
-        fast_ladder(adapter, 0.005, 0.01)
+        fast_ladder(adapter, 0.005, 0.01, 0.01)
         platform = FakePlatform(
             adapter, get_me=lambda attempt: rejected_getme_response()
         )

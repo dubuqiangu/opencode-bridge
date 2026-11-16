@@ -36,7 +36,11 @@ from .opencode_client import OpenCodeClient
 from .outbound import one_message_budget
 from .permission_ledger import PermissionLedger
 from .permission_timeout import PermissionTimeoutWatcher
-from .state import StateStore
+from .state import (
+    StateStore,
+    log_dormant_session_reconciliation,
+    reconcile_dormant_sessions,
+)
 # ``/api/event`` 订阅的**看护者**：重连状态机与退避策略归它（见该模块的 docstring
 # 为什么这件事必须住在另一个文件里）。这里只做装配。
 from .subscription_supervisor import SubscriptionStatus, SubscriptionSupervisor
@@ -280,6 +284,24 @@ class EventStream:
     #: 溢出时淘汰最早记入的名字（字典保序），"最近出现过哪些"这条信息不受影响。
     _UNHANDLED_EVENT_NAME_LIMIT = 256
 
+    #: 未知**会话**入站账本的容量上限（与 :attr:`_UNHANDLED_EVENT_NAME_LIMIT` 同形、
+    #: 同量级）。⚠️ 实测：``/api/event`` 是**全服务器广播**，同机别的 agent 会话
+    #: （含开发者自己正在跑的那个 opencode 会话）的 ``permission.asked`` /
+    #: ``session.execution.failed`` 都会推到这条流上 —— 每开一个新会话就是一个
+    #: 新 session id ⇒ 不设上界时这个 dict 在长跑里只增不减。溢出时淘汰最早记入的
+    #: 那个（字典保序），"最近哪些陌生会话在吵"这条排障信息不受影响。
+    _UNKNOWN_SESSION_INBOUND_LIMIT = 256
+
+    #: 构造后这么多秒内，未知会话的入站一律当作**正常启动抖动**，只记 INFO。
+    #: 取值理由：桥重启会重新订阅 `/api/event`，同机其它 agent 会话（含开发者自己
+    #: 的）正在跑的那几轮会把生命周期帧推过来 —— 这一阵通常是重启后几秒到十几秒，
+    #: 不是持续的。取 30 秒：足以盖住多路会话的重连/补推，又不至于长到把"真有东西
+    #: 一直在往这条流上推"这种长期现象也一起静音。
+    #: ⚠️ 知情代价：若某台机器上真有一个陌生会话在重启后头 30 秒内活动，它的那一行
+    #: 会落在 INFO 而不是 WARNING（只影响那一行；30 秒后立刻恢复升级，且每会话只升
+    #: 一次）。⛔ 刻意不做成配置键 —— 它不是用户该调的旋钮，是启动抖动的经验宽度。
+    _UNKNOWN_SESSION_ESCALATION_AFTER_SECONDS = 30.0
+
     def __init__(
         self,
         *,
@@ -374,6 +396,8 @@ class EventStream:
         self._sid_conv: dict[str, str] = {}
         #: (session_id, tool call id) -> tool name (from tool.input.started)
         self._tool_names: dict[tuple[str, str], str] = {}
+        #: 启动态对账只做一次（见 :meth:`_reconcile_dormant_sessions_once`）。
+        self._dormant_reconciled = False
 
         self._handlers: dict[str, Callable[[dict], None]] = {
             "session.execution.started": self._on_execution_started,
@@ -395,6 +419,26 @@ class EventStream:
         self._unhandled_event_names: dict[str, int] = {}
         #: 上一次打"未处理事件"日志的时刻，用于按时间节流汇总。
         self._last_unhandled_log_at: float = 0.0
+        #: ⚠️ 写者**只有 SSE 线程一个** —— 见
+        #: :meth:`_note_unknown_session_inbound` 的注释（那里给了证据与本模块
+        #: 的「不加锁」纪律）。读者是排障人（日志）与测试。所以这里与
+        #: :attr:`_unhandled_event_names` 一样**不吃** ``self._lock``：那把锁是
+        #: core 的共享 RLock、被 12 个方法抢，往每条广播事件的必经路上再插一次
+        #: 竞争只会把其它 lane 拖慢，而这三个 dict 之间没有需要原子性的不变量。
+        #:
+        #: session id -> 这个「本桥不服务的会话」推来的**用户可见级**事件条数。
+        #: 只数会走到 IM 的那两类（``permission.asked`` / ``session.execution.failed``）；
+        #: 高频帧在归属闸门就被丢掉、根本到不了这里，而 ``_KNOWN_BUT_IGNORED_EVENTS``
+        #: 连记都不记。有界，见 :attr:`_UNKNOWN_SESSION_INBOUND_LIMIT`。
+        self._unknown_session_inbound: dict[str, int] = {}
+        #: 已经为它打过**那一行** WARNING 的会话 —— 一次性升级的账本。
+        #: 与字典同容量、同淘汰纪律（否则它自己会是第二个无界增长点）。
+        self._unknown_session_escalated: set[str] = set()
+        #: 本对象的出生时刻（注入的时钟）。未知会话的入站要拿它判「是否还在启动
+        #: 抖动窗口内」。⚠️ 用 ``self.clock`` 而不是模块级 ``time.monotonic``：
+        #: 测试里那个时钟是假的，可被 ``self.ticks`` 推着走 —— 真实时钟会让
+        #: 「窗口内 / 窗口外」两条路都没法确定性地测。
+        self._started_at: float = self.clock()
 
     # ------------------------------------------------------------------
     # 订阅与分发
@@ -473,8 +517,9 @@ class EventStream:
             #
             # Cost is one in-memory dict copy per frame (``all_sessions`` holds
             # ``state._data`` under its own lock; no disk I/O).
+            registered_bindings = self._state.all_sessions()
             self._sid_conv = {
-                sid: conv for conv, sid in self._state.all_sessions().items()
+                sid: conv for conv, sid in registered_bindings.items()
             }
         if not self._owns_session_event(event_name, data):
             # 已知事件名，但**属于别的会话** —— 这是正常情况，不是错误。
@@ -491,6 +536,12 @@ class EventStream:
                 "忽略非本桥会话的事件 %s (session=%s)", event_name, _session_id(data)
             )
             return
+        # 启动态对账**只在本帧真的归本桥时才做**（放在归属闸门之后）。
+        # ⚠️ 放在闸门之前会污染两条守门：陌生会话的高频帧（``session.text.delta``）
+        # 被闸门静默丢掉，而那条守门断的正是"这一步一条日志都没有"；同理
+        # :meth:`_note_unknown_session_inbound` 那类"恰好一行 INFO"的用例也会
+        # 被这里多出来的一行对账日志顶掉。丢掉的高频帧不构成"本桥开始服务"。
+        self._reconcile_dormant_sessions_once(registered_bindings)
         handler(data)
 
     def _note_unhandled_event(self, event_name: str) -> None:
@@ -542,6 +593,34 @@ class EventStream:
             ", ".join("%s x%d" % (name, count) for name, count in top),
         )
 
+    def _reconcile_dormant_sessions_once(self, registered_bindings: dict) -> None:
+        """对 ``state.json`` 的登记做一次只读对账，**每个进程只做一次**。
+
+        ``registered_bindings`` = :meth:`StateStore.all_sessions` 的返回值，形状是
+        ``{conversation_id: session_id}``（盘上 ``state.json`` 的映射**原样**）——
+        所以 dormant 会话集合取的是它的**值**（session id），⛔ 不是键
+        （键是 ``chat:55`` 这类 conversation_id）。⚠️ 取错方向时活跃集合
+        （turn 表的 session id）与它永不相交：孤儿数恰好等于 dormant 数，
+        日志看起来"有产出"，其实一条都没对上。这是实测踩过的。
+
+        "活跃"取自 ``self._turns``：内存里的 turn 表就是本进程此刻真在服务的会话。
+        ⚠️ 它是**本进程**的知识，重启后为空 —— 而孤儿本身就是"盘上登记过、
+        但这一进程不再拥有"的绑定，所以用本进程的 turn 表来判恰是这条缺陷的定义，
+        不是对它的近似。
+
+        每进程只跑一次：对账是**启动态**的陈述，不是每帧都变的事实。
+        每帧重算会让日志每帧一行、并把这个数当成实时值（它一落地就在过期，
+        见 :func:`~opencode_bridge.state.reconcile_dormant_sessions` 的 docstring）。
+        """
+        if self._dormant_reconciled:
+            return
+        self._dormant_reconciled = True
+        with self._lock:
+            active_session_ids = tuple(self._turns)
+        dormant_session_ids = tuple(registered_bindings.values())
+        report = reconcile_dormant_sessions(dormant_session_ids, active_session_ids)
+        log_dormant_session_reconciliation(report, log=logger)
+
     def _owns_session_event(self, event_name: str, data: dict) -> bool:
         """这个事件是否属于本桥关心的会话。
 
@@ -557,6 +636,78 @@ class EventStream:
             return True
         with self._lock:
             return session_id in self._sid_conv or session_id in self._turns
+
+    def _note_unknown_session_inbound(
+        self, *, session_id: str, event_name: str
+    ) -> None:
+        """记账一次「本桥不服务的会话」推来了用户可见级事件，并决定这次打不打 WARNING。
+
+        两个 handler（``permission.asked`` 与 ``session.execution.failed``）都调它，
+        **各自保留自己那行 INFO** —— 这里只管计数与一次性升级，不管那句具体的话。
+
+        ## 为什么 INFO 是常态、WARNING 是例外
+        ``/api/event`` 是**全服务器广播**：同机其它 agent 会话（包括开发者自己正在跑
+        的那个 opencode 会话）的事件都会推到这条流上。生产实测那行
+        ``permission request for unknown session ses_effe80...`` 就是我们自己的会话，
+        与 Telegram 毫无关系 ⇒ 按 WARNING 打就是拿常规噪音把真信号淹掉。
+
+        ## 升级规则（严格单调，每个会话至多一次、进程内不再回退）
+        - 出生后 :attr:`_UNKNOWN_SESSION_ESCALATION_AFTER_SECONDS` 秒内 = 启动抖动，
+          一直是 INFO，⛔ 不进 :attr:`_unknown_session_escalated`；窗口过期后该会话
+          的下一个入站仍然**会**升级（窗口只压时间，不消耗那唯一一次）。
+        - 窗口之后，某会话的**第一条**入站打一行 WARNING，并把它记进 escalated。
+          之后（直到它被容量淘汰）永远 INFO —— 不重复告警。
+
+        ## 线程
+        调用链只有一条：``EventStream.run``（``BridgeCore.start`` 起的那个 ``Thread``
+        的 target）→ :meth:`_supervisor.run <...SubscriptionSupervisor.run>` →
+        ``on_frame=`` 的 :meth:`_consume_frame` → :meth:`dispatch` → ``handler(data)``。
+        **那个 ``handler(data)`` 在 ``with self._lock:`` 块之外、且锁已释放**（块只包
+        core 那份 ``_sid_conv`` 反向表的重建），也因此在 :meth:`_owns_session_event`
+        的二次加锁之后。所以这里天然是「只有 SSE 线程写」—— 与旁边
+        :meth:`_note_unhandled_event` 完全同一个写者。
+        ⇒ **刻意不加锁**：没有第二个写者 ⇒ 加锁换不来互斥，只是把 core 的共享 RLock
+        塞进热路径；而这三处状态之间没有需要原子性的**跨字段**不变量（两个字段都由
+        同一个线程顺序推进，读的人看到的是「这一帧之后的状态」，正合排障所需）。
+        ⚠️ 若将来有第二条线程写它，补锁的位置是**这个函数**，而不是调用点。
+
+        ``event_name`` 只用于 INFO/WARNING 里说清"是什么事件"，不参与判定。
+        """
+        previous_count = self._unknown_session_inbound.get(session_id, 0)
+        self._unknown_session_inbound[session_id] = previous_count + 1
+        # 溢出才淘汰，淘汰**最早记入**的（dict 保持插入序），与
+        # :meth:`_note_unhandled_event` 同一纪律。
+        # ⚠️ 代价：一个只来一次的会话会在 256 个更晚的陌生会话之后被挤掉，那时它那
+        # 行 INFO/WARNING 早就打过了 —— 被挤掉的只是"还在最近的排障视野里"，不是
+        # "从没被看见"。不淘汰的话这一份就是无界的（同机会话数只增不减）。
+        if (
+            len(self._unknown_session_inbound)
+            > self._UNKNOWN_SESSION_INBOUND_LIMIT
+        ):
+            self._unknown_session_inbound.pop(
+                next(iter(self._unknown_session_inbound)), None
+            )
+        if (self.clock() - self._started_at) < (
+            self._UNKNOWN_SESSION_ESCALATION_AFTER_SECONDS
+        ):
+            return
+        if session_id in self._unknown_session_escalated:
+            return
+        self._unknown_session_escalated.add(session_id)
+        # 淘汰纪律与上面同一条：这个 set 不许成为第二个无界增长点。
+        if len(self._unknown_session_escalated) > (
+            self._UNKNOWN_SESSION_INBOUND_LIMIT
+        ):
+            self._unknown_session_escalated.discard(
+                next(iter(self._unknown_session_escalated))
+            )
+        logger.warning(
+            "本桥不服务的会话 %s 仍在往里推用户可见事件（%s）；这类会话没有任何"
+            " IM 读者，已收到 %d 条 —— 本行每个会话进程内只打一次",
+            session_id,
+            event_name,
+            self._unknown_session_inbound[session_id],
+        )
 
     # ------------------------------------------------------------------
     # event handlers (each is called from the SSE thread)
@@ -892,10 +1043,17 @@ class EventStream:
         with self._lock:
             turn = self._turns.pop(session_id, None)
         if conversation_id is None:
-            logger.warning(
+            # INFO：``/api/event`` 是全服务器广播，同机别的 agent 会话的失败帧是常规
+            # 噪音。计数与「窗口过后每会话升级一次」的道理见
+            # :meth:`_note_unknown_session_inbound`。
+            logger.info(
                 "execution failed for unknown session %s: %s",
                 session_id,
                 error_message,
+            )
+            self._note_unknown_session_inbound(
+                session_id=session_id,
+                event_name="session.execution.failed",
             )
             return
         # 失败**走成功那条发布路径**（:meth:`_finalize_session` 用的同一个
@@ -930,8 +1088,12 @@ class EventStream:
         session_id = _session_id(data)
         conversation_id = self._conversation_for(session_id)
         if not conversation_id:
-            logger.warning(
+            # INFO，理由同 :meth:`_on_execution_failed` 那一处（全服务器广播）。
+            logger.info(
                 "permission request for unknown session %s", session_id
+            )
+            self._note_unknown_session_inbound(
+                session_id=session_id, event_name="permission.asked"
             )
             return
         request_id = str(data.get("id") or "")

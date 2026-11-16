@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -26,10 +27,13 @@ from unittest import mock
 
 from opencode_bridge.state import (
     STATE_SCHEMA_VERSION,
+    DormantSessionReport,
     MigrationReport,
     StateStore,
     _classify_key,
     migrate_document,
+    log_dormant_session_reconciliation,
+    reconcile_dormant_sessions,
 )
 
 
@@ -464,6 +468,168 @@ class TestMigratedStoreBehaviour(unittest.TestCase):
         self.assertEqual(reopened.get_session("telegram:77"), "ses_new")
         self.assertEqual(reopened.get_meta("telegram:77", "n"), 1)
         self.assertEqual(reopened.get_session("chat:55"), "ses_a")
+
+
+class DormantSessionReconciliationTests(unittest.TestCase):
+    """``state.json`` 里"登记过但没人服务"的 session 绑定：只读对账。
+
+    ⚠️ 这些用例构造的孤儿必须**真的是孤儿** —— 经 :meth:`StateStore.set_session`
+    写进映射、而活跃集合里没有对应 id。手搓一个字典再拿它和自己比，
+    测的是 ``set`` 的字典序，不是这条路径。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.td = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self.td, "state.json")
+
+    def store_with(self, bindings: dict) -> StateStore:
+        """``bindings`` = ``{conversation_id: session_id}``，全部经 store 自己的写路径落盘。"""
+        store = StateStore(self.path)
+        for conversation_id, session_id in bindings.items():
+            store.set_session(conversation_id, session_id)
+        return store
+
+    def all_registered_session_ids(self, store: StateStore) -> tuple:
+        """``state.json`` 里登记过的全部 session id —— ⚠️ 是 ``all_sessions()`` 的**值**。
+
+        ``all_sessions()`` 返回 ``{session_id: conversation_id}``（把盘上
+        ``{conversation_id: session_id}`` 翻过来的**反向表**）⇒ 键是会话键、
+        值是 session id。取错了方向，活跃集合与它永不相交 ⇒ 孤儿数恰好等于 dormant 数，
+        看起来"有产出"，其实一条都没对上。
+        """
+        return tuple(store.all_sessions().values())
+
+    def disk_snapshot(self) -> tuple:
+        with open(self.path, "rb") as handle:
+            payload = handle.read()
+        return os.stat(self.path).st_mtime_ns, payload
+
+    def test_no_orphans_when_every_dormant_id_is_active(self):
+        """dormant 全部出现在活跃集合里 ⇒ 孤儿为空集（不是"少几个"，是**零**）。
+
+        这是"零告警"的判据：一条永远报不出零的对账，读者会学会忽略它。
+        """
+        store = self.store_with({
+            "telegram:55": "ses_active_one",
+            "telegram:56": "ses_active_two",
+        })
+        dormant = self.all_registered_session_ids(store)
+        report = reconcile_dormant_sessions(dormant, dormant)
+        self.assertEqual(report.dormant, tuple(sorted(dormant)))
+        self.assertEqual(report.active, len(set(dormant)))
+        self.assertEqual(set(report.orphans), set())
+        self.assertEqual(report.orphan_count, 0)
+
+    def test_a_single_orphan_is_named_in_the_report(self):
+        """一条孤儿 ⇒ 报告点名它，且 ``active`` 数的是**调用方给的那批**。"""
+        store = self.store_with({
+            "telegram:55": "ses_active_one",
+            "telegram:56": "ses_dropped_one",
+        })
+        report = reconcile_dormant_sessions(
+            self.all_registered_session_ids(store), ["ses_active_one"])
+        self.assertEqual(report.orphans, ("ses_dropped_one",))
+        self.assertEqual(report.dormant_count, 2)
+        self.assertEqual(report.active, 1)
+        self.assertIn("ses_dropped_one", report.summary())
+        self.assertEqual(report.orphans, tuple(sorted(report.orphans)))
+
+    def test_empty_active_set_makes_every_dormant_id_an_orphan(self):
+        """重启之后、什么都还没重新登记 ⇒ 活跃集合为空 ⇒ **一条都不许漏**。
+
+        这个形状最容易"伪干净"：调用方没有活跃 id 可传，若实现把
+        ``dormant - {}`` 悄悄当成空集，日志会报告零孤儿而映射里全是死的。
+        """
+        store = self.store_with({
+            "telegram:55": "ses_hero_from_before",
+            "telegram:56": "ses_hero_from_before",
+            "matrix:!room:example.org": "ses_survivor",
+        })
+        dormant = self.all_registered_session_ids(store)
+        report = reconcile_dormant_sessions(dormant, [])
+        self.assertEqual(report.active, 0)
+        self.assertEqual(set(report.orphans), set(dormant))
+        self.assertEqual(report.orphan_count, report.dormant_count)
+        self.assertEqual(len(dormant), 3)
+
+    def test_reconciliation_never_writes_state_json(self):
+        """⚠️ 这条守的是「无写副作用」本身用它自己的形状，不是靠代码读起来没写。
+
+        判据：磁盘上那份 ``state.json`` 的 **mtime 与字节**在调用前后完全一致，
+        且调用之后 :meth:`StateStore.all_sessions` 读回的映射一条都没少 ——
+        如果实现真的顺手 ``drop_session``，字节会变（或至少映射会变），这里会红。
+        """
+        store = self.store_with({
+            "telegram:55": "ses_keep_one",
+            "telegram:56": "ses_orphan_one",
+        })
+        before_mtime, before_bytes = self.disk_snapshot()
+        before_map = store.all_sessions()
+
+        report = reconcile_dormant_sessions(
+            self.all_registered_session_ids(store), ["ses_keep_one"])
+
+        after_mtime, after_bytes = self.disk_snapshot()
+        self.assertEqual(report.orphans, ("ses_orphan_one",))
+        self.assertEqual(after_bytes, before_bytes, "state.json 的字节必须逐字节不变")
+        self.assertEqual(after_mtime, before_mtime, "state.json 的 mtime 不许变")
+        self.assertEqual(store.all_sessions(), before_map, "映射里一条都不许少")
+
+    def test_reconciliation_report_is_logged_as_exactly_one_info_record(self):
+        """每轮对账**恰好一行 INFO**、零 WARNING/ERROR —— 这是本功能的全部产出。
+
+        ``reconcile_dormant_sessions`` 是纯函数、**自己不写日志**（它没有 logger，
+        也不该有：那样一次调用会在不知道 cadence 的地方冒出一行）。
+        所以这里钉的是**设计上唯一的那条打点语句**的形状：
+        ``logger.info("%s", report.summary())`` —— 一个 %s、一行、零告警。
+        """
+        store = self.store_with({
+            "telegram:55": "ses_keep_one",
+            "telegram:56": "ses_orphan_one",
+            "telegram:57": "ses_orphan_two",
+        })
+        report = reconcile_dormant_sessions(
+            self.all_registered_session_ids(store), ["ses_keep_one"])
+
+        with self.assertNoLogs("opencode_bridge.state", level="WARNING"):
+            with self.assertLogs("opencode_bridge.state", level="INFO") as captured:
+                log_dormant_session_reconciliation(
+                    report, logging.getLogger("opencode_bridge.state"))
+
+        self.assertEqual(len(captured.records), 1)
+        record = captured.records[0]
+        self.assertEqual(record.levelno, logging.INFO)
+        self.assertEqual(record.name, "opencode_bridge.state")
+        self.assertIn("dormant=3", record.getMessage())
+        self.assertIn("active=1", record.getMessage())
+        self.assertIn("orphans=2", record.getMessage())
+        orphan_part = record.getMessage().split("orphan_ids=")[1]
+        self.assertIn("ses_orphan_one", orphan_part)
+        self.assertIn("ses_orphan_two", orphan_part)
+        self.assertNotIn("ses_keep_one", orphan_part)
+        self.assertNotIn("\n", record.getMessage())
+
+    def test_multiple_orphans_match_exactly_and_are_order_stable(self):
+        """多孤儿 ⇒ 集合**恰好相等**（不多不少），且与入参顺序无关。"""
+        store = self.store_with({
+            "telegram:55": "ses_keep_one",
+            "telegram:56": "ses_orphan_beta",
+            "telegram:57": "ses_orphan_alpha",
+            "telegram:58": "ses_orphan_gamma",
+        })
+        expected = {"ses_orphan_alpha", "ses_orphan_beta", "ses_orphan_gamma"}
+        dormant = self.all_registered_session_ids(store)
+        first = reconcile_dormant_sessions(dormant, ["ses_keep_one"])
+        reversed_dormant = list(reversed(dormant))
+        second = reconcile_dormant_sessions(reversed_dormant, ["ses_keep_one"])
+        self.assertEqual(set(first.orphans), expected)
+        self.assertEqual(set(second.orphans), expected)
+        self.assertEqual(len(first.orphans), len(expected))
+        self.assertEqual(len(second.orphans), len(expected))
+        self.assertEqual(first.orphans, second.orphans)
+        self.assertEqual(first.orphans, tuple(sorted(first.orphans)))
 
 
 class TestMigrationReportDefaults(unittest.TestCase):

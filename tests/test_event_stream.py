@@ -396,9 +396,15 @@ class DispatchTests(EventStreamTestCase):
         self.assertEqual(self.stream._sid_conv, {SESSION_ID: CONVERSATION})
 
     def test_low_frequency_events_from_another_session_still_reach_the_handler(self):
-        """低频事件放行：``permission.asked`` 的"未知会话"警告是有意义的信息。"""
+        """低频事件放行：``permission.asked`` 的"未知会话"那行仍然会打出来。
+
+        ⚠️ 断言的是 **INFO**：``/api/event`` 是全服务器广播（生产实测那行
+        ``unknown session ses_effe80...`` 就是开发者自己的会话），按 WARNING 打
+        等于常态噪音。升级到 WARNING 的条件（启动窗口过后、每会话一次）由
+        :class:`UnknownSessionInboundLedgerTests` 单独钉。
+        """
         with self.assertLogs("opencode_bridge.event_stream",
-                             level="WARNING") as logs:
+                             level="INFO") as logs:
             self.feed(ev("permission.asked", sessionID="ses_ghost", id="per_1"))
 
         self.assertTrue(any("unknown session" in line for line in logs.output))
@@ -556,7 +562,7 @@ class UnknownSessionAccountingTests(EventStreamTestCase):
         放行是**有意**的（见 ``_HIGH_VOLUME_SESSION_EVENTS`` 上方注释）：留一条路
         让"未知会话"在 handler 里被说出来，而不是被归属闸门无声吞掉。
         """
-        with self.assertLogs("opencode_bridge.event_stream", level="WARNING"):
+        with self.assertLogs("opencode_bridge.event_stream", level="INFO"):
             self.feed(ev("permission.asked", sessionID="ses_ghost", id="per_1"))
 
         self.assertEqual(self.send_text.outgoing, [])
@@ -582,7 +588,7 @@ class UnknownSessionAccountingTests(EventStreamTestCase):
 
     def test_a_low_frequency_event_for_an_unknown_session_is_not_accounted(self):
         """放行 ≠ 记账：handled 的名字永远不进未知事件账本（哪怕会话不认识）。"""
-        with self.assertLogs("opencode_bridge.event_stream", level="WARNING"):
+        with self.assertLogs("opencode_bridge.event_stream", level="INFO"):
             self.feed(ev("session.execution.failed",
                          sessionID="ses_ghost_in_failure",
                          error={"type": "boom", "message": "炸了"}))
@@ -611,6 +617,230 @@ class UnknownSessionAccountingTests(EventStreamTestCase):
                       "溢出淘汰的必须是**最早**记入的，最新的不许被挤掉")
         self.assertNotIn("session.flood.event.00000",
                          self.stream._unhandled_event_names)
+
+
+# ----------------------------------------------------------------------
+# 4c: Fix 2 --- unknown-session inbound: count it, escalate once per session
+# ----------------------------------------------------------------------
+class UnknownSessionInboundLedgerTests(EventStreamTestCase):
+    LOGGER_NAME = "opencode_bridge.event_stream"
+
+    def _past_grace_window(self) -> None:
+        self.ticks[0] += (
+            self.stream._UNKNOWN_SESSION_ESCALATION_AFTER_SECONDS + 1.0
+        )
+
+    def test_fix2_an_unknown_permission_ask_logs_no_warning_and_counts_once(
+            self):
+        """降级与计数是**两个**独立缺陷：只测一个，另一个修好前测试照样绿。"""
+        unknown_session_id = "ses_not_in_state_january"
+        self.assertNotIn(unknown_session_id, self.sessions,
+                         "前提：这个会话确实不在 state.json 里")
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            with self.assertLogs(self.LOGGER_NAME, level="INFO") as info_logs:
+                self.feed(ev("permission.asked",
+                             sessionID=unknown_session_id, id="per_jan"))
+        # ⚠️ 只数**本功能**那一行，⛔ 不用 `len(info_logs.output)` 做总量断言：
+        # 同一帧（本进程第一帧**真归本桥**的帧）还会触发一次启动态对账 ——
+        # 那是另一条 INFO，由 DormantSessionReconciliationWiringTests 单独钉。
+        # 用总量断言会把两个不相干的功能绑死：任一方多打一行都会红在这里，
+        # 而这里要钉的是"这条路径恰好一行点名该陌生会话"。
+        permission_lines = [
+            line for line in info_logs.output
+            if "permission request for unknown session" in line
+        ]
+        self.assertEqual(len(permission_lines), 1)
+        self.assertIn(unknown_session_id, permission_lines[0])
+        self.assertEqual(
+            self.stream._unknown_session_inbound[unknown_session_id], 1
+        )
+        self.assertEqual(self.stream._unknown_session_escalated, set())
+        self.assertEqual(self.send_text.outgoing, [])
+
+    def test_fix2_an_inbound_inside_the_grace_window_warns_not_even_once(
+            self):
+        """启动窗口内是**正常启动抖动**：一句 WARNING 都不许有，计数照记。"""
+        unknown_session_id = "ses_churn_inside_startup_window"
+        self.assertNotIn(unknown_session_id, self.sessions, "前提：陌生会话")
+        self.assertLess(
+            self.ticks[0] - self.stream._started_at,
+            self.stream._UNKNOWN_SESSION_ESCALATION_AFTER_SECONDS,
+        )
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            self.feed(ev("permission.asked",
+                         sessionID=unknown_session_id, id="per_quiet"))
+        self.assertEqual(
+            self.stream._unknown_session_inbound[unknown_session_id], 1
+        )
+        self.assertNotIn(unknown_session_id,
+                         self.stream._unknown_session_escalated)
+
+    def test_fix2_the_first_inbound_after_the_grace_window_is_the_single_warning(
+            self):
+        """窗口过后**第一条**就升级；那行要点名会话与「至今几条」。"""
+        unknown_session_id = "ses_noisy_after_startup_window"
+        self.assertNotIn(unknown_session_id, self.sessions, "前提：陌生会话")
+        for quiet_index in range(3):
+            self.feed(ev("permission.asked", sessionID=unknown_session_id,
+                         id="per_quiet_%d" % quiet_index))
+        self._past_grace_window()
+
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as caught:
+            self.feed(ev("permission.asked",
+                         sessionID=unknown_session_id, id="per_loud"))
+
+        self.assertEqual(len(caught.output), 1)
+        self.assertIn(unknown_session_id, caught.output[0])
+        self.assertIn("4 条", caught.output[0])
+        self.assertIn(unknown_session_id,
+                      self.stream._unknown_session_escalated)
+
+    def test_fix2_a_second_post_grace_inbound_for_the_same_session_warns_zero_more(
+            self):
+        """一次性就是一次性：同一个会话再吵也只升那一行。"""
+        unknown_session_id = "ses_still_noisy_after_first_warning"
+        self.assertNotIn(unknown_session_id, self.sessions, "前提：陌生会话")
+        self._past_grace_window()
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as first_warnings:
+            self.feed(ev("permission.asked",
+                         sessionID=unknown_session_id, id="per_b"))
+        self.assertEqual(len(first_warnings.output), 1)
+
+        with self.assertNoLogs(self.LOGGER_NAME, level="WARNING"):
+            self.feed(ev("permission.asked",
+                         sessionID=unknown_session_id, id="per_c"))
+            self.feed(ev("session.execution.failed",
+                         sessionID=unknown_session_id,
+                         error={"type": "x", "message": "still"}))
+        self.assertEqual(
+            self.stream._unknown_session_inbound[unknown_session_id], 3
+        )
+
+    def test_fix2_a_different_unknown_session_warns_its_own_single_time(
+            self):
+        """一次性按**会话**记，不是全局开关 —— 否则第二个陌生会话永远看不见。"""
+        first_session_id = "ses_first_stranger"
+        second_session_id = "ses_second_stranger"
+        self.feed(ev("permission.asked", sessionID=first_session_id, id="p1"))
+        self._past_grace_window()
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as first_warnings:
+            self.feed(ev("permission.asked", sessionID=first_session_id, id="p2"))
+        self.assertEqual(len(first_warnings.output), 1)
+
+        with self.assertLogs(self.LOGGER_NAME, level="WARNING") as second_warnings:
+            self.feed(ev("permission.asked", sessionID=second_session_id, id="p3"))
+        self.assertEqual(len(second_warnings.output), 1)
+        self.assertIn(second_session_id, second_warnings.output[0])
+
+    def test_fix2_the_inbound_ledger_stays_bounded_on_a_flood_of_unknown_sessions(
+            self):
+        capacity = EventStream._UNKNOWN_SESSION_INBOUND_LIMIT
+        total = capacity * 3
+
+        for flood_index in range(total):
+            self.ticks[0] += 1.0
+            self.feed(ev("permission.asked",
+                         sessionID="ses_flood_%05d" % flood_index,
+                         id="per_flood"))
+
+        self.assertEqual(len(self.stream._unknown_session_inbound), capacity)
+        latest = "ses_flood_%05d" % (total - 1)
+        earliest = "ses_flood_%05d" % 0
+        self.assertIn(latest, self.stream._unknown_session_inbound,
+                      "溢出淘汰的必须是**最早**记入的，最新的不许被挤掉")
+        self.assertNotIn(earliest, self.stream._unknown_session_inbound)
+        self.assertLessEqual(
+            len(self.stream._unknown_session_escalated), capacity,
+            "升级账本是第二个增长点，同样必须有界",
+        )
+
+    def test_fix2_a_known_session_failure_leaves_the_ledger_untouched(self):
+        """已知会话的失败走收尾那条路 —— 账本一个字都不许被写。"""
+        self.start_turn()
+
+        self.feed(ev("session.execution.failed", sessionID=SESSION_ID,
+                     error={"type": "boom", "message": "炸了"}))
+
+        self.assertEqual(self.stream._unknown_session_inbound, {})
+        self.assertEqual(self.stream._unknown_session_escalated, set())
+        self.assertTrue(self.finalize_calls, "前提：已知会话的失败真的走了收尾")
+
+
+class DormantSessionReconciliationWiringTests(EventStreamTestCase):
+    """``dispatch`` 是否真的把"登记过但没人服务"的会话交给只读对账。
+
+    ⚠️ 与 ``tests/test_state.py::DormantSessionReconciliationTests`` 是两层：
+    那边测的是差集算得对不对（纯函数），**它全绿也不能说明接线存在** ——
+    实测 ``state.py`` 的函数一次都没被 ``dispatch`` 调到，那 6 条用例照样全绿。
+    这里测的只有三件接线的事：调用发生过、方向取的是**键**、每进程只调一次。
+    """
+
+    LOGGER_NAME = "opencode_bridge.event_stream"
+
+    def test_the_first_dispatch_reconciles_the_registered_bindings(self):
+        """首帧必须对账一次 —— 一次都不调，整个功能就是死代码。"""
+        self.feed(ev("session.execution.started", sessionID=SESSION_ID))
+
+        self.assertTrue(self.stream._dormant_reconciled,
+                        "首帧之后这个标志必须已经立起来")
+
+    def test_a_dormant_session_with_no_turn_is_named_as_an_orphan(self):
+        """``state.json`` 登记了、而 ``_turns`` 里没有 ⇒ 就是孤儿，要点名。
+
+        ⚠️ 这条同时钉住**取的是键不是值**：``all_sessions()`` 返回
+        ``{session_id: conversation_id}``，值与 session id 不同形
+        （``chat:55`` vs ``ses_...``）。取错方向时活跃集合与它永不相交，
+        孤儿数恰好等于 dormant 数 —— 日志看着"有产出"，其实一条都没对上。
+        这里故意用**唯一一个**登记会话做对照臂：取错方向会把它也报成孤儿。
+        """
+        self.assertEqual(self.turns, {}, "前提：还没有任何 turn")
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.feed(ev("permission.asked", sessionID="ses_ghost", id="per_x"))
+
+        reconciliation_lines = [
+            line for line in captured.output
+            if "dormant=" in line and "orphans=" in line
+        ]
+        self.assertEqual(len(reconciliation_lines), 1,
+                         "每轮对账恰好一行 INFO")
+
+        line = reconciliation_lines[0]
+        self.assertIn("dormant=%d" % len(self.sessions), line)
+        #: 唯一一个登记的会话没有 turn ⇒ orphans 要么空、要么就是它；
+        #: 而 orphans 是已经 炮弹的，所以它必在那一行里。
+        self.assertIn(SESSION_ID, line)
+        self.assertNotIn(CONVERSATION, line,
+                         "conversation_id 是**值**，报成孤儿就说明取错了方向")
+
+    def test_a_second_dispatch_does_not_reconcile_again(self):
+        """一次性就是一次性：对账是**启动态**的陈述，不是每帧都变的事实。"""
+        self.feed(ev("session.execution.started", sessionID=SESSION_ID))
+        self.assertTrue(self.stream._dormant_reconciled, "前提：首帧已经对过账")
+
+        with self.assertNoLogs(self.LOGGER_NAME, level="INFO"):
+            self.feed(ev("session.text.delta", sessionID=SESSION_ID,
+                         assistantMessageID="msg_1", ordinal=0,
+                         delta="second frame"))
+
+    def test_an_empty_registry_reconciles_to_zero_orphans_not_to_silence(self):
+        """登记表为空 ⇒ 照样打那一行 ``orphans=0``。
+
+        ⚠️ 判据是"零告警"：一条**永不在干净时发声**的对账，看日志的人无法
+        分辨"没跑"与"跑了但没发现问题" —— 而这两种情况的排查结论相反。
+        """
+        self.state.sessions = {}
+
+        with self.assertLogs(self.LOGGER_NAME, level="INFO") as captured:
+            self.feed(ev("session.execution.started", sessionID=SESSION_ID))
+
+        reconciliation_lines = [
+            line for line in captured.output
+            if "dormant=" in line and "orphans=" in line
+        ]
+        self.assertEqual(len(reconciliation_lines), 1)
+        self.assertIn("dormant=0", reconciliation_lines[0])
+        self.assertIn("orphans=0", reconciliation_lines[0])
 
 
 # ----------------------------------------------------------------------

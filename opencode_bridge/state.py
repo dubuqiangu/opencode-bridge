@@ -27,8 +27,8 @@ import shutil
 import tempfile
 import threading
 import time
-from dataclasses import replace
-from typing import Any, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, Optional
 
 from .redaction import redact_state_values
 from .state_migration import (
@@ -45,6 +45,9 @@ __all__ = [
     "MigrationReport",
     "STATE_SCHEMA_VERSION",
     "migrate_document",
+    "DormantSessionReport",
+    "reconcile_dormant_sessions",
+    "log_dormant_session_reconciliation",
 ]
 
 logger = logging.getLogger("opencode_bridge.state")
@@ -74,6 +77,85 @@ def _lookup(mapping: dict, key: object) -> Any:
         if alias is not None:
             value = mapping.get(alias)
     return value
+
+
+@dataclass(frozen=True)
+class DormantSessionReport:
+    """一次 ``reconcile_dormant_sessions`` 的只读结果。
+
+    存在的理由与 :class:`MigrationReport` 相同：用例断言**这个值**，
+    而不是去解析日志文本 —— 日志格式一改，断言不该跟着改。
+    """
+
+    #: 进来时那批"登记过但当前没人服务"的 session id（去重并排序）。
+    dormant: tuple[str, ...] = ()
+    #: 调用方声明的活跃 session id 数。
+    active: int = 0
+    #: ``dormant`` 里**没有任何 active 认领**的那些（已排序）。
+    orphans: tuple[str, ...] = ()
+
+    @property
+    def dormant_count(self) -> int:
+        return len(self.dormant)
+
+    @property
+    def orphan_count(self) -> int:
+        return len(self.orphans)
+
+    def summary(self) -> str:
+        """单行、确定性、可直接 grep 的摘要。
+
+        排序是刻意的一层成本：同一批孤儿在不同进程里 ``set`` 的迭代顺序不同，
+        不排序则两行日志不可 diff —— 而这个功能的全部产出就是日志。
+        """
+        return (
+            f"dormant={self.dormant_count} active={self.active} "
+            f"orphans={self.orphan_count} orphan_ids={list(self.orphans)}"
+        )
+
+
+def reconcile_dormant_sessions(
+    dormant_session_ids: Iterable[str],
+    active_session_ids: Iterable[str],
+) -> DormantSessionReport:
+    """只读对账：算出 dormant 里哪些**没有任何 active 认领**。
+
+    ``dormant_session_ids`` = 登记在 ``state.json`` 里、但"当前没人服务"的那批
+    （调用方从 :meth:`StateStore.all_sessions` 之类的**只读**路径取）。
+    ``active_session_ids`` = **调用方认定此刻真在服务**的那批。
+    ⚠️ **本模块不猜它、也不负责推导它**：活跃来源有两个且不等价 ——
+    内存里的 turn 表（重启后为空）与 ``state.json`` 的整张映射（含孤儿，是超集）。
+    选哪个当"活跃"是调用方的判据；本函数只拿它做差集，从不多知道一个 id。
+
+    ⛔ 刻意不做的事：不探测 404、不告警、不改映射、不落盘、不发网络请求、不读配置。
+    孤儿本身无害（它的 session id 不会再出现在任何事件里，没有一次调用会来"报到"），
+    所以这里**只让它可见**、⛔ 不修它。代价是**这个数会过期**：两次调用之间
+    active 可能已变，消费者要操作时以最新那条为准。
+
+    返回 :class:`DormantSessionReport`；调用方以
+    ``logger.info("%s", report.summary())`` 打——每轮对账**恰好一行**。
+    """
+    dormant_ids = {str(session_id) for session_id in dormant_session_ids}
+    active_names = {str(session_id) for session_id in active_session_ids}
+    return DormantSessionReport(
+        dormant=tuple(sorted(dormant_ids)),
+        active=len(active_names),
+        orphans=tuple(sorted(dormant_ids - active_names)),
+    )
+
+
+def log_dormant_session_reconciliation(
+    report: DormantSessionReport,
+    log: logging.Logger = logger,
+) -> None:
+    """把一次对账的结果打成**恰好一行** INFO。
+
+    单独成函数而不是塞进 ``reconcile_dormant_sessions``：纯计算可以在用例里
+    无日志地反复做断言，而"本轮到底以什么级别说出去"只留在这一处
+    —— 改级别只需改这一行，``assertLogs(INFO)`` + ``assertNoLogs(WARNING)``
+    就钉得住它。⛔ 不接配置、不接开关。
+    """
+    log.info("%s", report.summary())
 
 
 class StateStore:

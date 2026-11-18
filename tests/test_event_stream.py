@@ -807,11 +807,12 @@ class DormantSessionReconciliationWiringTests(EventStreamTestCase):
 
         line = reconciliation_lines[0]
         self.assertIn("dormant=%d" % len(self.sessions), line)
-        #: 唯一一个登记的会话没有 turn ⇒ orphans 要么空、要么就是它；
-        #: 而 orphans 是已经 炮弹的，所以它必在那一行里。
+        #: 唯一一个登记的会话没有 turn ⇒ 它就是唯一的孤儿；
+        #: ⚠️ 判据是【session id 在不在】，不是"报成孤儿" —— 取错方向时
+        #: orphans 会变成 conversation_id，SESSION_ID 就从那一行里消失了。
         self.assertIn(SESSION_ID, line)
         self.assertNotIn(CONVERSATION, line,
-                         "conversation_id 是**值**，报成孤儿就说明取错了方向")
+                         "conversation_id is the KEY, so reporting it as an orphan means the direction was taken wrong")
 
     def test_a_second_dispatch_does_not_reconcile_again(self):
         """一次性就是一次性：对账是**启动态**的陈述，不是每帧都变的事实。"""

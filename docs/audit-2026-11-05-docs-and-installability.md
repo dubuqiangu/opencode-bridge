@@ -15,7 +15,7 @@
 | (a) 文档是否与当前代码同步 | **部分不同步。** 14 处「平台数/能力」硬编码仍停留在 13 平台（sms 之前）时代，且 **README §8 与 README 能力表自相矛盾** |
 | (b) 正文是否清晰、结构是否「只在末尾追加」 | **主结构清晰**，但存在明确的往末尾追加痕迹：README 编号段（1..11）被放在一大段无编号内容之后；§9 故障排查在大表格后追加 3 个小节；`config_version` 说明在 5 个文件里各抄一份 |
 | (c) 新手能否照文档走完 | **能走通 Telegram/Slack/Discord 全流程**；**另 11 个平台**在 `docs/install.md` 的 AI 向导里被 Step 2 明确排除（只问三平台），新手/agent 会漏掉 |
-| (d) 命令文档是否支持复制粘贴一键安装 | **支持。** 三条一键路径（原生 / PowerShell `iwr\|iex` / `curl\|bash`）+ jsDelivr 兜底都在，且脚本按设计不替用户重启 |
+| (d) 命令文档是否支持复制粘贴一键安装 | **支持，但本节当时的依据是【只读文档静读】、没有真跑过。** ⚠️ 2026-11-21 真机实测推翻了 Windows 那条的「可直接粘贴」结论：`iwr … \| iex` 在 PS 5.1 与 7 上都**装不上**（BOM 经管道进了 `iex` 的解析输入 ⇒ `<#` 块注释不成立 ⇒ 解析失败；退出码仍是 0 ⇒ 静默）。三条一键路径（原生 / PowerShell / `curl\|bash`）本身都在，脚本仍按设计不替用户重启；**已改**为标准路径改写成「`-OutFile` 落盘 ⇒ `-File` 执行」 |
 | 最严重的单点 | `README.md:910` 与 `README.md:175` 对「哪些平台没有编辑能力」的说法**与同文件 `README.md:158–173` 的能力表直接冲突**（只点名 IRC/Twitch，实际 8 家无编辑） |
 
 ---
@@ -212,7 +212,7 @@
 | 路径 | 命令 / 位置 | 结论 |
 |---|---|---|
 | 原生插件（推荐） | `opencode plugin add github:dubuqiangu/opencode-bridge`（`README.md:31–35`） | ✅ 单命令 |
-| Windows | `iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 \| iex`（`README.md:61`） | ✅ 可直接粘贴 |
+| Windows | `iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 \| iex`（`README.md:61`） | ⛔ **2026-11-21 实测推翻：装不上，且 exit=0 静默。** PS 5.1 与 pwsh 7 两臂同形：`iwr` 把 BOM 一起留在 `Content` 里 ⇒ 管道给 `iex` 的解析输入以 U+FEFF 开头 ⇒ `<#` 块注释不成立 ⇒ 4 处解析错误（`<# … #>` 里的 `1)`/`2)`/`3)`/`<本地目录>` 那几行）。A/B 只差这一个码点：`RAW len=14055 first_cp=65279 parse_errors=4` vs `TRIM len=14054 parse_errors=0`；trim 后两 shell 都装成（`bridge=True plugin=True`）。⚠️ BOM 又**不能删**：删掉后 PS 5.1 用 `-File` 跑同一份文件 exit=1（L277 `Invoke-Uninstall`「字符串缺少终止符」）。⇒ 已改为 `-OutFile` 落盘 + `-File` 执行（原始字节保住 BOM），两 shell 实测 exit=0、产物齐、无残留 |
 | macOS/Linux | `curl -fsSL https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.sh \| bash`（`README.md:67`） | ✅ 可直接粘贴 |
 | 镜像兜底 | `README.md:97–128`（jsDelivr） | ✅ 已提供 |
 | 安装后动作 | 脚本只 clone/铺文件/写插件 config；**不执行** `opencode service restart`（`README.md:70`；`install.sh:271` 用 `--check`） | ✅ 安全、符合文档 |

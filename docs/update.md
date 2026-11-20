@@ -113,7 +113,11 @@ opencode plugin update github:dubuqiangu/opencode-bridge
 **A. 标准**：
 
 ```powershell
-iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 | iex
+# ⚠️ 不要写成 iwr ... | iex（BOM 经管道会让 <# 块注释解析失败，装不上且退出码仍是 0）
+$p = Join-Path $env:TEMP "ocb-install.ps1"
+iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 -OutFile $p -UseBasicParsing
+powershell -NoProfile -ExecutionPolicy Bypass -File $p
+Remove-Item $p -ErrorAction SilentlyContinue
 ```
 
 ```bash

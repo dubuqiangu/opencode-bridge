@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     用法（三选一）：
-      1) 一行安装（无需下载文件）：
-           iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 | iex
+      1) 一行安装（先落盘再执行；⛔ 不要 `iwr ... | iex`）：
+           $p = Join-Path $env:TEMP "ocb-install.ps1"
+           iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 -OutFile $p -UseBasicParsing
+           powershell -NoProfile -ExecutionPolicy Bypass -File $p
       2) 本地开发安装（推送前自测）：
            powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Source <本地目录> [-Force]
       3) 卸载（删除插件目录）：

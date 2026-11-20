@@ -78,7 +78,14 @@ opencode plugin add github:dubuqiangu/opencode-bridge
 Windows：
 
 ```powershell
-iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 | iex
+# ⚠️ 不要写成 iwr ... | iex：install.ps1 必须以 UTF-8 with BOM 保存
+#    （PowerShell 5.1 用 -File 读中文时需要它），而 BOM 一旦经管道进了 iex 的
+#    解析输入，<# 块注释就识别不出来 —— 5.1 与 7 上都装不上，退出码却仍是 0。
+#    下面按原字节落盘（-OutFile 保住 BOM），再 -File 执行：
+$p = Join-Path $env:TEMP "ocb-install.ps1"
+iwr https://raw.githubusercontent.com/dubuqiangu/opencode-bridge/main/install.ps1 -OutFile $p -UseBasicParsing
+powershell -NoProfile -ExecutionPolicy Bypass -File $p
+Remove-Item $p -ErrorAction SilentlyContinue
 ```
 
 macOS / Linux：

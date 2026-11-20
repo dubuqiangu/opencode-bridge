@@ -91,15 +91,15 @@ class TelegramHttp:
         if proxy_endpoint is None:
             conn = http.client.HTTPSConnection(API_HOST, API_PORT, timeout=sock_timeout)
         else:
-            # 代理自身的 scheme 决定连代理用明文还是 TLS：``HTTPSConnection`` 会对
-            # **它连的那个主机**做 TLS，所以 http:// 代理要走 ``HTTPConnection``
-            # （此前恒用 HTTPSConnection，对 http:// 恰好对、对 https:// 错）。
-            connection_class = (
-                http.client.HTTPSConnection
-                if proxy_endpoint.scheme == "https"
-                else http.client.HTTPConnection
-            )
-            conn = connection_class(
+            # 一律用 ``HTTPSConnection``：目标恒为 TLS（443），而 CPython 的
+            # ``HTTPSConnection.connect()`` 对隧道做的是「先明文 CONNECT、收到 200 后
+            # 把隧道内 socket 套 TLS、证书按 ``_tunnel_host`` 校验」
+            # （http/client.py：``server_hostname = self._tunnel_host``）——
+            # 这正是 https:// 目标经 http:// 代理所要求的顺序。
+            # ⛔ 此前按代理 scheme 二选一、对 http:// 代理取 ``HTTPConnection``：
+            # 它天生不在隧道内做 TLS，于是明文 HTTP 被发到 Telegram 的 443，
+            # 平台回 "400 The plain HTTP request was sent to HTTPS port"（实测）。
+            conn = http.client.HTTPSConnection(
                 proxy_endpoint.host, proxy_endpoint.port, timeout=sock_timeout
             )
             if proxy_endpoint.proxy_authorization is not None:

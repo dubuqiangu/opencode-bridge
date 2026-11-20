@@ -7,8 +7,11 @@
 * ``ws.WebSocketClient.connect`` / ``transport.tcp_lines.TcpLineTransport._open``
   —— 经代理 ``CONNECT`` 隧道（``https://`` 代理先对**代理**做 TLS，随后 TLS 仍以
   **真实目标**校验证书）；
-* ``adapters.telegram_http.TelegramHttp._post`` —— 按代理 scheme 选
-  ``HTTPSConnection`` / ``HTTPConnection`` + ``set_tunnel`` 指向真实目标；
+* ``adapters.telegram_http.TelegramHttp._post`` —— 目标恒为 TLS（``API_PORT`` 443）
+  ⇒ 一律 ``HTTPSConnection`` + ``set_tunnel`` 指向真实目标。``HTTPSConnection``
+  在设了 tunnel 时把 TLS 放在**隧道内侧、对真实目标**（证书按 ``_tunnel_host``
+  校验），对代理那一段仍是明文 ``CONNECT`` —— 所以判据是**目标是否 TLS**，
+  ⛔ 不是代理自身 scheme；
 * ``proxy_tunnel.establish_proxy_tunnel`` —— CONNECT 的 ``Proxy-Authorization`` 头。
 
 **鉴别力来自真服务器，不是 mock**：代理是一个绑定 ``127.0.0.2`` 的真 socket 服务，
@@ -335,8 +338,10 @@ class _FakeHttpsResponse:
 class RecordingHttpConnection:
     """记录构造入参与 ``set_tunnel`` 的 ``http.client`` 连接替身。
 
-    同时给 ``HTTPSConnection`` 与 ``HTTPConnection`` 当替身（telegram 会按代理
-    scheme 二选一），所以名字取中性 —— 它记录的是「一次出站 HTTP 连接」。
+    两个类都当它的替身：``HTTPSConnection`` 记 ``"https"``、``HTTPConnection``
+    记 ``"http"``。⚠️ 后一个**不是**为了给等价分支发牌 —— 生产侧对代理**恒**选
+    ``HTTPSConnection``（判据是目标 443，⛔ 不是代理 scheme）。留它当替身是为了
+    让「退回去用 ``HTTPConnection``」这种回归**响亮地报类名**，而不是打真网络。
     """
 
     def __init__(self, host, port=None, *args, timeout=None, **kwargs) -> None:
@@ -763,9 +768,9 @@ class TestTelegramHttpProxyArms(ProxyEnvTestCase):
     def _post_once(self) -> tuple[str, RecordingHttpConnection]:
         """跑一次 ``_post``，返回 ``(实际用的连接类标签, 连接替身)``。
 
-        同时替换 ``HTTPSConnection`` 与 ``HTTPConnection`` 两个类：前者记
-        ``"https"``、后者记 ``"http"`` —— 于是「按代理 scheme 选对类」这件事有了
-        真咬合（只替换一个类会让另一条分支走进真网络）。
+        两个类都替换成同一替身（前者记 ``"https"``、后者记 ``"http"``），于是
+        「选了哪一类」有真咬合，且任何分支都不会走进真网络。⚠️ 判据只到**类名**：
+        真 TLS 由被替掉的那个类自己做，本替身看不到 TLS 边界。
         """
         recorded_connections: list[RecordingHttpConnection] = []
         used_connection_labels: list[str] = []
@@ -791,25 +796,35 @@ class TestTelegramHttpProxyArms(ProxyEnvTestCase):
         self.assertEqual((conn.host, conn.port), (API_HOST, API_PORT))
         self.assertIsNone(conn.tunnel)
 
-    def test_http_proxy_arm_uses_plain_connection_with_tunnel_to_api_host(self):
+    def test_http_proxy_arm_still_wraps_target_in_tls_with_tunnel_to_api_host(self):
         self.set_proxy()
         label, conn = self._post_once()
-        # http:// 代理走明文 HTTPConnection（不是对代理做 TLS 的 HTTPSConnection）。
-        self.assertEqual((label, conn.host, conn.port), ("http", PROXY_HOST, 8888))
+        # http:// 代理也照样用 HTTPSConnection：判据是**目标**要不要 TLS
+        # （API_PORT = 443 ⇒ 要），⛔ 不是代理自身 scheme。对代理那一段仍是明文 CONNECT。
+        # 用 HTTPConnection 会退化成「隧道里发明文 HTTP」，实测回 400
+        # "The plain HTTP request was sent to HTTPS port"。
+        self.assertEqual((label, conn.host, conn.port), ("https", PROXY_HOST, 8888))
         self.assertEqual(conn.tunnel, (API_HOST, API_PORT))
         # 代理 URL 无 userinfo ⇒ 不得带 Proxy-Authorization 头（对照臂）。
         self.assertIsNone(conn.tunnel_headers)
 
-    def test_https_proxy_arm_uses_tls_connection_to_proxy(self):
+    def test_https_proxy_url_does_not_move_tls_off_the_target(self):
         self.set_proxy(url=f"https://{PROXY_HOST}:8443")
         label, conn = self._post_once()
+        # 代理写成 https:// 也选 HTTPSConnection —— 但那个 TLS **打在隧道内的目标上**，
+        # ⛔ 不是打在代理上（CPython 对代理那一段始终发明文 CONNECT）。
+        # 所以「https:// 代理」当前的凭据面与 http:// 代理并无区别：
+        # 两者的 CONNECT 与 Proxy-Authorization 都是明文。这条只钉住
+        # 「不因 URL 形状把 TLS 挪走 ⇒ 目标不会退化成明文 HTTP」。
         self.assertEqual((label, conn.host, conn.port), ("https", PROXY_HOST, 8443))
         self.assertEqual(conn.tunnel, (API_HOST, API_PORT))
 
     def test_userinfo_proxy_arm_sends_basic_authorization_header(self):
         self.set_proxy(url=f"http://user:pass@{PROXY_HOST}:8888")
         label, conn = self._post_once()
-        self.assertEqual(label, "http")
+        # 凭据与连接类无关：http:// 代理 + https 目标 ⇒ 仍是 HTTPSConnection（见上一条），
+        # 而 Proxy-Authorization 头随 CONNECT 一起去（那是隧道内侧 TLS 之前的一段明文）。
+        self.assertEqual((label, conn.host, conn.port), ("https", PROXY_HOST, 8888))
         expected = "Basic " + base64.b64encode(b"user:pass").decode("ascii")
         self.assertEqual(conn.tunnel_headers, {"Proxy-Authorization": expected})
 

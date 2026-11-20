@@ -14,11 +14,22 @@ socket / 裸 ``http.client`` 的出站缝（:mod:`opencode_bridge.adapters.teleg
 
 返回的不再只是 ``(host, port)``
 --------------------------------
-调用方必须知道**代理 URL 自身的 scheme**（``https://`` 代理要先对代理本身做 TLS、
-再发 ``CONNECT``），以及代理要求鉴权时的 ``Proxy-Authorization`` 头值。这两样原先
-被本模块丢弃、由调用方「各自决定」，结果是三条缝对 ``https://`` 代理全线错误、对
-需鉴权的代理全线失败（而走 ``urllib`` 的适配器读同一环境变量却能工作）。现在统一
-由本模块算出，见 :class:`ProxyEndpoint`。
+调用方必须知道**代理 URL 自身的 scheme**，以及代理要求鉴权时的
+``Proxy-Authorization`` 头值。这两样原先被本模块丢弃、由调用方「各自决定」，结果是
+对 ``https://`` 代理全线错误、对需鉴权的代理全线失败（而走 ``urllib`` 的适配器读同一
+环境变量却能工作）。现在统一由本模块算出，见 :class:`ProxyEndpoint`。
+
+⚠️ 返回的 scheme 描述的是**代理 URL 自己**，⛔ 不是「连代理要不要 TLS」的指令：
+如何用它由调用方决定，两条缝并不相同。
+
+* ``ws`` / ``transport.tcp_lines``：``scheme == "https"`` ⇒ 先对**代理**做 TLS、
+  再在 TLS 之上发 ``CONNECT``，隧道内再对**目标**做一次 TLS（TLS 套 TLS）；
+* ``adapters.telegram_http``：按**目标**判据选连接类（``API_PORT`` 443 ⇒ 恒
+  ``HTTPSConnection``），TLS 一律落在 ``CONNECT`` 隧道**内侧**、对**真实目标**做
+  并以 ``_tunnel_host`` 校验证书。对代理那一段恒为明文 —— 所以它**读**这个 scheme
+  只是为了不在本模块里丢掉信息，⛔ 不会据此对代理说 TLS。
+  ⇒ 已知缺口：``https://`` 代理在 telegram 这条缝上目前只按明文 CONNECT 对待，
+  是否补齐属**产品判断**，本模块不代拍。
 """
 
 from __future__ import annotations

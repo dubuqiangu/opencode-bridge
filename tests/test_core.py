@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from unittest import mock
 
 from opencode_bridge.adapters.base import Adapter
@@ -22,6 +22,7 @@ from opencode_bridge import __main__ as cli
 from opencode_bridge import bridge_runner
 from opencode_bridge import logging_setup
 from opencode_bridge import platform_status
+from opencode_bridge import setup_view
 from opencode_bridge.channel_profile import _HINT_SEPARATOR
 from opencode_bridge.config import Config
 from opencode_bridge.adapters.base import build, registered_names
@@ -1478,6 +1479,13 @@ class StreamingTests(unittest.TestCase):
 
         但**不能一律过滤**：`permission.asked` 若因竞态丢失，agent 会永远等不到
         审批，而日志里什么都看不到。所以低频生命周期事件必须放行。
+
+        ⚠️ 「放行」自 `e1a774c` 起 = 打一行 **INFO**，不再是 WARNING：启动宽限窗内
+        （本用例里 `clock() - _started_at == 0`）不把全服务器广播的噪音打成 WARNING，
+        窗过之后每个未知会话**升一次** WARNING。升级阶梯由
+        :class:`tests.test_event_stream.UnknownSessionInboundLedgerTests` 独占钉住；
+        本条只管**归属闸门有没有把它吞掉**（吞掉 = 一条日志都没有），故级别钉在
+        INFO 这一档、措辞锚在会话标识上——两样都不随降噪策略搬动。
         """
         with tempfile.TemporaryDirectory() as td:
             core, client, adapter, _, _, _ = make_env(td)
@@ -1501,11 +1509,11 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(adapter.edited[-1][1].text, "我的内容")
 
             # 低频事件 + 未知会话 -> **必须放行**，让原有的警告继续暴露问题
-            with self.assertLogs("opencode_bridge.event_stream", level="WARNING") as logs:
+            with self.assertLogs("opencode_bridge.event_stream", level="INFO") as logs:
                 core.event_stream.dispatch(ev("permission.asked", sessionID="ses_ghost",
                                   id="per_1", action="bash"))
             self.assertTrue(
-                any("unknown session" in line for line in logs.output),
+                any("ses_ghost" in line for line in logs.output),
                 "低频事件不应被归属过滤吞掉，否则审批竞态会静默失败，实际: %r"
                 % (logs.output,),
             )
@@ -2183,13 +2191,34 @@ class CliTests(unittest.TestCase):
 
     @classmethod
     def _run_main_pinned_to(cls, pinned_workspace_directory: str, argv: list[str]) -> int:
-        """跑**真的** :func:`cli.main`，但把 :func:`cli._bridge_dir` 钉在 ``pinned_workspace_directory`` 上。
+        """跑**真的** :func:`cli.main`，但把 ``_bridge_dir`` 钉在 ``pinned_workspace_directory`` 上。
 
         ⚠️ 为什么必须钉：``main`` 在"配置里没有可用适配器"那条路上会走
-        :func:`cli._record_bridge_refusal` → :func:`opencode_bridge.health.record_startup_probes`，
+        :func:`~opencode_bridge.bridge_runner._record_bridge_refusal`
+        → :func:`opencode_bridge.health.record_startup_probes`，
         而它写的目录是 ``_bridge_dir()`` 的推导结果 —— 没有 ``OPENCODE_BRIDGE_CONFIG`` 时
         那个推导退回 **cwd**，跑测试时 cwd 就是**仓库根** ⇒ ``platform-health.json`` 会被
         写进仓库（``.gitignore`` 收得住它，但那是运行期产物，不该出现在仓库里）。
+
+        ⚠️ **钉哪个对象是量出来的，不是猜的**：写盘的那一函数住在
+        :mod:`opencode_bridge.bridge_runner`（第七刀 ``1ec8fd7`` 把它从 ``__main__`` 搬走），
+        它解析 ``_bridge_dir`` 用的是**自己模块的 ``__global__``** ⇒ 只钉 ``cli`` 那个名字
+        对它**零影响**（实测：同一 payload 只差钉哪一处，``patch=cli`` 时文件落在 cwd、
+        ``patch=bridge_runner`` 时落在临时目录）。
+
+        ⚠️ **必要的那一个钉是 ``bridge_runner``，⛔ 不是「四个都必需」** —— 这一条是
+        逐臂量出来的（每次只留一个钉／只去掉一个钉，跑本类的那两条 ``cli.main`` 用例，
+        再看仓库根长出什么）：`cli` / `platform_status` / `setup_view` 各自单独钉时
+        仓库根**照样**多出 ``platform-health.json``；只钉 ``bridge_runner`` 时干净；
+        「去掉 ``bridge_runner``、留其余三个」时**又红**。⇒ 四个里承重的只有它一个，
+        另外三个在本类当前的两条入口上并不被求值。
+
+        那为什么还钉四个？因为它与 :class:`tests.test_bridge_refusal_probe._RefusalHarness`
+        保持同一份名单：一旦将来某个改版让 ``platform_status`` / ``setup_view`` 也去解析
+        自己的 ``_bridge_dir``，只钉一个的那份会**静默变绿**（临时目录里没人建 handler，
+        断言仍过），而全钉的这份不会。⛔ 这是「防将来」，**不是**「少钉一个现在就会红」——
+        两句话别混，混了就会有人拿实测去否它。名单重复是刻意的：两处各自独立成立，
+        任一处被拆后忘了同步，自己会红。
 
         手法抄 :mod:`tests.test_bridge_refusal_probe` 的 ``_RefusalHarness``；⛔ **不许**
         用 ``os.chdir`` 换 cwd —— 那会影响同进程里后续所有用例。
@@ -2218,13 +2247,23 @@ class CliTests(unittest.TestCase):
         测试框架自己在 root 上可能常驻 RotatingFileHandler，所以判据只看
         ``LOG_FILE_MARKER``（本仓自己打的标记），不看「列表非空」。
         """
-        # ⚠️ 钉的是 ``cli._bridge_dir``，不是 ``bridge_runner._bridge_dir``：
-        # ``from .bridge_runner import _bridge_dir`` 是**按值**绑定的，``main()`` 解析的是
-        # ``__global__``（= 本模块字典），改 ``bridge_runner`` 上的同名属性**对它零影响**
-        # （实测：两臂只差钉哪一处，钉 bridge_runner 那臂 ``cli._bridge_dir()`` 仍回真实目录）
-        # ⇒ 钉错对象时 ``main()`` 从没读过这个替身，临时目录里也就从没建过 handler
-        # ⇒ ⇒ 漏 handle 的用例**恒绿**，而它还看着在测这一条。
-        with mock.patch.object(cli, "_bridge_dir", lambda: pinned_workspace_directory):
+        # ⚠️ 四个**各自按值绑定**的模块字典，全部要钉（名单与理由见 docstring）。
+        # 承重的是 ``bridge_runner`` 那一个：只钉 cli 时它仍在真的 ``_bridge_dir()``
+        # 上照写不误（实测仓库根长出 platform-health.json），而临时目录里**从没建过**
+        # handler ⇒ ⇒ 漏 handle 的用例**恒绿**，而它还看着在测这一条。其余三个是
+        # 「防将来」——本条实测它们单独钉／去掉都不改变结果，见 docstring。
+        with ExitStack() as pinned_modules:
+            for module_holding_bridge_dir in (
+                cli,
+                bridge_runner,
+                platform_status,
+                setup_view,
+            ):
+                pinned_modules.enter_context(
+                    mock.patch.object(
+                        module_holding_bridge_dir, "_bridge_dir", lambda: pinned_workspace_directory
+                    )
+                )
             rc = cli.main(argv)
         # ⚠️ 扫描必须在 ``with`` **之后**：``main()`` 的 ``finally`` 里已经卸过一次，
         # 而块内扫只能看见「还在不在」—— 两处都扫才区分得开「从没装上」与「装了没卸」。
